@@ -3,6 +3,15 @@ import { resolveRequestUrl } from "@/lib/http";
 /** 后端允许的固定图片派生预设；固定枚举避免调用方制造任意尺寸缓存。 */
 export type ImageVariant = "landscape-card" | "poster-card" | "photo-tile";
 
+/**
+ * 海报墙格子按主图比例挑派生预设：预设是等比缩放的外接框，横版封面（其他库
+ * 的 16:9 抓帧 / 横版 -poster）套进竖框只能缩到 328×184，在 220px 起步的宽列上
+ * 会糊；横图取横卡预设（480×270）才够 2x 屏。竖版海报仍走 poster-card。
+ */
+export function cardVariantFor(aspect: number | undefined): ImageVariant {
+  return aspect !== undefined && aspect >= 1 ? "landscape-card" : "poster-card";
+}
+
 function appendVariant(url: string, variant: ImageVariant): string {
   return `${url}${url.includes("?") ? "&" : "?"}variant=${variant}`;
 }

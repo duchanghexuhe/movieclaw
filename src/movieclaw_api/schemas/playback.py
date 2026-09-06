@@ -19,6 +19,11 @@ class RecentWatchItemView(BaseModel):
     title: str
     year: int | None
     poster_url: str | None
+    # 海报真实宽高比（同海报墙的 primary_aspect）：其他库的本地封面多是 16:9 抓帧，
+    # 缺横向剧照时前端按这个比例决定直接铺满 16:9 卡片还是模糊铺底居中完整显示
+    poster_aspect: float = Field(
+        default=0.6667, description="海报宽高比（同海报墙 primary_aspect）"
+    )
     backdrop_url: str | None
     episode_still_url: str | None
     season_number: int

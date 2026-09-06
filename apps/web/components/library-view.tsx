@@ -27,7 +27,7 @@ import { listRecentWatch, type RecentWatchItem } from "@/lib/api/playback";
 import type { Subscription } from "@/lib/api/subscriptions";
 import { publicEnv } from "@/lib/env";
 import { formatBytes } from "@/lib/format";
-import { imageUrl } from "@/lib/image-proxy";
+import { cardVariantFor, imageUrl } from "@/lib/image-proxy";
 import { libraryInventoryAction } from "@/lib/library-inventory-summary";
 import type { MediaItem } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
@@ -380,7 +380,9 @@ function libraryItemToMediaItem(item: LibraryItem): MediaItem {
     source: "tmdb",
     // 其他库条目没有发现页类型；卡片只当本地内容展示，不给订阅入口
     type: item.kind === "video" || item.kind === "photo" ? "movie" : item.kind,
-    aspect: item.primary_aspect,
+    // 首页横滚行卡片规格统一为 2:3 竖框；其他库的横版封面按真实比例居中完整显示
+    // （模糊铺底），不按真实比例撑宽卡片——横图等高排会是海报的 2.7 倍宽，整行太大
+    imageAspect: item.primary_aspect,
     title: item.title,
     originalTitle: "",
     year: item.year ?? 0,
@@ -394,8 +396,9 @@ function libraryItemToMediaItem(item: LibraryItem): MediaItem {
     // TMDB 图床绝对地址——统一经 imageUrl 解析（补 API base / 走缓存代理）。
     // 取 poster-card 派生图而非原图：格子实测渲染 150~170 CSS px，328px 的
     // 预设覆盖 2x 屏绰绰有余，而原图是 500px 宽的刮削资产——一屏 60 格直出
-    // 原图要 4.9 MB，取派生图只要 1.7 MB（实测单张 82KB → 29KB）
-    posterUrl: imageUrl(item.poster_url, "poster-card"),
+    // 原图要 4.9 MB，取派生图只要 1.7 MB（实测单张 82KB → 29KB）。
+    // 其他库的横版封面按比例取横卡预设，竖框会把它缩得太小
+    posterUrl: imageUrl(item.poster_url, cardVariantFor(item.primary_aspect)),
   };
 }
 

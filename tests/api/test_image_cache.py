@@ -167,6 +167,41 @@ async def test_variant_is_webp_cached_and_never_upscales(tmp_path: Path) -> None
         assert image.size == (300, 169), "小分集图不应为凑 480px 被强行放大"
 
 
+async def test_variant_keeps_source_aspect_without_cropping(tmp_path: Path) -> None:
+    """其他库的横版封面（16:9）走竖海报预设时等比缩进外接框，不能裁成 2:3 竖条：
+    前端卡片框按真实比例排版，服务端一裁就只剩画面正中一小块。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    service = ImageVariantService(_make_cache(tmp_path, handler))
+    wide = tmp_path / "wide-poster.jpg"
+    Image.new("RGB", (960, 540), "#335577").save(wide, "JPEG", quality=95)
+    derived = await service.get_or_create(
+        wide,
+        source_key="asset:wide-poster.jpg",
+        source_version=local_source_version(wide),
+        variant=ImageVariant.POSTER_CARD,
+    )
+    with Image.open(derived.path) as image:
+        width, height = image.size
+        assert width == 328, "宽度贴齐外接框"
+        assert abs(width / height - 16 / 9) < 0.02, f"比例应保持 16:9，实际 {width}x{height}"
+
+    tall = tmp_path / "tall-thumb.jpg"
+    Image.new("RGB", (1080, 1920), "#553377").save(tall, "JPEG", quality=95)
+    derived_tall = await service.get_or_create(
+        tall,
+        source_key="asset:tall-thumb.jpg",
+        source_version=local_source_version(tall),
+        variant=ImageVariant.LANDSCAPE_CARD,
+    )
+    with Image.open(derived_tall.path) as image:
+        width, height = image.size
+        assert height == 270, "高度贴齐外接框"
+        assert abs(width / height - 9 / 16) < 0.02, f"比例应保持 9:16，实际 {width}x{height}"
+
+
 # ---------------------------------------------------------------------------
 # 路由集成：登录 → /images/proxy → 缓存落盘 → FileResponse + 长缓存头
 # ---------------------------------------------------------------------------

@@ -51,6 +51,8 @@ export interface MediaItem {
   type: MediaType;
   /** 主图宽高比；缺省 2:3。媒体库里本地抓帧的缩略图是 16:9（见 LibraryItem.primary_aspect） */
   aspect?: number;
+  /** 主图的真实比例；与卡片框比例（aspect）不同时，图不裁切，模糊铺底居中完整显示（见 PosterVisualItem.imageAspect） */
+  imageAspect?: number;
   /** 中文标题 */
   title: string;
   /** 原名（拉丁/原语言） */

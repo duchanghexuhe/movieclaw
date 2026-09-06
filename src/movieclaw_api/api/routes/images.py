@@ -72,6 +72,11 @@ async def get_metadata_asset(
     可猜——所以这里还要按库可见范围判一次：条目落在主体不可浏览的库里就 404，
     否则「看不见库」的成员靠猜 id 也能把库里的海报/抓帧图翻个遍
     （docs/design/library-access.md 2.5）。
+
+    超管会话不做这层校验：超管对全部库都有管理权，「仅管理」只是把库从自己的
+    浏览面（首页 / 海报墙 / Jellyfin）摘掉，不是对超管保密。活动页「全部」口径
+    本来就给超管看范围外记录的片名，海报同级放行；否则那些行会请求到 404，
+    海报位一直空着（实测踩过）。
     """
     from movieclaw_api.services.library.access import assert_item_visible
     from movieclaw_api.services.media_scrape import assets_root
@@ -81,7 +86,7 @@ async def get_metadata_asset(
     if not target.is_relative_to(root) or not target.is_file():
         raise NotFoundException("图片资产不存在")
     head = path.split("/", 1)[0]
-    if head.isdigit():
+    if head.isdigit() and principal.kind != "admin":
         await assert_item_visible(session, principal, int(head))
     if variant is not None:
         cached = await get_image_variant_service().get_or_create(

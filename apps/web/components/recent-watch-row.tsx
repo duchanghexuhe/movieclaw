@@ -8,7 +8,7 @@ import { CheckIcon, PlayIcon } from "@/components/icons";
 import { PosterImage } from "@/components/poster-image";
 import type { RecentWatchItem } from "@/lib/api/playback";
 import { playHref, rememberPlayerReturnPath } from "@/lib/player/play-links";
-import { imageUrl } from "@/lib/image-proxy";
+import { cardVariantFor, imageUrl } from "@/lib/image-proxy";
 import { formatRelativeTime } from "@/lib/time";
 import { useTapGuard } from "@/lib/use-tap-guard";
 
@@ -152,7 +152,11 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
                     {code}
                   </span>
                 ) : (
-                  <MoviePosterFill title={item.title} posterUrl={item.poster_url} />
+                  <MoviePosterFill
+                    title={item.title}
+                    posterUrl={item.poster_url}
+                    posterAspect={item.poster_aspect}
+                  />
                 )
               }
             />
@@ -161,7 +165,11 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
               {code}
             </span>
           ) : (
-            <MoviePosterFill title={item.title} posterUrl={item.poster_url} />
+            <MoviePosterFill
+              title={item.title}
+              posterUrl={item.poster_url}
+              posterAspect={item.poster_aspect}
+            />
           )}
           <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/75 to-transparent" />
           {/* 右上角统一放"状态角标"：看完的对勾与未看提示同排，不再和底部进度抢位置。 */}
@@ -241,8 +249,24 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
   );
 }
 
-/** 电影缺少横向剧照时：海报模糊铺底，中央按 2:3 完整保留一张清晰海报。 */
-function MoviePosterFill({ title, posterUrl }: { title: string; posterUrl: string | null }) {
+/** 卡片是 16:9 的横卡 */
+const CARD_ASPECT = 16 / 9;
+
+/**
+ * 缺少横向剧照时用海报兜底，按海报真实比例处理（与首页海报墙的横版封面同一手法）：
+ * 其他库的本地封面多是 16:9 抓帧，和卡片同比例，直接铺满；2:3 竖海报等与卡片
+ * 比例不同的，用同一张图放大模糊铺底，中央按真实比例完整保留一张清晰图。
+ * 以前一律按 2:3 处理，16:9 封面被塞进卡片中央 37.5% 宽的竖条里，只剩画面正中一小块。
+ */
+function MoviePosterFill({
+  title,
+  posterUrl,
+  posterAspect,
+}: {
+  title: string;
+  posterUrl: string | null;
+  posterAspect: number;
+}) {
   if (!posterUrl) {
     return (
       <span className="flex size-full items-center justify-center px-5 text-center text-ui font-semibold text-white/25">
@@ -250,7 +274,16 @@ function MoviePosterFill({ title, posterUrl }: { title: string; posterUrl: strin
       </span>
     );
   }
-  const src = imageUrl(posterUrl, "poster-card");
+  const src = imageUrl(posterUrl, cardVariantFor(posterAspect));
+  if (Math.abs(posterAspect - CARD_ASPECT) <= 0.05) {
+    return (
+      <PosterImage
+        src={src}
+        alt={`${title}封面`}
+        className="size-full transition duration-500 group-hover/recent:scale-[1.03]"
+      />
+    );
+  }
   return (
     <div className="relative size-full overflow-hidden bg-[#10131c]">
       <PosterImage
@@ -259,8 +292,14 @@ function MoviePosterFill({ title, posterUrl }: { title: string; posterUrl: strin
         className="absolute inset-0 size-full scale-125 blur-xl opacity-45"
       />
       <div className="absolute inset-0 bg-black/25" />
-      <div className="absolute inset-y-0 left-1/2 w-[37.5%] -translate-x-1/2 shadow-[0_0_28px_rgba(0,0,0,0.55)]">
-        <PosterImage src={src} alt={`${title}海报`} className="size-full" />
+      <div className="absolute inset-0 flex items-center justify-center">
+        {/* 竖图贴齐卡高、横图贴齐卡宽；盒子比例等于图比例，object-cover 不会裁 */}
+        <div
+          style={{ aspectRatio: posterAspect }}
+          className={`${posterAspect > CARD_ASPECT ? "w-full" : "h-full"} shadow-[0_0_28px_rgba(0,0,0,0.55)]`}
+        >
+          <PosterImage src={src} alt={`${title}海报`} className="size-full" />
+        </div>
       </div>
     </div>
   );

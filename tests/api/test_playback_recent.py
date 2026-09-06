@@ -134,7 +134,13 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
                     runtime_minutes=42,
                     still_path="/episode-2.jpg",
                 ),
-                MediaMetadata(media_item_id=movie.id, runtime_minutes=130),
+                # 本地封面 16:9：最近观看卡缺横向剧照时靠 poster_aspect 决定铺满还是模糊铺底
+                MediaMetadata(
+                    media_item_id=movie.id,
+                    runtime_minutes=130,
+                    poster_width=1280,
+                    poster_height=720,
+                ),
                 # 当前成员连看两集：首页只保留更新的 S01E02。
                 PlaybackState(
                     member_id=7,
@@ -208,6 +214,7 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
         assert episode.progress_percent == 50
         assert episode.unwatched_ahead_count == 1
         assert episode.poster_url == "https://image.tmdb.org/t/p/w500/show.jpg"
+        assert episode.poster_aspect == 0.6667  # TMDB 海报无尺寸记录，按 2:3 惯例
         assert episode.episode_still_url == ("https://image.tmdb.org/t/p/w500/episode-2.jpg")
 
         completed = rows[1]
@@ -216,6 +223,7 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
         assert completed.progress_percent is None
         assert completed.unwatched_ahead_count == 0
         assert completed.backdrop_url == ("https://image.tmdb.org/t/p/w780/movie-backdrop.jpg")
+        assert completed.poster_aspect == 1.7778
         assert completed.episode_still_url is None
 
         # 一旦开始播放 S01E03，锚点推进且该集算已看，未看提醒随之清零。

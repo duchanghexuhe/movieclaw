@@ -129,7 +129,7 @@ Jellyfin member_id=0 = 同超管会话
 | 发现页「已入库」徽标、详情页入口 | 同上 | 同上 |
 | 活动页 `GET /playback/activity`（管理员） | 跨成员全量 | 默认口径（`scope=visible`）下正在播放 / 正在下载 / 最近观看统一把超管不可浏览的库内记录折叠为计数，不出片名与海报；`scope=all` 是管控视角的全量口径，范围外记录带 `browsable=false`、不渲染详情链接（activity.md「范围切换」） |
 | Jellyfin `/UserViews`、`/Items`、Latest、Resume、NextUp、搜索、人物 | 成员按可见集，超管设备不限 | 超管设备也按 `admin_visible`；`user_policy()` 对超管改为 `EnableAllFolders=false` + `EnabledFolders` |
-| 图片资产 `GET /images/assets/{media_item_id}/…` | 仅登录 | 条目所属库不在主体可浏览集 → 404 |
+| 图片资产 `GET /images/assets/{media_item_id}/…` | 仅登录 | 成员：条目所属库不在可浏览集 → 404；超管会话放行（「仅管理」只摘浏览面，活动页 `scope=all` 给范围外记录配海报） |
 | 条目详情、播放决策、取流、字幕、缩略图 | 按可见集 | 超管也按可浏览集 |
 | PAT / Agent 令牌 | 等价管理员 | 只见 `everyone` 库 |
 
@@ -248,7 +248,8 @@ DELETE /playback/history?scope=all
 
 真机验收路径（NAS）：把「其他」库改为「指定成员」并取消勾选自己 → 超管首页
 卡片变「仅管理」、最近添加无该库、最近观看无其记录、VidHub（超管登录）看不到
-该库、直接请求其条目海报 404 → 勾回「超管（我自己）」→ 全部恢复 → 新建一个
+该库、直接请求其条目海报仍 200（活动页「全部」口径靠它显示封面）→ 勾回
+「超管（我自己）」→ 全部恢复 → 新建一个
 成员账号不勾选 → 该成员登录 Web 与 VidHub 均看不到 → 在成员页或库设置页任一处
 勾选 → 另一处同步显示、该成员可见。
 

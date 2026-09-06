@@ -176,10 +176,12 @@ async def test_admin_out_of_scope_manages_but_cannot_browse(client: TestClient) 
     assert client.get(f"{_LIBS}/{lib}").status_code == 200
     assert client.get(f"{_LIBS}/{lib}/missing").status_code == 200
 
-    # 浏览面一律 404：海报墙、封面、条目图片
+    # 浏览面 404：海报墙、封面
     assert client.get(f"{_LIBS}/{lib}/items").status_code == 404
     assert client.get(f"{_LIBS}/{lib}/cover").status_code == 404
-    assert client.get(f"/api/v1/images/assets/{item}/poster.jpg").status_code == 404
+    # 条目图片对超管放行：「仅管理」不是对超管保密，活动页「全部」口径要给
+    # 范围外记录配海报（成员仍按可见集 404，见下一个用例）
+    assert client.get(f"/api/v1/images/assets/{item}/poster.jpg").status_code == 200
 
     # 勾回自己：全部恢复
     updated = _update_library(client, lib, admin_visible=True)

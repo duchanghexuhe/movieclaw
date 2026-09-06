@@ -34,7 +34,9 @@ export interface RecentWatchItem {
   title: string;
   year: number | null;
   poster_url: string | null;
-  /** 电影横向背景剧照；缺失时前端用竖版海报生成模糊铺底。 */
+  /** 海报真实宽高比（同海报墙 primary_aspect）；其他库的本地封面多是 16:9。 */
+  poster_aspect: number;
+  /** 电影横向背景剧照；缺失时前端按 poster_aspect 用海报铺满或模糊铺底。 */
   backdrop_url: string | null;
   /** 剧集最近播放那一集的 16:9 剧照；电影恒为 null。 */
   episode_still_url: string | null;

@@ -89,8 +89,12 @@ export interface PosterVisualItem {
   ribbonVariant?: "compact-left";
   /** 斜标的语义色：已入库为绿色，已订阅为蓝色。 */
   ribbonTone?: "owned" | "subscribed";
-  /** 主图宽高比；缺省 2:3 海报框。本地抓帧的缩略图是 16:9，硬塞进海报框会裁掉两边 */
+  /** 卡片框的宽高比；缺省 2:3 海报框。本地抓帧的缩略图是 16:9，硬塞进海报框会裁掉两边 */
   aspect?: number;
+  /** 主图的真实比例。与框比例不同时（首页横滚行里其他库的 16:9 封面进 2:3 竖框），
+   *  不裁切：用主图自己放大模糊铺底，中央按真实比例完整显示。行里卡片规格统一、
+   *  也不用把横图放大到海报 2.7 倍宽才能对齐。不传则主图直接铺满框（框比例即图比例） */
+  imageAspect?: number;
   /** 海报底部常显的一行左右信息；订阅墙用来承载剧集范围与收录进度。
    *  tracking=追更中绿点；upgrading=洗版中青点（绿点优先，同槽位只亮一个）；
    *  upgradingCount=青点旁的「洗 N」数量——只有点没有字用户感知不到洗版仍在进行。 */
@@ -306,19 +310,45 @@ function PosterCardContent({
     ribbon?.tone === "owned"
       ? "from-emerald-500 via-green-500 to-teal-500 shadow-[0_2px_8px_rgba(16,185,129,0.38)]"
       : "from-sky-500 via-blue-500 to-indigo-500 shadow-[0_2px_8px_rgba(59,130,246,0.38)]";
+  const frameAspect = item.aspect ?? 2 / 3;
+  // 主图与框比例明显不同才走「模糊铺底 + 中央完整图」；2:3 海报进 2:3 框（差在
+  // 像素取整）仍直接铺满，避免海报四周多出一圈模糊底
+  const letterbox =
+    item.imageAspect !== undefined && Math.abs(item.imageAspect - frameAspect) > 0.05;
   return (
     <>
       {/* 海报区（自身 relative：徽章与 hover 信息层都绝对定位在它内部） */}
       <div
         // 比例走内联样式：其他库的抓帧缩略图是 16:9，TMDB 海报是 2:3，同一张墙上按条目各自排版
-        style={{ aspectRatio: item.aspect ?? 2 / 3 }}
+        style={{ aspectRatio: frameAspect }}
         className="relative w-full overflow-hidden rounded-2xl bg-[#141824] shadow-[0_10px_28px_rgba(0,0,0,0.4)] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/card:-translate-y-1.5 group-hover/card:shadow-[0_22px_50px_rgba(0,0,0,0.6)] group-hover/card:ring-white/25"
       >
-        <PosterImage
-          src={item.posterUrl}
-          alt={`${item.title} 海报`}
-          className="absolute inset-0 size-full transition-transform duration-500 ease-out group-hover/card:scale-[1.06]"
-        />
+        {letterbox ? (
+          <>
+            {/* 与 recent-watch-row 的 MoviePosterFill 同一手法：同一张图放大模糊做底 */}
+            <PosterImage
+              src={item.posterUrl}
+              alt=""
+              className="absolute inset-0 size-full scale-125 blur-xl opacity-45"
+            />
+            <div className="absolute inset-0 bg-black/25" />
+            <div className="absolute inset-0 flex items-center justify-center transition-transform duration-500 ease-out group-hover/card:scale-[1.06]">
+              {/* 横图贴齐框宽、竖图贴齐框高；盒子比例等于图比例，object-cover 不会裁 */}
+              <div
+                style={{ aspectRatio: item.imageAspect }}
+                className={`${item.imageAspect! > frameAspect ? "w-full" : "h-full"} shadow-[0_0_28px_rgba(0,0,0,0.55)]`}
+              >
+                <PosterImage src={item.posterUrl} alt={`${item.title} 海报`} className="size-full" />
+              </div>
+            </div>
+          </>
+        ) : (
+          <PosterImage
+            src={item.posterUrl}
+            alt={`${item.title} 海报`}
+            className="absolute inset-0 size-full transition-transform duration-500 ease-out group-hover/card:scale-[1.06]"
+          />
+        )}
 
         {/* 左上：资源最高清晰度徽章（无资源信息时不渲染）。
             徽章不用 backdrop-blur：海报墙每张卡 2~3 个模糊合成层会显著放大

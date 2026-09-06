@@ -14,6 +14,7 @@ from sqlmodel import select
 
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.schemas.playback import RecentWatchItemView
+from movieclaw_api.services.library.thumbs import primary_aspect
 from movieclaw_api.services.media_scrape import asset_version
 from movieclaw_db.models import (
     FileState,
@@ -146,6 +147,8 @@ async def recent_watch_items(
             MediaItem,
             Library.id,
             MediaMetadata.poster_file,
+            MediaMetadata.poster_width,
+            MediaMetadata.poster_height,
             MediaMetadata.backdrop_file,
             MediaMetadata.runtime_minutes,
             MediaEpisode.name,
@@ -203,6 +206,8 @@ async def recent_watch_items(
         item,
         library_id,
         poster_file,
+        poster_width,
+        poster_height,
         backdrop_file,
         item_runtime_minutes,
         episode_name,
@@ -244,6 +249,7 @@ async def recent_watch_items(
                 title=item.title,
                 year=item.year,
                 poster_url=poster_url,
+                poster_aspect=primary_aspect(item, poster_width, poster_height),
                 backdrop_url=backdrop_url,
                 episode_still_url=episode_still_url,
                 season_number=state.season_number,

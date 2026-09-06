@@ -77,7 +77,7 @@ import { formatBytes } from "@/lib/format";
 import { formatLibraryInventorySummary } from "@/lib/library-inventory-summary";
 import { activeWallInitialAtViewport, wallInitialAtOffset } from "@/lib/library-wall-index";
 import { formatRelativeTime } from "@/lib/time";
-import { cachedImageUrl, imageUrl } from "@/lib/image-proxy";
+import { cachedImageUrl, cardVariantFor, imageUrl } from "@/lib/image-proxy";
 import { keepIfEqual, reconcileList } from "@/lib/poll-reconcile";
 import { usePermissions } from "@/lib/permissions";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
@@ -1504,12 +1504,17 @@ const InventoryCell = memo(function InventoryCell({
     title: item.title,
     year: item.year ?? undefined,
     rating: 0,
-    aspect: item.primary_aspect,
+    // 框比例按分区锁死（竖版 2:3 / 横版 16:9），同一分区里每格等高、片名一条线；
+    // 主图真实比例另传，和框不一致的（4:3 封面、1.5 的横版海报）模糊铺底居中完整显示，
+    // 不按各自真实比例撑格——那样一行里 1.5 与 1.78 的封面高度不一，片名参差
+    aspect: item.primary_aspect >= 1 ? 16 / 9 : 2 / 3,
+    imageAspect: item.primary_aspect,
     overlayDetails: inventoryLabel ? { primary: inventoryLabel } : undefined,
     // 海报可能是本地刮削资产的相对路径（断网可用），也可能是 TMDB 图床地址。
-    // 与首页海报墙同样取 poster-card 派生图：海报墙是全站最大的一张图片网格，
-    // 直出原图等于每屏多拉三倍字节（见 library-view.tsx 同名字段的注释）
-    posterUrl: imageUrl(item.poster_url, "poster-card"),
+    // 与首页海报墙同样取派生图（竖版 poster-card / 横版 landscape-card）：海报墙
+    // 是全站最大的一张图片网格，直出原图等于每屏多拉三倍字节（见 library-view.tsx
+    // 同名字段的注释）
+    posterUrl: imageUrl(item.poster_url, cardVariantFor(item.primary_aspect)),
   };
   // 文件全部缺失的"死条目"：海报置灰，一眼与在位内容区分
   const dead = item.file_count > 0 && item.missing_count >= item.file_count;
