@@ -580,7 +580,9 @@ export function LibraryItemDetailView({
       {/* —— 头部信息区 —— */}
       <div className="relative z-10 px-12 pt-6 max-md:px-4 max-md:pt-3">
         <div className="min-w-0 max-w-5xl pb-1">
-          <h1 className="text-on-image text-[42px] font-bold leading-[1.1] tracking-[-0.02em] text-white max-md:text-[28px]">
+          {/* break-words：未识别条目的标题就是文件名（Some.Movie.2023.2160p…），
+              整串无空格，不允许断词就会横向撑开整页 */}
+          <h1 className="text-on-image break-words text-[42px] font-bold leading-[1.1] tracking-[-0.02em] text-white max-md:text-[28px]">
             {detail.title}
           </h1>
           {!isMovie && selectedSeriesEpisode && (
