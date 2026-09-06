@@ -15,19 +15,9 @@ import { useEffect, useState } from "react";
 
 import { listLlmModels, type LlmModelOption } from "@/lib/api/llm";
 
-/** 统一词汇表的强度顺序（越靠后越深）：滑杆按它排刻度，服务端下发的菜单也按它归一。 */
-export const THINKING_LEVEL_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/** 档位文案（对齐 maka 的短单词标签）；「默认」由选择器的空值表达。 */
-export const THINKING_LEVEL_LABELS: Record<string, string> = {
-  off: "关",
-  minimal: "最少",
-  low: "低",
-  medium: "中",
-  high: "高",
-  xhigh: "超高",
-  max: "最高",
-};
+// 档位顺序与文案的事实源在 thinking-level-control.ts（纯逻辑、可单测）；
+// 这里转出口，设置页等既有引用不用改路径
+export { THINKING_LEVEL_LABELS, THINKING_LEVEL_ORDER } from "@/lib/thinking-level-control";
 
 /** 会话页与首页共享同一份模型清单，模块级缓存避免每次挂载都请求。 */
 let cachedOptions: Promise<LlmModelOption[]> | null = null;

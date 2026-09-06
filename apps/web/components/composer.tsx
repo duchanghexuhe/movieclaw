@@ -14,11 +14,14 @@ import {
 import { ComposerEditor, type ComposerEditorHandle } from "@/components/composer-editor";
 import { listSkills, type AgentSkill } from "@/lib/api/agent";
 import type { LlmModelOption } from "@/lib/api/llm";
+import { THINKING_LEVEL_LABELS, resolveModelOption } from "@/lib/llm-thinking";
 import {
-  THINKING_LEVEL_LABELS,
-  THINKING_LEVEL_ORDER,
-  resolveModelOption,
-} from "@/lib/llm-thinking";
+  steppedStopIndex,
+  stopIndexAtPointer,
+  stopPercent,
+  thinkingControlShape,
+  thinkingStops,
+} from "@/lib/thinking-level-control";
 import { useBackdrop } from "@/lib/backdrop";
 import { LiquidGlassIconButton } from "@/vendor/liquid-glass";
 
@@ -667,13 +670,19 @@ function ModelMenu({
   );
 }
 
-/* —— 思维链强度：pill 只显示当前档位本身；弹层是一根横向离散滑杆 ——
- * 强度是有序量（越右想得越深、越慢），滑杆比列表更贴合它的语义：
+/* —— 思维链强度：pill 只显示当前档位本身；弹层形态由菜单形状决定 ——
+ * 强度是有序量（越右想得越深、越慢），两档以上用一根横向离散滑杆：
  *   标题行  「强度  高」            右侧「恢复默认」（选了档位才出现）
  *   轴标签  「更快 ……… 更聪明」
  *   滑杆     ●──●──◉──●──●   刻度 = 该模型声明的档位，按统一词汇表排序
- * 「默认」= 不发任何参数、用模型自身行为，不是强度轴上的一点，所以不占
- * 刻度：默认态滑杆无滑块，点任一刻度即选中；键盘左右键在刻度间移动。 */
+ * 轨道整体可点可拖（指针捕获，滑出轨道也跟手），松手前一直吸附到最近刻度；
+ * 键盘左右键在刻度间移动。「默认」= 不发任何参数、用模型自身行为，不是强度
+ * 轴上的一点，所以不占刻度：默认态滑杆无滑块，靠「恢复默认」回去。
+ * 只有一档的模型（toggle 方言的「关」）没有可拖的距离，画成滑杆点了就
+ * 回不到默认——改用与模型选择器同款的两项列表「默认 / 关」。 */
+
+/** 刻度圆心离轨道两端的留白（px）：滑块半径 14px 加一点边距，与定位式共用。 */
+const TRACK_INSET_PX = 16;
 
 function ThinkingLevelMenu({
   levels,
@@ -686,29 +695,99 @@ function ThinkingLevelMenu({
   disabled?: boolean;
   onChange: (level: string | null) => void;
 }) {
-  const { open, toggle, rootRef, popoverRef, pos } = useAnchoredPopover();
-  // 服务端下发的菜单按统一词汇表归一排序（声明不是有序集合）
-  const stops = THINKING_LEVEL_ORDER.filter((level) => levels.includes(level));
-  const index = value === null ? -1 : stops.indexOf(value);
+  const stops = thinkingStops(levels);
   const currentLabel = value === null ? "默认" : (THINKING_LEVEL_LABELS[value] ?? value);
-  // 滑块位置：刻度均匀分布在轨道两端之间
-  const percent = (i: number) => (stops.length > 1 ? (i / (stops.length - 1)) * 100 : 50);
+  if (thinkingControlShape(stops) === "list") {
+    return (
+      <QuietMenu
+        ariaLabel="思维链强度"
+        pillLabel={currentLabel}
+        disabled={disabled}
+        options={[
+          {
+            key: "default",
+            label: "默认",
+            selected: value === null,
+            onSelect: () => onChange(null),
+          },
+          ...stops.map((level) => ({
+            key: level,
+            label: THINKING_LEVEL_LABELS[level] ?? level,
+            selected: value === level,
+            onSelect: () => onChange(level),
+          })),
+        ]}
+      />
+    );
+  }
+  return (
+    <ThinkingLevelSlider
+      stops={stops}
+      value={value}
+      currentLabel={currentLabel}
+      disabled={disabled}
+      onChange={onChange}
+    />
+  );
+}
 
-  const onKeyDown = (event: React.KeyboardEvent) => {
-    if (stops.length === 0) return;
-    if (event.key === "ArrowRight" || event.key === "ArrowUp") {
-      event.preventDefault();
-      onChange(stops[Math.min(index + 1, stops.length - 1)]);
-    } else if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
-      event.preventDefault();
-      onChange(stops[Math.max(index - 1, 0)]);
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      onChange(stops[0]);
-    } else if (event.key === "End") {
-      event.preventDefault();
-      onChange(stops[stops.length - 1]);
+function ThinkingLevelSlider({
+  stops,
+  value,
+  currentLabel,
+  disabled,
+  onChange,
+}: {
+  stops: string[];
+  value: string | null;
+  currentLabel: string;
+  disabled?: boolean;
+  onChange: (level: string | null) => void;
+}) {
+  const { open, toggle, rootRef, popoverRef, pos } = useAnchoredPopover();
+  const trackRef = useRef<HTMLDivElement>(null);
+  // 指针按下到抬起之间为拖拽态；用 ref 而不是 state，move 事件里读最新值且不触发重渲染
+  const dragging = useRef(false);
+  const index = value === null ? -1 : stops.indexOf(value);
+  const percent = (i: number) => stopPercent(i, stops.length);
+  const stopLeft = (i: number) =>
+    `calc(${TRACK_INSET_PX}px + (100% - ${TRACK_INSET_PX * 2}px) * ${percent(i) / 100})`;
+
+  /** 把指针横坐标吸附到最近刻度并选中；值没变时不回调，拖动时不会刷屏更新。 */
+  const pickAt = (clientX: number) => {
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const next =
+      stops[stopIndexAtPointer(clientX, rect.left, rect.width, stops.length, TRACK_INSET_PX)];
+    if (next !== value) onChange(next);
+  };
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.focus();
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // 无活动指针（合成事件等）时 capture 会抛错；丢失捕获只影响指针滑出
+      // 轨道后的跟踪，点选本身照常
     }
+    dragging.current = true;
+    pickAt(event.clientX);
+  };
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (dragging.current) pickAt(event.clientX);
+  };
+  const onPointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+    dragging.current = false;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    const next = steppedStopIndex(index, stops.length, event.key);
+    if (next === null) return;
+    event.preventDefault();
+    onChange(stops[next]);
   };
 
   const panel = open && pos && (
@@ -740,8 +819,10 @@ function ThinkingLevelMenu({
         <span>更快</span>
         <span>更聪明</span>
       </div>
-      {/* 轨道：横向，刻度点均布；滑块与已选左侧的亮段按索引定位 */}
+      {/* 轨道：横向，刻度点均布；整条轨道是一个指针目标，按下即选、按住可拖。
+          touch-none 让触屏拖动不被当成页面滚动；刻度点与滑块都是纯装饰 */}
       <div
+        ref={trackRef}
         role="slider"
         tabIndex={0}
         aria-valuemin={0}
@@ -749,39 +830,35 @@ function ThinkingLevelMenu({
         aria-valuenow={index < 0 ? undefined : index}
         aria-valuetext={currentLabel}
         onKeyDown={onKeyDown}
-        className="relative mt-2 h-8 rounded-full bg-white/[0.06] outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]/60"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerEnd}
+        onPointerCancel={onPointerEnd}
+        className="relative mt-2 h-8 cursor-pointer touch-none select-none rounded-full bg-white/[0.06] outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]/60"
       >
         {index >= 0 && (
           <div
             aria-hidden
             className="absolute inset-y-0 left-0 rounded-full bg-white/[0.08]"
-            style={{ width: `calc(${percent(index)}% )` }}
+            style={{ width: stopLeft(index) }}
           />
         )}
         {stops.map((level, i) => (
-          <button
+          <span
             key={level}
-            type="button"
-            tabIndex={-1}
-            aria-label={THINKING_LEVEL_LABELS[level] ?? level}
+            aria-hidden
             title={THINKING_LEVEL_LABELS[level] ?? level}
-            onClick={() => onChange(level)}
-            // 命中区域比可见的小圆点大得多，方便点选；点本身用伪装的小圆
-            className="absolute top-1/2 flex size-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center"
-            style={{ left: `calc(1rem + (100% - 2rem) * ${percent(i) / 100})` }}
-          >
-            <span
-              className={`block size-1.5 rounded-full ${
-                i <= index ? "bg-white/50" : "bg-white/25"
-              }`}
-            />
-          </button>
+            className={`pointer-events-none absolute top-1/2 block size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full ${
+              i <= index ? "bg-white/50" : "bg-white/25"
+            }`}
+            style={{ left: stopLeft(i) }}
+          />
         ))}
         {index >= 0 && (
           <span
             aria-hidden
-            className="pointer-events-none absolute top-1/2 h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow-[0_1px_6px_rgba(0,0,0,0.4)]"
-            style={{ left: `calc(1rem + (100% - 2rem) * ${percent(index) / 100})` }}
+            className="pointer-events-none absolute top-1/2 h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow-[0_1px_6px_rgba(0,0,0,0.4)] transition-[left] duration-100 ease-out"
+            style={{ left: stopLeft(index) }}
           />
         )}
       </div>
