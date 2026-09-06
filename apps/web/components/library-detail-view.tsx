@@ -8,7 +8,11 @@ import type { Route } from "next";
 import Link from "next/link";
 
 import { useConfirm, useToast } from "@/components/feedback";
-import { refreshLibraryConfirm, scanLibraryConfirm } from "@/lib/library-confirm";
+import {
+  chapterImagesConfirm,
+  refreshLibraryConfirm,
+  scanLibraryConfirm,
+} from "@/lib/library-confirm";
 import { LockIcon, MoreIcon, XIcon } from "@/components/icons";
 import { PAGE_NAV_BUTTON_CLASS, PageNav } from "@/components/page-nav";
 import { usePageTitle } from "@/lib/use-page-title";
@@ -47,6 +51,7 @@ import {
   SCAN_PHASE_LABELS,
   type ScanPhase,
   type ScanProgress,
+  startLibraryChapterImages,
   startLibraryMetadataRefresh,
   startLibraryScan,
   stopLibraryMetadataRefresh,
@@ -772,6 +777,26 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       }}
       pendingCount={pendingCount}
       onOpenPending={() => setIssueTab(pendingTab)}
+      onChapterImages={
+        library.extract_chapter_images
+          ? (force) => {
+              setNotice(null);
+              void confirm(chapterImagesConfirm(library.name, force)).then((ok) => {
+                if (ok) {
+                  startLibraryChapterImages(libraryId, { force })
+                    .then(() =>
+                      toast.success(
+                        force
+                          ? "已开始重新生成场景图，可在任务中心查看进度"
+                          : "已开始生成场景图，可在任务中心查看进度",
+                      ),
+                    )
+                    .catch((e) => toast.error((e as Error).message));
+                }
+              });
+            }
+          : undefined
+      }
       onEdit={() => setEditing(library)}
     />
   );
@@ -1167,6 +1192,8 @@ interface LibraryActionsMenuProps {
   onOpenPending: () => void;
   onOrganize: () => void;
   onToggleMetaRefresh: () => void;
+  /** 整库生成章节场景图（force=true 全部重抓，否则只补缺）；库关了开关时不传 */
+  onChapterImages?: (force: boolean) => void;
   onEdit: () => void;
 }
 
@@ -1187,6 +1214,7 @@ function LibraryActionsMenu({
   onOpenPending,
   onOrganize,
   onToggleMetaRefresh,
+  onChapterImages,
   onEdit,
 }: LibraryActionsMenuProps) {
   // 与站点配置一致用 Radix DropdownMenu：Portal 到 body + 碰撞检测，
@@ -1261,8 +1289,26 @@ function LibraryActionsMenu({
               ? `停止刷新${metaProgress === null ? "" : ` ${metaProgress}`}`
               : capabilities.scraped
                 ? "刷新元数据"
-                : "重新生成缩略图"}
+                : "重新生成封面"}
           </DropdownMenu.Item>
+          {onChapterImages && (
+            <>
+              <DropdownMenu.Item
+                onSelect={() => onChapterImages(false)}
+                disabled={busy}
+                className={itemClass}
+              >
+                生成场景图
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                onSelect={() => onChapterImages(true)}
+                disabled={busy}
+                className={itemClass}
+              >
+                重新生成场景图
+              </DropdownMenu.Item>
+            </>
+          )}
           <DropdownMenu.Item onSelect={onEdit} disabled={busy} className={itemClass}>
             编辑库
           </DropdownMenu.Item>
