@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { GlassPanel } from "@/components/glass-panel";
@@ -543,6 +543,26 @@ function useAnchoredPopover() {
     }
     setOpen((v) => !v);
   };
+
+  // 弹层左对齐 pill，但弹层（滑杆 18rem / 模型清单最宽 22rem）比 pill 宽得多：
+  // 窄屏上 pill 靠右时会直接伸出屏幕右缘。弹层宽度渲染前不可知，打开后量一次
+  // 真实尺寸把它夹回视口内（留 8px 边距）；同理键盘弹起后上方空间不够时往下夹。
+  // useLayoutEffect 在绘制前修正，不会先画在屏外再跳回来。尺寸用 offsetWidth /
+  // offsetHeight 而不是 getBoundingClientRect：入场动画从 scale(0.97) 起步，
+  // 后者量到的是缩小中的尺寸，按它夹完仍会差几像素露在屏外。
+  useLayoutEffect(() => {
+    if (!open || !pos) return;
+    const el = popoverRef.current;
+    if (!el) return;
+    const margin = 8;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const left = Math.max(margin, Math.min(pos.left, window.innerWidth - margin - width));
+    const top = window.innerHeight - pos.bottom - height;
+    const bottom =
+      top < margin ? Math.max(margin, window.innerHeight - margin - height) : pos.bottom;
+    if (left !== pos.left || bottom !== pos.bottom) setPos({ left, bottom });
+  }, [open, pos]);
 
   return { open, toggle, close: () => setOpen(false), rootRef, popoverRef, pos };
 }
