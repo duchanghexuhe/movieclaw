@@ -618,7 +618,10 @@ function WatchToolbar({
           </button>
         ))}
       </div>
-      <div className="flex shrink-0 items-center gap-1.5 pb-2">{children}</div>
+      {/* 窄屏三个筛选并排也放不下（周期 / 成员 / 范围合计约 460px），同切片行一样横向滑动，别把整页撑宽 */}
+      <div className="scroll-thin flex shrink-0 items-center gap-1.5 pb-2 max-md:min-w-0 max-md:basis-full max-md:overflow-x-auto">
+        {children}
+      </div>
     </div>
   );
 }
