@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 from pathlib import Path, PurePath
 from typing import Annotated, Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request, Response
 from fastapi.responses import FileResponse
@@ -103,7 +105,7 @@ from movieclaw_api.services.library.items import (
 from movieclaw_api.services.library.items import (
     search_library_items as search_visible_library_items,
 )
-from movieclaw_api.services.library.layout import entry_dir_of
+from movieclaw_api.services.library.layout import IMAGE_EXTS, entry_dir_of
 from movieclaw_api.services.library.organize import (
     build_organize_plan,
     enqueue_organize_job,
@@ -1163,7 +1165,6 @@ async def set_default_library(
 )
 async def delete_library(
     library_id: int,
-    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
 
@@ -1189,8 +1190,11 @@ async def delete_library(
         if i is not None
     ]
     await service.delete(library_id)
-    # 孤儿清理放后台：删几百个资产目录是纯磁盘活，不该拖住删库这一次请求
-    background_tasks.add_task(media_scrape.cleanup_orphan_items, affected)
+    # 孤儿条目的**数据库清理**在这里等它做完再返回：SQLite 会复用被删的库 id，
+    # 用户删库后立刻用同一目录重建，新库的本地条目会与旧条目同键，后台清理
+    # 晚一步就把新库刚认领的条目删掉（见 cleanup_orphan_items 的说明）。
+    # 删几百个资产目录是纯磁盘活，仍放后台，不拖住这一次请求
+    await media_scrape.cleanup_orphan_items(affected, defer_assets=True)
     return ok({}, message="已删除（磁盘上的媒体文件未受影响）")
 
 
@@ -1871,23 +1875,27 @@ async def list_library_item_ids(
 @router.get(
     "/{library_id}/item-index",
     response_model=ApiResponse[list[LibraryIndexEntryView]],
-    summary="海报墙的 A-Z 首字母索引（按标题排序下的分档与起始位置）",
+    summary="海报墙的跳转索引（按标题：A-Z 首字母档；按内容时间：月份档）",
     operation_id="ui.library.items.index",
     openapi_extra={"x-cli-hidden": True},
     dependencies=[Depends(require_library_visible)],
 )
 async def list_library_item_index(
     library_id: int,
+    sort: Literal["title", "release_date"] = Query(
+        default="title", description="title=首字母档；release_date=月份档（图片库/其他库时间线）"
+    ),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[LibraryIndexEntryView]]:
     """索引条数据：每档的条目数与起始 offset，只回非空档。
 
-    与 ``/items?sort=title`` 共用同一份拼音排序，因此 offset 直接可用——
-    前端点「S」就是拉 ``?sort=title&offset=<该档 offset>``。
+    与 ``/items?sort=<同一排序>`` 共用同一份排序，因此 offset 直接可用——
+    前端点「S」就是拉 ``?sort=title&offset=<该档 offset>``，点「2026-08」
+    就是拉 ``?sort=release_date&offset=<该档 offset>``。
     """
 
     await LibraryConfigService(session).get(library_id)  # 404 检查
-    buckets = await build_library_index(session, library_id)
+    buckets = await build_library_index(session, library_id, sort)
     return ok(
         [
             LibraryIndexEntryView(initial=initial, count=count, offset=offset)
@@ -2298,6 +2306,65 @@ async def get_file_thumb(
     if thumb is None:
         raise NotFoundException("该文件没有本地缩略图")
     return FileResponse(thumb, headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.get(
+    "/files/{file_id}/original",
+    response_class=FileResponse,
+    summary="图片库的原图（灯箱全屏查看与下载；按台账行推导路径、按库可见性鉴权）",
+    operation_id="ui.library.files.original",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def get_file_original(
+    file_id: int,
+    download: bool = Query(default=False, description="true=作为附件下载（Content-Disposition）"),
+    size: Literal["original", "screen"] = Query(
+        default="original",
+        description="original=原图；screen=长边 ≤2048 的屏幕适配 WebP（灯箱先看它，放大才拉原图）",
+    ),
+    principal: Principal = Depends(require_login),
+    session: AsyncSession = Depends(get_session),
+) -> FileResponse:
+    """只服务图片文件（docs/design/library-photo-kind.md 2.7）：视频走播放器与直连，
+    不从这里出。路径由台账行推导（客户端只给 id），不存在路径注入面；
+    ``FileResponse`` 自带 Last-Modified / ETag / Range。原图含完整 EXIF，
+    库的可见范围就是它的访问边界。
+
+    ``size=screen``：按原图惰性生成长边 2048 的 WebP 派生图，走图片缓存
+    （磁盘 LRU + singleflight），同一张只编码一次；原图改动（mtime/大小变）
+    自动失效。灯箱的渐进式加载靠它：几百 KB 先上屏，放大到 1:1 才拉几 MB 的原图。
+    """
+    row = await session.get(LibraryFile, file_id)
+    if row is None or Path(row.file_path).suffix.lower() not in IMAGE_EXTS:
+        raise NotFoundException("台账文件不存在或不是图片")
+    if row.library_id is not None:
+        await assert_library_visible(session, principal, row.library_id)
+    path = Path(row.file_path)
+    if not await asyncio.to_thread(path.is_file):
+        raise NotFoundException("图片文件不在磁盘上（可能已被移动或删除）")
+    if size == "screen" and not download:
+        from movieclaw_api.services.image_variants import (
+            ImageVariant,
+            get_image_variant_service,
+            local_source_version,
+        )
+
+        cached = await get_image_variant_service().get_or_create(
+            path,
+            source_key=f"library-file:{file_id}",
+            source_version=await asyncio.to_thread(local_source_version, path),
+            variant=ImageVariant.PHOTO_SCREEN,
+        )
+        return FileResponse(
+            cached.path,
+            media_type=cached.content_type,
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    headers = {"Cache-Control": "private, max-age=3600"}
+    if download:
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(path.name)}"
+    return FileResponse(path, media_type=media_type, headers=headers)
 
 
 @router.get(
