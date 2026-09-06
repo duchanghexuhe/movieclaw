@@ -222,9 +222,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   // 全局顶栏再叠一条就成了两层顶栏，于是把这一行让给页面自己（见 lib/page-chrome.tsx）。
   const showMobileTopBar = isMobile && pageNavCount === 0;
   const openDrawer = useCallback(() => setDrawerOpen(true), []);
+  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
   const pageChrome = useMemo(
-    () => ({ registerPageNav, onSearch: handleSearch, openDrawer, setTopBarActions, setTopBarTitle }),
-    [registerPageNav, handleSearch, openDrawer, setTopBarActions, setTopBarTitle],
+    () => ({
+      registerPageNav,
+      onSearch: handleSearch,
+      openDrawer,
+      closeDrawer,
+      setTopBarActions,
+      setTopBarTitle,
+    }),
+    [registerPageNav, handleSearch, openDrawer, closeDrawer, setTopBarActions, setTopBarTitle],
   );
 
   // 移动端抽屉：切换路由即自动收起（点导航项跳走后抽屉不该还盖着新页面），
