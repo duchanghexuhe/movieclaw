@@ -1,8 +1,9 @@
 import { publicEnv } from "@/lib/env";
+import { getPlayerDeviceId } from "@/lib/player/device";
 import type { TrickplayIndex } from "@/lib/player/trickplay";
 import { HttpError, request, resolveRequestUrl } from "@/lib/http";
 import type { LibraryEpisode } from "@/lib/api/libraries";
-import type { MediaType } from "@/lib/media-types";
+import type { LibraryKind, MediaType } from "@/lib/media-types";
 
 /**
  * 取流/字幕地址的最终解析。
@@ -66,7 +67,11 @@ export interface MediaActivityTarget {
   media_item_id: number;
   /** 详情页落点；作品没有在位文件时为 null（此时不渲染跳转）。 */
   library_id: number | null;
-  kind: MediaType;
+  /** 落点库是否在当前超管的可浏览范围内。「全部」口径下范围外记录照常出片名，
+   *  但浏览类接口对范围外超管是 404，前端不渲染详情链接。 */
+  browsable: boolean;
+  /** movie / tv / video（「其他」库的单本视频） */
+  kind: LibraryKind;
   title: string;
   year: number | null;
   poster_url: string | null;
@@ -86,6 +91,8 @@ export interface PlaybackFileSpec {
 
 export interface ActivePlaybackSession {
   device_id: string;
+  /** 能否「注销此设备」：只有持 Jellyfin 设备凭据的会话可以；网页播放器不行。 */
+  revocable: boolean;
   member_name: string;
   client: string;
   device_name: string;
@@ -107,6 +114,7 @@ export interface ActivePlaybackSession {
 
 export interface ActiveFileDownload {
   device_id: string;
+  revocable: boolean;
   member_name: string;
   client: string;
   device_name: string;
@@ -150,9 +158,18 @@ export interface MediaActivitySnapshot {
   downloads: ActiveFileDownload[];
   devices: PlaybackDevice[];
   recent: MediaRecentPlay[];
-  /** 落在当前超管不可浏览的库里的最近观看条数（只报个数，不出片名） */
+  /** 「我的浏览范围」口径下落在超管不可浏览的库里的记录数（只报个数，不出片名）；
+   *  「全部」口径恒为 0。 */
+  hidden_session_count: number;
+  hidden_download_count: number;
   hidden_recent_count: number;
 }
+
+/**
+ * 活动页的可见范围口径。`visible` = 按我的浏览范围折叠范围外记录（默认，尊重
+ * 超管给自己设的隐藏意图）；`all` = 管控视角的全量口径，跨成员跨库都看。
+ */
+export type MediaActivityScope = "visible" | "all";
 
 export interface PlaybackHistoryClearResult {
   deleted_states: number;
@@ -177,9 +194,162 @@ export async function clearPlaybackHistory(
   return { result: response.data, message: response.message };
 }
 
-/** 任务中心媒体库分类的完整快照：正在播放/下载、设备清单与全成员最近观看。 */
-export async function fetchMediaActivity(): Promise<MediaActivitySnapshot> {
-  const response = await request<ApiEnvelope<MediaActivitySnapshot>>("/playback/activity");
+/** 活动页「观看」视角的完整快照：正在播放/下载、设备清单与全成员最近观看。 */
+export async function fetchMediaActivity(
+  scope: MediaActivityScope = "visible",
+): Promise<MediaActivitySnapshot> {
+  const response = await request<ApiEnvelope<MediaActivitySnapshot>>(
+    `/playback/activity?scope=${scope}`,
+  );
+  return response.data;
+}
+
+/** 结束一台设备本次播放：不动凭据，设备下次亲手点播放即可继续。 */
+export async function endDevicePlayback(deviceId: string): Promise<string> {
+  const response = await request<ApiEnvelope<null>>(
+    `/playback/activity/sessions/${encodeURIComponent(deviceId)}/end`,
+    { method: "POST" },
+  );
+  return response.message;
+}
+
+// ---------------------------------------------------------------------------
+// 播放日志：播放记录与观看统计（docs/design/activity.md「播放日志与统计」）
+// ---------------------------------------------------------------------------
+
+export interface PlaybackLogEntry {
+  id: number;
+  member_name: string;
+  media: MediaActivityTarget;
+  client: string;
+  device_name: string;
+  started_at: string;
+  /** null = 仍在进行中 */
+  ended_at: string | null;
+  /** 实际观看时长（毫秒），暂停与 seek 跳过的区间不计 */
+  watched_ms: number;
+  start_position_ms: number;
+  end_position_ms: number;
+  /** 这一场结束时看到哪；条目已删时为 null */
+  duration_ms: number | null;
+  progress_percent: number | null;
+  completed: boolean;
+}
+
+export interface PlaybackHistory {
+  entries: PlaybackLogEntry[];
+  hidden_count: number;
+  /** 游标翻页：本页之后还有没有；有则 next_cursor 是下一页要带的 before */
+  has_more: boolean;
+  next_cursor: number | null;
+}
+
+export interface PlaybackStatsMemberRow {
+  member_id: number;
+  member_name: string;
+  plays: number;
+  watched_ms: number;
+  completed: number;
+}
+
+export interface PlaybackStatsClientRow {
+  client: string;
+  plays: number;
+  watched_ms: number;
+}
+
+export interface PlaybackStatsDayRow {
+  /** 按浏览器时区的日期 YYYY-MM-DD */
+  date: string;
+  plays: number;
+  watched_ms: number;
+  completed: number;
+  /** 当天有播放的成员数 */
+  members: number;
+}
+
+export interface PlaybackStatsTitleRow {
+  media: MediaActivityTarget;
+  plays: number;
+  watched_ms: number;
+  /** 看过这部作品的成员数 */
+  members: number;
+}
+
+export interface PlaybackStatsTotals {
+  plays: number;
+  watched_ms: number;
+  completed: number;
+  active_members: number;
+}
+
+export interface PlaybackStatsTierRow {
+  tier: number;
+  label: string;
+  plays: number;
+}
+
+/**
+ * 观看统计：当前周期与上一周期成对返回（没有参照系的数字只是数据，不是洞察）。
+ * by_day 与 previous_by_day 按天对齐，主图把两条线画在同一坐标系里；by_hour 是
+ * 星期 × 小时的观看时长矩阵（0 行 = 周一），按浏览器时区分桶。
+ */
+export interface PlaybackWatchStats {
+  days: number;
+  current: PlaybackStatsTotals;
+  previous: PlaybackStatsTotals;
+  /** 上一周期有没有日志；日志刚开始记时没有，卡片上不该显示 0% */
+  previous_available: boolean;
+  by_day: PlaybackStatsDayRow[];
+  previous_by_day: PlaybackStatsDayRow[];
+  by_hour: number[][];
+  by_member: PlaybackStatsMemberRow[];
+  by_client: PlaybackStatsClientRow[];
+  /** 网页播放按档位；Jellyfin 客户端恒为直连，不在内 */
+  by_tier: PlaybackStatsTierRow[];
+  top_titles: PlaybackStatsTitleRow[];
+  hidden_title_count: number;
+  /** 本期最受欢迎前三：看过的成员最多，并列取时长长的；与作品榜（按时长）口径不同 */
+  favorites: PlaybackStatsTitleRow[];
+  /** 上一周期的前三，用来标「蝉联 / 上期第 n / 新上榜」 */
+  previous_favorites: PlaybackStatsTitleRow[];
+}
+
+export async function fetchPlaybackHistory(
+  options: {
+    limit?: number;
+    /** 游标：上一页的 next_cursor，取更早的记录 */
+    before?: number | null;
+    days?: number;
+    /** 按成员筛选；0 = 超管 */
+    memberId?: number | null;
+    scope?: MediaActivityScope;
+  } = {},
+): Promise<PlaybackHistory> {
+  const params = new URLSearchParams({ scope: options.scope ?? "visible" });
+  if (options.limit != null) params.set("limit", String(options.limit));
+  if (options.before != null) params.set("before", String(options.before));
+  if (options.days != null) params.set("days", String(options.days));
+  if (options.memberId != null) params.set("member_id", String(options.memberId));
+  const response = await request<ApiEnvelope<PlaybackHistory>>(`/playback/history?${params}`);
+  return response.data;
+}
+
+/** 最近 N 天的观看统计；按天分组用浏览器时区，晚上的观看不会被算到第二天。 */
+export async function fetchPlaybackWatchStats(
+  days: number,
+  scope: MediaActivityScope = "visible",
+  memberId: number | null = null,
+): Promise<PlaybackWatchStats> {
+  const params = new URLSearchParams({
+    days: String(days),
+    scope,
+    tz_offset: String(-new Date().getTimezoneOffset()),
+  });
+  if (memberId != null) params.set("member_id", String(memberId));
+  const response = await request<ApiEnvelope<PlaybackWatchStats>>(
+    `/playback/stats/watch?${params}`,
+  );
   return response.data;
 }
 
@@ -405,11 +575,16 @@ export async function decidePlayback(body: DecideBody): Promise<PlaybackDecision
   return response.data;
 }
 
-/** 判定档位并（需要时）起转码会话，返回可直接播放的地址。 */
+/**
+ * 判定档位并（需要时）起转码会话，返回可直接播放的地址。
+ *
+ * 带上浏览器设备标识：服务端把它写进取流 token，取流字节才能记到活动页上
+ * 这台浏览器的会话名下（与进度上报同一个标识）。
+ */
 export async function startPlaybackSession(body: DecideBody): Promise<PlaybackSession> {
   const response = await request<ApiEnvelope<PlaybackSession>>("/playback/sessions", {
     method: "POST",
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, device_id: getPlayerDeviceId() }),
   });
   return response.data;
 }
@@ -507,6 +682,8 @@ export interface PlaybackWatchState {
   duration_ms: number | null;
   audio_track: string | null;
   subtitle_track: string | null;
+  /** 管理员已在活动页结束了这台浏览器的播放：播放器收到后退出，不再重开 */
+  ended_by_admin?: boolean;
 }
 
 /** 播放页要的条目信息（§6.10）：路由只带 media_item_id，库归属服务端解析。 */
@@ -557,6 +734,13 @@ export interface PlaybackProgressBody extends PlaybackUnit {
   position_ms?: number;
   audio_track?: string;
   subtitle_track?: string;
+  /** 暂停态；不报 = 实时会话保持原值 */
+  paused?: boolean;
+}
+
+/** 进度上报体统一带上浏览器设备标识（活动页「正在播放」按它区分会话）。 */
+function withDevice(body: PlaybackProgressBody): PlaybackProgressBody & { device_id: string } {
+  return { ...body, device_id: getPlayerDeviceId() };
 }
 
 /** 上报观看进度（开始 / 心跳 / 停止同一入口）。 */
@@ -565,7 +749,7 @@ export async function reportPlaybackProgress(
 ): Promise<PlaybackWatchState> {
   const response = await request<ApiEnvelope<PlaybackWatchState>>("/playback/progress", {
     method: "POST",
-    body: JSON.stringify(body),
+    body: JSON.stringify(withDevice(body)),
   });
   return response.data;
 }
@@ -581,7 +765,7 @@ export async function reportPlaybackProgress(
  */
 export function reportPlaybackProgressOnUnload(body: PlaybackProgressBody): void {
   if (typeof navigator === "undefined" || !navigator.sendBeacon) return;
-  const blob = new Blob([JSON.stringify(body)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify(withDevice(body))], { type: "application/json" });
   navigator.sendBeacon(resolveRequestUrl("/playback/progress"), blob);
 }
 

@@ -52,6 +52,9 @@ class MediaActivityTarget(BaseModel):
     media_item_id: int
     # 详情页落点：同一作品跨库时取一个确定可达的库；无在位文件为 None
     library_id: int | None
+    # 落点库是否在当前超管的可浏览范围内。「全部」口径下范围外记录照常出片名，
+    # 但浏览类接口对范围外超管是 404，前端据此不渲染详情链接
+    browsable: bool = True
     kind: MediaKind
     title: str
     year: int | None
@@ -76,6 +79,9 @@ class ActivePlaybackSessionView(BaseModel):
     """一台设备正在进行的播放会话。"""
 
     device_id: str
+    # 能否「注销此设备」：只有持 Jellyfin 设备凭据的会话可以；网页播放器走
+    # 登录会话，没有可撤销的设备凭据
+    revocable: bool = True
     member_name: str
     client: str
     device_name: str
@@ -99,6 +105,7 @@ class ActiveFileDownloadView(BaseModel):
     """一条正在进行的整文件下载（播放器的离线缓存）。"""
 
     device_id: str
+    revocable: bool = True
     member_name: str
     client: str
     device_name: str
@@ -148,9 +155,119 @@ class MediaActivityView(BaseModel):
     downloads: list[ActiveFileDownloadView]
     devices: list[PlaybackDeviceView]
     recent: list[MediaRecentPlayView]
-    # 落在当前超管不可浏览的库里的最近观看条数：不出片名与海报，只报个数
-    # （docs/design/library-access.md 2.5）
+    # 「我的浏览范围」口径下落在当前超管不可浏览的库里的记录：不出片名与海报，
+    # 只报个数（docs/design/library-access.md 2.5）。「全部」口径恒为 0。
+    hidden_session_count: int = Field(default=0, description="不在你可见范围内的正在播放数")
+    hidden_download_count: int = Field(default=0, description="不在你可见范围内的正在下载数")
     hidden_recent_count: int = Field(default=0, description="不在你可见范围内的最近观看条数")
+
+
+class PlaybackLogEntryView(BaseModel):
+    """一场播放（playback_log 的一行）。"""
+
+    id: int
+    member_name: str
+    media: MediaActivityTarget
+    client: str
+    device_name: str
+    started_at: datetime
+    # None = 仍在进行中（没收到停止且最后心跳还在保鲜期内）
+    ended_at: datetime | None
+    watched_ms: int = Field(description="实际观看时长（毫秒）")
+    start_position_ms: int
+    end_position_ms: int
+    # 这一场结束时看到哪：分母是服务端算的片长，条目已删时为 None
+    duration_ms: int | None = None
+    progress_percent: int | None = None
+    completed: bool = Field(description="本场是否看完")
+
+
+class PlaybackHistoryView(BaseModel):
+    entries: list[PlaybackLogEntryView]
+    hidden_count: int = Field(default=0, description="不在你可见范围内的记录数")
+    # 游标翻页：本页之后还有没有更多；有则带上下一页的游标（本页最后一行的 id）
+    has_more: bool = False
+    next_cursor: int | None = None
+
+
+class PlaybackStatsMemberRow(BaseModel):
+    member_id: int
+    member_name: str
+    plays: int
+    watched_ms: int
+    completed: int
+
+
+class PlaybackStatsClientRow(BaseModel):
+    client: str
+    plays: int
+    watched_ms: int
+
+
+class PlaybackStatsDayRow(BaseModel):
+    date: str = Field(description="按浏览器时区的日期 YYYY-MM-DD")
+    plays: int
+    watched_ms: int
+    completed: int = 0
+    members: int = Field(default=0, description="当天有播放的成员数")
+
+
+class PlaybackStatsTitleRow(BaseModel):
+    media: MediaActivityTarget
+    plays: int
+    watched_ms: int
+    members: int = Field(default=0, description="看过这部作品的成员数")
+
+
+class PlaybackStatsTotals(BaseModel):
+    """一个周期的四个汇总数。"""
+
+    plays: int = Field(description="播放场次")
+    watched_ms: int = Field(description="观看总时长（毫秒）")
+    completed: int = Field(description="看完的场次")
+    active_members: int = Field(description="有播放的成员数")
+
+
+class PlaybackStatsTierRow(BaseModel):
+    """网页播放按档位的分解（直连 / 重封装 / 音频转码 / 硬件转码 / 软件转码）。"""
+
+    tier: int
+    label: str
+    plays: int
+
+
+class PlaybackWatchStatsView(BaseModel):
+    """一段时间内的观看统计（docs/design/activity.md「观看统计」）。
+
+    当前周期与**上一周期**成对返回：没有参照系的数字只是数据，不是洞察。
+    ``by_day`` 与 ``previous_by_day`` 按天对齐（同为 days+1 行），主图把两条线画在
+    同一坐标系里。``by_hour`` 是星期 × 小时的观看时长矩阵（周一为 0 行），按浏览器
+    时区分桶，回答「家里什么时候有人在看」。
+    """
+
+    days: int
+    current: PlaybackStatsTotals
+    previous: PlaybackStatsTotals
+    previous_available: bool = Field(description="上一周期有没有日志（日志刚开始记时没有）")
+    by_day: list[PlaybackStatsDayRow]
+    previous_by_day: list[PlaybackStatsDayRow]
+    by_hour: list[list[int]] = Field(
+        description="7×24 观看时长（毫秒），行=星期（0=周一），列=小时"
+    )
+    by_member: list[PlaybackStatsMemberRow]
+    by_client: list[PlaybackStatsClientRow]
+    by_tier: list[PlaybackStatsTierRow] = Field(
+        description="网页播放按档位；Jellyfin 客户端恒为直连，不在内"
+    )
+    top_titles: list[PlaybackStatsTitleRow]
+    hidden_title_count: int = Field(default=0, description="作品榜里不在你可见范围内的条数")
+    favorites: list[PlaybackStatsTitleRow] = Field(
+        default_factory=list,
+        description="本期最受欢迎前三：看过的成员最多，并列取时长长的；与作品榜（按时长）口径不同",
+    )
+    previous_favorites: list[PlaybackStatsTitleRow] = Field(
+        default_factory=list, description="上一周期的前三，用来标「蝉联 / 上期第 n / 新上榜」"
+    )
 
 
 class PlaybackHistoryClearView(BaseModel):
@@ -215,6 +332,9 @@ class PlaybackDecideRequest(BaseModel):
     #: 用户选的画质上限（如 720）。语义是上限而非目标：源不超就照常直通，
     #: 超了才转码降下去。None = 自动。弱网救急用（§10「手动选清晰度」）。
     max_height: int | None = Field(default=None, ge=240, le=2160)
+    #: 浏览器的稳定标识（与进度上报同一个值）。开会话时写进取流 token，
+    #: 取流字节才能记到活动页上这台浏览器的会话名下。
+    device_id: str | None = Field(default=None, max_length=128)
 
 
 class VideoPlanView(BaseModel):
@@ -317,6 +437,8 @@ class PlaybackStateView(BaseModel):
     duration_ms: int | None = None
     audio_track: str | None = None
     subtitle_track: str | None = None
+    #: 管理员已在活动页结束了这台浏览器的播放：播放器收到后退出，不再重开
+    ended_by_admin: bool = False
 
 
 class PlaybackArtifactUploadView(BaseModel):
@@ -459,6 +581,11 @@ class PlaybackProgressRequest(BaseModel):
     #: None = 本次不报该轨，服务端保持原值不动。
     audio_track: str | None = None
     subtitle_track: str | None = None
+    #: 浏览器的稳定标识（前端生成、存 localStorage），语义对齐 Jellyfin 客户端
+    #: 的 DeviceId：活动页「正在播放」按它区分同一成员的不同浏览器。
+    device_id: str | None = Field(default=None, max_length=128)
+    #: 暂停态；None = 本次没报（实时会话保持原值）
+    paused: bool | None = None
 
 
 # PlaybackStateView 定义在会话模型之前（PlaybackSessionView.watch 引用它）。

@@ -772,6 +772,32 @@ def test_progress_reporting_flow(client: TestClient, seeded: dict) -> None:
     assert nextup["Items"][0]["Id"] == episode_guid(seeded["show"], 1, 2)
 
 
+def test_admin_end_playback_blocks_stream_until_device_restarts(
+    client: TestClient, seeded: dict
+) -> None:
+    """管理员「结束播放」后拒绝窗口内取流被拒；设备重新上报开始播放即解除。"""
+    from movieclaw_playback import activity
+
+    activity.reset()
+    token = jf_login(client)
+    auth = {"ApiKey": token}
+    guid = item_guid(seeded["movie"])
+    info = client.post(f"/Items/{guid}/PlaybackInfo", params=auth).json()
+    local = next(s for s in info["MediaSources"] if s["Protocol"] == "File")
+    stream = {"ApiKey": token, "static": "true", "mediaSourceId": local["Id"]}
+
+    client.post("/Sessions/Playing", params=auth, json={"ItemId": guid})
+    activity.end_device("test-device-1")
+    refused = client.get(f"/Videos/{guid}/stream", params=stream)
+    assert refused.status_code == 400
+    assert "管理员" in refused.text
+
+    # 用户亲手重新点播放：窗口解除
+    client.post("/Sessions/Playing", params=auth, json={"ItemId": guid})
+    assert client.get(f"/Videos/{guid}/stream", params=stream).status_code == 200
+    activity.reset()
+
+
 def test_stopped_failed_skips_persistence(client: TestClient, seeded: dict) -> None:
     token = jf_login(client)
     auth = {"ApiKey": token}
@@ -792,11 +818,11 @@ def test_stopped_cancels_device_streams_even_when_failed(
     client: TestClient, seeded: dict, monkeypatch
 ) -> None:
     """Stopped 是取流停止信号；Failed 只跳过播放状态写入，不能留下预读。"""
-    from movieclaw_jellyfin.routes import playstate
+    from movieclaw_api.services.playback import watch
 
     token = jf_login(client)
     calls: list[str] = []
-    monkeypatch.setattr(playstate, "stop_device_streams", calls.append)
+    monkeypatch.setattr(watch, "stop_device_streams", calls.append)
 
     response = client.post(
         "/Sessions/Playing/Stopped",

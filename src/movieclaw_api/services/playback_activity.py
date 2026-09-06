@@ -29,6 +29,7 @@ from movieclaw_api.schemas.playback import (
 )
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.services.media_scrape import asset_version
+from movieclaw_api.services.playback.session import get_session_manager
 
 # 与首页"最近观看"共用同一套时长回退与进度换算口径，避免两处各算各的
 from movieclaw_api.services.playback_recent import _progress_percent, _runtime_ms
@@ -68,10 +69,13 @@ def _poster_url(item: MediaItem, poster_file: str | None, image_base: str) -> st
     return None
 
 
-def _target(unit: Unit, ctx: _UnitContext) -> MediaActivityTarget:
+def _target(
+    unit: Unit, ctx: _UnitContext, *, library_id: int | None, browsable: bool
+) -> MediaActivityTarget:
     return MediaActivityTarget(
         media_item_id=unit[0],
-        library_id=ctx.file.library_id if ctx.file else None,
+        library_id=library_id,
+        browsable=browsable,
         kind=MediaKind(ctx.item.kind),
         title=ctx.item.title,
         year=ctx.item.year,
@@ -80,6 +84,58 @@ def _target(unit: Unit, ctx: _UnitContext) -> MediaActivityTarget:
         episode_number=unit[2],
         episode_title=ctx.episode_title if ctx.item.kind == "tv" else None,
     )
+
+
+@dataclass(frozen=True)
+class _Placement:
+    """一条活动记录相对当前超管浏览范围的落点。
+
+    - ``library_id``：详情页落点。条目跨库时优先取正在播放的那个文件所在库，
+      否则取范围内 id 最小的库，保证链接确定且可达；
+    - ``browsable``：落点库是否在超管的可浏览范围内。范围外的记录在「全部」
+      口径下照常出片名，但前端不渲染链接（浏览类接口对范围外超管是 404）；
+    - ``hidden``：按「我的浏览范围」口径要折叠成计数、不出片名与海报。
+    """
+
+    library_id: int | None
+    browsable: bool
+    hidden: bool
+
+
+class VisibilityScope:
+    """活动页的可见范围口径（docs/design/activity.md「范围切换」）。
+
+    ``browsable_library_ids`` 是当前超管的可浏览库集合（None = 内部流程不受限）；
+    ``fold_hidden`` 为真时范围外记录折叠成计数（默认口径），为假时全量展示、
+    只用 ``browsable`` 标志区分链接可达性（「全部」口径）。
+    """
+
+    def __init__(
+        self,
+        libraries_by_item: dict[int, set[int]],
+        browsable_library_ids: set[int] | None,
+        *,
+        fold_hidden: bool,
+    ) -> None:
+        self._libraries = libraries_by_item
+        self._browsable = browsable_library_ids
+        self._fold = fold_hidden
+
+    def place(self, item_id: int, preferred: int | None) -> _Placement:
+        libraries = self._libraries.get(item_id, set())
+        if not libraries:
+            # 没有任何台账行的条目不属于任何库（文件已删/只剩记录），不受范围约束
+            return _Placement(preferred, True, False)
+        if self._browsable is None:
+            return _Placement(self._pick(libraries, preferred), True, False)
+        allowed = libraries & self._browsable
+        if allowed:
+            return _Placement(self._pick(allowed, preferred), True, False)
+        return _Placement(self._pick(libraries, preferred), False, self._fold)
+
+    @staticmethod
+    def _pick(candidates: set[int], preferred: int | None) -> int:
+        return preferred if preferred in candidates else min(candidates)
 
 
 async def _load_unit_contexts(
@@ -253,12 +309,16 @@ async def media_activity_overview(
     *,
     recent_limit: int = 30,
     browsable_library_ids: set[int] | None = None,
+    fold_hidden: bool = True,
 ) -> MediaActivityView:
     """装配活动页「观看」视角的完整快照。
 
-    ``browsable_library_ids``：当前超管的可浏览库集合。落在范围外的最近观看
-    记录折叠成一个计数（``hidden_recent_count``），不出片名与海报——活动页是
-    管理视角，但「不可见就彻底不可见」对超管自己摘掉的库同样成立。None = 不折叠。
+    ``browsable_library_ids``：当前超管的可浏览库集合（None = 内部流程不受限）。
+    ``fold_hidden`` 为真是「我的浏览范围」口径：落在范围外的正在播放、正在下载
+    与最近观看统一折叠成计数（``hidden_*_count``），不出片名与海报——活动页是
+    管理视角，但「不可见就彻底不可见」对超管自己摘掉的库同样成立。为假是
+    「全部」口径：跨成员、跨库全量展示，范围外记录只带 ``browsable=false``，
+    前端据此不渲染详情链接（浏览类接口对范围外超管是 404）。
     """
     play_sessions, meters = activity.snapshot()
     play_meters = [m for m in meters if m.kind == activity.STREAM_KIND_PLAY]
@@ -279,20 +339,31 @@ async def media_activity_overview(
         ).scalars()
     )
     names_needed.update(d.member_id for d in device_rows)
+    # 只有持 Jellyfin 设备凭据的会话才能「注销」；网页播放器走登录会话，
+    # 没有可撤销的设备凭据，前端据此隐藏菜单
+    revocable_device_ids = {d.device_id for d in device_rows}
 
     recent_rows = await _recent_plays(session, names_needed, limit=recent_limit)
     names = await _member_names(session, names_needed)
     # 条目可能同时存在于多个库：只要有一个库在可浏览范围内就展示，详情落点
-    # 取范围内 id 最小的库；一个都不在的折叠进 hidden_recent_count
-    libraries_by_item = await _libraries_by_item(
-        session, {row[1].id for row in recent_rows if row[1].id is not None}
+    # 取范围内 id 最小的库；一个都不在的按口径折叠或标记为不可浏览
+    item_libraries = await libraries_by_item(
+        session,
+        {u[0] for u in units} | {row[1].id for row in recent_rows if row[1].id is not None},
     )
+    scope = VisibilityScope(item_libraries, browsable_library_ids, fold_hidden=fold_hidden)
+    hidden_session_count = 0
+    hidden_download_count = 0
     hidden_recent_count = 0
 
     session_views: list[ActivePlaybackSessionView] = []
     for play in sorted(play_sessions, key=lambda s: s.started_at, reverse=True):
         ctx = contexts.get(play.unit)
         if ctx is None:  # 条目在播放中被删除的边角：快照里直接略过
+            continue
+        placement = scope.place(play.unit[0], ctx.file.library_id if ctx.file else None)
+        if placement.hidden:
+            hidden_session_count += 1
             continue
         device_meters = [
             m for m in play_meters if m.device_id == play.device_id and m.unit == play.unit
@@ -307,11 +378,17 @@ async def media_activity_overview(
         session_views.append(
             ActivePlaybackSessionView(
                 device_id=play.device_id,
+                revocable=play.device_id in revocable_device_ids,
                 member_name=names[play.member_id],
                 client=play.client.name,
                 device_name=play.client.device_name,
                 client_version=play.client.version,
-                media=_target(play.unit, ctx),
+                media=_target(
+                    play.unit,
+                    ctx,
+                    library_id=placement.library_id,
+                    browsable=placement.browsable,
+                ),
                 position_ms=play.position_ms,
                 duration_ms=ctx.duration_ms,
                 progress_percent=_progress_percent(
@@ -351,6 +428,14 @@ async def media_activity_overview(
     ):
         first = group[0]
         ctx = contexts.get(first.unit)
+        placement = (
+            scope.place(first.unit[0], ctx.file.library_id if ctx.file else None)
+            if ctx
+            else None
+        )
+        if placement is not None and placement.hidden:
+            hidden_download_count += 1
+            continue
         # 下载进度取"推进得最远的那条连接"：顺序下载（播放器离线缓存的常态，
         # 含断点续传）下这就是真实位置。并发分段下载会偏乐观，但那类客户端
         # 不是本接口的服务对象，不为它把读数复杂化。
@@ -359,10 +444,20 @@ async def media_activity_overview(
         download_views.append(
             ActiveFileDownloadView(
                 device_id=first.device_id,
+                revocable=first.device_id in revocable_device_ids,
                 member_name=names[first.member_id],
                 client=first.client.name,
                 device_name=first.client.device_name,
-                media=_target(first.unit, ctx) if ctx else None,
+                media=(
+                    _target(
+                        first.unit,
+                        ctx,
+                        library_id=placement.library_id,
+                        browsable=placement.browsable,
+                    )
+                    if ctx and placement
+                    else None
+                ),
                 file_name=first.file_name,
                 size_bytes=size,
                 bytes_sent=sum(m.bytes_sent for m in group),
@@ -404,14 +499,10 @@ async def media_activity_overview(
         file_duration_seconds,
         library_id,
     ) in recent_rows:
-        item_libraries = libraries_by_item.get(item.id, set())  # type: ignore[arg-type]
-        if browsable_library_ids is not None and item_libraries:
-            # 没有任何台账行的条目不属于任何库（文件已删/只剩记录），不受范围约束
-            allowed = sorted(item_libraries & browsable_library_ids)
-            if not allowed:
-                hidden_recent_count += 1
-                continue
-            library_id = allowed[0]
+        placement = scope.place(item.id, library_id)  # type: ignore[arg-type]
+        if placement.hidden:
+            hidden_recent_count += 1
+            continue
         duration_ms = _runtime_ms(
             file_duration_seconds,
             episode_runtime_minutes if item.kind == "tv" else None,
@@ -422,7 +513,8 @@ async def media_activity_overview(
                 member_name=names[state.member_id],
                 media=MediaActivityTarget(
                     media_item_id=item.id,
-                    library_id=library_id,
+                    library_id=placement.library_id,
+                    browsable=placement.browsable,
                     kind=MediaKind(item.kind),
                     title=item.title,
                     year=item.year,
@@ -445,11 +537,13 @@ async def media_activity_overview(
         downloads=download_views,
         devices=device_views,
         recent=recent_views,
+        hidden_session_count=hidden_session_count,
+        hidden_download_count=hidden_download_count,
         hidden_recent_count=hidden_recent_count,
     )
 
 
-async def _libraries_by_item(session: AsyncSession, item_ids: set[int]) -> dict[int, set[int]]:
+async def libraries_by_item(session: AsyncSession, item_ids: set[int]) -> dict[int, set[int]]:
     """条目 id → 它有在位台账的库 id 集合（最近观看那几十条一次取回）。"""
     if not item_ids:
         return {}
@@ -465,6 +559,35 @@ async def _libraries_by_item(session: AsyncSession, item_ids: set[int]) -> dict[
     for item_id, library_id in rows.all():
         grouped.setdefault(item_id, set()).add(library_id)
     return grouped
+
+
+def live_session_label(device_id: str) -> str | None:
+    """当前正在播放的设备的展示名；不在播放返回 None。"""
+    sessions, _ = activity.snapshot()
+    for play in sessions:
+        if play.device_id == device_id:
+            client = play.client
+            return client.device_name or client.name or device_id
+    return None
+
+
+async def end_playback(device_id: str) -> int:
+    """管理员结束一台设备**本次**播放，不动凭据（与「注销设备」的区别）。
+
+    三件事：实时会话立即消失并进入拒绝窗口（``activity.end_device``，否则
+    播放器换条连接就续上了）、停掉仍在读盘的直出取流、停掉这台浏览器的转码
+    会话。设备下次亲手点播放即可继续，观看进度照常保存。返回停掉的取流连接数。
+    """
+    activity.end_device(device_id)
+    stopped = stop_device_streams(device_id)
+    sessions = await get_session_manager().stop_for_device(device_id)
+    logger.info(
+        "管理员已结束设备「%s」的播放：停止 %d 条取流、%d 个转码会话",
+        device_id,
+        stopped,
+        sessions,
+    )
+    return stopped
 
 
 async def revoke_device(session: AsyncSession, device_id: str) -> str | None:

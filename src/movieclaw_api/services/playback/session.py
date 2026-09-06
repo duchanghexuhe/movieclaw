@@ -53,6 +53,7 @@ from movieclaw_api.services.playback.remote_worker import (
     get_remote_worker_registry,
 )
 from movieclaw_events import new_ulid
+from movieclaw_playback import activity
 from movieclaw_playback.decide import PlaybackPlan, PlaybackTier
 from movieclaw_playback.hls_vod import SegmentPlan
 
@@ -241,6 +242,13 @@ class TranscodeSession:
     restart_target: int | None = None
     #: 首个分片已供出（供起播计时打点用，只打一次）
     first_segment_served: bool = False
+    #: 活动页的字节计量器：整个会话共用一条（HLS 分片是几秒一个的小请求，
+    #: 逐请求登记会让「连接数」与速率在分片间隙反复归零）。首个分片请求时
+    #: 按取流 token 里的浏览器设备标识建立，会话停止时回收。
+    activity_meter: activity.StreamMeter | None = None
+    #: 起会话的浏览器设备标识（web-<成员>-<浏览器>），管理员「结束播放」按它
+    #: 找到并停掉这台浏览器的全部会话。
+    device_id: str = ""
     _stderr_task: asyncio.Task | None = None
     _restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -408,6 +416,7 @@ class TranscodeSessionManager:
         # 源/产物根地址的**覆盖项**，通常为空；留空时用接单 Worker 连上来的地址
         remote_base_url: str = "",
         display_name: str = "",
+        device_id: str = "",
     ) -> TranscodeSession:
         """起一个会话。playlist 出现即返回，不等全部分片转完。
 
@@ -434,6 +443,7 @@ class TranscodeSessionManager:
             id=session_id,
             file_id=plan.file_id,
             display_name=display_name,
+            device_id=device_id,
             member_id=member_id,
             tier=plan.tier,
             # 目录名就用会话 id：排查问题时看一眼盘上的目录就知道是哪个会话
@@ -1355,7 +1365,21 @@ class TranscodeSessionManager:
             session.state = "stopped"
             await self._terminate(session)
         shutil.rmtree(session.directory, ignore_errors=True)
+        if session.activity_meter is not None:
+            # 活动页的字节流随会话一起结束，否则「正在播放」会一直显示一条
+            # 已经没人拉的流
+            activity.unregister_stream(session.activity_meter)
+            session.activity_meter = None
         return True
+
+    async def stop_for_device(self, device_id: str) -> int:
+        """停掉一台浏览器设备的全部会话（管理员「结束播放」）。"""
+        if not device_id:
+            return 0
+        victims = [sid for sid, s in self._sessions.items() if s.device_id == device_id]
+        for sid in victims:
+            await self.stop(sid)
+        return len(victims)
 
     async def stop_for_file(self, file_id: int, member_id: int) -> int:
         """停掉同一成员对同一文件的其它会话。
