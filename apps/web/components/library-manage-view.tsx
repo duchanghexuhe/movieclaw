@@ -496,7 +496,6 @@ export function LibraryManageView() {
                     : ""}
             </span>
             <span className="flex items-center gap-3">
-              <Legend className="bg-white/30">空闲</Legend>
               <Legend className="bg-[var(--info)]">任务进行中</Legend>
               <Legend className="bg-[var(--warn)]">有待处理</Legend>
               <Legend className="bg-[var(--danger)]">有缺失</Legend>
