@@ -20,6 +20,9 @@ import {
   stopIndexAtPointer,
   stopPercent,
   thinkingControlShape,
+  thinkingListItems,
+  thinkingListNote,
+  thinkingPillLabel,
   thinkingStops,
 } from "@/lib/thinking-level-control";
 import { useBackdrop } from "@/lib/backdrop";
@@ -557,6 +560,8 @@ interface QuietMenuOption {
   label: string;
   selected: boolean;
   onSelect: () => void;
+  /** 第二行灰字：这一项到底做什么（思考开关这种一个词说不清的用） */
+  description?: string;
 }
 
 function QuietMenu({
@@ -565,6 +570,7 @@ function QuietMenu({
   options,
   disabled,
   wide = false,
+  note,
 }: {
   ariaLabel: string;
   pillLabel: string;
@@ -572,6 +578,8 @@ function QuietMenu({
   disabled?: boolean;
   /** 模型清单可能很长：弹层放宽并限高滚动 */
   wide?: boolean;
+  /** 清单底部的一行备注（如「该模型只能开关思考」） */
+  note?: string | null;
 }) {
   const { open, toggle, close, rootRef, popoverRef, pos } = useAnchoredPopover();
 
@@ -609,10 +617,22 @@ function QuietMenu({
             option.selected ? "text-[var(--text)]" : "text-[var(--text-muted)]"
           }`}
         >
-          <span className="min-w-0 truncate">{option.label}</span>
+          <span className="min-w-0">
+            <span className="block truncate">{option.label}</span>
+            {option.description && (
+              <span className="block text-caption leading-4 text-[var(--text-faint)]">
+                {option.description}
+              </span>
+            )}
+          </span>
           {option.selected && <span aria-hidden>✓</span>}
         </button>
       ))}
+      {note && (
+        <p className="mx-1 mt-1 border-t border-white/[0.08] px-1.5 pb-0.5 pt-2 text-caption text-[var(--text-faint)]">
+          {note}
+        </p>
+      )}
     </div>
   );
 
@@ -696,27 +716,24 @@ function ThinkingLevelMenu({
   onChange: (level: string | null) => void;
 }) {
   const stops = thinkingStops(levels);
-  const currentLabel = value === null ? "默认" : (THINKING_LEVEL_LABELS[value] ?? value);
+  const currentLabel = thinkingPillLabel(stops, value);
   if (thinkingControlShape(stops) === "list") {
+    // 只能开关的模型：「默认」说不清是开是关，列表写成「开启（模型默认）/ 关闭」
+    // 并各带一行说明，底部注明没有强度档位（文案在 thinking-level-control.ts）
     return (
       <QuietMenu
-        ariaLabel="思维链强度"
+        ariaLabel="思维链"
         pillLabel={currentLabel}
         disabled={disabled}
-        options={[
-          {
-            key: "default",
-            label: "默认",
-            selected: value === null,
-            onSelect: () => onChange(null),
-          },
-          ...stops.map((level) => ({
-            key: level,
-            label: THINKING_LEVEL_LABELS[level] ?? level,
-            selected: value === level,
-            onSelect: () => onChange(level),
-          })),
-        ]}
+        wide
+        note={thinkingListNote(stops)}
+        options={thinkingListItems(stops).map((item) => ({
+          key: item.level ?? "default",
+          label: item.label,
+          description: item.description,
+          selected: value === item.level,
+          onSelect: () => onChange(item.level),
+        }))}
       />
     );
   }

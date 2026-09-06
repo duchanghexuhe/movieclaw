@@ -8,6 +8,9 @@ import {
   stopIndexAtPointer,
   stopPercent,
   thinkingControlShape,
+  thinkingListItems,
+  thinkingListNote,
+  thinkingPillLabel,
   thinkingStops,
 } from "../lib/thinking-level-control.ts";
 
@@ -25,7 +28,7 @@ test("菜单按统一词汇表归一排序，词汇表外的值丢弃", () => {
   assert.equal(THINKING_LEVEL_ORDER[0], "off");
 });
 
-test("只有开关的模型（kimi-k2.6 / glm-5.x）不画滑杆，用「默认 / 关」列表", () => {
+test("只有开关的模型（kimi-k2.6 / glm-5.x）不画滑杆，用两项列表", () => {
   // 曾经的 bug：单刻度滑杆没有可拖的距离，点了「关」再点还是「关」，回不到默认
   assert.equal(thinkingControlShape(thinkingStops(KIMI_K2_6)), "list");
   assert.equal(thinkingControlShape(thinkingStops(KIMI_K3)), "slider");
@@ -95,4 +98,39 @@ test("键盘步进：默认态先落到最浅档，两端不越界，Home/End �
   assert.equal(steppedStopIndex(2, n, "Home"), 0);
   assert.equal(steppedStopIndex(1, n, "Enter"), null);
   assert.equal(steppedStopIndex(-1, 0, "ArrowRight"), null);
+});
+
+test("只能关的模型：列表写成「开启（模型默认）/ 关闭」并各带说明，底部注明没有档位", () => {
+  const items = thinkingListItems(thinkingStops(KIMI_K2_6));
+  assert.deepEqual(
+    items.map((i) => [i.level, i.label]),
+    [
+      [null, "开启（模型默认）"],
+      ["off", "关闭"],
+    ],
+  );
+  // 两项都要说清到底发不发参数、后果是什么，不能只有一个词
+  for (const item of items) assert.ok(item.description.length >= 8, item.label);
+  assert.match(items[0].description, /不发送/);
+  assert.match(items[1].description, /关闭/);
+  assert.equal(thinkingListNote(thinkingStops(KIMI_K2_6)), "该模型的思考只能开或关，没有强度档位");
+  // pill 上不再是孤零零的「默认」
+  assert.equal(thinkingPillLabel(thinkingStops(KIMI_K2_6), null), "思考 开");
+  assert.equal(thinkingPillLabel(thinkingStops(KIMI_K2_6), "off"), "思考 关");
+});
+
+test("单档但不是「关」的罕见声明退回通用「默认 / 该档」；多档滑杆的 pill 文案不变", () => {
+  const items = thinkingListItems(["max"]);
+  assert.deepEqual(
+    items.map((i) => [i.level, i.label]),
+    [
+      [null, "默认"],
+      ["max", "最高"],
+    ],
+  );
+  assert.equal(thinkingListNote(["max"]), null);
+  assert.equal(thinkingListNote(thinkingStops(KIMI_K3)), null);
+  assert.equal(thinkingPillLabel(thinkingStops(KIMI_K3), null), "默认");
+  assert.equal(thinkingPillLabel(thinkingStops(KIMI_K3), "high"), "高");
+  assert.equal(thinkingPillLabel(thinkingStops(GPT), "off"), "关");
 });

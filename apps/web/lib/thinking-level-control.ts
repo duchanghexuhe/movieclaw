@@ -90,3 +90,61 @@ export function steppedStopIndex(index: number, count: number, key: string): num
       return null;
   }
 }
+
+/** 列表形态的一项：level=null 即「默认」（不发参数）。 */
+export interface ThinkingListItem {
+  level: string | null;
+  label: string;
+  /** 第二行灰字：说明这一项到底发什么、后果是什么 */
+  description: string;
+}
+
+/** 单档菜单是否就是 toggle 方言的「只能关」（kimi-k2.6、glm-5.x）。 */
+function isOffOnly(stops: readonly string[]): boolean {
+  return stops.length === 1 && stops[0] === "off";
+}
+
+/**
+ * 列表形态的两项文案。只有「关」的模型，「默认」对用户没有信息量——它到底
+ * 是开还是关？按后端定义（toggle：开 = 默认，不发参数），直接写成
+ * 「开启（模型默认）/ 关闭」，各配一行说明。单档不是「关」的罕见声明
+ * （比如只声明了 max 的自定义模型）退回通用的「默认 / 该档」。
+ */
+export function thinkingListItems(stops: readonly string[]): ThinkingListItem[] {
+  if (isOffOnly(stops)) {
+    return [
+      {
+        level: null,
+        label: "开启（模型默认）",
+        description: "不发送思考参数，沿用模型自身的默认行为",
+      },
+      {
+        level: "off",
+        label: "关闭",
+        description: "发送关闭指令，不再输出思考过程，响应更快",
+      },
+    ];
+  }
+  return [
+    { level: null, label: "默认", description: "不发送思考参数，由模型自行决定强度" },
+    ...stops.map((level) => ({
+      level,
+      label: THINKING_LEVEL_LABELS[level] ?? level,
+      description: `按「${THINKING_LEVEL_LABELS[level] ?? level}」强度思考`,
+    })),
+  ];
+}
+
+/** 列表底部的备注：只能开关的模型要说清没有强度档位；其他形态不需要。 */
+export function thinkingListNote(stops: readonly string[]): string | null {
+  return isOffOnly(stops) ? "该模型的思考只能开或关，没有强度档位" : null;
+}
+
+/**
+ * pill 上的当前值文案。滑杆形态显示档位本身（默认 / 高）；只能开关的模型
+ * 显示「思考 开 / 思考 关」——工具行里孤零零一个「默认」看不出是什么的默认。
+ */
+export function thinkingPillLabel(stops: readonly string[], value: string | null): string {
+  if (isOffOnly(stops)) return value === "off" ? "思考 关" : "思考 开";
+  return value === null ? "默认" : (THINKING_LEVEL_LABELS[value] ?? value);
+}
