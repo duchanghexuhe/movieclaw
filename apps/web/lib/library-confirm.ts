@@ -1,4 +1,4 @@
-import type { ConfirmOptions } from "@/components/feedback";
+import type { ConfirmCheckbox, ConfirmOptions } from "@/components/feedback";
 
 /**
  * 扫描库 / 刷新元数据的二次确认文案——三处入口共用一份，口径一致：
@@ -54,19 +54,21 @@ export function refreshItemConfirm(title: string): ConfirmOptions {
   };
 }
 
-/** 整库生成章节场景图：补缺（默认）或全部重抓（force）。 */
-export function chapterImagesConfirm(name: string, force: boolean): ConfirmOptions {
-  return force
-    ? {
-        title: `重新生成「${name}」的全部场景图？`,
-        description:
-          "已有的图也会重抓，按当前章节与合成策略重新生成。后台低优先级执行，可在任务中心观察或取消；每个文件按章节数定位读取若干次，网络挂载的库会有读取流量。",
-        confirmLabel: "重新生成",
-      }
-    : {
-        title: `为「${name}」生成场景图？`,
-        description:
-          "只补还没有图的文件，后台低优先级执行，可在任务中心观察或取消。每个文件按章节数定位读取若干次，网络挂载的库会有读取流量。",
-        confirmLabel: "开始生成",
-      };
+/** 整库生成章节场景图：默认只补缺，勾选项决定是否全部重抓（force）。
+ *  一个菜单入口 + 弹窗内开关，与「刷新元数据」的交互保持一致。 */
+export function chapterImagesConfirm(name: string): ConfirmOptions & { checkbox: ConfirmCheckbox } {
+  return {
+    title: `为「${name}」生成场景图？`,
+    description: "后台低优先级执行，可在任务中心观察或取消：",
+    bullets: [
+      "只补还没有场景图的文件，已有的不动",
+      "每个文件按章节数定位读取若干次，网络挂载的库会有读取流量",
+      "不会移动、修改或删除你的视频文件",
+    ],
+    checkbox: {
+      label: "已有的场景图也重新生成",
+      description: "按当前章节与合成策略全部重抓，你手动选定的图不会被覆盖",
+    },
+    confirmLabel: "开始生成",
+  };
 }

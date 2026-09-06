@@ -804,14 +804,14 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       onOpenPending={() => setIssueTab(pendingTab)}
       onChapterImages={
         library.extract_chapter_images
-          ? (force) => {
+          ? () => {
               setNotice(null);
-              void confirm(chapterImagesConfirm(library.name, force)).then((ok) => {
+              void confirm(chapterImagesConfirm(library.name)).then(({ ok, checked }) => {
                 if (ok) {
-                  startLibraryChapterImages(libraryId, { force })
+                  startLibraryChapterImages(libraryId, { force: checked })
                     .then(() =>
                       toast.success(
-                        force
+                        checked
                           ? "已开始重新生成场景图，可在任务中心查看进度"
                           : "已开始生成场景图，可在任务中心查看进度",
                       ),
@@ -1247,7 +1247,7 @@ interface LibraryActionsMenuProps {
   onOrganize: () => void;
   onToggleMetaRefresh: () => void;
   /** 整库生成章节场景图（force=true 全部重抓，否则只补缺）；库关了开关时不传 */
-  onChapterImages?: (force: boolean) => void;
+  onChapterImages?: () => void;
   onEdit: () => void;
   /** 图片库：相册墙的密度（个人偏好，与管理权无关）；不传不渲染这一组 */
   density?: PhotoWallDensity;
@@ -1351,22 +1351,9 @@ function LibraryActionsMenu({
                 : "重新生成封面"}
           </DropdownMenu.Item>
           {onChapterImages && (
-            <>
-              <DropdownMenu.Item
-                onSelect={() => onChapterImages(false)}
-                disabled={busy}
-                className={itemClass}
-              >
-                生成场景图
-              </DropdownMenu.Item>
-              <DropdownMenu.Item
-                onSelect={() => onChapterImages(true)}
-                disabled={busy}
-                className={itemClass}
-              >
-                重新生成场景图
-              </DropdownMenu.Item>
-            </>
+            <DropdownMenu.Item onSelect={onChapterImages} disabled={busy} className={itemClass}>
+              生成场景图
+            </DropdownMenu.Item>
           )}
           <DropdownMenu.Item onSelect={onEdit} disabled={busy} className={itemClass}>
             编辑库

@@ -243,9 +243,9 @@ export function LibraryManageView() {
           if (ok) run(startLibraryMetadataRefresh(library.id));
         });
       },
-      onChapterImages: (library, force) => {
-        void confirm(chapterImagesConfirm(library.name, force)).then((ok) => {
-          if (ok) run(startLibraryChapterImages(library.id, { force }));
+      onChapterImages: (library) => {
+        void confirm(chapterImagesConfirm(library.name)).then(({ ok, checked }) => {
+          if (ok) run(startLibraryChapterImages(library.id, { force: checked }));
         });
       },
       onEdit: (library) => setEditing(library),

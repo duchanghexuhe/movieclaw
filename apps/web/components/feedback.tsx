@@ -93,7 +93,29 @@ export interface ConfirmOptions {
   cancelLabel?: string;
   /** danger 时确认键为红色（删除、撤销令牌等破坏性操作） */
   tone?: "default" | "danger";
+  /** 可选的勾选项（如「已有的也重新生成」）：一个入口带一个开关，
+   *  避免菜单里出现「生成 / 重新生成」这种只差一个词的两条。带了
+   *  checkbox 的 confirm 解析为 ConfirmResult，否则仍是 boolean。 */
+  checkbox?: ConfirmCheckbox;
 }
+
+export interface ConfirmCheckbox {
+  label: string;
+  /** 勾上之后的额外后果说明，灰字放在 label 下方 */
+  description?: string;
+  defaultChecked?: boolean;
+}
+
+/** 带 checkbox 的确认结果：ok=false 时 checked 无意义 */
+export interface ConfirmResult {
+  ok: boolean;
+  checked: boolean;
+}
+
+/** 按 options 是否带 checkbox 决定 confirm 的返回类型 */
+type ConfirmReturn<O extends ConfirmOptions> = O extends { checkbox: ConfirmCheckbox }
+  ? ConfirmResult
+  : boolean;
 
 export interface PromptOptions {
   title: string;
@@ -111,12 +133,12 @@ export interface PromptOptions {
 }
 
 type DialogRequest =
-  | { kind: "confirm"; options: ConfirmOptions; resolve: (ok: boolean) => void }
+  | { kind: "confirm"; options: ConfirmOptions; resolve: (result: ConfirmResult) => void }
   | { kind: "prompt"; options: PromptOptions; resolve: (value: string | null) => void };
 
 interface FeedbackApi {
   toast: ToastApi;
-  confirm: (options: ConfirmOptions) => Promise<boolean>;
+  confirm: <O extends ConfirmOptions>(options: O) => Promise<ConfirmReturn<O>>;
   prompt: (options: PromptOptions) => Promise<string | null>;
 }
 
@@ -132,7 +154,7 @@ export function useToast(): ToastApi {
   return useFeedback().toast;
 }
 
-export function useConfirm(): (options: ConfirmOptions) => Promise<boolean> {
+export function useConfirm(): FeedbackApi["confirm"] {
   return useFeedback().confirm;
 }
 
@@ -187,7 +209,7 @@ export function FeedbackProvider({ children }: { children: ReactNode }) {
   const openDialog = useCallback((next: DialogRequest) => {
     const previous = dialogRef.current;
     if (previous) {
-      if (previous.kind === "confirm") previous.resolve(false);
+      if (previous.kind === "confirm") previous.resolve({ ok: false, checked: false });
       else previous.resolve(null);
     }
     dialogRef.current = next;
@@ -201,8 +223,10 @@ export function FeedbackProvider({ children }: { children: ReactNode }) {
         error: (message, options) => push("error", message, options),
         info: (message, options) => push("info", message, options),
       },
-      confirm: (options) =>
-        new Promise<boolean>((resolve) => openDialog({ kind: "confirm", options, resolve })),
+      confirm: <O extends ConfirmOptions>(options: O) =>
+        new Promise<ConfirmResult>((resolve) =>
+          openDialog({ kind: "confirm", options, resolve }),
+        ).then((result) => (options.checkbox ? result : result.ok) as ConfirmReturn<O>),
       prompt: (options) =>
         new Promise<string | null>((resolve) => openDialog({ kind: "prompt", options, resolve })),
     }),
@@ -210,10 +234,13 @@ export function FeedbackProvider({ children }: { children: ReactNode }) {
   );
 
   // 关闭弹窗并回传结果
-  const settle = (result: boolean | string | null) => {
+  const settle = (result: ConfirmResult | string | null) => {
     if (!dialog) return;
-    if (dialog.kind === "confirm") dialog.resolve(Boolean(result));
-    else dialog.resolve(typeof result === "string" ? result : null);
+    if (dialog.kind === "confirm") {
+      dialog.resolve(
+        typeof result === "object" && result !== null ? result : { ok: false, checked: false },
+      );
+    } else dialog.resolve(typeof result === "string" ? result : null);
     dialogRef.current = null;
     setDialog(null);
   };
@@ -268,7 +295,7 @@ export function FeedbackProvider({ children }: { children: ReactNode }) {
           document.body,
         )}
       {dialog?.kind === "confirm" && (
-        <ConfirmDialog options={dialog.options} onSettle={(ok) => settle(ok)} />
+        <ConfirmDialog options={dialog.options} onSettle={(result) => settle(result)} />
       )}
       {dialog?.kind === "prompt" && (
         <PromptDialog options={dialog.options} onSettle={(value) => settle(value)} />
@@ -311,15 +338,17 @@ function ConfirmDialog({
   onSettle,
 }: {
   options: ConfirmOptions;
-  onSettle: (ok: boolean) => void;
+  onSettle: (result: ConfirmResult) => void;
 }) {
   // 初始焦点给取消键：危险操作按 Enter 不应直接生效，多一步指向性点击
   const cancelRef = useRef<HTMLButtonElement>(null);
   useEffect(() => cancelRef.current?.focus(), []);
-  useEscapeCapture(() => onSettle(false));
+  const [checked, setChecked] = useState(options.checkbox?.defaultChecked ?? false);
+  const cancel = () => onSettle({ ok: false, checked });
+  useEscapeCapture(cancel);
 
   return (
-    <Modal open onClose={() => onSettle(false)} label={options.title} topmost>
+    <Modal open onClose={cancel} label={options.title} topmost>
       <div className="p-6 max-md:p-5">
         <h2 className="text-title-sm font-bold text-white">{options.title}</h2>
         {options.description && (
@@ -358,18 +387,31 @@ function ConfirmDialog({
             ))}
           </ul>
         )}
+        {options.checkbox && (
+          <label className="mt-4 flex cursor-pointer items-start gap-2.5">
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(e) => setChecked(e.target.checked)}
+              className="mt-1 size-4 shrink-0 accent-[var(--accent-2)]"
+            />
+            <span className="min-w-0">
+              <span className="block text-sub leading-6 text-white/90">{options.checkbox.label}</span>
+              {options.checkbox.description && (
+                <span className="block text-xs leading-5 text-[var(--text-muted)]">
+                  {options.checkbox.description}
+                </span>
+              )}
+            </span>
+          </label>
+        )}
         <div className="mt-5 flex justify-end gap-2.5">
-          <button
-            ref={cancelRef}
-            type="button"
-            onClick={() => onSettle(false)}
-            className={CANCEL_BTN_CLS}
-          >
+          <button ref={cancelRef} type="button" onClick={cancel} className={CANCEL_BTN_CLS}>
             {options.cancelLabel ?? "取消"}
           </button>
           <button
             type="button"
-            onClick={() => onSettle(true)}
+            onClick={() => onSettle({ ok: true, checked })}
             className={confirmButtonCls(options.tone)}
           >
             {options.confirmLabel ?? "确定"}
