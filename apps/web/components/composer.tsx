@@ -836,10 +836,12 @@ function ThinkingLevelSlider({
         onPointerCancel={onPointerEnd}
         className="relative mt-2 h-8 cursor-pointer touch-none select-none rounded-full bg-white/[0.06] outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]/60"
       >
+        {/* 已选段用主色冷银填充（与应用更新进度条同款）：此前只比轨道亮 2%，
+            选了几档肉眼看不出；滑块保持纯白，仍是整根轨道上最亮的点 */}
         {index >= 0 && (
           <div
             aria-hidden
-            className="absolute inset-y-0 left-0 rounded-full bg-white/[0.08]"
+            className="absolute inset-y-0 left-0 rounded-full bg-[var(--accent)]/55 transition-[width] duration-100 ease-out"
             style={{ width: stopLeft(index) }}
           />
         )}
@@ -849,7 +851,7 @@ function ThinkingLevelSlider({
             aria-hidden
             title={THINKING_LEVEL_LABELS[level] ?? level}
             className={`pointer-events-none absolute top-1/2 block size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full ${
-              i <= index ? "bg-white/50" : "bg-white/25"
+              i <= index ? "bg-black/40" : "bg-white/25"
             }`}
             style={{ left: stopLeft(i) }}
           />
