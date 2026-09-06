@@ -598,6 +598,12 @@ _MEMBER_ALLOWLIST = {
     # （不可见的单元一律 404，与"不存在"不可区分）。
     ("POST", "/api/v1/playback/progress"),
     ("GET", "/api/v1/playback/resume"),
+    # 已看 / 收藏标记同样是按成员隔离的个人数据（与 Jellyfin 客户端点的心
+    # 同一张表），目标条目不可见一律 404
+    ("GET", "/api/v1/playback/marks"),
+    ("POST", "/api/v1/playback/marks"),
+    # 首页「我的收藏」：个人数据，且只列可见库里有在位文件的作品
+    ("GET", "/api/v1/playback/favorites"),
     # 搜索历史：个人数据；统一结果端点再按记录类型检查对应能力。
     ("GET", "/api/v1/search/history"),
     ("GET", "/api/v1/search/history/{history_id}/results"),

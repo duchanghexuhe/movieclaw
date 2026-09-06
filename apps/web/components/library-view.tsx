@@ -23,9 +23,16 @@ import {
   listLibraryItems,
   SCAN_PHASE_LABELS,
 } from "@/lib/api/libraries";
-import { listRecentWatch, type RecentWatchItem } from "@/lib/api/playback";
+import {
+  type FavoriteItem,
+  type FavoritesPage,
+  listFavorites,
+  listRecentWatch,
+  type RecentWatchItem,
+} from "@/lib/api/playback";
 import type { Subscription } from "@/lib/api/subscriptions";
 import { publicEnv } from "@/lib/env";
+import { favoriteLevelLabel } from "@/lib/favorites";
 import { formatBytes } from "@/lib/format";
 import { cardVariantFor, imageUrl } from "@/lib/image-proxy";
 import { libraryInventoryAction } from "@/lib/library-inventory-summary";
@@ -38,6 +45,8 @@ import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /** 每个库「最近添加」行的格数（也是本页向服务端要的条目数上限）。 */
 const RECENT_COUNT = 20;
+/** 「我的收藏」横滚行只放最近收藏的这么多部，更多的到 /library/favorites 看。 */
+const FAVORITES_COUNT = 20;
 
 /**
  * 库存条目的悬浮操作与本卡 hover 的完整度文案同源：季或集有一项未齐就
@@ -102,6 +111,8 @@ export function LibraryView() {
     new Map(),
   );
   const [recentWatch, setRecentWatch] = useState<RecentWatchItem[] | null>(null);
+  // 我的收藏：与最近观看同一轮拉取、同一套失败策略（拉不到保留旧数据）
+  const [favorites, setFavorites] = useState<FavoritesPage | null>(null);
   const [failed, setFailed] = useState(false);
 
   // 轮询乱序守卫：扫描期间后端响应时间抖动大，上一轮的慢响应可能晚于
@@ -115,14 +126,17 @@ export function LibraryView() {
     const seq = ++reloadSeq.current;
     Promise.all([
       listLibraries(),
-      // 最近观看失败不拖垮媒体库首页；保留旧数据，下一轮轮询自动重试。
+      // 最近观看 / 我的收藏失败不拖垮媒体库首页；保留旧数据，下一轮轮询自动重试。
       listRecentWatch(RECENT_COUNT).catch(() => null),
+      listFavorites(FAVORITES_COUNT).catch(() => null),
     ])
-      .then(async ([libs, latestWatch]) => {
+      .then(async ([libs, latestWatch, latestFavorites]) => {
         if (seq !== reloadSeq.current) return;
         setFailed(false);
         if (latestWatch !== null) setRecentWatch(latestWatch);
         else setRecentWatch((previous) => previous ?? []);
+        if (latestFavorites !== null) setFavorites(latestFavorites);
+        else setFavorites((previous) => previous ?? { items: [], total: 0 });
         const snapshot = JSON.stringify(libs);
         // 内容没变就复用旧引用，跳过整页卡片的无谓重渲染
         setLibraries((prev) => (prev && JSON.stringify(prev) === snapshot ? prev : libs));
@@ -227,6 +241,22 @@ export function LibraryView() {
     [libraries, itemsByLibrary],
   );
 
+  // 「我的收藏」横滚行：与「最近添加」同一张海报卡、同一个行组件，只把 hover
+  // 层换成收藏的层级说明；落点是服务端解析好的可见库里的条目详情
+  const favoriteRow = useMemo(() => {
+    const items = favorites?.items ?? [];
+    const hrefs = new Map(
+      items.map((it) => [
+        libraryItemKey(it),
+        `/library/${it.library_id}/item/${it.media_item_id}` as Route,
+      ]),
+    );
+    return {
+      items: items.map(favoriteItemToMediaItem),
+      hrefOf: (m: MediaItem) => hrefs.get(m.id),
+    };
+  }, [favorites]);
+
   return (
     <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
       {/* 页头：标题 + 统计，右侧是页面级操作「管理媒体库」（SaaS 惯例：页面
@@ -285,6 +315,22 @@ export function LibraryView() {
           清空观看记录的入口就在这一行的标题右侧，清完重新拉一次数据。 */}
       {(!failed || libraries !== null) && (
         <RecentWatchRow items={recentWatch} libraries={visibleLibraries} onCleared={reload} />
+      )}
+
+      {/* 「我的收藏」跟在最近观看之下：先接着看、再挑想看的。只横滚最近收藏的
+          20 部（网页与 Jellyfin 客户端点的心同一份），「查看全部」进与单库页同一
+          套海报墙的 /library/favorites；没有收藏时整段隐藏 */}
+      {(!failed || libraries !== null) && favoriteRow.items.length > 0 && (
+        <div className="mt-8 max-md:mt-6" data-testid="favorites-row">
+          <MediaRow
+            row={{ id: "favorites", title: "我的收藏", items: favoriteRow.items }}
+            moreHref={"/library/favorites" as Route}
+            moreLabel={`查看全部 ${favorites?.total ?? 0} 部`}
+            cardAction="none"
+            cardHref={favoriteRow.hrefOf}
+            cardRevealInfoOnTouch
+          />
+        </div>
       )}
 
       {libraries !== null && libraries.length === 0 && (
@@ -402,6 +448,19 @@ function libraryItemToMediaItem(item: LibraryItem): MediaItem {
     // 原图要 4.9 MB，取派生图只要 1.7 MB（实测单张 82KB → 29KB）。
     // 其他库的横版封面按比例取横卡预设，竖框会把它缩得太小
     posterUrl: imageUrl(item.poster_url, cardVariantFor(item.primary_aspect)),
+  };
+}
+
+/** 收藏卡：海报卡形态同库存条目，hover 层只说「收藏的是哪一层」（整剧与电影不解释）。 */
+function favoriteItemToMediaItem(item: FavoriteItem): MediaItem {
+  const level = favoriteLevelLabel(
+    item.kind,
+    item.favorite_season_number,
+    item.favorite_episode_number,
+  );
+  return {
+    ...libraryItemToMediaItem(item),
+    overlayDetails: level ? { primary: level } : undefined,
   };
 }
 

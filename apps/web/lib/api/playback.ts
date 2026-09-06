@@ -2,7 +2,7 @@ import { publicEnv } from "@/lib/env";
 import { getPlayerDeviceId } from "@/lib/player/device";
 import type { TrickplayIndex } from "@/lib/player/trickplay";
 import { HttpError, request, resolveRequestUrl } from "@/lib/http";
-import type { LibraryEpisode } from "@/lib/api/libraries";
+import type { LibraryEpisode, LibraryItem } from "@/lib/api/libraries";
 import type { LibraryKind, MediaType } from "@/lib/media-types";
 import { readLocalProgress, writeLocalProgress } from "@/lib/player/local-progress";
 
@@ -94,6 +94,33 @@ export async function listRecentWatch(limit = 20): Promise<RecentWatchItem[]> {
     `/playback/recent?limit=${limit}`,
   );
   return response.data.items;
+}
+
+/**
+ * 首页「我的收藏」的一格：单库海报墙的条目视图 + 收藏上下文。
+ * 收藏层级来自最近一次收藏：整剧两者皆 null，整季只有季号，单集季集都有；
+ * 电影恒为 null。
+ */
+export interface FavoriteItem extends LibraryItem {
+  /** 卡片的详情落点库（同一作品跨库时取首页顺序第一个可见库） */
+  library_id: number;
+  favorite_season_number: number | null;
+  favorite_episode_number: number | null;
+}
+
+export interface FavoritesPage {
+  items: FavoriteItem[];
+  /** 去重后的收藏作品总数；items 受 limit 截断 */
+  total: number;
+}
+
+/** 当前账号在可见媒体库中收藏的作品（网页与 Jellyfin 客户端点的心同一份），
+ *  最近收藏在前。首页横滚行取前 20；「全部收藏」海报墙按 offset 滚动加载。 */
+export async function listFavorites(limit = 20, offset = 0): Promise<FavoritesPage> {
+  const response = await request<ApiEnvelope<FavoritesPage>>(
+    `/playback/favorites?limit=${limit}&offset=${offset}`,
+  );
+  return response.data;
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +809,54 @@ export async function fetchResumeState(
   const response = await request<ApiEnvelope<PlaybackWatchState>>(
     `/playback/resume?${params}`,
   );
+  return response.data;
+}
+
+/**
+ * 已看 / 收藏标记的目标。不带季集 = 整个条目（电影，或整剧级联到全部集）；
+ * 只带季 = 整季；季集都带 = 单集——与 Jellyfin 客户端的 Series / Season /
+ * Episode 三级一一对应，后端落的是同一张表、同一套哨兵约定。
+ */
+export interface PlaybackMarkTarget {
+  media_item_id: number;
+  season_number?: number;
+  episode_number?: number;
+}
+
+export interface PlaybackMarks {
+  played: boolean;
+  is_favorite: boolean;
+  /** 整剧 / 整季尚未看完的集数；电影与单集为 null */
+  unplayed_count: number | null;
+}
+
+function markParams(target: PlaybackMarkTarget): URLSearchParams {
+  const params = new URLSearchParams({ media_item_id: String(target.media_item_id) });
+  if (target.season_number != null) params.set("season_number", String(target.season_number));
+  if (target.episode_number != null) params.set("episode_number", String(target.episode_number));
+  return params;
+}
+
+/** 目标的已看 / 收藏状态（详情页心与对勾的初始态）。 */
+export async function fetchPlaybackMarks(target: PlaybackMarkTarget): Promise<PlaybackMarks> {
+  const response = await request<ApiEnvelope<PlaybackMarks>>(
+    `/playback/marks?${markParams(target)}`,
+  );
+  return response.data;
+}
+
+/**
+ * 标记已看 / 收藏。与 Jellyfin 的 UserPlayedItems / UserFavoriteItems 走同一个
+ * 服务：Infuse 里看到的与这里点的完全一致。返回写完后的状态，直接刷新按钮。
+ */
+export async function setPlaybackMarks(
+  target: PlaybackMarkTarget,
+  change: { played?: boolean; favorite?: boolean },
+): Promise<PlaybackMarks> {
+  const response = await request<ApiEnvelope<PlaybackMarks>>("/playback/marks", {
+    method: "POST",
+    body: JSON.stringify({ ...target, ...change, device_id: getPlayerDeviceId() }),
+  });
   return response.data;
 }
 

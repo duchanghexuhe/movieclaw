@@ -7,6 +7,7 @@ from datetime import datetime
 from pydantic import Field
 
 from movieclaw_api.schemas.base import BaseModel
+from movieclaw_api.schemas.library import LibraryItemView
 from movieclaw_media.models import MediaKind
 
 
@@ -44,6 +45,26 @@ class RecentWatchView(BaseModel):
     """最近观看横排的数据载荷。"""
 
     items: list[RecentWatchItemView]
+
+
+class FavoriteItemView(LibraryItemView):
+    """首页「我的收藏」的一格：单库海报墙的条目视图 + 收藏上下文。
+
+    收藏层级来自最近一次收藏的那一行：整剧两者皆 null，整季只有季号，
+    单集季集都有；电影恒为 null（内部 (0,0) 哨兵不外泄）。
+    """
+
+    library_id: int = Field(description="卡片的详情落点库（同一作品跨库时取首页顺序第一个可见库）")
+    favorite_season_number: int | None = None
+    favorite_episode_number: int | None = None
+
+
+class FavoritesView(BaseModel):
+    """「我的收藏」分区的数据载荷。``total`` 是去重后的收藏作品总数，
+    ``items`` 受 limit 截断——前端据此决定要不要给「展开全部」。"""
+
+    items: list[FavoriteItemView]
+    total: int
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +591,39 @@ class PlaybackProgressRequest(BaseModel):
 
 
 # PlaybackStateView 定义在会话模型之前（PlaybackSessionView.watch 引用它）。
+
+
+# ---------------------------------------------------------------------------
+# 网页端：已看 / 收藏标记（与 Jellyfin 的 UserPlayedItems / UserFavoriteItems 同一落点）
+# ---------------------------------------------------------------------------
+
+
+class PlaybackMarksRequest(BaseModel):
+    """一次标记：目标 + 要改成什么。
+
+    目标的表达与 Jellyfin 的 Series / Season / Episode 三级一一对应：不带季集
+    = 整个条目（电影，或整剧级联到全部集）；只带季 = 整季；季集都带 = 单集。
+    电影也可以像播放接口那样带哨兵 ``(0, 0)``，落到同一个单元。
+    ``played`` 与 ``favorite`` 至少给一个，没给的那个保持原值。
+    """
+
+    media_item_id: int
+    season_number: int | None = Field(default=None, ge=0)
+    episode_number: int | None = Field(default=None, ge=0)
+    played: bool | None = None
+    favorite: bool | None = None
+    #: 浏览器的稳定标识（同进度上报），webhook 事件的 client 字段据此归因
+    device_id: str | None = Field(default=None, max_length=128)
+
+
+class PlaybackMarksView(BaseModel):
+    """目标在当前成员名下的已看 / 收藏状态。读接口与写接口同一形状，
+    写完直接拿它刷新按钮，不必再查一次。"""
+
+    played: bool
+    is_favorite: bool
+    #: 整剧 / 整季尚未看完的集数；电影与单集为 null
+    unplayed_count: int | None = None
 
 
 # ---------------------------------------------------------------------------

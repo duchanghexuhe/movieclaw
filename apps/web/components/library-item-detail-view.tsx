@@ -19,6 +19,7 @@ import {
   CheckIcon,
   ChevronRightIcon,
   FolderIcon,
+  HeartIcon,
   MoreIcon,
   PlayIcon,
   TrashIcon,
@@ -58,8 +59,10 @@ import {
 import {
   type PlaybackUnit,
   type PlaybackWatchState,
+  fetchPlaybackMarks,
   fetchResumeState,
   clearPlaybackHistory,
+  setPlaybackMarks,
 } from "@/lib/api/playback";
 import { type ShareView, getItemShare } from "@/lib/api/shares";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
@@ -180,6 +183,14 @@ export function LibraryItemDetailView({
   // 「播放 / 继续观看 / 重新播放」之间切换——null 表示还没问到，按钮先按
   // 「播放」渲染，不为一次可能是全零的查询留骨架。
   const [watched, setWatched] = useState<PlaybackWatchState | null>(null);
+  // 整个条目（电影 / 整部剧）的收藏态——与 Jellyfin 客户端在条目页点的心是
+  // 同一份数据。null = 还没问到，心先按未收藏渲染。
+  const [favorite, setFavorite] = useState<boolean | null>(null);
+  // 心 / 对勾的请求进行中：防连点，两个按钮共用一把锁（同一行数据）
+  const [marking, setMarking] = useState(false);
+  // 在页面内改写了观看状态（对勾）之后让分集区静默重拉：分集卡的绿色对勾
+  // 与 Hero 的「已看完」必须同步，但不能重置当前选中的集
+  const [episodesVersion, setEpisodesVersion] = useState(0);
 
   /**
    * 播放入口指向的播放单元（media_item + 季集三元组，与播放器同一套约定）。
@@ -223,6 +234,57 @@ export function LibraryItemDetailView({
     // playUnit 是对象字面量，按内容（三元组）比较
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playUnitKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFavorite(null);
+    fetchPlaybackMarks({ media_item_id: mediaItemId })
+      .then((marks) => {
+        if (!cancelled) setFavorite(marks.is_favorite);
+      })
+      // 查不到收藏态不影响浏览，心按未收藏渲染即可
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaItemId]);
+
+  /** 收藏 / 取消收藏整个条目：先翻按钮再请求，失败翻回来并提示。 */
+  const toggleFavorite = useCallback(async () => {
+    if (marking) return;
+    const next = !(favorite ?? false);
+    setMarking(true);
+    setFavorite(next);
+    try {
+      const marks = await setPlaybackMarks({ media_item_id: mediaItemId }, { favorite: next });
+      setFavorite(marks.is_favorite);
+    } catch (e) {
+      setFavorite(!next);
+      toast.error(e instanceof Error ? e.message : "收藏失败，请稍后重试");
+    } finally {
+      setMarking(false);
+    }
+  }, [favorite, marking, mediaItemId, toast]);
+
+  /**
+   * 标记当前播放单元已看 / 未看（电影，或剧集当前选中的那一集）。写完重查一次
+   * 续播点而不是本地改字段：标已看会清零续播位置、取消会清零播放次数，这些
+   * 结论以服务端为准（与 Jellyfin 客户端点对勾的语义完全一致）。
+   */
+  const togglePlayed = useCallback(async () => {
+    if (marking || !playUnit) return;
+    const next = !(watched?.played ?? false);
+    setMarking(true);
+    try {
+      await setPlaybackMarks(playUnit, { played: next });
+      setWatched(await fetchResumeState(playUnit));
+      setEpisodesVersion((v) => v + 1);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "标记失败，请稍后重试");
+    } finally {
+      setMarking(false);
+    }
+  }, [marking, playUnit, toast, watched]);
 
   const handleTransferFinished = useCallback(
     (targetLibraryId: number) => {
@@ -641,6 +703,11 @@ export function LibraryItemDetailView({
           {availableTrackFiles.length > 0 && (isMovie || selectedSeriesEpisode) && (
             <PlayAction
               watched={watched}
+              favorite={favorite}
+              favoriteLabel={isMovie ? "这部电影" : "这部剧"}
+              marking={marking}
+              onToggleFavorite={toggleFavorite}
+              onTogglePlayed={togglePlayed}
               onPlay={() => {
                 // 退出播放要回到用户离开的这一屏（含季集查询参数）。导航
                 // 状态不进播放页地址（§6.10 地址就是分享凭证），走
@@ -703,6 +770,7 @@ export function LibraryItemDetailView({
             initialSeason={initialSeason}
             initialEpisode={initialEpisode}
             onEpisodeChange={setSelectedSeriesEpisode}
+            refreshKey={episodesVersion}
           />
         )}
 
@@ -903,6 +971,22 @@ export function LibraryItemDetailView({
 }
 
 /**
+ * 播放键旁的心 / 对勾的骨架：桌面端是与播放键**等高**（48px）的圆形玻璃键，
+ * 只放图标（说明走悬停提示）；窄屏没有悬停，改成「图标 + 文字」的胶囊，两枚
+ * 平分播放键下面的一整行（Netflix / Apple TV 手机端的做法）。
+ *
+ * 曾经直接复用顶栏 ⋯ 键的 36px 规格：与 48px 的播放键排在同一行，一大两小，
+ * 看起来像播放键旁边挂了两个页面工具，而不是同一组动作。
+ *
+ * 外壳在所有状态下都是同一副深色玻璃：状态只落在**图标颜色**上（红心 / 绿勾），
+ * 不给按钮铺红底绿底——试过一版整块上色，两枚重色大键压在白色播放键旁边，
+ * 比播放键还抢眼，把这一行的主次弄反了。图标颜色写在 svg 自己身上，与按钮的
+ * 文字色不在同一个元素，不存在工具类互相覆盖的问题。
+ */
+const MARK_BUTTON_CLASS =
+  "inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full border border-white/[0.12] bg-white/[0.08] text-white/85 backdrop-blur-md transition duration-200 hover:bg-white/[0.14] hover:text-white active:scale-[0.96] disabled:pointer-events-none disabled:opacity-60 md:size-12 max-md:h-11 max-md:px-4";
+
+/**
  * 播放入口（主行动按钮 + 续播进度）。
  *
  * 三态一个按钮，而不是并排铺三个入口：
@@ -917,13 +1001,33 @@ export function LibraryItemDetailView({
  * 尺寸也按这套规格给：整页标题 42px、正文栏宽 max-w-4xl，原来 px-6/py-2.5
  * 的小胶囊放在这样的版面里明显不像主行动按钮，因此抬到 h-12 + text-body，
  * 窄屏改为整行铺满（拇指区最容易命中的形状）。
+ *
+ * 播放键右侧是两枚等高的圆键：心（收藏整个条目）与对勾（标记当前单元已看 /
+ * 未看）——Jellyfin 客户端条目页上那两个按钮的网页对应物，点的是同一份数据
+ * （同一张 playback_state 表），在 Infuse 里点过的这里立刻能看到。已看态由
+ * 对勾自己变绿表达，不再另写一行「已看完」；只有看过不止一次时才在
+ * 旁边补一句次数。传了 onToggle* 才渲染；影片分享页的访客没有成员身份，
+ * 不传就没有这两枚键。
  */
 export function PlayAction({
   watched,
   onPlay,
+  favorite = null,
+  favoriteLabel = "",
+  marking = false,
+  onToggleFavorite,
+  onTogglePlayed,
 }: {
   watched: PlaybackWatchState | null;
   onPlay: () => void;
+  /** 整个条目的收藏态；null = 还没问到，按未收藏渲染 */
+  favorite?: boolean | null;
+  /** 收藏对象的称呼（「这部电影」/「这部剧」），进提示文案 */
+  favoriteLabel?: string;
+  /** 标记请求进行中：两枚键一起禁用，防连点 */
+  marking?: boolean;
+  onToggleFavorite?: () => void;
+  onTogglePlayed?: () => void;
 }) {
   const positionMs = watched?.position_ms ?? 0;
   const durationMs = watched?.duration_ms ?? null;
@@ -966,6 +1070,54 @@ export function PlayAction({
         {label}
       </button>
 
+      {(onToggleFavorite || onTogglePlayed) && (
+        <div className="flex items-center gap-2.5">
+          {onToggleFavorite && (
+            <Tooltip
+              content={favorite ? `取消收藏${favoriteLabel}` : `收藏${favoriteLabel}`}
+              dismissOnReferencePress
+            >
+              <button
+                type="button"
+                onClick={onToggleFavorite}
+                disabled={marking}
+                aria-pressed={Boolean(favorite)}
+                aria-label={favorite ? "取消收藏" : "收藏"}
+                className={MARK_BUTTON_CLASS}
+              >
+                <HeartIcon
+                  className={favorite ? "size-5 text-[var(--danger)]" : "size-5"}
+                  fill={favorite ? "currentColor" : "none"}
+                />
+                {/* 窄屏没有悬停提示，按钮自己带文字；文字随状态变，一眼知道现在是什么 */}
+                <span className="text-ui font-medium md:hidden">{favorite ? "已收藏" : "收藏"}</span>
+              </button>
+            </Tooltip>
+          )}
+          {onTogglePlayed && (
+            <Tooltip content={finished ? "标记为未看" : "标记为已看"} dismissOnReferencePress>
+              <button
+                type="button"
+                onClick={onTogglePlayed}
+                disabled={marking}
+                aria-pressed={finished}
+                aria-label={finished ? "标记为未看" : "标记为已看"}
+                className={MARK_BUTTON_CLASS}
+              >
+                <CheckIcon
+                  className={
+                    finished ? "size-5 stroke-[2.4] text-[var(--ok)]" : "size-5 stroke-[2.4]"
+                  }
+                />
+                <span className="text-ui font-medium md:hidden">
+                  {finished ? "已看完" : "标为已看"}
+                </span>
+              </button>
+            </Tooltip>
+          )}
+        </div>
+      )}
+
       {progressText && (
         <div className="min-w-0 max-md:w-full">
           <div
@@ -982,12 +1134,9 @@ export function PlayAction({
         </div>
       )}
 
-      {finished && (
-        <p className="flex items-center gap-1.5 text-caption text-white/55">
-          <CheckIcon className="size-3.5 text-emerald-300/90" />
-          已看完
-          {watched && watched.play_count > 1 ? ` · 看过 ${watched.play_count} 次` : ""}
-        </p>
+      {/* 已看态已由对勾变绿表达；只有看过不止一次才值得多说一句 */}
+      {finished && watched && watched.play_count > 1 && (
+        <p className="tnum text-caption text-white/55">看过 {watched.play_count} 次</p>
       )}
     </div>
   );
@@ -1304,6 +1453,7 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
   initialEpisode,
   onEpisodeChange,
   fetchEpisodes,
+  refreshKey = 0,
 }: {
   libraryId: number;
   detail: EpisodeSectionItem<F>;
@@ -1312,6 +1462,8 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
   onEpisodeChange?: (selection: SelectedEpisodeContext<F> | null) => void;
   /** 分集数据源；缺省按库详情接口拉。影片分享页传访客通道的取数函数 */
   fetchEpisodes?: (mediaItemId: number, season: number) => Promise<SeasonEpisodes>;
+  /** 变化即静默重拉本季分集（页面内改了观看状态后），不重置选中集与滚动位置 */
+  refreshKey?: number;
 }) {
   const seasons = detail.seasons;
   // 季选择器列的是「元数据的季 ∪ 库里实有的季」，本地没有的季也在里面（看得到
@@ -1373,6 +1525,27 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
     initialEpisode,
     fetchEpisodes,
   ]);
+
+  // Hero 的对勾改了当前集的观看状态：只换分集数据（进度条 / 绿色对勾跟上），
+  // 不走上面那条会重置选中集的加载路径。首次渲染（refreshKey=0）不拉。
+  useEffect(() => {
+    if (!refreshKey) return;
+    let cancelled = false;
+    (fetchEpisodes
+      ? fetchEpisodes(detail.media_item_id, season)
+      : getItemEpisodes(libraryId, detail.media_item_id, season)
+    )
+      .then((result) => {
+        if (!cancelled && result.season_number === season) setData(result);
+      })
+      // 拉不到就保持旧数据，下次换季自然刷新
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+    // 只响应 refreshKey：其余依赖变化由上面的加载效果处理
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   // 分集数据异步到达后，把最近观看对应的集卡横向滚到中间；只执行一次，
   // 后续用户手动换季/选集不抢滚动位置。
