@@ -249,6 +249,49 @@ export const ListIcon = (p: IconProps) => (
   </Base>
 );
 
+/**
+ * 媒体库（侧栏入口）：四格藏品网格，右下一格填实。
+ *
+ * 原先用 LayersIcon，但那枚在搜索页表示「分组视图」，一套图标两个含义。
+ * 这里挑图标的约束比看上去紧：邻居「发现电影 / 发现剧集」都是方框类
+ * （胶片、电视），媒体盒之类的方框一列看下来分不出；两张卡前后叠的画法
+ * 与 CopyIcon（复制）构造完全一样；书架在 18px 下像柱状图。四格网格与
+ * 上述全都不撞，填实的那一格让它不至于被读成一个「网格视图」开关。
+ */
+export const LibraryIcon = (p: IconProps) => (
+  <Base {...p}>
+    <rect x="3.4" y="3.6" width="7.4" height="7.4" rx="1.4" />
+    <rect x="13.2" y="3.6" width="7.4" height="7.4" rx="1.4" />
+    <rect x="3.4" y="13" width="7.4" height="7.4" rx="1.4" />
+    <rect x="13.2" y="13" width="7.4" height="7.4" rx="1.4" fill="currentColor" />
+  </Base>
+);
+
+/**
+ * 瀑布流墙 / 海报墙：媒体库顶栏「海报墙 ⇄ 图床浏览」的一对切换图标。
+ *
+ * 视图切换器的通用做法是把图标画成**目标布局本身的样子**（同 Finder /
+ * 资源管理器的视图切换），一眼看出点过去会变成什么，不必记语义：
+ *   - MasonryIcon：高低错落的瓦片 = 图床模式那面瀑布流；
+ *   - PosterGridIcon：两张竖卡 + 卡下一道片名线 = 海报墙的一格。
+ * 只用三 / 两块而不是画满，18px 下才不糊成一团（实测四块起就分不清）。
+ */
+export const MasonryIcon = (p: IconProps) => (
+  <Base {...p}>
+    <rect x="3.5" y="4" width="7.5" height="16" rx="1.4" />
+    <rect x="13" y="4" width="7.5" height="7" rx="1.4" />
+    <rect x="13" y="13" width="7.5" height="7" rx="1.4" />
+  </Base>
+);
+
+export const PosterGridIcon = (p: IconProps) => (
+  <Base {...p}>
+    <rect x="3.2" y="3.6" width="7.6" height="11" rx="1.4" />
+    <rect x="13.2" y="3.6" width="7.6" height="11" rx="1.4" />
+    <path d="M4.6 17.6h4.8M14.6 17.6h4.8" />
+  </Base>
+);
+
 /** 层叠分组（搜索结果的「分组」视图切换用） */
 export const LayersIcon = (p: IconProps) => (
   <Base {...p}>
