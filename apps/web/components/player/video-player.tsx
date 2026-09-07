@@ -33,6 +33,7 @@ import { type AutoplayOutcome, attemptAutoplay, shouldAttemptAutoplay } from "@/
 import { getCapabilitySnapshot } from "@/lib/player/capability";
 import type { PlaybackEngine } from "@/lib/player/engine";
 import { createEngine, preloadHlsEngine } from "@/lib/player/engine";
+import { bufferedAhead } from "@/lib/player/stall";
 import {
   awaitsUserDecision,
   initialPlayerState,
@@ -69,10 +70,12 @@ import type { TrickplayIndex } from "@/lib/player/trickplay";
 import { isEditableTarget, resolveShortcut } from "@/lib/player/shortcuts";
 import {
   type AdjustKind,
+  type SwipeIntent,
   EDGE_GUARD_PX,
   applySwipe,
+  classifyIntent,
   classifyTouchZone,
-  isVerticalIntent,
+  seekDeltaMs,
   toLayoutPoint,
 } from "@/lib/player/touch-adjust";
 import type { SubtitleStyle } from "@/lib/player/subtitles";
@@ -82,7 +85,14 @@ import {
   planSubtitleTracks,
   saveSubtitleStyle,
 } from "@/lib/player/subtitles";
-import { isInEndCredits, planSeek, toFileMs, toSessionSeconds } from "@/lib/player/timeline";
+import {
+  clampSeekTarget,
+  formatClock,
+  isInEndCredits,
+  planSeek,
+  toFileMs,
+  toSessionSeconds,
+} from "@/lib/player/timeline";
 
 /**
  * 网页播放器（docs/design/web-player.md §6）。
@@ -336,6 +346,13 @@ export function VideoPlayer(props: VideoPlayerProps) {
     hide: null,
     gone: null,
   });
+  /** 横滑拖进度时的落点读数。手势期间常显，松手/取消后淡出 */
+  const [seekPreview, setSeekPreview] = useState<{
+    targetMs: number;
+    deltaMs: number;
+    leaving: boolean;
+  } | null>(null);
+  const seekPreviewTimerRef = useRef<number | null>(null);
 
   /**
    * 弹出/刷新调节胶囊，并重排它的退场：每次调用都把「0.9 秒后开始淡出、
@@ -387,6 +404,29 @@ export function VideoPlayer(props: VideoPlayerProps) {
     }, 800);
   }, []);
 
+  /**
+   * 横滑拖进度的落点胶囊。
+   *
+   * 与亮度/音量胶囊不同，它**没有自动退场计时**：手势没结束就该一直挂着，
+   * 手指停在半路时读数消失会让人以为手势断了。退场由 `hideSeekPreview` 在
+   * 松手/取消时显式触发。
+   */
+  const showSeekPreview = useCallback((targetMs: number, deltaMs: number) => {
+    if (seekPreviewTimerRef.current !== null) {
+      window.clearTimeout(seekPreviewTimerRef.current);
+      seekPreviewTimerRef.current = null;
+    }
+    setSeekPreview({ targetMs, deltaMs, leaving: false });
+  }, []);
+
+  const hideSeekPreview = useCallback(() => {
+    setSeekPreview((prev) => (prev ? { ...prev, leaving: true } : prev));
+    seekPreviewTimerRef.current = window.setTimeout(() => {
+      seekPreviewTimerRef.current = null;
+      setSeekPreview(null);
+    }, 180);
+  }, []);
+
   /** 一次性文字提示（顶部胶囊，与调节读数同视觉）；给「画中画被系统拒绝」
    * 这类**本来会静默失败**的操作一个出口——用户分不清「没反应」和「被拒绝」
    * 是最难排查的一类反馈。 */
@@ -421,6 +461,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
       ]) {
         if (timers.hide !== null) window.clearTimeout(timers.hide);
         if (timers.gone !== null) window.clearTimeout(timers.gone);
+      }
+      if (seekPreviewTimerRef.current !== null) {
+        window.clearTimeout(seekPreviewTimerRef.current);
       }
     },
     [],
@@ -537,6 +580,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
     if (state.session?.timeline === "file") return videoDurationMs;
     return sessionId ? null : videoDurationMs;
   }, [resume?.duration_ms, state.session?.timeline, sessionId, videoDurationMs]);
+  const durationMsRef = useRef<number | null>(null);
+  durationMsRef.current = durationMs;
 
   const subtitles = useMemo(() => {
     const session = state.session;
@@ -921,13 +966,18 @@ export function VideoPlayer(props: VideoPlayerProps) {
             : null,
         );
     };
+    // 只认**播放头所在**那段连续缓冲，不能取 buffered 的最后一段：往回拖
+    // 之后旧的前向缓冲还挂在时间轴后面（back buffer 只回收播放头之后 30
+    // 秒以前的部分，拖回去之后那一段落在播放头**前方**，不会被回收），
+    // 取最后一段会让浅色底一路铺到一小时开外，而那里根本没有连着的数据。
+    const onBuffered = () => {
+      if (!isCurrentSession()) return;
+      setBufferedEndMs(toFileMs(video.currentTime + bufferedAhead(video), startMsRef.current));
+    };
     const onTimeUpdate = () => {
       if (!isCurrentSession()) return;
       setPositionMs(toFileMs(video.currentTime, startMsRef.current));
-      const ranges = video.buffered;
-      setBufferedEndMs(
-        ranges.length ? toFileMs(ranges.end(ranges.length - 1), startMsRef.current) : null,
-      );
+      onBuffered();
     };
     // 「现在应该能播了」的两个时机：挂流那一次可能太早，这两次是补刀
     const onReady = () => {
@@ -942,6 +992,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
     video.addEventListener("ended", onEnded);
     video.addEventListener("durationchange", onDurationChange);
     video.addEventListener("timeupdate", onTimeUpdate);
+    // 缓冲条不能只跟 timeupdate：暂停时它根本不发，而 hls.js 照样在往前缓，
+    // 浅色底就一直停在按下暂停的那一刻，看不出还要等多久才能接着放。
+    // progress 是「又收到数据了」的通知，暂停期间照发。
+    video.addEventListener("progress", onBuffered);
     video.addEventListener("loadedmetadata", onReady);
     video.addEventListener("canplay", onReady);
     return () => {
@@ -953,6 +1007,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
       video.removeEventListener("ended", onEnded);
       video.removeEventListener("durationchange", onDurationChange);
       video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("progress", onBuffered);
       video.removeEventListener("loadedmetadata", onReady);
       video.removeEventListener("canplay", onReady);
     };
@@ -1458,8 +1513,27 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 换会话，干等 ffmpeg 追上来只会让用户看着永远转不完的圈。
    */
   const seekToFileMs = useCallback(
-    (fileMs: number) => {
+    (rawFileMs: number) => {
       if (!video) return;
+      // 先夹进片长之内：越过片尾的落点会让换会话那条路开出一个转不出任何
+      // 东西的会话（理由见 timeline.ts 的 clampSeekTarget）。
+      const fileMs = clampSeekTarget(rawFileMs, durationMs);
+      // 会话正在重开的空档（换音轨 / 换画质 / 心跳自愈 / 上一次 seek 换流）：
+      // video 上已经没有流了，native seek 打在空元素上什么也不会发生，而在途
+      // 的新会话仍会落回 pendingFileMs 那个**旧**位置——用户看到进度条跳过去
+      // 又自己弹回来，这一拖白拖。改走换会话这条路：restart 递增 attempt 顶掉
+      // 在途的那次请求，新会话直接从目标位置起。
+      // 报错页与同意弹窗同样没有会话，但它们是等用户拍板的终态（见
+      // machine.ts 的 awaitsUserDecision），绝不能在背后替他换流。
+      if (!state.session) {
+        // startMs 为 null = 首次起播，起点还等着服务端按观看状态定（§6.10）。
+        // 那一刻按下的快进键不该把续播点顶掉，让它照旧落空。
+        if (!isBusy(state.phase) || state.startMs === null) return;
+        pendingFileMsRef.current = fileMs;
+        setPositionMs(fileMs);
+        dispatch({ type: "restart", startMs: fileMs });
+        return;
+      }
       const seekable = video.seekable;
       const plan = planSeek(fileMs, {
         startMs: startMsRef.current,
@@ -1488,11 +1562,16 @@ export function VideoPlayer(props: VideoPlayerProps) {
       setPositionMs(plan.startMs);
       dispatch({ type: "restart", startMs: plan.startMs });
     },
-    [video, sessionId, mode],
+    [video, sessionId, mode, durationMs, state.session, state.phase, state.startMs],
   );
 
+  /** 供触摸手势回调读最新值：跟着依赖重绑 touch 监听会在手势中途换掉监听器 */
+  const seekToFileMsRef = useRef(seekToFileMs);
+  seekToFileMsRef.current = seekToFileMs;
+
+  // 上下界都由 seekToFileMs 里的 clampSeekTarget 收住，这里不再各夹一次
   const seekBy = useCallback(
-    (seconds: number) => seekToFileMs(Math.max(0, positionRef.current + seconds * 1000)),
+    (seconds: number) => seekToFileMs(positionRef.current + seconds * 1000),
     [seekToFileMs],
   );
 
@@ -1892,16 +1971,28 @@ export function VideoPlayer(props: VideoPlayerProps) {
   }, []);
 
   // ---------------------------------------------------------------------
-  // 触屏滑动调节：左半屏亮度、右半屏音量（分区/映射/换算在 touch-adjust.ts）
+  // 触屏滑动手势：竖滑调亮度/音量（左半屏亮度、右半屏音量），横滑拖进度
+  // （分区、方向裁决、换算都在 touch-adjust.ts）
   // ---------------------------------------------------------------------
 
-  /** 进行中的滑动手势；active 前只是「手指放上来了」，竖直位移过门槛才生效 */
-  const adjustGestureRef = useRef<{
+  /**
+   * 进行中的滑动手势。
+   *
+   * `intent` 为 null = 只是「手指放上来了」，位移过门槛后一次性裁决方向，
+   * 到松手为止不再改判——中途改判会让一次手势前半段调音量、后半段拖进度。
+   */
+  const swipeGestureRef = useRef<{
+    /** 竖滑调哪一个量（由起手落在左半还是右半屏决定） */
     kind: AdjustKind;
     startX: number;
     startY: number;
+    /** 竖滑起点的亮度/音量 */
     startValue: number;
-    active: boolean;
+    /** 横滑起点的播放位置（文件毫秒） */
+    startPositionMs: number;
+    intent: SwipeIntent | null;
+    /** 横滑当前算出的落点；松手才提交，中途只喂胶囊 */
+    targetMs: number;
   } | null>(null);
   /** 音量能不能调：null=还没探完；不可调 = iOS（WebKit 只认硬件侧键）。 */
   const volumeAdjustableRef = useRef<boolean | null>(null);
@@ -1935,26 +2026,30 @@ export function VideoPlayer(props: VideoPlayerProps) {
     if (!video) return;
     const onTouchStart = (event: TouchEvent) => {
       if (event.touches.length !== 1) {
-        adjustGestureRef.current = null;
+        swipeGestureRef.current = null;
         return;
       }
       const touch = event.touches[0];
+      // 排除带（顶部通知中心起手区、底部进度条、左右缘返回手势）对三种手势
+      // 一视同仁：横滑同样不能在贴着进度条的地方起手，否则与拖进度条打架。
       const kind = classifyTouchZone(touch.clientX, touch.clientY, {
         width: window.innerWidth,
         height: window.innerHeight,
         fakeLandscape: fakeLandscapeRef.current,
       });
       if (!kind) return;
-      adjustGestureRef.current = {
+      swipeGestureRef.current = {
         kind,
         startX: touch.clientX,
         startY: touch.clientY,
         startValue: kind === "brightness" ? brightnessRef.current : video.volume,
-        active: false,
+        startPositionMs: positionRef.current,
+        intent: null,
+        targetMs: positionRef.current,
       };
     };
     const onTouchMove = (event: TouchEvent) => {
-      const gesture = adjustGestureRef.current;
+      const gesture = swipeGestureRef.current;
       if (!gesture || event.touches.length !== 1) return;
       const touch = event.touches[0];
       const viewport = {
@@ -1962,15 +2057,39 @@ export function VideoPlayer(props: VideoPlayerProps) {
         height: window.innerHeight,
         fakeLandscape: fakeLandscapeRef.current,
       };
+      // 一律换算到**布局**坐标：伪横屏是容器转了 90°，用户觉得自己在横划，
+      // 物理上是竖着划的——直接用事件坐标会把两种手势对调。
       const start = toLayoutPoint(gesture.startX, gesture.startY, viewport);
       const now = toLayoutPoint(touch.clientX, touch.clientY, viewport);
-      if (!gesture.active) {
-        if (!isVerticalIntent(now.x - start.x, now.y - start.y)) return;
-        gesture.active = true;
+      const deltaX = now.x - start.x;
+      const deltaY = now.y - start.y;
+      if (!gesture.intent) {
+        const intent = classifyIntent(deltaX, deltaY);
+        if (!intent) return;
+        if (intent === "horizontal" && !durationMsRef.current) {
+          // 片长未知就没有落点可算（那时进度条本身也是禁用的）。整根手指
+          // 作废而不是回落到调音量：用户明明在横划，半路改判成调音量比
+          // 「什么都没发生」更费解。
+          swipeGestureRef.current = null;
+          return;
+        }
+        gesture.intent = intent;
       }
       // 生效后接管这根手指：不让它同时滚动页面/触发下拉刷新
       event.preventDefault();
-      const value = applySwipe(gesture.kind, gesture.startValue, now.y - start.y, now.height);
+      if (gesture.intent === "horizontal") {
+        // 滑动中**只更新胶囊、不 seek**：每次 move 都跳会让服务端一路杀
+        // ffmpeg 重启（seek 走的就是那条路），画面永远追不上手指。与进度条
+        // 拖拽同一套语义，松手才提交一次。
+        const target = clampSeekTarget(
+          gesture.startPositionMs + seekDeltaMs(deltaX, now.width),
+          durationMsRef.current,
+        );
+        gesture.targetMs = target;
+        showSeekPreview(target, target - gesture.startPositionMs);
+        return;
+      }
+      const value = applySwipe(gesture.kind, gesture.startValue, deltaY, now.height);
       if (gesture.kind === "brightness") {
         setBrightness(value);
         flashAdjust({ kind: "brightness", value });
@@ -1989,14 +2108,27 @@ export function VideoPlayer(props: VideoPlayerProps) {
         flashAdjust({ kind: "volume", value: video.volume, unsupported: true });
       }
     };
-    // 退场由 flashAdjust 自己排（每次 move 都会顺延），松手清掉手势；
-    // 音量手势松手后复核一次「赋的值是否真的留住了」——挂载探测万一误判
-    // 可调（WebKit 行为随版本漂），这里能把结论纠回来，下一次滑动就会
-    // 如实提示由侧键控制
-    const onTouchEnd = () => {
-      const gesture = adjustGestureRef.current;
-      adjustGestureRef.current = null;
-      if (!gesture?.active || gesture.kind !== "volume") return;
+    /**
+     * 手势收尾。`commit` 区分抬手与被打断：
+     *
+     * - 抬手（touchend）= 用户认了这个落点，横滑在这里提交唯一那次 seek；
+     * - 打断（touchcancel，系统手势/来电/第二根手指）= **不提交**，与进度条
+     *   拖拽被取消时同一条规矩——用户没抬手确认过这个位置。
+     *
+     * 亮度/音量没有「提交」一说（滑动中已经实时生效），两条路都只是收尾。
+     * 音量手势收尾时复核一次「赋的值是否真的留住了」——挂载探测万一误判
+     * 可调（WebKit 行为随版本漂），这里能把结论纠回来，下一次滑动就会如实
+     * 提示由侧键控制。
+     */
+    const finishGesture = (commit: boolean) => {
+      const gesture = swipeGestureRef.current;
+      swipeGestureRef.current = null;
+      if (gesture?.intent === "horizontal") {
+        if (commit) seekToFileMsRef.current(gesture.targetMs);
+        hideSeekPreview();
+        return;
+      }
+      if (gesture?.intent !== "vertical" || gesture.kind !== "volume") return;
       if (volumeAdjustableRef.current === false) return;
       const expected = video.volume;
       window.setTimeout(() => {
@@ -2005,17 +2137,19 @@ export function VideoPlayer(props: VideoPlayerProps) {
         }
       }, 300);
     };
+    const onTouchEnd = () => finishGesture(true);
+    const onTouchCancel = () => finishGesture(false);
     video.addEventListener("touchstart", onTouchStart, { passive: true });
     video.addEventListener("touchmove", onTouchMove, { passive: false });
     video.addEventListener("touchend", onTouchEnd);
-    video.addEventListener("touchcancel", onTouchEnd);
+    video.addEventListener("touchcancel", onTouchCancel);
     return () => {
       video.removeEventListener("touchstart", onTouchStart);
       video.removeEventListener("touchmove", onTouchMove);
       video.removeEventListener("touchend", onTouchEnd);
-      video.removeEventListener("touchcancel", onTouchEnd);
+      video.removeEventListener("touchcancel", onTouchCancel);
     };
-  }, [video, flashAdjust]);
+  }, [video, flashAdjust, showSeekPreview, hideSeekPreview]);
 
   /** 播放中申请防息屏。切到后台会被系统收走，回来时重新申请。 */
   useEffect(() => {
@@ -2286,6 +2420,35 @@ export function VideoPlayer(props: VideoPlayerProps) {
                   <span className="tnum w-9 text-right">{Math.round(adjust.value * 100)}%</span>
                 </>
               )}
+            </div>
+          </div>
+        ) : null}
+
+        {/* 横滑拖进度的落点读数。放**画面正中**：手指在画面上滑，读数就跟在
+            眼睛看的地方，不必再去够底边那条进度条（各家手机播放器同此）。
+            大字是落点、小字是相对起点的增量——只给落点的话，用户不知道自己
+            这一划到底走了多远，也就没法凭手感修正。 */}
+        {seekPreview ? (
+          <div
+            {...{ noautohide: "" }}
+            className="pointer-events-none absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2"
+          >
+            <div
+              className={`flex flex-col items-center gap-1.5 rounded-2xl bg-black/70 px-6 py-3.5 text-white shadow-[0_10px_28px_rgba(0,0,0,0.45)] ${
+                seekPreview.leaving ? "player-flash-out" : "player-flash-in"
+              }`}
+            >
+              <p className="tnum text-[24px] font-semibold leading-none max-md:text-[22px]">
+                {formatClock(seekPreview.targetMs)}
+                <span className="text-[15px] font-normal text-white/45">
+                  {" / "}
+                  {durationMs ? formatClock(durationMs) : "--:--"}
+                </span>
+              </p>
+              <p className="tnum text-[13px] leading-none text-white/70">
+                {seekPreview.deltaMs < 0 ? "−" : "+"}
+                {formatClock(Math.abs(seekPreview.deltaMs))}
+              </p>
             </div>
           </div>
         ) : null}

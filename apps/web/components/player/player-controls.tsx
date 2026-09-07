@@ -414,7 +414,11 @@ export function PlayerControls(props: PlayerControlsProps) {
             // （见下方圆点注释），手指永远按不中——表现为拖动时圆点不跟手、
             // 松手 seek 到的是按下点。setPointerCapture 让移出条外也不断跟。
             onPointerDown={(e) => {
-              if (!durationMs) return;
+              // 只认主指针的主键起手。不挡的话右键点进度条会**当场 seek**
+              // 再弹出上下文菜单（中键同理），而右键的意图从来不是跳转；
+              // 触屏上第二根手指落在条上也会顶掉第一根正在进行的拖动。
+              // 触摸/笔的主接触点 button 恒为 0，这条不会误伤它们。
+              if (!durationMs || e.button !== 0 || !e.isPrimary) return;
               e.currentTarget.setPointerCapture(e.pointerId);
               const rect = e.currentTarget.getBoundingClientRect();
               const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
@@ -430,10 +434,23 @@ export function PlayerControls(props: PlayerControlsProps) {
               if (dragging !== null) onSeek(dragging);
               setDragging(null);
             }}
+            // 手势被系统收走时浏览器**只发 pointercancel、不再发 pointerup**：
+            // 进度条贴着屏幕最底边，正压在 iOS 的 Home 指示条上滑区里，拖到
+            // 边上一带就会被系统当成返回桌面的起手式；通知中心下拉、第二根
+            // 手指落下同理。不接这条的话 dragging 会永远停在最后一个拖动值
+            // 上——进度点和时间从此钉死在那儿不再跟画面走，而画面照常播，
+            // 中央的退进十秒/快捷键还能把画面跳走却带不动进度条，直到下一次
+            // 完整拖拽把它清掉才「自己好了」。
+            // 取消的手势**不提交** seek：用户没松手确认过这个位置，退回
+            // positionMs 才是真值。
+            onPointerCancel={() => setDragging(null)}
             onKeyUp={() => {
               if (dragging !== null) onSeek(dragging);
               setDragging(null);
             }}
+            // 键盘拖动（方向键改 range 的值走 onChange）对称的一条：焦点离开
+            // 时那次键盘调整已经结束，没等到 keyup 就不能让它继续遮着 positionMs
+            onBlur={() => setDragging(null)}
             // 触屏把命中带加高到 44px（Apple HIG 的最小触控目标）：视觉上还是
             // 那条细线，但手指按在线的上下 20px 内都算按中了——竖屏上「滑不准、
             // 按不中」的直接解法。桌面维持 20px，不跟鼠标抢悬停区。
