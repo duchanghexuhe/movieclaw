@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,6 +15,7 @@ from sqlmodel import select
 
 from movieclaw_api.api.routes.libraries import get_library_item
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.services import jobs
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library import chapters as chapters_mod
 from movieclaw_db.engine import dispose_db, get_database, init_db
@@ -308,30 +310,38 @@ async def test_probe_failure_and_missing_ffmpeg_leave_row_untouched(db, tmp_path
         assert row.chapter_images is None
 
 
-async def test_item_regenerate_route_schedules_force(db, tmp_path, monkeypatch):
-    """条目菜单「重新生成场景图」：独立于刷新元数据，后台 force 重抓；库关了开关拒绝。"""
-    from movieclaw_api.api.routes.libraries import regenerate_item_chapter_images
+async def test_item_regenerate_route_enqueues_resumable_job(db, tmp_path):
+    """条目菜单「重新生成章节」：独立于刷新元数据，落成可恢复 Job（重启不丢）；
+    同条目重复点复用同一个作业；库关了开关拒绝。
+
+    曾经的问题：它是个裸 asyncio 任务，重启直接消失，任务中心也看不到。
+    """
+    from movieclaw_api.api.routes.libraries import get_library_item, regenerate_item_chapter_images
     from movieclaw_api.exceptions import ConflictException
 
     video = tmp_path / "media" / "r.mkv"
     video.parent.mkdir()
     video.write_bytes(b"x")
     lib_id, item_id, _file_id = await _seed(db, video, chapters=[], chapter_images=[])
-    calls: list[tuple[int, bool]] = []
-    monkeypatch.setattr(
-        chapters_mod,
-        "schedule_item_chapter_images",
-        lambda i, *, force=False: calls.append((i, force)) or True,
-    )
     async with db.session() as session:
-        resp = await regenerate_item_chapter_images(lib_id, item_id, session)
-        assert resp.data == {"started": True} and calls == [(item_id, True)]
+        resp = await regenerate_item_chapter_images(lib_id, item_id, None, session)
+        job_id = resp.data["job_id"]
+        assert resp.data["started"] is True and resp.data["created"] is True
+        # 重复点：返回同一个作业，不排第二份
+        again = await regenerate_item_chapter_images(lib_id, item_id, None, session)
+        assert again.data["job_id"] == job_id and again.data["created"] is False
 
+    # 作业还排在队列里（进程内没有任何协程在跑）时，详情页仍要轮询
+    async with db.session() as session:
+        view = (await get_library_item(lib_id, item_id, _ADMIN, session)).data
+        assert view.chapters_pending is True
+
+    async with db.session() as session:
         lib = await session.get(Library, lib_id)
         lib.extract_chapter_images = False
         await session.commit()
         with pytest.raises(ConflictException):
-            await regenerate_item_chapter_images(lib_id, item_id, session)
+            await regenerate_item_chapter_images(lib_id, item_id, None, session)
 
 
 async def test_library_views_carry_chapter_job_progress(db, tmp_path):
@@ -384,3 +394,184 @@ async def test_library_views_carry_chapter_job_progress(db, tmp_path):
     async with db.session() as session:
         detail = (await get_library(lib_id, principal=_ADMIN, session=session)).data
         assert detail.chapter_job is None
+
+
+async def _seed_files(db, lib_id: int, item_id: int, folder: Path, count: int) -> list[int]:
+    """给同一个库再挂 count 个在位文件，返回 id。"""
+    ids: list[int] = []
+    async with db.session() as session:
+        for i in range(count):
+            row = LibraryFile(
+                library_id=lib_id,
+                media_item_id=item_id,
+                file_path=str(folder / f"ep{i}.mkv"),
+                container="mkv",
+                duration_seconds=600,
+                chapters=[],
+                source=FileSource.SCANNED,
+            )
+            session.add(row)
+            await session.flush()
+            ids.append(row.id)
+        await session.commit()
+    return ids
+
+
+async def _claim(db, created) -> tuple[str, jobs.JobContext]:
+    """把刚入队的作业改成"已被领取"（running + 租约），返回 job_id 与其 JobContext。"""
+    from datetime import timedelta
+
+    from movieclaw_db.models import utcnow
+    from movieclaw_db.models.job import Job, JobStatus
+
+    async with db.session() as session:
+        job = await session.get(Job, created.job.id)
+        job.status = JobStatus.RUNNING
+        job.lease_owner = "lease-test"
+        job.lease_expires_at = utcnow() + timedelta(minutes=5)
+        await session.commit()
+    return created.job.id, jobs.JobContext(
+        created.job.id, lease_token="lease-test", lease_lost=asyncio.Event()
+    )
+
+
+@pytest.mark.parametrize("force", [False, True])
+async def test_library_job_resumes_after_restart(db, tmp_path, monkeypatch, force):
+    """重启（应用内更新/重启把 Job 退回队列重跑处理器）后不重抓已完成的文件。
+
+    补缺靠台账、force 重抓靠进度里的游标；两种模式的进度都从断点接着数，
+    而不是回到 0 再数一遍"剩下的文件"——曾经的问题：force 重抓在重启后从头
+    再跑一遍整库，补缺虽然跳过了已完成的行，但进度归零看着像重跑。
+    """
+    from movieclaw_db.models.job import Job
+
+    monkeypatch.setattr(jobs.JobContext, "progress_due", lambda self, **_: True)
+    folder = tmp_path / "media"
+    folder.mkdir()
+    video = folder / "a.mkv"
+    video.write_bytes(b"x")
+    # 已有图的第一行：force 时它也要重抓，补缺时它不该出现在目标里
+    lib_id, item_id, first_id = await _seed(db, video, chapters=[], chapter_images=[])
+    rest = await _seed_files(db, lib_id, item_id, folder, 4)
+    everything = {first_id, *rest}
+
+    calls: list[int] = []
+    stop_after = 2  # 抓完第二个文件就"停机"
+
+    async def fake_refresh(session, row, *, force=False):
+        if not force and row.chapter_images is not None:
+            return False
+        calls.append(row.id)
+        if len(calls) > stop_after:
+            raise asyncio.CancelledError("模拟重启")  # 停机会直接取消执行协程
+        row.chapter_images = [{"start_ms": 0, "frame_ms": 0, "image": f"x/{row.id}.jpg"}]
+        session.add(row)
+        await session.commit()
+        return True
+
+    monkeypatch.setattr(chapters_mod, "refresh_file_chapter_images", fake_refresh)
+    async with db.session() as session:
+        created = await chapters_mod.enqueue_library_chapter_images_job(
+            session, lib_id, "家庭录像", force=force
+        )
+    job_id, context = await _claim(db, created)
+
+    with pytest.raises(asyncio.CancelledError):
+        await chapters_mod._run_chapter_images_job(context, {"library_id": lib_id, "force": force})
+    first_round = list(calls)
+    assert len(first_round) == stop_after + 1  # 最后一个是被打断的那个
+
+    # 重启：同一个 Job 被重新领取，处理器整体再跑一遍
+    interrupted = first_round.pop()  # 被打断的文件没写回台账，重启后要重来
+    calls.clear()
+    stop_after = 99
+    result = await chapters_mod._run_chapter_images_job(
+        context, {"library_id": lib_id, "force": force}
+    )
+
+    assert not set(first_round) & set(calls), "重启后不该重抓上一轮已完成的文件"
+    assert interrupted in calls  # 只有被打断的那个重来
+    assert set(first_round) | set(calls) == (everything if force else everything - {first_id})
+    async with db.session() as session:
+        job = await session.get(Job, job_id)
+    total = len(everything) if force else len(everything) - 1
+    assert (job.progress["current"], job.progress["total"]) == (total, total)
+    assert result["processed"] == total  # 累计口径：不是"重启后这一轮跑了几个"
+
+
+async def test_item_job_targets_only_that_item_and_cleans_orphans(db, tmp_path, monkeypatch):
+    """条目作业：只抓该条目的合格文件（原盘/strm 不抓），顺带清掉孤儿目录；
+    条目已不存在时明确失败，而不是静默跑完。"""
+    from movieclaw_db.models.job import Job, JobStatus
+
+    folder = tmp_path / "media"
+    folder.mkdir()
+    video = folder / "a.mkv"
+    video.write_bytes(b"x")
+    lib_id, item_id, first_id = await _seed(db, video, chapters=[])
+    (mine,) = await _seed_files(db, lib_id, item_id, folder, 1)
+    async with db.session() as session:
+        # 同库另一个条目的文件，以及本条目里不该抓的 strm
+        other = MediaItem(
+            kind="video",
+            source=MediaSource.LOCAL,
+            external_id=f"{lib_id}:path:other",
+            title="别的片",
+            original_title="",
+            aliases=[],
+        )
+        session.add(other)
+        await session.flush()
+        session.add(MediaMetadata(media_item_id=other.id))
+        session.add_all(
+            [
+                LibraryFile(
+                    library_id=lib_id,
+                    media_item_id=other.id,
+                    file_path=str(folder / "other.mkv"),
+                    container="mkv",
+                    source=FileSource.SCANNED,
+                ),
+                LibraryFile(
+                    library_id=lib_id,
+                    media_item_id=item_id,
+                    file_path=str(folder / "link.strm"),
+                    container="strm",
+                    source=FileSource.SCANNED,
+                ),
+            ]
+        )
+        await session.commit()
+    assets = Path(get_settings().metadata_dir) / "images"
+    orphan = assets / str(item_id) / "chapters" / "999"
+    orphan.mkdir(parents=True)
+    (orphan / "0000000000.jpg").write_bytes(b"x")
+
+    calls: list[int] = []
+
+    async def fake_refresh(session, row, *, force=False):
+        calls.append(row.id)
+        return True
+
+    monkeypatch.setattr(chapters_mod, "refresh_file_chapter_images", fake_refresh)
+    async with db.session() as session:
+        created = await chapters_mod.enqueue_item_chapter_images_job(session, item_id, "测试片")
+    _job_id, context = await _claim(db, created)
+    result = await chapters_mod._run_item_chapter_images_job(
+        context, {"media_item_id": item_id, "force": True}
+    )
+
+    assert sorted(calls) == sorted([first_id, mine])  # 别的条目与 strm 都不在内
+    assert result["processed"] == 2
+    assert not orphan.exists()
+
+    # 条目连台账行都没有了：明确失败，用户能在任务中心看到原因
+    async with db.session() as session:
+        created2 = await chapters_mod.enqueue_item_chapter_images_job(session, 4242, "已删条目")
+        job = await session.get(Job, created2.job.id)
+        job.status = JobStatus.RUNNING
+        job.lease_owner = "lease-gone"
+        await session.commit()
+    gone = jobs.JobContext(created2.job.id, lease_token="lease-gone", lease_lost=asyncio.Event())
+    with pytest.raises(jobs.JobFailed):
+        await chapters_mod._run_item_chapter_images_job(gone, {"media_item_id": 4242})
