@@ -15,7 +15,6 @@ import {
 } from "@/lib/library-confirm";
 import { chapterJobLabel } from "@/lib/library-manage";
 import {
-  CheckIcon,
   LockIcon,
   MasonryIcon,
   MoreIcon,
@@ -37,8 +36,12 @@ import {
 } from "@/components/photo-wall";
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import {
+  GALLERY_LOAD_MARGIN,
+  GALLERY_PAGE_SIZE,
+  dedupeGalleryGroups,
   VideoGalleryLightbox,
   VideoGalleryWall,
+  WallPrefItems,
   flattenGallery,
   useVideoGalleryGrouped,
   useVideoGalleryMode,
@@ -146,26 +149,6 @@ const PROVISIONAL_LIMIT = 200;
 const WALL_PAGE_SIZE = 60;
 /** 后端单次分页的硬上限；轮询已加载窗口时按此上限分块请求。 */
 const WALL_API_PAGE_SIZE = 200;
-/** 图床浏览模式一页的作品数：一部作品十来张图，24 部约一屏半 */
-const GALLERY_PAGE_SIZE = 24;
-/**
- * 图床浏览模式提前取下一页的距离：约一屏半，也就是当前这一页快滑完时就去要
- * 下一页。图大、下载慢，等滑到底再发请求接上来的就是一屏空瓦片。
- */
-const GALLERY_LOAD_MARGIN = "1200px 0px";
-
-/**
- * 图廊分组上墙前的统一口径：没图的条目不占位（服务端按条目分页，空组只用来
- * 数页），同一条目只留最前面那一组。追加下一页与整窗对账都过这一道。
- */
-function dedupeGalleryGroups(groups: LibraryGalleryGroup[]): LibraryGalleryGroup[] {
-  const seen = new Set<number>();
-  return groups.filter((group) => {
-    if (group.images.length === 0 || seen.has(group.media_item_id)) return false;
-    seen.add(group.media_item_id);
-    return true;
-  });
-}
 
 /**
  * 列表拉取失败折成 ``null``（而不是空数组）。
@@ -1236,7 +1219,6 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
                     density={photoDensity}
                     grouped={galleryGrouped}
                     onOpen={setLightboxIndex}
-                    libraryId={libraryId}
                   />
                 ) : photoWall ? (
                   <div ref={wallGrid}>
@@ -1364,7 +1346,6 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           </div>
           {gallery && lightboxIndex !== null && galleryEntries[lightboxIndex] && (
             <VideoGalleryLightbox
-              libraryId={libraryId}
               entries={galleryEntries}
               index={lightboxIndex}
               hasMore={galleryHasMore}
@@ -1569,45 +1550,15 @@ function LibraryActionsMenu({
           {canManage && (grouped !== undefined || density) && (
             <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
           )}
-          {/* 图床浏览：关掉分组，整库的图就混成一条瀑布流 */}
-          {grouped !== undefined && onGroupedChange && (
-            <DropdownMenu.CheckboxItem
-              checked={grouped}
-              onCheckedChange={onGroupedChange}
-              className={`${itemClass} flex items-center justify-between`}
-            >
-              按作品分组
-              <DropdownMenu.ItemIndicator>
-                <CheckIcon className="size-3.5 text-[var(--accent)]" />
-              </DropdownMenu.ItemIndicator>
-            </DropdownMenu.CheckboxItem>
-          )}
-          {density && onDensityChange && (
-            <>
-              <DropdownMenu.Label className="px-3 pb-1 pt-1.5 text-caption text-[var(--text-faint)]">
-                瀑布流密度
-              </DropdownMenu.Label>
-              <DropdownMenu.RadioGroup
-                value={density}
-                onValueChange={(next) => onDensityChange(next as PhotoWallDensity)}
-              >
-                {(
-                  [
-                    ["compact", "紧凑"],
-                    ["standard", "标准"],
-                    ["loose", "宽松"],
-                  ] as [PhotoWallDensity, string][]
-                ).map(([key, label]) => (
-                  <DropdownMenu.RadioItem key={key} value={key} className={`${itemClass} flex items-center justify-between`}>
-                    {label}
-                    <DropdownMenu.ItemIndicator>
-                      <CheckIcon className="size-3.5 text-[var(--accent)]" />
-                    </DropdownMenu.ItemIndicator>
-                  </DropdownMenu.RadioItem>
-                ))}
-              </DropdownMenu.RadioGroup>
-            </>
-          )}
+          {/* 与「全部收藏」页的图廊菜单是同一组（见 video-gallery.tsx）：
+              图片库只传密度，图床浏览模式两项都传 */}
+          <WallPrefItems
+            grouped={grouped}
+            onGroupedChange={onGroupedChange}
+            density={density}
+            onDensityChange={onDensityChange}
+            itemClass={itemClass}
+          />
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
@@ -1686,6 +1637,7 @@ export const InventoryCell = memo(function InventoryCell({
   libraryId,
   wallInitial,
   workingLabel,
+  frameAspect,
 }: {
   item: LibraryItem;
   libraryId: number;
@@ -1693,6 +1645,12 @@ export const InventoryCell = memo(function InventoryCell({
   wallInitial?: string;
   /** 这一格正被后台处理（整库刷新的阶段 / 扫描补探）时的文案；不在处理为 undefined */
   workingLabel?: string;
+  /**
+   * 强制锁定框比例。单库页的墙已按主图比例切成竖横两区，每区内比例天然一致，
+   * 不传即按本格主图自选（竖 2:3 / 横 16:9）；而「全部收藏」是跨库按时间排的
+   * 一面墙，不能为了对齐去打散收藏顺序，只能由调用方把整面墙钉死在一个比例上。
+   */
+  frameAspect?: number;
 }) {
   const inventoryLabel =
     item.kind === "tv" && item.inventory_summary
@@ -1708,8 +1666,9 @@ export const InventoryCell = memo(function InventoryCell({
     rating: 0,
     // 框比例按分区锁死（竖版 2:3 / 横版 16:9），同一分区里每格等高、片名一条线；
     // 主图真实比例另传，和框不一致的（4:3 封面、1.5 的横版海报）模糊铺底居中完整显示，
-    // 不按各自真实比例撑格——那样一行里 1.5 与 1.78 的封面高度不一，片名参差
-    aspect: item.primary_aspect >= 1 ? 16 / 9 : 2 / 3,
+    // 不按各自真实比例撑格——那样一行里 1.5 与 1.78 的封面高度不一，片名参差。
+    // 调用方给了 frameAspect 就一切照它来（竖横混排的墙，见上面参数注释）
+    aspect: frameAspect ?? (item.primary_aspect >= 1 ? 16 / 9 : 2 / 3),
     imageAspect: item.primary_aspect,
     overlayDetails: inventoryLabel ? { primary: inventoryLabel } : undefined,
     favorite: item.is_favorite,
