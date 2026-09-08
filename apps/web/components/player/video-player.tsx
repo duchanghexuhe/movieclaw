@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { MediaController } from "media-chrome/react";
 
-import { ChevronLeftIcon } from "@/components/icons";
+import { ChevronLeftIcon, LockIcon } from "@/components/icons";
 
 import { ConsentDialog } from "@/components/player/consent-dialog";
 import { DiagnosticsPanel } from "@/components/player/diagnostics-panel";
@@ -67,7 +67,7 @@ import {
   summarize,
 } from "@/lib/player/qoe";
 import type { TrickplayIndex } from "@/lib/player/trickplay";
-import { isEditableTarget, resolveShortcut } from "@/lib/player/shortcuts";
+import { FALLBACK_FRAME_RATE, isEditableTarget, resolveShortcut } from "@/lib/player/shortcuts";
 import {
   type AdjustKind,
   type SwipeIntent,
@@ -75,6 +75,7 @@ import {
   applySwipe,
   classifyIntent,
   classifyTouchZone,
+  pointerOffsetX,
   seekDeltaMs,
   toLayoutPoint,
 } from "@/lib/player/touch-adjust";
@@ -86,9 +87,20 @@ import {
   saveSubtitleStyle,
 } from "@/lib/player/subtitles";
 import {
+  HOLD_SPEED_DELAY_MS,
+  HOLD_SPEED_RATE,
+  type HoldSpeedEvent,
+  type HoldSpeedState,
+  canHoldSpeed,
+  holdSpeedReducer,
+} from "@/lib/player/hold-speed";
+import { nextSeekTarget, seekBatchWindowMs } from "@/lib/player/seek-batch";
+import { resolveTap } from "@/lib/player/tap";
+import {
   clampSeekTarget,
   formatClock,
   isInEndCredits,
+  isWithinRanges,
   planSeek,
   toFileMs,
   toSessionSeconds,
@@ -297,6 +309,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
   /** 当前是否在横屏（全屏 + 锁横向，或 iOS 上的 CSS 伪横屏）里 */
   const [landscape, setLandscape] = useState(false);
   /**
+   * 设备当前是不是横着（与我们自己的横屏按钮无关）。
+   *
+   * 锁屏要跟着**画面真的横过来**出现：多数人是直接把手机转过来（系统自动
+   * 旋转），根本不会去按播放器的横屏键——只认 `landscape` 的话，最需要防
+   * 误触的那批人反而看不到这颗按钮。
+   */
+  const [deviceLandscape, setDeviceLandscape] = useState(false);
+  /**
    * 走的是 CSS 伪横屏（把播放器容器旋转 90° 铺满视口）。
    *
    * iPhone Safari 既没有元素级全屏也没有 `screen.orientation.lock`，真横屏
@@ -346,6 +366,19 @@ export function VideoPlayer(props: VideoPlayerProps) {
     hide: null,
     gone: null,
   });
+  /**
+   * 横屏锁屏（docs/design/player-feel.md §2.B3）。
+   *
+   * 横躺着看片时手掌、拇指常常压在屏幕上，一次误触就是暂停或跳走。锁上之后
+   * 所有触摸手势与轻点全部作废，控制层也不再被唤出——只留一颗解锁键，点一下
+   * 画面它露 3 秒。
+   */
+  const [locked, setLocked] = useState(false);
+  /** 锁屏态下解锁键的露出（点画面唤出、3 秒后自己收） */
+  const [lockHint, setLockHint] = useState(false);
+  const lockHintTimerRef = useRef<number | null>(null);
+  /** 长按倍速是否生效中（HUD 与还原都看它） */
+  const [holdSpeed, setHoldSpeed] = useState(false);
   /** 横滑拖进度时的落点读数。手势期间常显，松手/取消后淡出 */
   const [seekPreview, setSeekPreview] = useState<{
     targetMs: number;
@@ -582,6 +615,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
   }, [resume?.duration_ms, state.session?.timeline, sessionId, videoDurationMs]);
   const durationMsRef = useRef<number | null>(null);
   durationMsRef.current = durationMs;
+
+  /** 进度条上的章节刻度。会话没换就保持同一个数组身份，免得下游白算一遍 */
+  const chapters = useMemo(() => state.session?.chapters ?? [], [state.session]);
 
   const subtitles = useMemo(() => {
     const session = state.session;
@@ -855,6 +891,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
       // 首个 init/segment，触发 MEDIA_ERR_DECODE。
       if (shouldApplyPostAttachSeek(mode.engine, target)) {
         const seek = () => {
+          // 已经在目标附近就不跳（jellyfin-web 的 setCurrentTimeIfNeeded 同款）：
+          // VOD 列表里流本来就从目标分片起，再赋一次 currentTime 是白白触发一次
+          // seek——起播那一刻的 seek 会打断刚建立的缓冲，首帧要多等一拍。
+          if (Math.abs((video.currentTime || 0) - target) < 1) return;
           video.currentTime = target;
         };
         if (video.readyState >= 1) seek();
@@ -949,7 +989,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
     };
     const onSeeking = () => {
       if (!isCurrentSession()) return;
-      qoe({ type: "seeking", at: performance.now() });
+      const scrub = scrubRef.current;
+      // 同一次拖动的第二次及以后：位置是我们自己每 100 毫秒写进去的，
+      // 不是用户又跳了一次（第一次照常计入——他确实跳了）
+      const fromScrub = scrub.count > 0 && performance.now() - scrub.at < 250;
+      if (!fromScrub) qoe({ type: "seeking", at: performance.now() });
       dispatch({ type: "seeking" });
     };
     const onSeeked = () => {
@@ -1397,6 +1441,41 @@ export function VideoPlayer(props: VideoPlayerProps) {
     }
   }, [video]);
 
+  /** 供触摸/点击回调读最新的锁屏态：它们绑在 video 元素上，不重绑 */
+  const lockedRef = useRef(false);
+  lockedRef.current = locked;
+  /** 长按倍速松手后要吞掉的那一次 click */
+  const suppressClickRef = useRef(false);
+  /** 上一次轻点：时刻 + 那一下之前控制层的显隐（双击时要恢复回去） */
+  const tapRef = useRef<{ at: number; chromeBefore: boolean } | null>(null);
+
+  /**
+   * 锁屏态下把解锁键唤出来，3 秒后自己收。
+   *
+   * 常显是不行的：锁屏本来就是「别让我碰到任何东西」，画面上却挂着一颗
+   * 亮着的按钮，等于把误触目标从整块屏幕缩成一个点而不是消掉。
+   */
+  const revealLock = useCallback(() => {
+    setLockHint(true);
+    if (lockHintTimerRef.current !== null) window.clearTimeout(lockHintTimerRef.current);
+    lockHintTimerRef.current = window.setTimeout(() => {
+      lockHintTimerRef.current = null;
+      setLockHint(false);
+    }, 3000);
+  }, []);
+
+  /** 锁上的那一刻把控制层收掉：锁屏还挂着一排能点的按钮说不过去 */
+  useEffect(() => {
+    if (locked) setChromeVisible(false);
+  }, [locked]);
+
+  useEffect(
+    () => () => {
+      if (lockHintTimerRef.current !== null) window.clearTimeout(lockHintTimerRef.current);
+    },
+    [],
+  );
+
   /**
    * 点画面只负责控制层的显隐：藏着就唤出，露着就收起。
    *
@@ -1407,10 +1486,58 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * click，不会走到这里——控制层的显隐只回应真正的轻点。暂停中收不掉是
    * 有意的——chromeMustStayVisible 会立刻把它拉回来，暂停画面本来就该
    * 带着控制条。
+   *
+   * **触屏的双击另有含义**（左右三分之一 = 退/进十秒，§2.B1）：这推翻了
+   * 从前「触屏双击就是两次控制层开关、净效果回到原状」的取舍——双击左右
+   * 快退快进已经是手机上的肌肉记忆，白白空着不值。判定在 tap.ts。
    */
-  const onSurfaceClick = useCallback(() => {
-    setChromeVisible(!chromeWasVisibleRef.current);
-  }, []);
+  const onSurfaceClick = useCallback(
+    (event: React.MouseEvent<HTMLVideoElement>) => {
+      // 锁屏中：轻点只把解锁键唤出来 3 秒，不碰控制层也不跳转
+      if (lockedRef.current) {
+        revealLock();
+        return;
+      }
+      // 长按倍速松手时浏览器仍会补一次 click，吞掉它——否则每次长按结束
+      // 都顺带把控制层切一下
+      if (suppressClickRef.current) {
+        suppressClickRef.current = false;
+        return;
+      }
+      // 伪横屏下画面整体转了 90°，用物理 clientX 分左右会把三等分转到
+      // 竖直方向上去——换算与进度条同源（touch-adjust.ts 的 pointerOffsetX）
+      const { offset, length } = pointerOffsetX(
+        event,
+        event.currentTarget.getBoundingClientRect(),
+        fakeLandscapeRef.current,
+      );
+      const xRatio = length > 0 ? offset / length : 0.5;
+      const now = performance.now();
+      const previous = tapRef.current;
+      // 双击跳转只属于触屏：桌面的双击是全屏（onSurfaceDoubleClick），
+      // 一个手势不能在同一种指针上有两种含义
+      const action =
+        lastPointerTypeRef.current === "mouse"
+          ? ({ type: "chrome" } as const)
+          : resolveTap({ nowMs: now, lastTapMs: previous?.at ?? null, xRatio });
+      if (action.type === "seek") {
+        // 第二下：撤掉第一下对控制层的开关，净效果只剩跳转
+        if (previous) setChromeVisible(previous.chromeBefore);
+        // **链不能断在这里**：连点第三下、第四下要继续累加（YouTube 同款，
+        // 点三下就是 30 秒）。清成 null 的话第三下会退回「开关控制层」，
+        // 而胶囊上的累加读数还在往上走——手上的动作与屏幕说的对不上。
+        tapRef.current = { at: now, chromeBefore: previous?.chromeBefore ?? chromeVisible };
+        seekByRef.current(action.seconds);
+        // 双击是「盲操作」：没有按钮的按下反馈，必须给方向提示，
+        // 且连点累加（点三下显示 30 秒，与键盘同一套胶囊）
+        flashSeek(action.seconds);
+        return;
+      }
+      tapRef.current = { at: now, chromeBefore: chromeWasVisibleRef.current };
+      setChromeVisible(!chromeWasVisibleRef.current);
+    },
+    [flashSeek, revealLock, chromeVisible],
+  );
 
   /**
    * 换音轨。
@@ -1565,20 +1692,181 @@ export function VideoPlayer(props: VideoPlayerProps) {
     [video, sessionId, mode, durationMs, state.session, state.phase, state.startMs],
   );
 
-  /** 供触摸手势回调读最新值：跟着依赖重绑 touch 监听会在手势中途换掉监听器 */
+  /**
+   * 连按快进/快退的累积落点（docs/design/player-feel.md §2.B4）。
+   *
+   * 转码会话里一次 seek 可能就是一次「杀 ffmpeg 换会话」，连按三次 ⟳10
+   * 发三次 seek 就是黑三下才走到 +30 秒。所以按键只累积落点、立刻更新读数，
+   * 静默 400ms 后提交唯一一次跳转。null = 没有在途的累积。
+   */
+  const [pendingSeekMs, setPendingSeekMs] = useState<number | null>(null);
+  const pendingSeekRef = useRef<{ targetMs: number | null; timer: number | null }>({
+    targetMs: null,
+    timer: null,
+  });
+
+  /** 撤销在途的累积（进度条拖动、横滑等其它跳转入口接管时必须先清） */
+  const cancelPendingSeek = useCallback(() => {
+    const pending = pendingSeekRef.current;
+    if (pending.timer !== null) window.clearTimeout(pending.timer);
+    pending.timer = null;
+    pending.targetMs = null;
+    setPendingSeekMs(null);
+  }, []);
+
+  /** 供延时提交的合并计时器读最新值：它跨过一段时间才执行 */
   const seekToFileMsRef = useRef(seekToFileMs);
   seekToFileMsRef.current = seekToFileMs;
 
-  // 上下界都由 seekToFileMs 里的 clampSeekTarget 收住，这里不再各夹一次
+  // 上下界都由 nextSeekTarget / seekToFileMs 里的 clampSeekTarget 收住
   const seekBy = useCallback(
-    (seconds: number) => seekToFileMs(positionRef.current + seconds * 1000),
-    [seekToFileMs],
+    (seconds: number) => {
+      const target = nextSeekTarget({
+        pendingMs: pendingSeekRef.current.targetMs,
+        positionMs: positionRef.current,
+        deltaMs: seconds * 1000,
+        durationMs: durationMsRef.current,
+      });
+      const windowMs = seekBatchWindowMs({
+        hasSession: Boolean(sessionIdRef.current),
+        buffered: isCheapSeekRef.current(target),
+      });
+      if (windowMs <= 0) {
+        // 便宜的跳转立刻执行，手感最好——这里合并只是凭空加延迟
+        cancelPendingSeek();
+        seekToFileMs(target);
+        return;
+      }
+      const pending = pendingSeekRef.current;
+      pending.targetMs = target;
+      // 读数立刻跟上：进度条与时间文字都走 overrideMs，用户按下就看到落点
+      setPendingSeekMs(target);
+      if (pending.timer !== null) window.clearTimeout(pending.timer);
+      pending.timer = window.setTimeout(() => {
+        pending.timer = null;
+        const committed = pending.targetMs;
+        pending.targetMs = null;
+        setPendingSeekMs(null);
+        // 走 ref 而不是闭包里的那个：这 400 毫秒里会话可能已经换过一轮
+        // （降档、换轨、心跳自愈），旧闭包会拿着过期的 session/startMs 去跳
+        if (committed !== null) seekToFileMsRef.current(committed);
+      }, windowMs);
+    },
+    [seekToFileMs, cancelPendingSeek],
   );
+
+  /** 供点击/触摸回调读最新值：它们定义在 seekBy 之前，且不该跟着它重绑 */
+  const seekByRef = useRef(seekBy);
+  seekByRef.current = seekBy;
+
+  /**
+   * 换集与卸载都要撤掉在途的合并计时器。
+   *
+   * **播放器在切集时不重挂**（player-page 没给它 key，只换 unit），所以那个
+   * 400 毫秒的计时器会活过切集：用户在片尾按一下快进、随手点了「下一集」，
+   * 400 毫秒后它就把**新一集**跳到上一集的落点上去。
+   */
+  useEffect(() => {
+    // 这个 ref 装的对象身份恒定（只改字段不换对象），可以放心带进 cleanup
+    const pending = pendingSeekRef.current;
+    cancelPendingSeek();
+    return () => {
+      if (pending.timer !== null) window.clearTimeout(pending.timer);
+    };
+  }, [unitKey, cancelPendingSeek]);
+
+  /**
+   * 拖动进度条时的实时跟随（docs/design/player-feel.md §2.C2）。
+   *
+   * 松手才提交是转码会话逼出来的规矩：拖动中每次 move 都跳会让服务端一路杀
+   * ffmpeg 重启，画面永远追不上手指。但**跳转不要钱的时候没有理由不跟随**：
+   *
+   * - 档 0 直出：整个文件都能跳，浏览器自己按 range 取数据；
+   * - 任何模式落在已缓冲区间内：数据就在手上，跳过去是零成本。
+   *
+   * 其余情况（拖到没缓冲的地方、旧会话相对制）原样按下不表，等松手那一次。
+   * 100ms 节流：hls.js 在列表内跳转会取消在途的分片请求，一秒跳六十次反而
+   * 让缓冲永远建立不起来。
+   */
+  /**
+   * 拖动跟随自己写 currentTime 的节流与计数。
+   *
+   * `count` 是**这一次拖动里写到第几次**：第一次要照常算作用户跳转（他确实
+   * 跳了），第二次起是同一个动作的延续——一次拖动写十几次，全算进 QoE 的话
+   * 「拖动次数」就从「用户跳了几次」变成「写了几次 currentTime」，指标废掉。
+   */
+  const scrubRef = useRef({ at: 0, count: 0 });
+
+  /**
+   * 这一跳贵不贵：落点已在缓冲里、或档 0 直出（整个文件随便跳）就是零成本，
+   * 否则转码会话要按分片请求把 ffmpeg 杀掉重启直奔目标。
+   *
+   * 拖动实时跟随（只在便宜时跟）与连按合并（只在贵时等）共用同一条判据。
+   */
+  const isCheapSeek = useCallback(
+    (fileMs: number) => {
+      if (!video) return false;
+      if (mode?.engine === "direct") return true;
+      return isWithinRanges(video.buffered, toSessionSeconds(fileMs, startMsRef.current));
+    },
+    [video, mode],
+  );
+  const isCheapSeekRef = useRef(isCheapSeek);
+  isCheapSeekRef.current = isCheapSeek;
+
+  const scrubTo = useCallback(
+    (fileMs: number) => {
+      // 拖动就是活动：不重排自动隐藏的倒计时的话，手指按着不动四秒钟，
+      // 控制条会**在拖动过程中**淡出——指针捕获让拖动照旧生效，用户却是
+      // 对着一条看不见的进度条在拖，松手才知道跳到了哪儿。
+      bumpChromeActivity();
+      if (!video) return;
+      const now = performance.now();
+      if (now - scrubRef.current.at < 100) return;
+      const seconds = toSessionSeconds(fileMs, startMsRef.current);
+      if (seconds < 0 || !isCheapSeek(fileMs)) return;
+      // 500 毫秒之内的连续写视为同一次拖动
+      const continuing = now - scrubRef.current.at < 500;
+      scrubRef.current = { at: now, count: continuing ? scrubRef.current.count + 1 : 0 };
+      // **只动 currentTime，不走 engine.seek**：后者会 stopLoad + startLoad
+      // 把在途的分片请求全掐掉重来——那是给「跳到没缓冲的地方」准备的重手段。
+      // 拖动跟随只在数据已经在手上时才发生（isCheapSeek），一秒十次地掐断
+      // 加载管线，恰恰会把这条路本来想改善的手感反过来毁掉。
+      // fastSeek 是浏览器为「拖动预览」准备的：就近落在关键帧上，省掉从
+      // 关键帧解到精确帧的那段解码。Safari / Firefox 有，Chrome 至今没有，
+      // 所以要探测。松手那次提交仍走精确 seek——落点差半秒用户是看得出来的。
+      if (typeof video.fastSeek === "function") video.fastSeek(seconds);
+      else video.currentTime = seconds;
+    },
+    [video, isCheapSeek, bumpChromeActivity],
+  );
+
+  /**
+   * 进度条拖动与横滑落点的提交入口：先撤掉在途的连按累积，再跳。
+   *
+   * 不撤的话，用户「连按两下快进又改主意去拖进度条」时，那个 400ms 的
+   * 计时器会在拖动落地之后再把画面拽回连按的落点。
+   */
+  const commitSeek = useCallback(
+    (fileMs: number) => {
+      cancelPendingSeek();
+      seekToFileMs(fileMs);
+    },
+    [cancelPendingSeek, seekToFileMs],
+  );
+  /** 供触摸手势回调读最新值：跟着依赖重绑 touch 监听会在手势中途换掉监听器 */
+  const commitSeekRef = useRef(commitSeek);
+  commitSeekRef.current = commitSeek;
 
   useEffect(() => {
     // 粗指针（手指）就是能转的设备。不再要求 orientation.lock 存在：
     // iPhone Safari 没有它，但可以走 CSS 伪横屏，按钮照样要给
     setCanRotate(window.matchMedia("(pointer: coarse)").matches);
+    const landscapeQuery = window.matchMedia("(orientation: landscape)");
+    const sync = () => setDeviceLandscape(landscapeQuery.matches);
+    sync();
+    landscapeQuery.addEventListener("change", sync);
+    return () => landscapeQuery.removeEventListener("change", sync);
   }, []);
 
   /**
@@ -1688,7 +1976,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
   }, [video]);
 
   /** 桌面惯例：双击画面进/出全屏（YouTube/Netflix 网页端同款）。只认鼠标——
-   * 触屏的双击就是两次控制层开关，净效果回到原状，不搭全屏的车。 */
+   * 触屏的双击另有含义（左右三分之一 = 退/进十秒，见 onSurfaceClick），
+   * 一个手势不能在同一种指针上有两种结果。 */
   const onSurfaceDoubleClick = useCallback(() => {
     if (lastPointerTypeRef.current !== "mouse") return;
     toggleFullscreen();
@@ -1778,7 +2067,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
           flashSeek(action.seconds);
           break;
         case "seek-percent":
-          if (durationMs) seekToFileMs((durationMs * action.percent) / 100);
+          // 走 commitSeek：数字键是「跳到片子的某个比例」这种绝对跳转，
+          // 必须先撤掉在途的连按累积，否则 400 毫秒后它会把画面拽回去
+          if (durationMs) commitSeek((durationMs * action.percent) / 100);
           break;
         case "volume-by":
           if (video) {
@@ -1795,6 +2086,16 @@ export function VideoPlayer(props: VideoPlayerProps) {
         case "toggle-fullscreen":
           toggleFullscreen();
           break;
+        case "step-frame":
+          // 逐帧只在暂停时有意义（播着的画面根本看不出走了一帧），
+          // 与 jellyfin 的 seekFrames 同一条规矩。帧率取台账真值。
+          if (video?.paused) {
+            // 同上：逐帧是精确到一帧的绝对定位，在途的连按累积必须先作废
+            cancelPendingSeek();
+            const fps = state.session?.source?.frame_rate || FALLBACK_FRAME_RATE;
+            video.currentTime = Math.max(0, video.currentTime + action.direction / fps);
+          }
+          break;
         case "toggle-subtitles":
           setSelectedSubtitle((current) =>
             current ? null : (subtitles.options[0]?.ref ?? null),
@@ -1804,7 +2105,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [togglePlay, seekBy, seekToFileMs, toggleFullscreen, durationMs, video, subtitles.options, flashAdjust, flashSeek, bumpChromeActivity]);
+  }, [togglePlay, seekBy, commitSeek, cancelPendingSeek, toggleFullscreen, durationMs, video, state.session, subtitles.options, flashAdjust, flashSeek, bumpChromeActivity]);
 
   // ---------------------------------------------------------------------
   // 系统集成：媒体键 / 锁屏信息 / 防息屏
@@ -1826,6 +2127,20 @@ export function VideoPlayer(props: VideoPlayerProps) {
     mediaSession.setActionHandler("seekbackward", () => seekBy(-10));
     mediaSession.setActionHandler("seekforward", () => seekBy(10));
     mediaSession.setActionHandler("nexttrack", next ? () => onPlayNext() : null);
+    mediaSession.setActionHandler("previoustrack", prev ? () => onPlayPrev() : null);
+    // 锁屏/通知栏那条进度条**能拖**，靠的就是这个动作。不注册的话它要么
+    // 不出现、要么拖了没反应——而 `seekbackward/forward` 顶不了它的位：
+    // 那两个是「±10 秒」按钮，跳到某一点是另一回事（jellyfin-web 同样注册）。
+    try {
+      mediaSession.setActionHandler("seekto", (details) => {
+        if (typeof details.seekTime !== "number") return;
+        // 走 commitSeek：锁屏上拖一下与拖进度条是同一件事，
+        // 在途的连按累积要先撤掉，否则 400ms 后它会把画面拽回去
+        commitSeekRef.current(details.seekTime * 1000);
+      });
+    } catch {
+      // 老浏览器不认这个动作，锁屏上就只剩按钮，不影响播放
+    }
     /**
      * 「切走标签页就自动进画中画」。
      *
@@ -1850,8 +2165,20 @@ export function VideoPlayer(props: VideoPlayerProps) {
     }
     return () => {
       mediaSession.metadata = null;
-      for (const action of ["play", "pause", "seekbackward", "seekforward", "nexttrack"] as const) {
+      for (const action of [
+        "play",
+        "pause",
+        "seekbackward",
+        "seekforward",
+        "nexttrack",
+        "previoustrack",
+      ] as const) {
         mediaSession.setActionHandler(action, null);
+      }
+      try {
+        mediaSession.setActionHandler("seekto", null);
+      } catch {
+        // 同上，没注册上自然也不用清
       }
       try {
         mediaSession.setActionHandler("enterpictureinpicture" as MediaSessionAction, null);
@@ -1859,7 +2186,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
         // 同上，没注册上自然也不用清
       }
     };
-  }, [title, episodeLabel, posterUrl, togglePlay, seekBy, next, onPlayNext, video]);
+  }, [title, episodeLabel, posterUrl, togglePlay, seekBy, next, onPlayNext, prev, onPlayPrev, video]);
 
   /**
    * 原生 HLS 模式：选中的系统字幕轨**常开**（showing），所有表面（内联/
@@ -1994,6 +2321,12 @@ export function VideoPlayer(props: VideoPlayerProps) {
     /** 横滑当前算出的落点；松手才提交，中途只喂胶囊 */
     targetMs: number;
   } | null>(null);
+  /** 长按倍速的状态机进度 + 计时器 + 长按前的速率（迁移规则见 hold-speed.ts） */
+  const holdRef = useRef<{ state: HoldSpeedState; timer: number | null; rate: number }>({
+    state: "idle",
+    timer: null,
+    rate: 1,
+  });
   /** 音量能不能调：null=还没探完；不可调 = iOS（WebKit 只认硬件侧键）。 */
   const volumeAdjustableRef = useRef<boolean | null>(null);
   const fakeLandscapeRef = useRef(false);
@@ -2024,9 +2357,61 @@ export function VideoPlayer(props: VideoPlayerProps) {
 
   useEffect(() => {
     if (!video) return;
+
+    // ---- 长按倍速（docs/design/player-feel.md §2.B2）----
+    const hold = holdRef.current;
+    const setRate = (rate: number) => {
+      // 变速必须保音高，不然 2× 是鸭子叫。Safari 到现在仍只认带前缀的那个。
+      video.preservesPitch = true;
+      (video as HTMLVideoElement & { webkitPreservesPitch?: boolean }).webkitPreservesPitch = true;
+      video.playbackRate = rate;
+    };
+    const dispatchHold = (event: HoldSpeedEvent) => {
+      const next = holdSpeedReducer(hold.state, event);
+      if (next === hold.state) return;
+      if (hold.timer !== null) {
+        window.clearTimeout(hold.timer);
+        hold.timer = null;
+      }
+      if (next === "pending") {
+        hold.timer = window.setTimeout(() => dispatchHold("elapsed"), HOLD_SPEED_DELAY_MS);
+      } else if (next === "active") {
+        // 记住长按前的速率再改：用户可能自己调过（将来有倍速菜单时更要）
+        hold.rate = video.playbackRate || 1;
+        setRate(HOLD_SPEED_RATE);
+        setHoldSpeed(true);
+      } else if (hold.state === "active") {
+        setRate(hold.rate);
+        setHoldSpeed(false);
+        // 松手后浏览器还会补一次 click，吞掉它，否则每次长按都顺带切控制层
+        if (event === "release") suppressClickRef.current = true;
+        if (event === "starve") flashNotice("缓冲跟不上，已退出 2 倍速");
+      }
+      hold.state = next;
+    };
+    // 倍速把前向缓冲吃得比转码器产出更快时，video 会发 waiting——那就是
+    // 「追上编码器了」的信号，立刻还原，别让用户按着不放对着转圈
+    const onWaiting = () => dispatchHold("starve");
+    video.addEventListener("waiting", onWaiting);
+
     const onTouchStart = (event: TouchEvent) => {
-      if (event.touches.length !== 1) {
+      // 新的一次触摸开始 = 上一次要吞的 click 要么已经来过、要么不会来了
+      // （长按松手后浏览器不一定补 click：Android 弹了长按菜单就没有）。
+      // 不清的话那个标记会一直挂着，把下一次正经的轻点吞掉。
+      suppressClickRef.current = false;
+      // 锁屏：所有手势作废（轻点由 onSurfaceClick 处理成「露出解锁键」）
+      if (lockedRef.current) {
         swipeGestureRef.current = null;
+        return;
+      }
+      if (event.touches.length !== 1) {
+        // 第二根手指落下 = 这次手势作废。作废之后 `finishGesture` 拿到的
+        // gesture 是 null，**不会再走到 hideSeekPreview**，而落点胶囊没有
+        // 自动退场计时——留着它就是画面正中钉死一个旧落点，进度条却跟着
+        // 画面继续往前走，两个读数各说各话（2026-09-08 真机反馈）。
+        if (swipeGestureRef.current?.intent === "horizontal") hideSeekPreview();
+        swipeGestureRef.current = null;
+        dispatchHold("release");
         return;
       }
       const touch = event.touches[0];
@@ -2047,6 +2432,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
         intent: null,
         targetMs: positionRef.current,
       };
+      // 长按与滑动共用这一根手指：先起计时，位移过门槛（下面裁决方向那一步）
+      // 就撤掉——「按住不动」与「按住划走」必须是两件事
+      if (canHoldSpeed({ paused: video.paused, locked: lockedRef.current, touchCount: 1 })) {
+        dispatchHold("press");
+      }
     };
     const onTouchMove = (event: TouchEvent) => {
       const gesture = swipeGestureRef.current;
@@ -2066,6 +2456,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
       if (!gesture.intent) {
         const intent = classifyIntent(deltaX, deltaY);
         if (!intent) return;
+        // 手指开始滑了：这一定不是长按
+        dispatchHold("move");
         if (intent === "horizontal" && !durationMsRef.current) {
           // 片长未知就没有落点可算（那时进度条本身也是禁用的）。整根手指
           // 作废而不是回落到调音量：用户明明在横划，半路改判成调音量比
@@ -2121,10 +2513,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
      * 提示由侧键控制。
      */
     const finishGesture = (commit: boolean) => {
+      dispatchHold("release");
       const gesture = swipeGestureRef.current;
       swipeGestureRef.current = null;
       if (gesture?.intent === "horizontal") {
-        if (commit) seekToFileMsRef.current(gesture.targetMs);
+        if (commit) commitSeekRef.current(gesture.targetMs);
         hideSeekPreview();
         return;
       }
@@ -2148,23 +2541,77 @@ export function VideoPlayer(props: VideoPlayerProps) {
       video.removeEventListener("touchmove", onTouchMove);
       video.removeEventListener("touchend", onTouchEnd);
       video.removeEventListener("touchcancel", onTouchCancel);
+      video.removeEventListener("waiting", onWaiting);
+      // 换 video 元素/卸载时把倍速还原，否则新流会带着 2× 起播
+      dispatchHold("release");
+      // 换 video 元素（或组件卸载）时手势就此断掉，touchend 再也不会来：
+      // 与上面第二根手指同一条理由，胶囊必须在这里一起收走，否则它会一直
+      // 挂着一个旧落点。手势本身也作废——不提交没抬手确认过的落点。
+      if (swipeGestureRef.current?.intent === "horizontal") hideSeekPreview();
+      swipeGestureRef.current = null;
     };
-  }, [video, flashAdjust, showSeekPreview, hideSeekPreview]);
+  }, [video, flashAdjust, flashNotice, showSeekPreview, hideSeekPreview]);
 
-  /** 播放中申请防息屏。切到后台会被系统收走，回来时重新申请。 */
+  /**
+   * 锁屏/通知栏卡片上的位置与时长。
+   *
+   * 不喂这个，系统那条进度条要么空着、要么停在 0——注册了 `seekto` 却没有
+   * 位置可拖，比不注册更奇怪。跟 `positionMs` 走（约 4Hz）就够：那是给人
+   * 眼看的读数，不需要每帧。
+   *
+   * 两条守卫都是规范要求，违反会抛：`position` 不能超过 `duration`（换会话
+   * 的空档里位置可能短暂越界），`playbackRate` 不能为 0（长按倍速结束的
+   * 那一瞬间读到 0 会把整块卡片清掉）。
+   */
+  useEffect(() => {
+    const mediaSession = navigator.mediaSession;
+    if (!mediaSession?.setPositionState || !durationMs || !video) return;
+    try {
+      mediaSession.setPositionState({
+        duration: durationMs / 1000,
+        position: Math.min(positionMs, durationMs) / 1000,
+        playbackRate: video.playbackRate || 1,
+      });
+    } catch {
+      // 读数暂时自相矛盾（换会话空档）时跳过这一次，下一拍就正常
+    }
+  }, [positionMs, durationMs, video]);
+
+  /**
+   * 播放中申请防息屏。
+   *
+   * **必须跟着可见性重新申请**：规范规定文档一转入后台，系统就把锁收走，而
+   * 且此时 `request()` 会直接拒绝。只在 effect 里申请一次的话，用户切出去接
+   * 个消息再回来，锁就永远没有了——电影放到一半屏幕自己暗下去，而这正是这
+   * 段代码要防的事（这条注释以前就写着「回来时重新申请」，但没人真的写）。
+   */
   useEffect(() => {
     if (paused || state.phase !== "playing") return;
     let sentinel: WakeLockSentinel | null = null;
     let released = false;
-    void navigator.wakeLock
-      ?.request("screen")
-      .then((lock) => {
-        if (released) void lock.release().catch(() => undefined);
-        else sentinel = lock;
-      })
-      .catch(() => undefined);
+    const acquire = () => {
+      // 后台申请必被拒；有锁在手也不重复申请
+      if (released || sentinel || document.visibilityState !== "visible") return;
+      void navigator.wakeLock
+        ?.request("screen")
+        .then((lock) => {
+          if (released) {
+            void lock.release().catch(() => undefined);
+            return;
+          }
+          sentinel = lock;
+          // 系统收走时把引用一起丢掉，否则回到前台会以为还锁着、不再申请
+          lock.addEventListener?.("release", () => {
+            if (sentinel === lock) sentinel = null;
+          });
+        })
+        .catch(() => undefined);
+    };
+    acquire();
+    document.addEventListener("visibilitychange", acquire);
     return () => {
       released = true;
+      document.removeEventListener("visibilitychange", acquire);
       void sentinel?.release().catch(() => undefined);
     };
   }, [paused, state.phase]);
@@ -2176,6 +2623,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
   const awaitingUser = awaitsUserDecision(state.phase);
 
   useEffect(() => {
+    // 锁屏优先级最高：锁上之后暂停、开菜单都不该把一排能点的按钮放回来
+    if (locked) return;
     if (chromeMustStayVisible({ paused, menuOpen, awaitingUser })) {
       setChromeVisible(true);
       return;
@@ -2183,7 +2632,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     const timer = window.setTimeout(() => setChromeVisible(false), IDLE_HIDE_MS);
     return () => window.clearTimeout(timer);
     // chromeActivity：用户的每次操作都重排这个倒计时（声明见 state 注释）
-  }, [paused, menuOpen, awaitingUser, chromeVisible, chromeActivity]);
+  }, [locked, paused, menuOpen, awaitingUser, chromeVisible, chromeActivity]);
 
   /**
    * 片尾「下一集」卡片该不该显示。
@@ -2220,6 +2669,22 @@ export function VideoPlayer(props: VideoPlayerProps) {
     state.phase !== "error" &&
     state.phase !== "consent" &&
     positionMs > 0;
+
+  /**
+   * 进度条与时间读数的**覆盖位置**：有它就显示它，没有才显示真实播放位置。
+   *
+   * 两个来源，都是「用户已经表达了意图、但画面还没跳过去」的中间态：
+   *
+   * - **横滑拖进度**：手势期间画面照常播，进度条要是继续跟画面，屏幕上就
+   *   同时挂着两个各说各话的读数——正中的胶囊报 9:58、底下的进度条停在
+   *   19:00，用户根本不知道松手会落到哪儿（2026-09-08 真机反馈）。淡出阶段
+   *   （leaving）交还给真实位置：提交那条路 seek 已经把位置带到落点、读数
+   *   不会跳，取消那条路本来就该弹回真值。
+   * - **连按快进的累积落点**：合并窗口内画面还没动，读数必须先走到累积落点，
+   *   否则连按三下屏幕上什么都不变，用户只会以为按键没生效。
+   */
+  const overrideMs =
+    seekPreview && !seekPreview.leaving ? seekPreview.targetMs : pendingSeekMs;
 
   return (
     <div
@@ -2372,13 +2837,31 @@ export function VideoPlayer(props: VideoPlayerProps) {
 
               浏览器不支持由网页发起时整颗不渲染（Firefox 的画中画只在它自己
               的界面里，留着就是个死按钮）。 */}
+          {/* 锁屏只在触屏的横屏里出现：横躺着看片时手掌压在屏幕上是常态，
+              而竖屏握持时误触少得多，多一颗按钮反而是噪音。 */}
+          {canRotate && (landscape || fakeLandscape || deviceLandscape) ? (
+            <button
+              type="button"
+              onClick={() => {
+                setLocked(true);
+                revealLock();
+              }}
+              className={`ml-auto grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] max-md:size-11 ${
+                chromeVisible ? "pointer-events-auto" : "pointer-events-none"
+              }`}
+              aria-label="锁屏"
+              title="锁屏（防误触）"
+            >
+              <LockIcon className="size-[18px] max-md:size-[22px]" />
+            </button>
+          ) : null}
           {canPip ? (
             <button
               type="button"
               onClick={togglePip}
-              className={`ml-auto grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] max-md:size-11 ${
-                chromeVisible ? "pointer-events-auto" : "pointer-events-none"
-              }`}
+              className={`grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] max-md:size-11 ${
+                canRotate && (landscape || fakeLandscape || deviceLandscape) ? "" : "ml-auto"
+              } ${chromeVisible ? "pointer-events-auto" : "pointer-events-none"}`}
               aria-label={pipActive ? "退出画中画" : "画中画"}
               title={pipActive ? "退出画中画" : "画中画"}
             >
@@ -2386,6 +2869,45 @@ export function VideoPlayer(props: VideoPlayerProps) {
             </button>
           ) : null}
         </div>
+
+        {/* 锁屏中的解锁键：画面左侧居中（拇指够得到，又不压在中央播放键上）。
+            点画面唤出、3 秒后自己收——常显等于把误触目标从整块屏幕缩成一个点，
+            而锁屏要的是「碰哪儿都不响应」。noautohide：它不属于控制层。 */}
+        {locked ? (
+          <div
+            {...{ noautohide: "" }}
+            className={`absolute left-[6%] top-1/2 z-30 -translate-y-1/2 transition-opacity duration-300 ${
+              lockHint ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+            }`}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setLocked(false);
+                setChromeVisible(true);
+              }}
+              className="grid size-11 place-items-center rounded-full border border-white/[0.09] bg-black/45 text-white backdrop-blur-md transition active:scale-[0.94]"
+              aria-label="解锁"
+              title="解锁"
+            >
+              <LockIcon className="size-[22px]" />
+            </button>
+          </div>
+        ) : null}
+
+        {/* 长按倍速的 HUD：顶部居中，与调节胶囊同一套视觉。生效期间常驻
+            （手指还按着就还在倍速），松手即消失，所以不做两段式退场。 */}
+        {holdSpeed ? (
+          <div
+            {...{ noautohide: "" }}
+            className="pointer-events-none absolute left-1/2 top-[calc(1rem_+_var(--safe-top))] z-30 -translate-x-1/2"
+          >
+            <div className="player-flash-in flex items-center gap-2 rounded-full bg-black/70 px-4 py-2 text-[13px] font-medium text-white shadow-[0_10px_28px_rgba(0,0,0,0.45)]">
+              <span className="tnum">{HOLD_SPEED_RATE}× 快进中</span>
+              <SeekChevrons back={false} />
+            </div>
+          </div>
+        ) : null}
 
         {/* 调节反馈胶囊：顶部居中，触摸滑动与键盘 ↑↓/M 共用；调节中常驻、
             停手 0.9 秒后淡出（两段式，动画类见 globals 的 .player-flash-*）。
@@ -2636,10 +3158,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
           ) : null}
           <PlayerControls
             positionMs={positionMs}
+            video={video}
+            startMs={mode?.originMs ?? 0}
+            overrideMs={overrideMs}
             durationMs={durationMs}
             bufferedEndMs={bufferedEndMs}
             chromeVisible={chromeVisible}
-            onSeek={seekToFileMs}
+            onSeek={commitSeek}
+            onScrub={scrubTo}
             subtitles={subtitles}
             selectedSubtitle={selectedSubtitle}
             onSelectSubtitle={selectSubtitle}
@@ -2667,6 +3193,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
             onToggleFullscreen={toggleFullscreen}
             onMenuOpenChange={setMenuOpen}
             trickplay={trickplay}
+            chapters={chapters}
+            fakeLandscape={fakeLandscape}
           />
         </div>
       </MediaController>

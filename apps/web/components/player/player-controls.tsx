@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ActivityIcon, CheckIcon, ExpandIcon, GearIcon, ShrinkIcon } from "@/components/icons";
+import type { PlaybackChapterMark } from "@/lib/api/playback";
 import type { AudioOption } from "@/lib/player/audio-tracks";
 import { SUBTITLE_OFFSET_STEP, clampSubtitleOffset } from "@/lib/player/subtitles";
 import { QUALITY_OPTIONS } from "@/lib/player/quality";
 import type { SubtitleStyle, SubtitleTracks } from "@/lib/player/subtitles";
-import { formatClock } from "@/lib/player/timeline";
+import { pointerOffsetX } from "@/lib/player/touch-adjust";
+import { formatClock, progressRatio, shownPositionMs, toFileMs } from "@/lib/player/timeline";
 import { type TrickplayIndex, tileAt } from "@/lib/player/trickplay";
 
 /**
@@ -168,7 +170,29 @@ function RotateGlyph({ active }: { active: boolean }) {
 }
 
 export interface PlayerControlsProps {
+  /**
+   * 播放位置（文件毫秒）的**状态**值，跟着 `timeupdate` 走（约 4Hz）。
+   *
+   * 它只负责时间文字与静止态的进度条；**播放中进度条的位置不看它**——
+   * 4Hz 会让圆点每 250 毫秒跳一格。见下面 `video` 的说明。
+   */
   positionMs: number;
+  /**
+   * 正在播的 video 元素。进度条据此每帧自绘位置（见 paint effect）。
+   *
+   * 传元素而不是位置数字，是因为 60fps 的位置更新不能走 React state：
+   * 这个组件重，每帧 setState 会把整条控制条重渲染 60 次。
+   */
+  video: HTMLVideoElement | null;
+  /** 时间轴参照点（会话相对制的 start_ms；VOD/直通恒为 0）。文件时间 =
+   * startMs + video.currentTime × 1000，与 timeline.ts 的 toFileMs 同式 */
+  startMs: number;
+  /**
+   * 覆盖位置：横滑拖进度的落点、连按快进的累积落点。非 null 时进度条与
+   * 时间文字都显示它而不是真实播放位置——**屏幕上任何时刻只能有一个读数**
+   * （2026-09-08 真机反馈：胶囊报 9:58、进度条停在 19:00）。
+   */
+  overrideMs: number | null;
   /** 片长（文件时间）。服务端算不出时为 null，此时进度条只显示已播时间 */
   durationMs: number | null;
   /** 当前会话已缓冲到的文件位置，用于进度条的浅色底 */
@@ -176,6 +200,12 @@ export interface PlayerControlsProps {
   /** 控制条是否可见。进度条与其它控件一起淡入淡出（全出全收） */
   chromeVisible: boolean;
   onSeek: (fileMs: number) => void;
+  /**
+   * 拖动过程中的实时跟随。父组件自己判断这次跳转值不值得做（跳转不要钱的
+   * 直通/已缓冲区间才跟随，转码会话拖出缓冲要换会话，一路拖过去就是连着
+   * 捅十几刀），这里只管把落点递过去。
+   */
+  onScrub: (fileMs: number) => void;
   subtitles: SubtitleTracks;
   selectedSubtitle: string | null;
   onSelectSubtitle: (ref: string | null) => void;
@@ -216,15 +246,29 @@ export interface PlayerControlsProps {
   onMenuOpenChange: (open: boolean) => void;
   /** 进度条缩略图索引。null = 还没生成好，表现为没有预览 */
   trickplay: TrickplayIndex | null;
+  /** 章节刻度（文件毫秒）。空表 = 这个文件没有内嵌章节，轨道保持干净 */
+  chapters: PlaybackChapterMark[];
+  /**
+   * iOS 伪横屏（整个容器 rotate(90deg)）。
+   *
+   * 进度条上所有「指针位置 → 时间」的换算都要知道它：转过来之后元素的
+   * 布局 x 轴沿物理 y 轴，`rect.width` 量到的是条的厚度而不是长度
+   * （换算见 touch-adjust.ts 的 pointerOffsetX）。
+   */
+  fakeLandscape: boolean;
 }
 
 export function PlayerControls(props: PlayerControlsProps) {
   const {
     positionMs,
+    video,
+    startMs,
+    overrideMs,
     durationMs,
     bufferedEndMs,
     chromeVisible,
     onSeek,
+    onScrub,
     subtitles,
     selectedSubtitle,
     onSelectSubtitle,
@@ -248,19 +292,181 @@ export function PlayerControls(props: PlayerControlsProps) {
     onSelectQuality,
     onMenuOpenChange,
     trickplay,
+    chapters,
+    fakeLandscape,
   } = props;
 
   // 拖动中的本地值：直接跟 positionMs 会被 timeupdate 反复拉回去，手感是
   // 滑块「粘手」——松手才提交是进度条唯一能用的做法
   const [dragging, setDragging] = useState<number | null>(null);
+  // 片长转为未知（换会话的空档里 durationMs 会短暂变 null）会让下面的 input
+  // 变成 disabled，而 disabled 的元素**不再收到 pointerup/pointercancel**——
+  // 正拖着的那次手势就此没了收尾，dragging 会永远钉在最后一个拖动值上：
+  // 进度条和时间读数从此不跟画面走，画面照常播，两处读数各说各话
+  // （2026-09-08 反馈）。片长一没就地清掉，退回 positionMs 这个真值。
+  useEffect(() => {
+    if (!durationMs) setDragging(null);
+  }, [durationMs]);
   const [menu, setMenu] = useState<"none" | "audio" | "subtitles" | "settings">("none");
   // 悬停预览的位置（文件毫秒 + 进度条内的像素横坐标）。null = 没在悬停
   const [hover, setHover] = useState<{ ms: number; x: number } | null>(null);
-  const shown = dragging ?? positionMs;
+  /** 时间文字用的位置。取值规则与进度条自绘**同一个函数**，见 shownPositionMs */
+  const shown = shownPositionMs({
+    draggingMs: dragging,
+    overrideMs,
+    // 文字是秒级读数，用不着每帧去读 video：4Hz 的状态值足够
+    livePositionMs: null,
+    positionMs,
+  });
   const previewTile = hover ? tileAt(trickplay, hover.ms) : null;
-  const progress = durationMs ? Math.min(100, (shown / durationMs) * 100) : 0;
+  /** 刻度位置。0 秒那条不画——片头永远在最左端，画出来只是一条噪音 */
+  const chapterMarks = useMemo(
+    () =>
+      durationMs
+        ? chapters
+            .filter((mark) => mark.start_ms > 0 && mark.start_ms < durationMs)
+            .map((mark) => ({ start_ms: mark.start_ms, ratio: progressRatio(mark.start_ms, durationMs) }))
+        : [],
+    [chapters, durationMs],
+  );
+  /** 悬停/拖动位置落在哪一章：取最后一个起点不晚于它的章节 */
+  const hoverChapter = useMemo(() => {
+    if (!hover) return null;
+    let title: string | null = null;
+    for (const mark of chapters) {
+      if (mark.start_ms > hover.ms) break;
+      title = mark.title;
+    }
+    return title;
+  }, [chapters, hover]);
+  /**
+   * 气泡贴边时夹回轨道内。
+   *
+   * 气泡是「按触点居中」的，拖到两端时有一半会探出播放器——缩略图被裁一半、
+   * 章节名直接跑到画面外（加了章节名之后更宽，更明显）。ArtPlayer 与
+   * jellyfin-web 都在这里夹一次，我们此前漏了。
+   *
+   * 夹的是渲染后的实际宽度，所以只能在布局阶段直接改 style，不走 state——
+   * 用 state 会「渲染 → 量 → 再渲染」抖一帧。
+   */
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const bubble = bubbleRef.current;
+    if (!bubble || !hover) return;
+    const trackWidth = bubble.parentElement?.clientWidth ?? 0;
+    const half = bubble.offsetWidth / 2;
+    const max = Math.max(half, trackWidth - half);
+    bubble.style.left = `${Math.min(Math.max(hover.x, half), max)}px`;
+  }, [hover, previewTile, hoverChapter]);
+
   const buffered =
     durationMs && bufferedEndMs ? Math.min(100, (bufferedEndMs / durationMs) * 100) : 0;
+
+  // ---------------------------------------------------------------------
+  // 进度条自绘（docs/design/player-feel.md §2.A1）
+  //
+  // 已播段的宽度与圆点的位置**不走 React**：位置的唯一状态来源 `timeupdate`
+  // 只有约 4Hz 且间隔不均，跟着它渲染就是「圆点每 250 毫秒跳一格」——这是
+  // 「播放器不够丝滑」最主要的来源。改成 rAF 每帧直接读 video.currentTime
+  // 写这两个元素的 style，React 那侧只留 4Hz 的时间文字。
+  //
+  // 每帧 setState 是不行的：这个组件带着菜单、缩略图、按钮簇，一秒重渲染
+  // 60 次会把省下来的流畅又赔回去。
+  // ---------------------------------------------------------------------
+  const playedRef = useRef<HTMLDivElement>(null);
+  const thumbRef = useRef<HTMLDivElement>(null);
+  /** 供 rAF 回调读最新值：跟着依赖重建循环会在播放中反复起停 */
+  const paintInputRef = useRef({ video, startMs, durationMs, positionMs, dragging, overrideMs });
+  paintInputRef.current = { video, startMs, durationMs, positionMs, dragging, overrideMs };
+
+  const paint = useCallback(() => {
+    const {
+      video: el,
+      startMs: origin,
+      durationMs: total,
+      positionMs: state,
+      dragging: draggingMs,
+      overrideMs: override,
+    } = paintInputRef.current;
+    if (!total) {
+      // 片长未知（换会话的空档）时进度条是禁用态：**必须清零**而不是直接
+      // 返回——留着上一路会话画的宽度，用户看到的是一条与新内容无关的进度。
+      if (playedRef.current) playedRef.current.style.width = "0%";
+      if (thumbRef.current) thumbRef.current.style.left = "0%";
+      return;
+    }
+    // 取值规则与时间文字**同一个函数**，这里只多喂一路「正在播的真实位置」
+    // ——它是唯一每帧都在变的来源。不可用（暂停 / seek 途中 / 换会话空档，
+    // 那时 video 还挂着旧流）就传 null，由函数退回状态值。
+    const live =
+      el && !el.paused && !el.seeking && el.readyState >= 2
+        ? toFileMs(el.currentTime, origin)
+        : null;
+    const ratio = progressRatio(
+      shownPositionMs({ draggingMs, overrideMs: override, livePositionMs: live, positionMs: state }),
+      total,
+    );
+    const percent = `${ratio * 100}%`;
+    if (playedRef.current) playedRef.current.style.width = percent;
+    if (thumbRef.current) thumbRef.current.style.left = percent;
+  }, []);
+
+  useEffect(() => {
+    if (!video) {
+      paint();
+      return;
+    }
+    // 合帧：排下一帧前先撤掉上一帧，保证一帧最多写一次 DOM（emby-slider
+    // 同款做法）。事件与 rAF 会在同一帧里同时要求重绘，不合帧就是重复布局。
+    let frame = 0;
+    let loop = 0;
+    const schedule = () => {
+      // 循环在跑时它这一帧本来就会画，再排一帧就是同一帧写两次
+      if (loop) return;
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        paint();
+      });
+    };
+    const tick = () => {
+      paint();
+      loop = requestAnimationFrame(tick);
+    };
+    const start = () => {
+      if (!loop) loop = requestAnimationFrame(tick);
+    };
+    const stop = () => {
+      if (loop) cancelAnimationFrame(loop);
+      loop = 0;
+      schedule();
+    };
+    // 只在真的在播时跑循环：暂停/缓冲/看不见的时候位置不动，空转 60 次/秒
+    // 没有意义（页面切到后台时浏览器自己会停 rAF，这里管的是前台暂停）。
+    video.addEventListener("playing", start);
+    video.addEventListener("play", start);
+    video.addEventListener("pause", stop);
+    video.addEventListener("ended", stop);
+    // 暂停态的位置变化（seek、换会话后的落点）靠这两个事件补画
+    video.addEventListener("seeked", schedule);
+    video.addEventListener("timeupdate", schedule);
+    if (!video.paused) start();
+    else schedule();
+    return () => {
+      video.removeEventListener("playing", start);
+      video.removeEventListener("play", start);
+      video.removeEventListener("pause", stop);
+      video.removeEventListener("ended", stop);
+      video.removeEventListener("seeked", schedule);
+      video.removeEventListener("timeupdate", schedule);
+      if (loop) cancelAnimationFrame(loop);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [video, paint]);
+
+  // 拖动值、落点、片长、状态位置的每一次变化都要立刻见效：rAF 循环在暂停
+  // 时是停的，只靠它这些变化会等到下一次播放才画出来。
+  useEffect(paint, [paint, shown, positionMs, durationMs, startMs]);
 
   const openMenu = (next: "none" | "audio" | "subtitles" | "settings") => {
     setMenu(next);
@@ -357,9 +563,13 @@ export function PlayerControls(props: PlayerControlsProps) {
           className="player-scrub-shade relative h-5"
           onPointerMove={(e) => {
             if (!durationMs) return;
-            const rect = e.currentTarget.getBoundingClientRect();
-            const x = Math.min(Math.max(e.clientX - rect.left, 0), rect.width);
-            setHover({ ms: (x / rect.width) * durationMs, x });
+            const { offset, length } = pointerOffsetX(
+              e,
+              e.currentTarget.getBoundingClientRect(),
+              fakeLandscape,
+            );
+            const x = Math.min(Math.max(offset, 0), length);
+            setHover({ ms: (x / length) * durationMs, x });
           }}
           onPointerLeave={() => setHover(null)}
         >
@@ -369,6 +579,7 @@ export function PlayerControls(props: PlayerControlsProps) {
               压着下缘，64px 让预览完整露在指尖上方。 */}
           {hover ? (
             <div
+              ref={bubbleRef}
               className="pointer-events-none absolute bottom-8 -translate-x-1/2 pointer-coarse:bottom-16"
               style={{ left: hover.x }}
             >
@@ -383,7 +594,15 @@ export function PlayerControls(props: PlayerControlsProps) {
                   className="rounded-[10px] shadow-[0_10px_28px_rgba(0,0,0,0.55)] ring-1 ring-white/30"
                 />
               ) : null}
-              <p className="mt-1.5 text-center text-[13px] font-medium tabular-nums text-white drop-shadow">
+              {/* 章节名 + 时间：拖动时知道自己拖到了哪一段，比只有一个
+                  时间戳有用得多（jellyfin-web 的气泡同样是三合一）。
+                  章节名在上、时间在下——时间是刚需，永远在固定位置。 */}
+              {hoverChapter ? (
+                <p className="mt-1.5 max-w-[220px] truncate text-center text-[12px] text-white/75 drop-shadow">
+                  {hoverChapter}
+                </p>
+              ) : null}
+              <p className="mt-0.5 text-center text-[13px] font-medium tabular-nums text-white drop-shadow">
                 {formatClock(hover.ms)}
               </p>
             </div>
@@ -395,10 +614,23 @@ export function PlayerControls(props: PlayerControlsProps) {
               静止 3px、悬停 5px，Netflix 的细红线就是这个手感 */}
           <div className="player-scrub-track pointer-events-none absolute inset-x-0 top-1/2 h-[3px] -translate-y-1/2 overflow-hidden rounded-full bg-[var(--player-track)] transition-[height] duration-150 [.player-scrub-row:hover_&]:h-[5px]">
             <div className="h-full bg-[var(--player-buffered)]" style={{ width: `${buffered}%` }} />
+            {/* 宽度由上面的 paint 每帧写，不在这里跟 React 的渲染节奏。
+                data-player-played 是给端到端验收脚本认的锚点（按第几个子元素
+                找会在轨道里多一层时悄悄量错东西，见 scripts/perf/e2e_player_feel.py）*/}
             <div
-              className="absolute inset-y-0 left-0 bg-[var(--player-accent)]"
-              style={{ width: `${progress}%` }}
+              ref={playedRef}
+              data-player-played=""
+              className="absolute inset-y-0 left-0 w-0 bg-[var(--player-accent)]"
             />
+            {/* 章节刻度：压在已播段之上，两侧留白靠 2px 宽的暗色竖条本身。
+                画在轨道内部（overflow-hidden）所以不用再夹一次边界。 */}
+            {chapterMarks.map((mark) => (
+              <span
+                key={mark.start_ms}
+                className="absolute inset-y-0 w-[2px] -translate-x-1/2 bg-black/55"
+                style={{ left: `${mark.ratio * 100}%` }}
+              />
+            ))}
           </div>
           <input
             type="range"
@@ -420,15 +652,26 @@ export function PlayerControls(props: PlayerControlsProps) {
               // 触摸/笔的主接触点 button 恒为 0，这条不会误伤它们。
               if (!durationMs || e.button !== 0 || !e.isPrimary) return;
               e.currentTarget.setPointerCapture(e.pointerId);
-              const rect = e.currentTarget.getBoundingClientRect();
-              const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+              const { offset, length } = pointerOffsetX(
+                e,
+                e.currentTarget.getBoundingClientRect(),
+                fakeLandscape,
+              );
+              const ratio = Math.min(1, Math.max(0, offset / length));
               setDragging(Math.round(ratio * durationMs));
             }}
             onPointerMove={(e) => {
               if (dragging === null || !durationMs) return;
-              const rect = e.currentTarget.getBoundingClientRect();
-              const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-              setDragging(Math.round(ratio * durationMs));
+              const { offset, length } = pointerOffsetX(
+                e,
+                e.currentTarget.getBoundingClientRect(),
+                fakeLandscape,
+              );
+              const ratio = Math.min(1, Math.max(0, offset / length));
+              const next = Math.round(ratio * durationMs);
+              setDragging(next);
+              // 画面跟着手指走——能免费跳的时候不跟随是白白浪费手感
+              onScrub(next);
             }}
             onPointerUp={() => {
               if (dragging !== null) onSeek(dragging);
@@ -469,15 +712,17 @@ export function PlayerControls(props: PlayerControlsProps) {
               不然「拖拽那个点」根本无从下手——用户不知道该按哪里；拖动中再
               放大一号，指下有反馈。桌面维持悬停才现，不挡画面。 */}
           <div
-            className={`pointer-events-none absolute top-1/2 size-[14px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--player-thumb)] shadow-[0_0_0_4px_var(--accent-soft)] transition-transform duration-150 pointer-coarse:size-[18px] ${
+            ref={thumbRef}
+            data-player-thumb=""
+            className={`pointer-events-none absolute left-0 top-1/2 size-[14px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--player-thumb)] shadow-[0_0_0_4px_var(--accent-soft)] transition-transform duration-150 pointer-coarse:size-[18px] ${
               durationMs
                 ? dragging !== null
-                  ? "scale-100 pointer-coarse:scale-110"
+                  ? // 按下的一刻回弹到原尺寸：指下有「按住了」的反馈
+                    "scale-100 pointer-coarse:scale-110"
                   : // 收起态整行 opacity-0，触屏常显不用再按 chromeVisible 分岔
-                    "scale-0 [.player-scrub-row:hover_&]:scale-100 pointer-coarse:scale-100"
+                    "scale-0 [.player-scrub-row:hover_&]:scale-110 pointer-coarse:scale-100"
                 : "scale-0"
             }`}
-            style={{ left: `${progress}%` }}
           />
         </div>
       </div>

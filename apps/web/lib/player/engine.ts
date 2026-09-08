@@ -15,6 +15,8 @@ import type Hls from "hls.js";
 import type { MseKind } from "@/lib/api/playback";
 import { reportPlaybackClientLog } from "@/lib/api/playback";
 
+import { backBufferSeconds } from "./buffer-budget";
+import { type MediaRecoverState, nextMediaRecovery } from "./media-recover";
 import { NUDGE_STEP_S, bufferedAhead, classifyStall, shouldNudge, stallReason } from "./stall";
 
 /** 把 `<video>` 的当下状态压成一行上报（排障用，字段都很小）。 */
@@ -105,14 +107,6 @@ function clientLog(options: EngineOptions, event: string, detail: Record<string,
   if (options.telemetry === false) return;
   reportPlaybackClientLog(event, detail);
 }
-
-/**
- * 回收多少秒的已播缓冲（hls.js `backBufferLength`）。
- *
- * 不回收的话，一部三小时的片子会把已播分片一路堆在 SourceBuffer 里，吃掉
- * 几个 G 内存然后整个标签页崩掉——长片播放最典型的一种"放到一半就没了"。
- */
-const BACK_BUFFER_S = 30;
 
 /** 掉帧与缓冲读数：三种引擎共用一份取法。 */
 function readCommonStats(video: HTMLVideoElement): Omit<EngineStats, "engine" | "bitrate"> {
@@ -316,6 +310,7 @@ class DirectEngine implements PlaybackEngine {
  */
 const MAX_NETWORK_RECOVERIES = 4;
 
+
 /** 档 1–4：hls.js 喂 fMP4 分片。 */
 class HlsEngine implements PlaybackEngine {
   private hls: Hls | null = null;
@@ -323,6 +318,8 @@ class HlsEngine implements PlaybackEngine {
   private currentBitrate: number | null = null;
   /** 连续网络恢复计数；任何一个分片成功落地就清零 */
   private networkRecoveries = 0;
+  /** 解码错误自救阶梯的进度（时刻），语义见 media-recover.ts */
+  private readonly mediaRecover: MediaRecoverState = { lastRecoverAt: null, lastSwapAt: null };
 
   constructor(private readonly options: EngineOptions) {}
 
@@ -330,11 +327,17 @@ class HlsEngine implements PlaybackEngine {
     const { video, streamUrl, onFailed } = this.options;
     const { default: HlsCtor } = await import("hls.js");
     this.hls = new HlsCtor({
-      // 已播缓冲回收，见 BACK_BUFFER_S
-      backBufferLength: BACK_BUFFER_S,
+      // 已播缓冲回收：先按「码率未知」的上限给，拿到真实码率后立刻收紧
+      // （见 backBufferSeconds 与下面的 LEVEL_LOADED）
+      backBufferLength: backBufferSeconds(null),
       // 前向缓冲拉到 60 秒（hls.js 默认 30）：局域网抢先缓、弱网抗抖动都
       // 受益。服务端 readrate 1.5 倍限速决定了缓冲天然追不过这个数太多。
       maxBufferLength: 60,
+      // 上限跟着一起钉死（jellyfin-web 同样两个都设）。只设前一个的话
+      // hls.js 仍会在码率低时把目标一路涨到默认的 600 秒——而我们刚把
+      // 回退缓冲放宽到 180 秒，前后加起来就是十几分钟的解码数据挂在
+      // SourceBuffer 里，长片正好撞上那条「放到一半标签页没了」。
+      maxMaxBufferLength: 60,
       // 转码会话的 playlist 是 EVENT 类型、只增不改，边转边给。低延迟模式
       // 的那套 part 级请求在这里没有意义，只会多打服务端。
       lowLatencyMode: false,
@@ -380,17 +383,63 @@ class HlsEngine implements PlaybackEngine {
         return;
       }
       if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR) {
+        // 解码类致命错误先就地自救，救不回来才判失败（docs/design/player-feel.md
+        // §2.D1）。直接判失败的代价是走降档回路：画质掉一级 + 几秒黑屏重开
+        // 会话；而这类错误（buffer append error、解码器抽风）hls.js 自己
+        // 往往一秒内就能救回来——最贵的手段不该是第一反应。
+        // 阶梯与冷却的判定在 media-recover.ts（纯函数，带单测）。
+        const now = performance.now();
+        const step = nextMediaRecovery(this.mediaRecover, now);
+        if (step !== "give-up") {
+          clientLog(this.options, "hls-media-recover", { details: data.details, step });
+          if (step === "swap") {
+            this.mediaRecover.lastSwapAt = now;
+            this.hls?.swapAudioCodec();
+          } else {
+            this.mediaRecover.lastRecoverAt = now;
+          }
+          this.hls?.recoverMediaError();
+          return;
+        }
+        clientLog(this.options, "hls-media-recover-failed", { details: data.details });
         onFailed(`码流解码失败（${data.details}）`);
         return;
       }
       onFailed(`播放失败（${data.details}）`);
     });
+    /**
+     * 按实测码率收紧已播缓冲的保留时长（理由见 buffer-budget.ts）。
+     *
+     * **码率只能靠分片实测**：MSE 这条路喂给 hls.js 的是**媒体**播放列表，
+     * 里面没有 BANDWIDTH（那是 master 列表的属性，只有 iOS 原生 HLS 才吃
+     * master），所以 `levels[].bitrate` 恒为 0。分片的字节数除以时长才是这
+     * 部片真实的码率，而且转码档也一样准——服务端的目标码率前端本来就不知道。
+     *
+     * 取历史最大值而不是最新值：预算要按最坏的一段留，动作戏那几段翻倍时
+     * 不能等到内存已经涨上去才收。
+     */
+    const syncBackBuffer = () => {
+      if (!this.hls) return;
+      const seconds = backBufferSeconds(this.currentBitrate);
+      if (this.hls.config.backBufferLength === seconds) return;
+      this.hls.config.backBufferLength = seconds;
+      clientLog(this.options, "hls-back-buffer", {
+        seconds,
+        bitrate: Math.round(this.currentBitrate ?? 0),
+      });
+    };
+
     // 任何一个分片成功到手都说明链路是通的，连续失败计数从头数
-    this.hls.on(HlsCtor.Events.FRAG_LOADED, () => {
+    this.hls.on(HlsCtor.Events.FRAG_LOADED, (_event, data) => {
       this.networkRecoveries = 0;
-    });
-    this.hls.on(HlsCtor.Events.LEVEL_SWITCHED, () => {
-      this.currentBitrate = this.hls?.levels[this.hls.currentLevel]?.bitrate ?? null;
+      // 顺手实测码率：字节 ÷ 时长。它同时是诊断面板那行「实时码率」的来源
+      // ——媒体播放列表里没有 BANDWIDTH，只读 levels[].bitrate 那行永远是空的。
+      const bytes = data.frag?.stats?.total ?? 0;
+      const seconds = data.frag?.duration ?? 0;
+      if (bytes > 0 && seconds > 0) {
+        this.currentBitrate = Math.max(this.currentBitrate ?? 0, (bytes * 8) / seconds);
+        syncBackBuffer();
+      }
     });
 
     this.hls.loadSource(streamUrl);
