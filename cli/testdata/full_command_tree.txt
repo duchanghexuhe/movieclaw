@@ -5,6 +5,7 @@
 # 它被同名的父命令 `dl limits` 挤掉了；cobra 允许一个节点既可执行又带子命令，
 # 由退役中的 Python CLI 导出，是 Go 迁移的命令面契约：一条不多、一条不少。
 # 装配完成后的整棵命令树（精选层 + 生成层，含分组名），一行一条命令路径。
+activity
 app
 app port
 app port set
@@ -91,6 +92,10 @@ dl submit
 dl target-prefs
 dl target-prefs forget
 dl target-prefs list
+dl tasks
+dl torrent
+dl torrent delete
+dl torrent replace
 dl update
 dl verify
 download
@@ -104,6 +109,8 @@ extension token
 extension token create
 extension token revoke
 extension token show
+fs
+fs browse
 health
 health check
 jobs
@@ -154,6 +161,10 @@ library items refresh-metadata
 library items regenerate-chapter-images
 library items reidentify
 library items restore-file
+library items share
+library items share create
+library items share get
+library items share revoke
 library items transfer
 library list
 library list-routing-options
@@ -232,6 +243,14 @@ notices dismiss
 notices list
 people
 people show
+playback
+playback activity
+playback activity end
+playback device
+playback device revoke
+playback history
+playback stats
+playback stats watch
 rules
 rules create
 rules default
@@ -265,6 +284,9 @@ session rename
 session retry
 session start
 session stop
+shares
+shares list
+shares revoke
 site
 site add
 site boost-stats

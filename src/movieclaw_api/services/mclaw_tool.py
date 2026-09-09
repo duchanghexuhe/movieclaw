@@ -32,7 +32,9 @@ _DOMAIN_LINES = {
     "高分、口碑及地区/类型片单；list-collections 列片单，browse-collection 浏览片单，"
     "get-title-details 看资料/演职员/剧照/相关推荐）",
     "dl": "dl       qBittorrent/Transmission 下载器与投递（接入/验证/启停/设默认实例，配置"
-    "保存路径与路径映射，预演落点并提交种子）",
+    "保存路径与路径映射，预演落点并提交种子；tasks 汇总所有下载器里正在跑的任务及其对应的"
+    "影片/集与订阅——「我的剧下到哪了」看这里，torrent replace 给卡住的下载换源、"
+    "torrent delete 删任务）",
     "extension": "extension Chromium 浏览器插件 Cookie 同步（管理同步令牌/支持站点，把页面中的"
     " httpOnly 站点 Cookie 安全同步到服务端）",
     "health": "health   API 存活检查（通常优先用顶级 status 查看更完整的部署状态）",
@@ -42,13 +44,17 @@ _DOMAIN_LINES = {
     "条目与物理文件，处理待识别/错识别/缺失内容，并管理元数据、图片、字幕和跨库转移；"
     "list 默认只列当前身份可浏览的库（与网页首页一致），用户明确要看全部可管理的库时"
     "加 --scope all；organize-files 按 scrape 里配的命名模板把存量文件批量改名归位，"
-    "可反复执行）",
+    "可反复执行；items share 把一部影片生成公开链接发给没有账号的人看，有效期最长 30 天、"
+    "可加密码、随时撤回）",
     "llm": "llm      AI 模型供应商（接入 OpenAI、阿里云百炼或任意 OpenAI 兼容服务，选择模型"
     "并验证连通性，供 AI 对话等智能能力使用）",
     "net": "net      网络与代理（配置全局/指定服务代理及镜像地址，立即生效；按 TMDB/豆瓣/"
     "GitHub/PT 站点等服务测试连通性）",
     "notices": "notices  系统待处理事项（查看按严重程度排序的活跃问题，或忽略指定提示）",
     "people": "people   本地媒体库影人档案（按 TMDB 人物 ID 查看资料及已入库参演作品）",
+    "playback": "playback 观看活动（activity 看此刻谁在看什么、用哪台设备、速度多快，"
+    "history 翻每场播放的流水，stats watch 汇总一段时间的观看时长/场次/看完率/时段分布；"
+    "activity end 掐断某台设备本次播放，device revoke 注销设备让它重新登录）",
     "rules": "rules    订阅过滤规则组（管理分辨率、编码、HDR、字幕/音轨、免费/H&R、做种数、"
     "体积和制作组等条件及默认规则组）",
     "scrape": "scrape   刮削与整理配置（元数据语言优先级与缺失回落、海报/背景按语言优先级"
@@ -60,6 +66,8 @@ _DOMAIN_LINES = {
     "session": "session  用户与智能体的会话管理（发起新对话或继续已有对话，按指定用户消息"
     "重新提问，读取并分析完整 message/compaction 轨迹；也可重命名、压缩上下文、跟随或"
     "停止处理，以及删除会话）",
+    "shares": "shares   影片分享链接（列出目前分享出去的影片：链接、有没有密码、什么时候到期、"
+    "被打开过多少次；也可按 id 撤回。给单部影片生成链接在 library items share）",
     "site": "site     PT 资源站点（查看支持目录/鉴权要求，配置、验证、启停站点，查看本地种子"
     "缓存统计；Cookie 可由 extension 同步）",
     "subscriptions": "subscriptions  电影/剧集订阅与自动追更（持续追踪新资源，按规则自动搜索、"
@@ -79,9 +87,15 @@ _TOP_LEVEL_LINES = [
     "download 下载：把上次 search 的结果行号（或明确的站点+链接）投递到下载器，"
     "可指定媒体库/保存目录",
     "status   部署总览：服务健康、当前身份、客户端/服务端版本与命令目录同步状态",
+    "activity 现在有什么事：需要处理与进行中的任务数、有几个人在看；"
+    "口径与网页活动页一致（下载与它触发的入库算一件事）",
 ]
 
 # 不进目录的域：
+# - fs：与 logs 同理，对 Agent 是 bash 的弱化重复——Agent 与服务端同容器，
+#   ls 能看到的正是接口要列的那些目录，多一个只列目录的工具只会干扰选型。
+#   命令行保留：mclaw 是独立二进制，远程管理时本机 ls 看到的是**客户端**的
+#   文件系统，与服务端容器里的路径根本不是一回事（这正是根路径填错的由来）。
 # - logs：对 Agent 是 bash 的弱化重复——日志就是同容器内的本地文件（路径已写进
 #   系统提示词环境段），grep/tail 能力更强；且 logs tail -f 永不退出，模型误用
 #   会干等到工具超时。CLI 命令保留，服务远程管理的人类用户。
@@ -90,7 +104,7 @@ _TOP_LEVEL_LINES = [
 #   放进目录等于把开号/改权限的能力交给模型）。CLI 命令保留给人类管理员。
 # - mcp：MCP 端点的增删改与令牌轮换属于凭证签发面，和 members 同理不该由对话式
 #   Agent 代劳；真正的签发闸门在 require_admin_session（人 + 浏览器）上。
-_EXCLUDED_DOMAINS = {"logs", "members", "mcp"}
+_EXCLUDED_DOMAINS = {"fs", "logs", "members", "mcp"}
 
 
 def spec_domains() -> set[str]:
