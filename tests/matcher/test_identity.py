@@ -8,15 +8,30 @@ from __future__ import annotations
 
 from movieclaw_enrich.models import TorrentAttrs
 from movieclaw_matcher import MediaIdentity, TorrentCandidate, match_identity
+from movieclaw_matcher.identity import (
+    better_explained_by_twin,
+    implausible_for_runtime,
+    implied_bitrate_mbps,
+)
 
 
-def _candidate(title: str, subtitle: str = "", **attrs) -> TorrentCandidate:
+def _candidate(
+    title: str,
+    subtitle: str = "",
+    *,
+    imdb_id: str | None = None,
+    douban_id: str | None = None,
+    **attrs,
+) -> TorrentCandidate:
+    """外部 ID 挂在候选本身、其余关键字进 attrs——两者分属不同的层。"""
     return TorrentCandidate(
         site_id="test",
         torrent_id="1",
         title=title,
         subtitle=subtitle,
         attrs=TorrentAttrs(**attrs),
+        imdb_id=imdb_id,
+        douban_id=douban_id,
     )
 
 
@@ -450,3 +465,217 @@ def test_tv_without_any_unit_info_is_unusable() -> None:
         media_type="tv", year=2024,
     )
     assert match_identity(candidate, _tv(["House of the Dragon", "龙之家族"], 2022)) is None
+
+
+# ---------------------------------------------------------------------------
+# 外部 ID 反证：内核如实报告冲突，不自己裁决
+# ---------------------------------------------------------------------------
+
+
+def test_conflicting_imdb_is_reported_not_silently_dropped() -> None:
+    """两边都有 IMDb 且不等：身份照常成立，但带出 id_conflict 让消费侧裁决。
+
+    内核不自己 return None——站点的 IMDb 是上传者手填的，填错真实存在，而误
+    否决的代价是漏配（用户只看得到活动流水里一行字），比错配更难被发现。
+    """
+    candidate = _candidate(
+        "The Odyssey 2026 1080p AMZN WEB-DL DDP5.1 H.264-Group",
+        "",
+        media_type="movie",
+        year=2026,
+        imdb_id="tt3559656",
+    )
+    match = match_identity(candidate, _movie(["The Odyssey"], 2026, imdb_id="tt32138219"))
+    assert match is not None
+    assert match.id_conflict is not None
+    assert "tt3559656" in match.id_conflict and "tt32138219" in match.id_conflict
+
+
+def test_missing_id_on_either_side_is_not_a_conflict() -> None:
+    """只有一边有 ID 不构成冲突——绝大多数站点行根本没标，不能一律当反证。"""
+    candidate = _candidate(
+        "The Odyssey 2026 1080p WEB-DL", "", media_type="movie", year=2026
+    )
+    match = match_identity(candidate, _movie(["The Odyssey"], 2026, imdb_id="tt32138219"))
+    assert match is not None and match.id_conflict is None
+
+    candidate_with_id = _candidate(
+        "The Odyssey 2026 1080p WEB-DL", "", media_type="movie", year=2026, imdb_id="tt3559656"
+    )
+    match = match_identity(candidate_with_id, _movie(["The Odyssey"], 2026))
+    assert match is not None and match.id_conflict is None
+
+
+def test_matching_imdb_never_carries_a_conflict() -> None:
+    """ID 命中即 exact_id，另一个 ID 对不上只是数据噪音（站点链接贴串行）。"""
+    candidate = _candidate(
+        "The Odyssey 2026 1080p WEB-DL",
+        "",
+        media_type="movie",
+        year=2026,
+        imdb_id="tt32138219",
+        douban_id="99999",
+    )
+    match = match_identity(
+        candidate, _movie(["The Odyssey"], 2026, imdb_id="tt32138219", douban_id="11111")
+    )
+    assert match is not None
+    assert match.confidence == "exact_id" and match.id_conflict is None
+
+
+def test_twin_movies_same_title_same_year_are_indistinguishable_by_title(  # noqa: E501
+) -> None:
+    """孪生对抗：同一个候选喂给同名同年的两个条目，只靠片名+年份两边都成立。
+
+    这正是错配的成因（真实案例：2026 年两部《The Odyssey》，诺兰版与
+    Marcel Walz 版）。本用例钉死这个事实——它不是可以靠调覆盖率阈值解决的
+    问题，两边的片名段完全相同；解法只能是引入片名之外的证据（ID / 时长 /
+    体积），见 docs/design/identity-confidence.md。
+    """
+    candidate = _candidate(
+        "The.Odyssey.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-Group",
+        "",
+        media_type="movie",
+        year=2026,
+    )
+    nolan = _movie(["The Odyssey", "奥德赛"], 2026, imdb_id="tt32138219")
+    walz = _movie(["The Odyssey"], 2026, imdb_id="tt3559656")
+    assert match_identity(candidate, nolan) is not None
+    assert match_identity(candidate, walz) is not None
+
+    # 而站点一旦标了 IMDb，两者立刻可分：正主 exact_id，另一部带冲突反证
+    with_id = _candidate(
+        "The.Odyssey.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-Group",
+        "",
+        media_type="movie",
+        year=2026,
+        imdb_id="tt3559656",
+    )
+    assert match_identity(with_id, walz).confidence == "exact_id"
+    assert match_identity(with_id, nolan).id_conflict is not None
+
+
+# ---------------------------------------------------------------------------
+# 体积 ÷ 片长 反证（零请求）
+# ---------------------------------------------------------------------------
+
+
+def _sized(title: str, size_gb: float, **attrs) -> TorrentCandidate:
+    c = _candidate(title, "", **attrs)
+    return TorrentCandidate(
+        site_id=c.site_id,
+        torrent_id=c.torrent_id,
+        title=c.title,
+        subtitle=c.subtitle,
+        attrs=c.attrs,
+        size_bytes=int(size_gb * 1024**3),
+    )
+
+
+def test_trailer_sized_release_is_implausible_for_a_feature_length_movie() -> None:
+    """预告片体量的"电影"：0.2 GB ÷ 120 分钟 ≈ 0.24 Mbps，远在下限之下。"""
+    candidate = _sized(
+        "Some Movie 2024 1080p WEB-DL", 0.2, media_type="movie", year=2024, resolution="1080p"
+    )
+    media = _movie(["Some Movie"], 2024, runtime_minutes=120)
+    reason = implausible_for_runtime(candidate, media)
+    assert reason is not None and "1080p" in reason
+
+
+def test_low_bitrate_x265_encode_is_not_flagged() -> None:
+    """正常的 x265 低码压制不能被误伤：2.5 GB ÷ 120 分钟 ≈ 3.0 Mbps。"""
+    candidate = _sized(
+        "Some Movie 2024 1080p WEB-DL x265", 2.5, media_type="movie", year=2024,
+        resolution="1080p",
+    )
+    media = _movie(["Some Movie"], 2024, runtime_minutes=120)
+    assert implausible_for_runtime(candidate, media) is None
+
+
+def test_missing_evidence_never_judges() -> None:
+    """片长/体积/分辨率任一未知都不判——不判优于判错。"""
+    sized = _sized(
+        "Some Movie 2024 1080p WEB-DL", 0.2, media_type="movie", year=2024, resolution="1080p"
+    )
+    assert implausible_for_runtime(sized, _movie(["Some Movie"], 2024)) is None  # 片长未知
+
+    known = _movie(["Some Movie"], 2024, runtime_minutes=120)
+    no_res = _sized("Some Movie 2024 WEB-DL", 0.2, media_type="movie", year=2024)
+    assert implausible_for_runtime(no_res, known) is None
+
+    no_size = _candidate(
+        "Some Movie 2024 1080p WEB-DL", "", media_type="movie", year=2024, resolution="1080p"
+    )
+    assert implausible_for_runtime(no_size, known) is None
+
+
+def test_single_sided_sentinel_does_not_catch_the_twin_movie_case() -> None:
+    """诚实钉死这条反证的能力边界：它**抓不住**同名同年错配。
+
+    §0 的现场——4 GB 的种子若真是 210 分钟的诺兰版，隐含码率约 2.7 Mbps，
+    低得可疑但仍在 1080p 的离谱下限之上，单边哨兵放行。要分辨这个 case 需要
+    的是**相对比较**（两个同名同年条目谁的片长更能解释这个体积），那得等
+    §9 的孪生探测提供第二个比较对象。本用例存在的意义是：日后有人想靠调高
+    这个阈值来覆盖错配时，先看到调高的代价是误伤正常发布。
+    """
+    candidate = _sized(
+        "The.Odyssey.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-Group",
+        4.0,
+        media_type="movie",
+        year=2026,
+        resolution="1080p",
+    )
+    nolan = _movie(["The Odyssey"], 2026, runtime_minutes=210)
+    assert implausible_for_runtime(candidate, nolan) is None
+
+    # 但相对比较是成立的：同一个体积，88 分钟那版的隐含码率正常得多——
+    # 这正是 §9 落地后要用的判别方式
+    assert implied_bitrate_mbps(candidate, 210) < implied_bitrate_mbps(candidate, 88)
+
+
+def test_runtime_counter_evidence_is_movie_only() -> None:
+    """剧集不参与：runtime_minutes 是单集时长，拿它去除整季包体积没有意义。"""
+    pack = _sized(
+        "Test Show S01 1080p WEB-DL", 0.2, media_type="tv", year=2024, seasons=[1],
+        resolution="1080p",
+    )
+    tv = MediaIdentity(
+        kind="tv", year=2024, aliases=("Test Show",), season_numbers=(1,), runtime_minutes=45
+    )
+    assert implausible_for_runtime(pack, tv) is None
+
+
+# ---------------------------------------------------------------------------
+# 孪生判别器：谁的片长更能解释这个体积
+# ---------------------------------------------------------------------------
+
+
+def test_twin_discriminator_speaks_only_when_one_side_is_implausible() -> None:
+    """一边的体积对那个片长明显说不通时才判：1 GB 配 210 分钟 = 0.68 Mbps。"""
+    candidate = _sized("Movie 2026 1080p WEB-DL", 1.0, media_type="movie", resolution="1080p")
+    assert better_explained_by_twin(candidate, 210, {999: 45}) == 999
+
+
+def test_twin_discriminator_stays_silent_on_the_real_odyssey_numbers() -> None:
+    """诚实边界：§0 的现场它**判不出来**，应当交给用户确认。
+
+    4 GB 按 210 分钟算是 2.7 Mbps、按 88 分钟算是 6.5 Mbps——两个都落在 1080p
+    的合理区间内。设计初稿写的"答案毫无悬念"是错的：把门槛降到能判这一档，
+    等于对几乎每一对孪生都强行表态，会错一半。分不出就问用户，那是正确的
+    归宿，不是这条反证的失败。
+    """
+    candidate = _sized(
+        "The.Odyssey.2026.1080p.AMZN.WEB-DL", 4.0, media_type="movie", resolution="1080p"
+    )
+    assert better_explained_by_twin(candidate, 210, {999: 88}) is None
+
+
+def test_twin_discriminator_never_speaks_without_evidence() -> None:
+    """本条目片长未知、孪生片长未知、分辨率未知——任一缺失都不判。"""
+    candidate = _sized("Movie 2026 1080p WEB-DL", 1.0, media_type="movie", resolution="1080p")
+    assert better_explained_by_twin(candidate, None, {999: 45}) is None
+    assert better_explained_by_twin(candidate, 210, {}) is None
+    assert better_explained_by_twin(candidate, 210, {999: None}) is None
+
+    no_res = _sized("Movie 2026 WEB-DL", 1.0, media_type="movie")
+    assert better_explained_by_twin(no_res, 210, {999: 45}) is None

@@ -28,6 +28,7 @@ from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
     DownloadAttemptStatus,
+    MediaItem,
     SiteTorrent,
     SubscriptionActivity,
     SubscriptionDownloadAttempt,
@@ -991,3 +992,531 @@ async def test_refresh_keeps_user_forced_search_pending(db, monkeypatch) -> None
     async with db.session() as session:
         w = list((await _wanted_map(session, sub.id)).values())[0]
         assert w.next_search_at == forced_at  # 强制仍在排队，未被改回未来档期
+
+
+# ---------------------------------------------------------------------------
+# 身份证据：ID 反证、证据强度选优、证据落台账
+# （docs/design/identity-confidence.md §5）
+# ---------------------------------------------------------------------------
+
+
+async def _set_item_imdb(session, sub, imdb_id: str) -> None:
+    """给夹具条目补一个 IMDb 身份（TMDB 假实现不带这个字段）。"""
+    from movieclaw_db.models import MediaItem
+
+    row = await session.get(MediaItem, sub.media_item_id)
+    row.imdb_id = imdb_id
+    await session.commit()
+
+
+async def test_conflicting_site_imdb_is_rejected_with_an_explanation(db) -> None:
+    """站点标注的 IMDb 与条目不符 → 不投递，且必须留下能读懂的拒绝理由。
+
+    静默拒绝会把漏配变成查不出原因的哑巴故障：站点的 IMDb 是上传者手填的，
+    填错真实存在，用户看到理由才可能判断"这是站点标错了"并手动选种。
+    """
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        await _set_item_imdb(session, sub, "tt32138219")
+        row = await _insert_torrent(
+            session,
+            "wrongimdb",
+            "Test Show S01 2160p WEB-DL",
+            {"media_type": "tv", "year": 2025, "seasons": [1], "resolution": "2160p"},
+            imdb_id="tt3559656",
+            seeders=999,
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        wanted = await _wanted_map(session, sub.id)
+        assert all(w.status == WantedStatus.WANTED for w in wanted.values())
+        rejected = [a for a in await _activities(session, sub.id) if a.type == "match_rejected"]
+        assert len(rejected) == 1
+        assert rejected[0].payload["reason_code"] == "identity_id_conflict"
+        assert "tt3559656" in rejected[0].message and "tt32138219" in rejected[0].message
+
+
+async def test_id_backed_candidate_beats_a_higher_seeded_guess(db, monkeypatch) -> None:
+    """选优先看身份证据：IMDb 命中的候选赢过做种数高得多、只靠片名蒙的候选。
+
+    旧排序里做种数能压过身份证据，这正是同名同年错配能走到投递的原因之一。
+    """
+    from importlib import import_module
+
+    dispatch_mod = import_module("movieclaw_api.services.subscription.dispatch")
+    monkeypatch.setenv("SUBSCRIPTION_DISPATCH_DRY_RUN", "false")
+    get_settings.cache_clear()
+
+    async def submit(*args, **kwargs):
+        return (
+            SubmitResult(info_hash="b" * 40, name="Test Show S01", already_exists=False),
+            SimpleNamespace(id=None),
+        )
+
+    monkeypatch.setattr(dispatch_mod, "_submit_real", submit)
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        await _set_item_imdb(session, sub, "tt32138219")
+        attrs = {"media_type": "tv", "year": 2025, "seasons": [1], "resolution": "2160p"}
+        popular_guess = await _insert_torrent(
+            session, "guess", "Test Show S01 2160p WEB-DL", attrs, seeders=999
+        )
+        id_backed = await _insert_torrent(
+            session,
+            "idbacked",
+            "Test Show S01 2160p WEB-DL",
+            attrs,
+            imdb_id="tt32138219",
+            seeders=1,
+        )
+        await evaluate_and_dispatch(session, [popular_guess, id_backed], source="被动匹配")
+
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub.id
+                )
+            )
+        ).scalar_one()
+        assert attempt.torrent_id == "idbacked"
+        # 证据强度同时落进台账，入库时 info_hash 认领据此分级
+        assert attempt.identity_confidence == "exact_id"
+
+
+async def test_dispatch_records_the_identity_evidence(db, monkeypatch) -> None:
+    """只靠片名+年份认下来的投递，台账要如实记成 title_year 并留下命中的别名。"""
+    from importlib import import_module
+
+    dispatch_mod = import_module("movieclaw_api.services.subscription.dispatch")
+    monkeypatch.setenv("SUBSCRIPTION_DISPATCH_DRY_RUN", "false")
+    get_settings.cache_clear()
+
+    async def submit(*args, **kwargs):
+        return (
+            SubmitResult(info_hash="c" * 40, name="Test Show S01", already_exists=False),
+            SimpleNamespace(id=None),
+        )
+
+    monkeypatch.setattr(dispatch_mod, "_submit_real", submit)
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        row = await _insert_torrent(
+            session,
+            "guessonly",
+            "Test Show S01 2160p WEB-DL",
+            {"media_type": "tv", "year": 2025, "seasons": [1], "resolution": "2160p"},
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub.id
+                )
+            )
+        ).scalar_one()
+        assert attempt.identity_confidence == "title_year"
+        assert attempt.matched_alias == "Test Show"
+
+
+async def _set_runtime(session, sub, runtime_minutes: int) -> None:
+    """给夹具条目补片长（TMDB 假实现不带 runtime；建订阅时元数据行已建好）。"""
+    from movieclaw_db.models import MediaMetadata
+
+    row = (
+        await session.execute(
+            select(MediaMetadata).where(MediaMetadata.media_item_id == sub.media_item_id)
+        )
+    ).scalar_one()
+    row.runtime_minutes = runtime_minutes
+    await session.commit()
+
+
+async def test_bitrate_counter_evidence_is_recorded_but_does_not_block(db, monkeypatch) -> None:
+    """体积÷片长 反证走 shadow 模式：照常投递，只把判定记进投递活动 payload。
+
+    阈值是凭经验拍的，直接开成否决会误伤正常发布（identity-confidence.md §10.2）。
+    先在真实流量上攒触发率与误报率，再决定是否生效——所以这个用例同时钉死
+    两件事：**记录发生了**，且**行为没有变**。
+    """
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 101)
+        await _set_runtime(session, sub, 120)
+
+        # 0.2 GB 的"1080p 电影"：隐含码率约 0.24 Mbps，预告片体量
+        row = await _insert_torrent(
+            session,
+            "tiny",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+            size_bytes=int(0.2 * 1024**3),
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        wanted = await _wanted_map(session, sub.id)
+        assert wanted[(0, 0)].status == WantedStatus.GRABBED  # 行为未变：照常投递
+        grabbed = [a for a in await _activities(session, sub.id) if a.type == "grabbed"]
+        assert len(grabbed) == 1
+        assert "bitrate_reject" in grabbed[0].payload["shadow"]
+        # shadow 判定绝不进用户可见的文案
+        assert "Mbps" not in grabbed[0].message
+
+
+async def test_normal_sized_release_records_no_shadow_note(db) -> None:
+    """正常体积的发布不留 shadow 记录——否则统计触发率时全是噪音。"""
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 101)
+        await _set_runtime(session, sub, 120)
+
+        row = await _insert_torrent(
+            session,
+            "normal",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+            size_bytes=int(6 * 1024**3),  # ≈ 7.2 Mbps，完全正常
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        grabbed = [a for a in await _activities(session, sub.id) if a.type == "grabbed"]
+        assert len(grabbed) == 1 and "shadow" not in grabbed[0].payload
+
+
+# ---------------------------------------------------------------------------
+# 投递前的外部 ID 复核（identity-confidence.md §7）
+# ---------------------------------------------------------------------------
+
+
+def _fake_detail(monkeypatch, *, imdb_id=None, douban_id=None, calls=None, boom=False):
+    """替掉「按站点取已认证客户端 → 拉详情页」这一步，不连真实站点。"""
+    from movieclaw_api.services.subscription import identity_recheck as mod
+
+    class _Site:
+        async def get_torrent_detail(self, target):
+            if calls is not None:
+                calls.append(target)
+            if boom:
+                raise RuntimeError("站点超时")
+            return SimpleNamespace(imdb_id=imdb_id, douban_id=douban_id)
+
+    class _Access:
+        async def get(self, site_id):
+            return _Site()
+
+    monkeypatch.setattr(mod, "get_site_access", lambda: _Access(), raising=False)
+    import movieclaw_api.services.site_access as access_mod
+
+    monkeypatch.setattr(access_mod, "get_site_access", lambda: _Access())
+
+
+async def _movie_sub_with_imdb(session, imdb_id: str):
+    sub = await _service(session).create(MediaKind.MOVIE, 101)
+    await _set_item_imdb(session, sub, imdb_id)
+    return sub
+
+
+async def test_pre_dispatch_recheck_blocks_a_torrent_the_site_says_is_another_film(
+    db, monkeypatch
+) -> None:
+    """站点详情页标的 IMDb 和条目不符 → 不投递，理由写明双方编号。
+
+    这是 §0 那个错配的正面拦截：两部片同名同年，片名和年份都区分不了，但站点
+    详情页上的 IMDb 编号可以。
+    """
+    _fake_detail(monkeypatch, imdb_id="tt3559656")
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        row = await _insert_torrent(
+            session,
+            "twin",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        wanted = await _wanted_map(session, sub.id)
+        assert wanted[(0, 0)].status == WantedStatus.WANTED  # 没投出去
+        rejected = [a for a in await _activities(session, sub.id) if a.type == "match_rejected"]
+        assert len(rejected) == 1
+        assert "tt3559656" in rejected[0].message and "tt32138219" in rejected[0].message
+
+
+async def test_pre_dispatch_recheck_confirms_and_upgrades_the_evidence(db, monkeypatch) -> None:
+    """详情页 IMDb 与条目一致 → 照常投递，且台账记成 exact_id；ID 回填种子索引。"""
+    from importlib import import_module
+
+    dispatch_mod = import_module("movieclaw_api.services.subscription.dispatch")
+    monkeypatch.setenv("SUBSCRIPTION_DISPATCH_DRY_RUN", "false")
+    get_settings.cache_clear()
+
+    async def submit(*args, **kwargs):
+        return (
+            SubmitResult(info_hash="d" * 40, name="Upcoming Movie", already_exists=False),
+            SimpleNamespace(id=None),
+        )
+
+    monkeypatch.setattr(dispatch_mod, "_submit_real", submit)
+    _fake_detail(monkeypatch, imdb_id="tt32138219")
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        row = await _insert_torrent(
+            session,
+            "confirmed",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        wanted = await _wanted_map(session, sub.id)
+        assert wanted[(0, 0)].status == WantedStatus.GRABBED
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub.id
+                )
+            )
+        ).scalar_one()
+        assert attempt.identity_confidence == "exact_id"
+        # 回填是关键：被动匹配下次遇到同一行直接走信号一，不必再拉详情页
+        refreshed = await session.get(SiteTorrent, row.id)
+        assert refreshed.imdb_id == "tt32138219"
+
+
+async def test_pre_dispatch_recheck_passes_when_the_site_has_no_id(db, monkeypatch) -> None:
+    """站点没标 IMDb：当作没有这条证据，照常投递（不能因为查不到就不下）。"""
+    _fake_detail(monkeypatch, imdb_id=None)
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        row = await _insert_torrent(
+            session,
+            "noid",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        assert (await _wanted_map(session, sub.id))[(0, 0)].status == WantedStatus.GRABBED
+
+
+async def test_pre_dispatch_recheck_never_blocks_on_a_site_failure(db, monkeypatch) -> None:
+    """详情页请求失败一律放行——绝不让一次网络抖动卡死投递。"""
+    _fake_detail(monkeypatch, boom=True)
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        row = await _insert_torrent(
+            session,
+            "boom",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        assert (await _wanted_map(session, sub.id))[(0, 0)].status == WantedStatus.GRABBED
+
+
+async def test_pre_dispatch_recheck_spares_tv_and_id_less_items(db, monkeypatch) -> None:
+    """两种情况不花这次请求：剧集（成本集中在这、收益几乎没有）、条目自己没 ID。"""
+    calls: list = []
+    _fake_detail(monkeypatch, imdb_id="tt999", calls=calls)
+    async with db.session() as session:
+        # 剧集：条目有 IMDb 也不复核
+        tv = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        await _set_item_imdb(session, tv, "tt32138219")
+        pack = await _insert_torrent(
+            session,
+            "tvpack",
+            "Test Show S01 2160p WEB-DL",
+            {"media_type": "tv", "year": 2025, "seasons": [1], "resolution": "2160p"},
+        )
+        await evaluate_and_dispatch(session, [pack], source="被动匹配")
+        assert calls == []
+
+        # 电影但条目没有外部 ID：拿回来也没得比，同样不花
+        movie = await _service(session).create(MediaKind.MOVIE, 103)
+        row = await _insert_torrent(
+            session,
+            "noimdbitem",
+            "Undated Movie 1080p WEB-DL",
+            {"media_type": "movie", "resolution": "1080p"},
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+        assert calls == []
+        assert movie is not None
+
+
+# ---------------------------------------------------------------------------
+# 同名同年歧义（identity-confidence.md §9）
+# ---------------------------------------------------------------------------
+
+
+def _fake_twin_probe(monkeypatch, twins: list[dict], calls: list | None = None):
+    """替掉 TMDB 孪生探测，避免连网。"""
+    from movieclaw_api.services.subscription import twins as twins_mod
+
+    async def probe(item):
+        if calls is not None:
+            calls.append(item.id)
+        return list(twins)
+
+    monkeypatch.setattr(twins_mod, "_probe", probe)
+
+
+_TWIN = {
+    "tmdb_id": 555,
+    "title": "另一部同名片",
+    "year": 2026,
+    "imdb_id": "tt3559656",
+    "runtime_minutes": 88,
+}
+
+
+async def test_ambiguous_movie_stops_and_asks_the_user(db, monkeypatch) -> None:
+    """有同名同年的兄弟、又没有任何可区分的证据 → 不投递，点亮待确认告警。
+
+    这正是 §0 现场在"站点没标影片编号"时的正确归宿：宁可停下来问一句，
+    也不要凭片名+年份蒙一个。
+    """
+    from movieclaw_db.models import SystemNotice
+
+    _fake_detail(monkeypatch, imdb_id=None)  # 站点没标编号
+    _fake_twin_probe(monkeypatch, [_TWIN])
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        await _set_runtime(session, sub, 210)
+        row = await _insert_torrent(
+            session,
+            "ambiguous",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+            size_bytes=int(4 * 1024**3),  # 两边的片长都解释得通 → 判别器不表态
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        assert (await _wanted_map(session, sub.id))[(0, 0)].status == WantedStatus.WANTED
+        notice = (await session.execute(select(SystemNotice))).scalars().one()
+        assert notice.payload["site_id"] == "testsite"
+        assert notice.payload["torrent_id"] == "ambiguous"
+        assert notice.payload["twins"][0]["tmdb_id"] == 555
+        # 探测结果落缓存，下轮不再打 TMDB
+        item = await session.get(MediaItem, sub.media_item_id)
+        assert item.identity_twins == [_TWIN]
+
+
+async def test_ambiguous_movie_is_rejected_silently_when_size_says_it_is_the_twin(
+    db, monkeypatch
+) -> None:
+    """体积明显只解释得通孪生那一部 → 直接否决，**不打扰用户**。"""
+    from movieclaw_db.models import SystemNotice
+
+    _fake_detail(monkeypatch, imdb_id=None)
+    _fake_twin_probe(monkeypatch, [{**_TWIN, "runtime_minutes": 45}])
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        await _set_runtime(session, sub, 210)
+        row = await _insert_torrent(
+            session,
+            "tinyfortwin",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+            size_bytes=int(1 * 1024**3),  # 1 GB 配 210 分钟 = 0.68 Mbps，说不通
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        assert (await _wanted_map(session, sub.id))[(0, 0)].status == WantedStatus.WANTED
+        assert (await session.execute(select(SystemNotice))).scalars().all() == []
+        rejected = [a for a in await _activities(session, sub.id) if a.type == "match_rejected"]
+        assert rejected[0].payload["reason_code"] == "identity_ambiguous_reject"
+        assert "另一部同名片" in rejected[0].message
+
+
+async def test_id_backed_candidate_ignores_the_twin_gate(db, monkeypatch) -> None:
+    """有编号佐证的候选不受歧义影响——ID 说了算，照常投递。"""
+    calls: list = []
+    _fake_detail(monkeypatch, imdb_id="tt32138219")
+    _fake_twin_probe(monkeypatch, [_TWIN], calls=calls)
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        await _set_runtime(session, sub, 210)
+        row = await _insert_torrent(
+            session,
+            "idwins",
+            "Upcoming Movie 2026 1080p WEB-DL",
+            {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+        )
+        await evaluate_and_dispatch(session, [row], source="被动匹配")
+
+        assert (await _wanted_map(session, sub.id))[(0, 0)].status == WantedStatus.GRABBED
+        assert calls == []  # 连孪生探测都不必做
+
+
+async def test_twin_probe_is_skipped_for_tv(db, monkeypatch) -> None:
+    """剧集不探孪生：另有季集号做区分，而剧集条目多得多，成本不值当。"""
+    calls: list = []
+    _fake_twin_probe(monkeypatch, [_TWIN], calls=calls)
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        pack = await _insert_torrent(
+            session,
+            "tvnotwin",
+            "Test Show S01 2160p WEB-DL",
+            {"media_type": "tv", "year": 2025, "seasons": [1], "resolution": "2160p"},
+        )
+        await evaluate_and_dispatch(session, [pack], source="被动匹配")
+
+        assert calls == []
+        assert (await _wanted_map(session, sub.id))[(1, 1)].status == WantedStatus.GRABBED
+
+
+async def test_ambiguous_movie_asks_at_most_once_per_round(db, monkeypatch) -> None:
+    """一批几十个候选时最多问一次——逐个点灯等于给用户刷屏。
+
+    候选已按证据强度与评分排序，问最靠前的那个就够；后续候选照常评估
+    （其中带影片编号的仍能自动裁决出结果），只是不再重复发问。
+    """
+    from movieclaw_db.models import SystemNotice
+
+    _fake_detail(monkeypatch, imdb_id=None)
+    _fake_twin_probe(monkeypatch, [_TWIN])
+    async with db.session() as session:
+        sub = await _movie_sub_with_imdb(session, "tt32138219")
+        await _set_runtime(session, sub, 210)
+        rows = [
+            await _insert_torrent(
+                session,
+                f"many{n}",
+                "Upcoming Movie 2026 1080p WEB-DL",
+                {"media_type": "movie", "year": 2026, "resolution": "1080p"},
+                size_bytes=int(4 * 1024**3),
+                seeders=100 - n,
+            )
+            for n in range(5)
+        ]
+        await evaluate_and_dispatch(session, rows, source="被动匹配")
+
+        notices = (await session.execute(select(SystemNotice))).scalars().all()
+        assert len(notices) == 1
+        # 每个候选仍各自留下了拒绝记录（可解释性不打折）
+        rejected = [a for a in await _activities(session, sub.id) if a.type == "match_rejected"]
+        assert len(rejected) == 5
+
+
+async def test_twin_cache_is_invalidated_by_metadata_refresh(db, monkeypatch) -> None:
+    """元数据刷新会作废孪生缓存：用户常在上映前订阅，同名的另一部可能几个月
+    后才进 TMDB，缓存成 [] 就再也发现不了。"""
+    from movieclaw_api.services.media_scrape import _merge_identity
+    from movieclaw_media.library import MediaProfile
+
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.MOVIE, 101)
+        item = await session.get(MediaItem, sub.media_item_id)
+        item.identity_twins = []  # 上次探测：干净
+        await session.commit()
+
+        _merge_identity(
+            item,
+            MediaProfile(
+                kind="movie", tmdb_id=101, title="未上映电影", original_title="Upcoming Movie"
+            ),
+        )
+        assert item.identity_twins is None  # 回到"未探测"，下轮重新探

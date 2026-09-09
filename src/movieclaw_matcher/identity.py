@@ -4,6 +4,12 @@
 1. 外部 ID 精确相等（imdb/douban，详情富化带回）——免费且最可靠；
 2. 别名 × 标题段**覆盖率**匹配 + 年份约束。
 
+外部 ID **不等**同样是信号，但方向相反：走完 2 仍命中时，``IdentityMatch``
+上会带一条 ``id_conflict`` 说明。内核只报告不裁决——站点的 IMDb 是上传者
+手填的，填错真实存在，而误否决的代价（漏配，用户只看得到活动流水里一行字）
+比错配更难被发现。裁决需要时长/体积/孪生条目等内核拿不到的上下文，交给
+消费侧（docs/design/identity-confidence.md §5.2）。
+
 覆盖率而非子串包含，源自真实误配教训：《金特务：本色回归》(김부장) 的 TMDB
 泛化别名 "Mr Kim" 曾以子串命中另一部剧《The Dream Life of Mr Kim》。因此别名
 必须覆盖候选"标题段"（去掉年份/季集/画质等标记后的片名部分）的大多数字符——
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import replace
 
 from movieclaw_matcher.models import IdentityMatch, MediaIdentity, TorrentCandidate
 
@@ -232,7 +239,144 @@ def match_identity(
         return None
 
     confidence = "title_year" if attrs.year is not None else "title_only"
-    return _derive_units(candidate, media, confidence=confidence, alias=matched_alias)
+    match = _derive_units(candidate, media, confidence=confidence, alias=matched_alias)
+    # 走到这里说明两边的 ID 没能相等（信号一没命中）。若两边**都有** ID 而它们
+    # 不同，这是一条必须带出去的反证：站点已经明确说了"这是另一部片"，而旧逻辑
+    # 掉到别名匹配就当没看见。内核只报告，裁决在消费侧（见字段注释）
+    if match is not None and (conflict := _id_conflict(candidate, media)):
+        return replace(match, id_conflict=conflict)
+    return match
+
+
+# 各分辨率的"离谱下限"码率（Mbps）——**不是**典型下限，是典型下限的约 1/3。
+# 正常发布不可能踩线（1080p 的 x265 低码压制也在 1.8 Mbps 上下），踩线的基本
+# 是预告片、sample、假种，以及"片长对不上"的错配。
+#
+# ⚠ 需真实数据校准（docs/design/identity-confidence.md §10）：这几个数字是凭
+# 经验拍的，上线先走 shadow 模式只记录不生效，看过真实触发率与误报率再说。
+_BITRATE_FLOOR_MBPS = {
+    "2160p": 4.0,
+    "1080p": 1.5,
+    "1080i": 1.5,
+    "720p": 0.8,
+    "576p": 0.5,
+    "480p": 0.4,
+}
+
+
+def implied_bitrate_mbps(candidate: TorrentCandidate, runtime_minutes: int) -> float | None:
+    """体积 ÷ 片长 = 隐含码率（Mbps）。体积未知或片长非正返回 None。"""
+    if not candidate.size_bytes or runtime_minutes <= 0:
+        return None
+    return candidate.size_bytes * 8 / (runtime_minutes * 60) / 1_000_000
+
+
+def implausible_for_runtime(candidate: TorrentCandidate, media: MediaIdentity) -> str | None:
+    """体积与片长严重对不上时给一句中文说明；对得上或证据不足返回 None。
+
+    这是一条**零请求**的反证：体积、片长、分辨率全都已经在手上
+    （docs/design/identity-confidence.md §6）。
+
+    刻意只做单边、极粗的判定——码率的合理区间跨度太大（编码、片源、年代都
+    影响它），做成双边或贴近典型值的门禁必然误伤正常发布。踩到这条线的基本
+    不是"码率偏低的正规资源"，而是预告片/sample/假种这类根本不是正片的东西。
+    证据不足（片长未知、体积未知、分辨率未知）一律返回 None：不判 > 判错。
+
+    **它抓不住同名同年错配**（§0 那个 case 隐含码率约 2.7 Mbps，远在下限之上）
+    ——那需要的是"两个孪生条目谁的片长更能解释这个体积"的**相对**比较，等
+    §9 的孪生探测落地后才有第二个比较对象。本函数是那件事的算术基础。
+
+    **只对电影生效**：``runtime_minutes`` 对剧集是**单集**时长，而一个整季包的
+    体积覆盖 N 集，两者根本不可比（拿单集时长去除整季体积，算出来的"码率"会
+    虚高 N 倍）。剧集侧另有季集号做区分，不缺这条反证。
+    """
+    if media.kind != "movie" or media.runtime_minutes is None:
+        return None
+    floor = _BITRATE_FLOOR_MBPS.get(candidate.attrs.resolution or "")
+    if floor is None:
+        return None  # 分辨率未知：没有可比的基准，不判
+    bitrate = implied_bitrate_mbps(candidate, media.runtime_minutes)
+    if bitrate is None or bitrate >= floor:
+        return None
+    return (
+        f"体积与片长对不上：{candidate.size_bytes / 1024**3:.1f} GB ÷ "
+        f"{media.runtime_minutes} 分钟 ≈ {bitrate:.1f} Mbps，"
+        f"远低于 {candidate.attrs.resolution} 的合理下限"
+    )
+
+
+def better_explained_by_twin(
+    candidate: TorrentCandidate, own_runtime: int | None, twin_runtimes: dict[int, int]
+) -> int | None:
+    """同名同年的几个条目里，谁的片长最能解释这个体积？返回胜出孪生的 tmdb_id。
+
+    本条目胜出（或分不出）时返回 None——**只在能证伪时说话**。
+
+    比单机看"隐含码率是否离谱"更有力：同一个文件、同一个编码、同一个片源，
+    "该用多少码率"这个未知量在孪生之间被抵消掉一部分。
+
+    **但它远没有强到能包打一切**——真实的分辨力比设计初稿预期的低得多。以
+    §0 的现场实测：4 GB 的种子，按 210 分钟算是 2.7 Mbps、按 88 分钟算是
+    6.5 Mbps，两个都落在 1080p 的合理区间内，对数距离只差 0.13（噪音级），
+    本函数**返回 None**。把门槛降到能判这一档，等于对几乎每一对孪生都强行
+    表态，错一半。所以它只在**一边的体积对那个片长明显说不通**时才开口
+    （例如 1 GB 配 210 分钟 = 0.68 Mbps，对 1080p 根本不成立）。
+
+    分不出就交给用户确认——那是正确的归宿，不是这条反证的失败。
+
+    判据：取隐含码率最接近该分辨率**典型区间**的那个片长。典型值用离谱下限
+    的 3 倍近似（``_BITRATE_FLOOR_MBPS`` 本身就是典型值的约 1/3），比的是
+    对数距离——码率是乘性量，2 Mbps 与 8 Mbps 的差距和 8 与 32 是同一量级，
+    用差值比会让高分辨率一边倒。
+
+    要求胜者比本条目**明显更好**（对数距离差 ≥ ``_TWIN_MARGIN``）才判，
+    否则宁可分不出：这条反证只用来拦，不用来选，误判的代价是漏配。
+    """
+    import math
+
+    if own_runtime is None or not twin_runtimes:
+        return None
+    floor = _BITRATE_FLOOR_MBPS.get(candidate.attrs.resolution or "")
+    if floor is None:
+        return None
+    typical = floor * 3
+
+    def distance(runtime: int) -> float | None:
+        bitrate = implied_bitrate_mbps(candidate, runtime)
+        if bitrate is None or bitrate <= 0:
+            return None
+        return abs(math.log(bitrate / typical))
+
+    own = distance(own_runtime)
+    if own is None:
+        return None
+    scored = [
+        (dist, tmdb_id)
+        for tmdb_id, runtime in sorted(twin_runtimes.items())
+        if runtime and (dist := distance(runtime)) is not None
+    ]
+    if not scored:
+        return None
+    best_distance, best_id = min(scored)
+    return best_id if own - best_distance >= _TWIN_MARGIN else None
+
+
+# 孪生判别的最小说服力：两者的对数距离差要到这个量级才敢判。ln(2)≈0.69 相当于
+# "一边的隐含码率离典型值差了两倍、另一边没有"。⚠ 待校准（§10）。
+_TWIN_MARGIN = 0.69
+
+
+def _id_conflict(candidate: TorrentCandidate, media: MediaIdentity) -> str | None:
+    """两边都有外部 ID 且不相等时，给一句可直接进活动流水的中文说明。
+
+    只在信号一未命中后调用：任一 ID 相等即已按 exact_id 返回，那种情况下
+    另一个 ID 对不上是数据噪音（站点两个链接贴串行），不构成反证。
+    """
+    if candidate.imdb_id and media.imdb_id and candidate.imdb_id != media.imdb_id:
+        return f"站点标注 IMDb {candidate.imdb_id}，本条目是 {media.imdb_id}"
+    if candidate.douban_id and media.douban_id and candidate.douban_id != media.douban_id:
+        return f"站点标注豆瓣 {candidate.douban_id}，本条目是 {media.douban_id}"
+    return None
 
 
 def _year_compatible(media: MediaIdentity, torrent_year: int | None) -> bool:

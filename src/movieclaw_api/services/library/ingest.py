@@ -1799,10 +1799,31 @@ async def _ingest_entry(
     # 文件被记成 CHDWEB 投递，qb 里的 CHDWEB 任务白下、清理证据链也锚错）
     prov_site: str | None = None
     prov_torrent: str | None = None
+    prov_confidence: str | None = None
     if manual_intent is not None:
         prov_site, prov_torrent = manual_intent.site_id, manual_intent.torrent_id
     elif matched_hashes:
-        prov_site, prov_torrent = await _delivery_provenance(session, matched_hashes)
+        prov_site, prov_torrent, prov_confidence = await _delivery_provenance(
+            session, matched_hashes
+        )
+    # 身份来源分档：这条入库记录的身份是怎么来的、有多可信。这一列此前在
+    # 监听导入路径上恒为 NULL——连"用户亲手认领的"和"机器蒙的"都分不出来
+    ledger_identity = _ledger_identity_source(
+        forced=forced_item is not None,
+        identity_source=identity_source,
+        confidence=prov_confidence,
+    )
+    # 时长体检（§8）：订阅按 info_hash 认领身份时会短路整条名称识别链，连带
+    # 跳过 resolve.py 上那套佐证/反证机器；这里补上被跳过的那一次反证。
+    # 已有外部 ID 佐证的（SUBSCRIPTION_EXACT）不必再疑，人工拍板的更不该疑。
+    from movieclaw_db.models.library_file import IdentitySource
+
+    expected_runtime = (
+        await _expected_runtime_minutes(session, item.id)
+        if ledger_identity
+        not in (IdentitySource.MANUAL.value, IdentitySource.SUBSCRIPTION_EXACT.value)
+        else None
+    )
 
     # auto 规则：识别后决定目标库（docs/design/library-routing.md 2.3）。
     # 订阅/手动下载的已确认身份均沿用提交时定格的库——粘性 + 不让规则
@@ -1959,6 +1980,7 @@ async def _ingest_entry(
                 media_source=DISC_SOURCE,
                 release_group=release_attrs.release_group,
                 source=FileSource.IMPORTED,
+                identity_source=ledger_identity,
                 site_id=prov_site,
                 torrent_id=prov_torrent,
                 added_batch_id=added_batch_id,
@@ -2191,6 +2213,31 @@ async def _ingest_entry(
         assert dest_library is not None and dest_library.id is not None
         # stat 落位后的目标文件（跨盘复制时 mtime 与源不同），size/mtime 一次拿全
         final_stat = final.stat()
+        # 时长体检：**shadow 模式，只留台账不点灯**（§10.2）。触发线是凭经验
+        # 定的，直接弹告警会被导演剪辑版/加长版刷屏；先攒真实触发率与误报率。
+        # 注意它**不阻断入库**——踩线更常见的原因就是版本差异，拦下来的代价
+        # 大于收益，所以定位是"照常入库 + 留痕"，不是门禁
+        # **只体检主视频**：一个电影目录里常还躺着花絮、预告、导演访谈，它们
+        # 的时长天生就和正片对不上，逐个判等于给自己造噪音源（正是这条体检最
+        # 该避免的东西）
+        doubt = (
+            runtime_doubt(
+                kind=kind,
+                expected_minutes=expected_runtime,
+                duration_seconds=file_spec.duration_seconds if file_spec else None,
+            )
+            if file == main
+            else None
+        )
+        if doubt:
+            logger.info(
+                "入库时长存疑（shadow，未告警）：《%s》实测 %d 分钟，"
+                "影片信息标注 %d 分钟——可能是认错了片，也可能是剪辑版/加长版：%s",
+                item.title,
+                doubt["actual_minutes"],
+                doubt["expected_minutes"],
+                final.name,
+            )
         await repo.upsert_by_path(
             LibraryFile(
                 library_id=dest_library.id,
@@ -2216,6 +2263,8 @@ async def _ingest_entry(
                 media_source=release_attrs.media_source,
                 release_group=release_attrs.release_group,
                 source=FileSource.IMPORTED,
+                identity_source=ledger_identity,
+                identity_doubt=doubt,
                 site_id=prov_site,
                 torrent_id=prov_torrent,
                 added_batch_id=added_batch_id,
@@ -2591,11 +2640,93 @@ async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem |
     return item, library_id
 
 
-async def _delivery_provenance(session, info_hashes: list[str]) -> tuple[str | None, str | None]:
-    """按 info_hash 反查订阅投递记录的 (site_id, torrent_id) 来源戳。
+def _ledger_identity_source(
+    *, forced: bool, identity_source: str | None, confidence: str | None
+) -> str | None:
+    """入库台账的 ``identity_source`` 取值（docs/design/identity-confidence.md §5.3）。
 
-    条目匹配到的 hash 就是这个种子本身，任何同 hash 的投递记录都是它的
-    来源——与身份认领走哪条链无关。查不到（外部种子）返回 (None, None)。
+    - 用户拍板的认领（``forced``）与手动下载确认的身份 → ``MANUAL``：都是人
+      看过并决定过的，对账机制不该自动翻案；
+    - 订阅投递 → 按投递时的证据强度分 ``SUBSCRIPTION_EXACT`` /
+      ``SUBSCRIPTION_GUESS``。旧数据的证据强度未知（台账那两列是本次才加的），
+      按 guess 记——保守：宁可日后多做一次反证体检，不可漏掉真错配；
+    - 名称识别链 → None，由识别链自己的结论覆盖（它有更细的 nfo/path_tag/
+      resolved 分档）。
+    """
+    from movieclaw_db.models.library_file import IdentitySource
+
+    if forced or identity_source == "manual":
+        return IdentitySource.MANUAL.value
+    if identity_source == "subscription":
+        return (
+            IdentitySource.SUBSCRIPTION_EXACT.value
+            if confidence == "exact_id"
+            else IdentitySource.SUBSCRIPTION_GUESS.value
+        )
+    return None
+
+
+# 时长体检的触发线（docs/design/identity-confidence.md §8.3）：两个条件**都要**
+# 满足才算存疑。只看比例，30 分钟的纪录短片差 7.5 分钟就报警、噪音爆表；只看
+# 绝对值，210 分钟的片差 15 分钟完全正常、也会报。两条一起才分得开"版本差异"
+# 与"认错片"：210 vs 88 是 58%、122 分钟，远远踩爆；120 分钟正片的导演剪辑版
+# +18 分钟是 15%，不报。
+# ⚠ 需真实数据校准（§10）：先走 shadow 只留台账，看过触发率与误报率再点灯。
+_RUNTIME_DOUBT_RATIO = 0.25
+_RUNTIME_DOUBT_MINUTES = 15
+
+
+def runtime_doubt(
+    *, kind: MediaKind, expected_minutes: int | None, duration_seconds: int | None
+) -> dict | None:
+    """实测片长与影片信息严重不符时给一条存疑记录；证据不足返回 None。
+
+    只对电影：剧集单集时长噪音太大（OP/ED、导视、双集合并、番外），
+    ``MediaEpisode.runtime_minutes`` 本身也常不准，开了就是噪音源——与
+    ``resolve.py::_strong_corroborations`` 里 ``kind is MediaKind.MOVIE``
+    的既有取舍一致。
+
+    这是订阅认领**被跳过的那次反证**：``_wanted_identity`` 命中后直接短路了
+    名称识别链（那条链上挂着 resolve.py 的全套佐证/反证机器），短路本身没错
+    ——前提是投递没错；投递错了，它就是错误的高速通道。
+    """
+    if kind is not MediaKind.MOVIE:
+        return None
+    if not expected_minutes or not duration_seconds:
+        return None
+    actual_minutes = round(duration_seconds / 60)
+    gap = abs(actual_minutes - expected_minutes)
+    if gap <= expected_minutes * _RUNTIME_DOUBT_RATIO or gap <= _RUNTIME_DOUBT_MINUTES:
+        return None
+    return {
+        "reason": "runtime_mismatch",
+        "expected_minutes": expected_minutes,
+        "actual_minutes": actual_minutes,
+    }
+
+
+async def _expected_runtime_minutes(session, media_item_id: int) -> int | None:
+    """条目的片长（media_metadata）；冷门片 TMDB 常缺，缺了体检自动跳过。"""
+    from movieclaw_db.models import MediaMetadata
+
+    return (
+        await session.execute(
+            select(MediaMetadata.runtime_minutes).where(
+                MediaMetadata.media_item_id == media_item_id
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _delivery_provenance(
+    session, info_hashes: list[str]
+) -> tuple[str | None, str | None, str | None]:
+    """按 info_hash 反查订阅投递记录的来源戳与身份证据强度。
+
+    返回 ``(site_id, torrent_id, identity_confidence)``。条目匹配到的 hash 就是
+    这个种子本身，任何同 hash 的投递记录都是它的来源——与身份认领走哪条链无关。
+    证据强度用于给入库台账的 ``identity_source`` 分档（exact / guess）。
+    查不到（外部种子）返回 (None, None, None)。
     """
     from movieclaw_db.models import SubscriptionDownloadAttempt
 
@@ -2608,8 +2739,8 @@ async def _delivery_provenance(session, info_hashes: list[str]) -> tuple[str | N
     ).scalars()
     for attempt in rows:
         if attempt.site_id:
-            return attempt.site_id, attempt.torrent_id
-    return None, None
+            return attempt.site_id, attempt.torrent_id, attempt.identity_confidence
+    return None, None, None
 
 
 async def _manual_download_identity(

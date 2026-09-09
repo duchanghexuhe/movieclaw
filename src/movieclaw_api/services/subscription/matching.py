@@ -14,16 +14,22 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api.services.subscription.identity_recheck import (
+    fetch_external_ids,
+    needs_external_id_recheck,
+)
+from movieclaw_api.services.subscription.twins import ambiguous_verdict, ensure_twins
 from movieclaw_db.models import (
     ActivityType,
     MediaItem,
+    MediaMetadata,
     MediaSeason,
     RuleSet,
     SiteCredential,
@@ -46,6 +52,7 @@ from movieclaw_matcher import (
     TorrentCandidate,
     candidate_ladder_rank,
     evaluate_rules,
+    implausible_for_runtime,
     match_identity,
 )
 from movieclaw_tracker.datetime_utils import DEFAULT_SITE_TIMEZONE
@@ -215,6 +222,14 @@ async def _ensure_context(
     if item is None:  # 外键保证下理论不可达
         return None
     season_titles = await load_season_titles(session, media_item_id)
+    # 片长：体积÷片长 的反证要用（§6）。冷门片 TMDB 常缺，缺了反证自动跳过
+    runtime_minutes = (
+        await session.execute(
+            select(MediaMetadata.runtime_minutes).where(
+                MediaMetadata.media_item_id == media_item_id
+            )
+        )
+    ).scalar_one_or_none()
     ctx = MediaContext(
         item=item,
         identity=MediaIdentity(
@@ -225,6 +240,7 @@ async def _ensure_context(
             douban_id=item.douban_id,
             season_numbers=(),  # 先占位，收集完工单后统一回填
             season_titles=season_titles,
+            runtime_minutes=runtime_minutes,
         ),
         subscription=subscription,
         spec=spec,
@@ -421,15 +437,9 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
         seasons = tuple(
             sorted({s for s, _ in ctx.open_wanted} | {s for s, _ in ctx.upgrade_wanted})
         )
-        ctx.identity = MediaIdentity(
-            kind=ctx.identity.kind,
-            year=ctx.identity.year,
-            aliases=ctx.identity.aliases,
-            imdb_id=ctx.identity.imdb_id,
-            douban_id=ctx.identity.douban_id,
-            season_numbers=seasons,
-            season_titles=ctx.identity.season_titles,
-        )
+        # 用 replace 而不是逐字段重建：逐字段重建会在 MediaIdentity 长出新字段
+        # 时**静默丢掉**它（判定口径的裂缝就是这么来的），这里只改季号一项
+        ctx.identity = replace(ctx.identity, season_numbers=seasons)
     return contexts
 
 
@@ -466,6 +476,49 @@ def to_candidate(row: SiteTorrent) -> TorrentCandidate | None:
         download_url=row.download_url,
         publish_time=row.publish_time,
     )
+
+
+def _id_conflict_verdict(match: IdentityMatch) -> RuleVerdict:
+    """把内核报告的 ID 冲突包装成一条可进活动流水的拒绝理由。
+
+    借用 RuleVerdict 只是为了复用 ``_log_rejection`` 的去重与单集履历注解，
+    它并非规则过滤的结论——身份阶段就被否掉的候选压根走不到规则那一步。
+    """
+    return RuleVerdict(
+        accepted=False,
+        reason_code="identity_id_conflict",
+        reason_text=(
+            f"站点标注的影片编号与本条目不符（{match.id_conflict}）；"
+            "若确认是站点标错，可在搜索页手动选种投递"
+        ),
+    )
+
+
+def _ambiguous_verdict(outcome: str, reason: str) -> RuleVerdict:
+    """同名同年歧义的拒绝理由（``reject`` 自动否决 / ``ask`` 已转待确认）。"""
+    return RuleVerdict(
+        accepted=False,
+        reason_code=f"identity_ambiguous_{outcome}",
+        reason_text=reason,
+    )
+
+
+def _recheck_mismatch_verdict(candidate: TorrentCandidate) -> RuleVerdict:
+    """复核取回 ID 后连身份都不成立了——理论上不可达（片名年份没变），但
+    真出现说明这个候选的证据自相矛盾，按拒绝处理并留痕。"""
+    return RuleVerdict(
+        accepted=False,
+        reason_code="identity_recheck_failed",
+        reason_text=(
+            f"投递前复核后无法确认「{candidate.title[:60]}」属于本条目，已跳过"
+        ),
+    )
+
+
+# 身份证据强度的选优次序：ID 佐证过的候选永远优先于只靠片名+年份蒙的。
+# 缺了这一档，一个"只靠片名蒙的、做种数多"的候选会赢过"IMDb 精确命中、
+# 做种数少"的候选——正是同名同年错配能走到投递的原因之一。
+_CONFIDENCE_RANK = {"exact_id": 2, "title_year": 1, "title_only": 0}
 
 
 def covered_units(
@@ -649,6 +702,22 @@ async def evaluate_and_dispatch(
             if not covered and not upgrade_covered:
                 continue  # 身份命中但既无缺口也无可洗单元，无需任何动作
             summary.identity_hits += 1
+            if match.id_conflict:
+                # 外部 ID 反证：站点明确说了这是另一部片。当下没有别的上下文
+                # 可以推翻它（时长/体积反证与孪生条目探测尚未落地），按保守
+                # 口径否决——但**必须留下解释**：站点的 IMDb 是上传者手填的，
+                # 填错真实存在，用户看到活动流水才可能发现"这是站点标错了"
+                # 并手动选种。静默拒绝会让漏配变成一个查不出原因的哑巴故障
+                summary.rejected += 1
+                await _log_rejection(
+                    repo,
+                    ctx,
+                    candidate,
+                    covered or upgrade_covered,
+                    _id_conflict_verdict(match),
+                    source,
+                )
+                continue
             pack_units = len(match.episodes) or (len(covered) + len(upgrade_covered))
             verdict = evaluate_rules(candidate, ctx.spec, pack_episode_count=pack_units)
             if not verdict.accepted:
@@ -679,11 +748,26 @@ async def evaluate_and_dispatch(
     # 而纯洗版候选按定义不碰缺口单元，两侧的选优互不干扰。
     for media_id, entries in accepted.items():
         ctx = contexts[media_id]
+        # 身份证据强度排在洗版档位与评分之前：先要**对的片**，再谈档位和评分。
+        # 位置在 is_pack 之后是刻意的——"整季包优先"是既有的已确认决策，本次
+        # 只补身份维度，不顺手改包优先的语义
         entries.sort(
-            key=lambda e: (e[1].is_pack, e[3], e[2].score, e[0].seeders or 0), reverse=True
+            key=lambda e: (
+                e[1].is_pack,
+                _CONFIDENCE_RANK.get(e[1].confidence, 0),
+                e[3],
+                e[2].score,
+                e[0].seeders or 0,
+            ),
+            reverse=True,
         )
         remaining = dict(ctx.open_wanted)
         remaining_upgrade = dict(ctx.upgrade_wanted)
+        # 同名同年歧义每轮**最多问一次**：一部热门片一批能有几十个候选，逐个
+        # 问等于给用户刷屏几十条"这个是不是你要的片"。候选已按证据强度与评分
+        # 排好序，问最靠前的那个就够；后续候选照常评估（其中若有带影片编号的，
+        # 它能自动裁决出结果，比问用户更好），只是不再重复发问
+        asked_once = False
         for candidate, match, verdict, _rank in entries:
             published = publish_calendar_date(candidate.publish_time)
             targets = drop_proven_missing(
@@ -694,6 +778,71 @@ async def evaluate_and_dispatch(
             )
             if not targets and not upgrade_targets:
                 continue
+            # 投递前的外部 ID 复核（§7）：站点详情页几乎都标了 IMDb，而我们
+            # 从来没读过。位置放在这里是刻意的——只为**真的要投出去**的候选
+            # 花这一次请求（下一步本来就要向同站取种），被规则拒掉的、被更优
+            # 候选顶掉的都不花
+            if needs_external_id_recheck(candidate, ctx.identity):
+                enriched = await fetch_external_ids(session, candidate)
+                if enriched is not candidate:
+                    rechecked = match_identity(enriched, ctx.identity)
+                    if rechecked is None or rechecked.id_conflict:
+                        summary.rejected += 1
+                        await _log_rejection(
+                            repo,
+                            ctx,
+                            enriched,
+                            targets or upgrade_targets,
+                            _id_conflict_verdict(rechecked)
+                            if rechecked is not None
+                            else _recheck_mismatch_verdict(enriched),
+                            source,
+                        )
+                        continue
+                    # 证据变强了：候选与判定一起换成复核后的版本，投递台账
+                    # 记下的就是 exact_id
+                    candidate, match = enriched, rechecked
+            # 同名同年歧义（§9）：走到这里还只有"片名+年份"这一条证据的电影，
+            # 先问一句"这部片有没有同名同年的兄弟"。有兄弟就不能再凭片名年份
+            # 自动投——那正是本次错配的成因。ID 佐证过的（exact_id）不受影响
+            if match.confidence != "exact_id" and ctx.item.kind == "movie":
+                twins = await ensure_twins(session, ctx.item)
+                if twins:
+                    assert ctx.subscription.id is not None
+                    outcome, reason = await ambiguous_verdict(
+                        session,
+                        subscription_id=ctx.subscription.id,
+                        item=ctx.item,
+                        identity=ctx.identity,
+                        candidate=candidate,
+                        twins=twins,
+                        may_ask=not asked_once,
+                    )
+                    asked_once = asked_once or outcome == "ask"
+                    summary.rejected += 1
+                    await _log_rejection(
+                        repo,
+                        ctx,
+                        candidate,
+                        targets or upgrade_targets,
+                        _ambiguous_verdict(outcome, reason),
+                        source,
+                    )
+                    continue
+            # 体积÷片长 反证：**shadow 模式，只记录不改变行为**
+            # （docs/design/identity-confidence.md §10.2）。阈值是凭经验拍的，
+            # 直接开成否决会误伤正常发布；先让它在真实流量上跑一段，用投递
+            # 活动 payload 里的这条记录统计触发率与误报率，再决定是否生效。
+            # 只在真的投递出去的候选上记——那正是"这条规则本会拦下什么"的
+            # 待考察样本，被规则拒掉的候选不在此列
+            shadow = implausible_for_runtime(candidate, ctx.identity)
+            if shadow:
+                logger.info(
+                    "体积反证（shadow，未生效）：%s/%s %s",
+                    candidate.site_id,
+                    candidate.torrent_id,
+                    shadow,
+                )
             done = await dispatch(
                 session,
                 subscription=ctx.subscription,
@@ -704,6 +853,8 @@ async def evaluate_and_dispatch(
                 source=source,
                 upgrade_rows=upgrade_targets,
                 upgrade_labels=upgrade_labels,
+                match=match,
+                shadow_notes={"bitrate_reject": shadow} if shadow else None,
             )
             if done:
                 summary.dispatched_units += len(targets) + len(upgrade_targets)
