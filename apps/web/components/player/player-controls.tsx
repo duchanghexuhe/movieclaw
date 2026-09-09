@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ActivityIcon, CheckIcon, ExpandIcon, GearIcon, ShrinkIcon } from "@/components/icons";
+import { ActivityIcon, CheckIcon, ExpandIcon, MoreIcon, ShrinkIcon } from "@/components/icons";
 import type { PlaybackChapterMark } from "@/lib/api/playback";
 import type { AudioOption } from "@/lib/player/audio-tracks";
 import { SUBTITLE_OFFSET_STEP, clampSubtitleOffset } from "@/lib/player/subtitles";
@@ -43,8 +43,22 @@ import { type TrickplayIndex, tileAt } from "@/lib/player/trickplay";
  * 本身也是 `fill=currentColor` 的，所以这不算破例。
  */
 
-/** 功能键图标尺寸：与 page-nav 的顶栏控件一致。 */
-const ICON = "size-[18px] max-md:size-[22px]";
+/**
+ * 功能键图标尺寸：与 page-nav 的顶栏控件一致。
+ *
+ * **放大的判据是 `pointer-coarse`（手指），不是 `max-md`（窄视口）**——播放器里
+ * 所有控件的尺寸分档都照这条。两者在竖屏手机上恰好同时成立，看不出区别，但在
+ * **横屏手机**上会分家：iPhone 横屏是 844/852/932 宽，越过了 md 断点，按视口
+ * 分档就把命中区从 44 降到 36，低于 HIG 的 44pt 最小值（Material 是 48dp）——
+ * 而横屏正是看片的主要姿势，iPad 更是全程落在这一档。手指的大小跟屏幕转没转
+ * 没有关系。
+ *
+ * 进度条的命中带（.player-scrub 的 `pointer-coarse:h-11`）本来就是这么判的，
+ * 按钮这边曾用 `max-md`，于是同一条控制条里两套判据：横屏下进度条给足 44、
+ * 旁边的按钮只有 36。2026-09-09 统一到手指这一条。
+ */
+const ICON = "size-[18px] pointer-coarse:size-[22px]";
+
 
 /**
  * 描边图标底座：镜像 components/icons.tsx 里的 `Base`（那边没导出）。
@@ -69,7 +83,7 @@ function StrokeIcon({ children, className }: { children: React.ReactNode; classN
 
 /** 播放 / 暂停。只出现在中央簇，所以尺寸按中央簇给。 */
 function PlayGlyph({ paused }: { paused: boolean }) {
-  const cls = "size-[52px] fill-current max-md:size-11";
+  const cls = "size-[52px] fill-current pointer-coarse:size-11";
   return paused ? (
     <svg viewBox="0 0 24 24" className={cls} aria-hidden>
       <path d="M6 4.3v15.4a.7.7 0 0 0 1.07.6l12.3-7.7a.7.7 0 0 0 0-1.2L7.07 3.7A.7.7 0 0 0 6 4.3Z" />
@@ -93,7 +107,7 @@ function SkipGlyph({ forward }: { forward: boolean }) {
   // 弧心 (12,12.5)、半径 8。一端在正顶部 (12,4.5)，另一端留 60° 缺口——
   // 箭头要盖掉顶端一段，缺口小了箭头尖会怼上弧尾，圆环看起来是闭合的。
   return (
-    <svg viewBox="0 0 24 24" className="size-9 fill-current max-md:size-8" aria-hidden>
+    <svg viewBox="0 0 24 24" className="size-9 fill-current pointer-coarse:size-8" aria-hidden>
       <path
         d={forward ? "M12 4.5A8 8 0 1 0 18.93 8.5" : "M12 4.5A8 8 0 1 1 5.07 8.5"}
         fill="none"
@@ -197,13 +211,6 @@ export interface PlayerControlsProps {
   durationMs: number | null;
   /** 当前会话已缓冲到的文件位置，用于进度条的浅色底 */
   bufferedEndMs: number | null;
-  /**
-   * 实测取流速度的现成读数（「3.2 MB/s」）；null = 样本还不够，那一格不出现。
-   *
-   * 传格式化后的字符串而不是数字：这一格每秒刷一次，传数字的话每次都是新值、
-   * 每秒把整条控制条重渲染一遍，而屏幕上那行字十有八九一模一样。
-   */
-  networkSpeed: string | null;
   /** 控制条是否可见。进度条与其它控件一起淡入淡出（全出全收） */
   chromeVisible: boolean;
   onSeek: (fileMs: number) => void;
@@ -225,17 +232,6 @@ export interface PlayerControlsProps {
   onSubtitleStyleChange: (style: SubtitleStyle) => void;
   diagnosticsOpen: boolean;
   onToggleDiagnostics: () => void;
-  /** 剧集才有右下角那个位；电影不显示（「已完结」对电影是错的说法） */
-  isSeries: boolean;
-  /** 有下一集时的回调；剧集但为 null = 本季到头了，那个位显示「已完结」 */
-  onNext: (() => void) | null;
-  /**
-   * 有上一集时的回调；null = 已经是本季第一集（或往前没有在位文件）。
-   *
-   * 与 `onNext` 不同，没有上一集时**整颗按钮不出现**而不是留一个灰字：
-   * 「已完结」是对剧集状态的陈述、用户需要知道，「没有上一集」则不是信息。
-   */
-  onPrev: (() => void) | null;
   /** 横屏（全屏 + 锁横向）；已经在里面时点它就是退出 */
   landscape: boolean;
   /** 触屏设备（手机/平板）：显示横屏按钮。桌面只有全屏按钮 */
@@ -273,7 +269,6 @@ export function PlayerControls(props: PlayerControlsProps) {
     overrideMs,
     durationMs,
     bufferedEndMs,
-    networkSpeed,
     chromeVisible,
     onSeek,
     onScrub,
@@ -287,9 +282,6 @@ export function PlayerControls(props: PlayerControlsProps) {
     onSubtitleStyleChange,
     diagnosticsOpen,
     onToggleDiagnostics,
-    isSeries,
-    onNext,
-    onPrev,
     landscape,
     canRotate,
     onToggleLandscape,
@@ -512,64 +504,32 @@ export function PlayerControls(props: PlayerControlsProps) {
         }`}
       />
 
-      {/* ---- 进度条上方这一行：左边时间，右边横屏键，两端对齐 ----
-          横屏不跟字幕/设置放一起：那两个是「调这一路播放怎么放」，横屏是
-          「把画面铺满整块屏幕」，属于跟时间同级的观看形态。放在这一行还有
-          个实际好处——它和右下角的切集胶囊隔着进度条，不会误按。
-          两边高度取同一档，左右才真的对称。 */}
+      {/* ---- 进度条上方这一行：只有时间读数 ----
+          横屏/全屏原本占着这行右端，2026-09-09 随切集位一起挪到了进度条下方
+          （那里现在是左右两张同形制的按钮卡片）。这一行因此只剩一个读数，
+          整行不吃指针事件。 */}
       <div
-        // 行容器**永远 pointer-events-none**，命中权在右侧按钮组那个子元素上：
-        // pt-24 那截透明内边距只是撑视觉间距，但挂上 auto 它就会吃掉底下的
-        // 点击——横屏只有 320~390pt 高，这截正好罩在中央簇的退十秒按钮上，
-        // 按钮看得见按不动（层级在下、命中被这行截胡）。
-        className={`player-inset-x pointer-events-none relative flex items-center justify-between pt-24 pb-2 transition-opacity duration-300 max-md:pt-16 ${
+        // 行容器**永远 pointer-events-none**：pt-24 那截透明内边距只是撑视觉
+        // 间距，挂上 auto 它就会吃掉底下的点击——横屏只有 320~390pt 高，这截
+        // 正好罩在中央簇的退十秒按钮上，按钮看得见按不动（层级在下、命中被
+        // 这行截胡）。现在这行只有读数，没有任何需要命中的东西。
+        className={`player-inset-x pointer-events-none relative flex items-center pt-24 pb-2 transition-opacity duration-300 max-md:pt-16 ${
           chromeVisible ? "opacity-100" : "opacity-0"
         }`}
       >
-        {/* 两段各自成元素、靠 gap 分开：药丸是 flex，写在文字里的前导空格会
-            被折掉，变成「41:00/ 2:32:00」 */}
-        <div className="flex items-center gap-2">
-          <span className="player-glass inline-flex h-9 items-center gap-1 rounded-full px-3.5 text-[13px] tabular-nums text-white/90 max-md:h-11 max-md:text-[12px]">
-            <span>{formatClock(shown)}</span>
-            <span className="text-white/45">
-              / {durationMs ? formatClock(durationMs) : "--:--"}
-            </span>
+        {/* 时间是**读数**，比进度条下方那排操作键明显矮一档（28 vs 44/52）：
+            最不需要被点的东西不该看着最像能点的。也不跟着断点放大——那 44px
+            是最小触控目标，给一个点不了的读数套触控尺寸纯属白占地方。
+            主次靠颜色分：已播时间实白 + medium，总时长压到 40%。
+
+            两段各自成元素、靠 gap 分开：药丸是 flex，写在文字里的前导空格会
+            被折掉，变成「41:00/ 2:32:00」。 */}
+        <span className="player-glass inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[12px] font-medium tabular-nums text-white">
+          <span>{formatClock(shown)}</span>
+          <span className="font-normal text-white/40">
+            / {durationMs ? formatClock(durationMs) : "--:--"}
           </span>
-
-          {/* 实测取流速度。放在时间旁边而不是右上角：外网上「现在下得动吗」
-              和「放到哪了」是同一类持续关注的读数，凑一起扫一眼就够，右上角
-              那排是按钮区，塞读数进去会让人想去点它。
-              样本不够时整格不出现——空着比显示「-- MB/s」干净，而且这一格
-              本来就不是每个人都需要看的东西。 */}
-          {networkSpeed ? (
-            <span className="player-glass inline-flex h-9 items-center gap-1 rounded-full px-3 text-[13px] tabular-nums text-white/70 max-md:h-11 max-md:text-[12px]">
-              <span className="text-white/45">↓</span>
-              {networkSpeed}
-            </span>
-          ) : null}
-        </div>
-
-        {/* 横屏管方向、全屏管铺满——真横屏会顺带进全屏，此时全屏键自然
-            成为退出键。iPhone 没有元素级全屏，全屏键走系统原生播放器，
-            字幕靠 video 上的原生 VTT 轨跟进去（见 video-player 的 pip 轨） */}
-        <div className={`flex items-center gap-2 ${chromeVisible ? "pointer-events-auto" : ""}`}>
-          {canRotate ? (
-            <IconButton
-              glass
-              tip={landscape ? "退出横屏" : "横屏"}
-              onClick={onToggleLandscape}
-            >
-              <RotateGlyph active={landscape} />
-            </IconButton>
-          ) : null}
-          <IconButton
-            glass
-            tip={fullscreen ? "退出全屏" : "全屏"}
-            onClick={onToggleFullscreen}
-          >
-            {fullscreen ? <ShrinkIcon className={ICON} /> : <ExpandIcon className={ICON} />}
-          </IconButton>
-        </div>
+        </span>
       </div>
 
       {/* ---- 进度条 ----
@@ -579,7 +539,7 @@ export function PlayerControls(props: PlayerControlsProps) {
           pointer-events-none 必须跟着：透明但可拖的进度条会把「点屏幕下缘
           唤出控制层」截胡成一次误 seek。 */}
       <div
-        className={`player-scrub-row player-scrub-inset relative transition-opacity duration-300 ${
+        className={`player-scrub-row player-inset-x relative transition-opacity duration-300 ${
           chromeVisible ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
         }`}
       >
@@ -837,7 +797,11 @@ export function PlayerControls(props: PlayerControlsProps) {
                   open={menu === "settings"}
                   onClick={() => openMenu(menu === "settings" ? "none" : "settings")}
                 >
-                  <GearIcon className={ICON} />
+                  {/* 三点而不是齿轮：齿轮在播放器里指向「偏好设置」，而这颗后面
+                      是画质与播放诊断——一组针对**这次播放**的杂项，三点的
+                      「还有别的」正是这个语义。说明气泡与面板标题仍是「设置」，
+                      点开看到的东西没变。 */}
+                  <MoreIcon className={ICON} />
                 </IconButton>
                 {menu === "settings" ? (
                   <MenuPanel title="设置" onClose={() => openMenu("none")}>
@@ -877,40 +841,27 @@ export function PlayerControls(props: PlayerControlsProps) {
 
             <div className="flex-1" />
 
-            {/* 右下角切集位。剧集才有：「已完结」这句话对电影是错的，
-                而电影本来也没有别的东西会因为这个位空着而移位。
+            {/* 右下角：横屏 + 全屏。两颗共一张卡片，与左边那张**完全同形制**
+                （同高、同圆角、同内边距），一行两端因此是对称的两块，而不是
+                一块卡片对一组文字胶囊。
 
-                上一集恒在下一集左边（包括本季放到头、右边是「已完结」的
-                时候）——切集是双向的，只给单向会逼用户退回详情页点集。
+                横屏管方向、全屏管铺满——真横屏会顺带进全屏，此时全屏键自然
+                成为退出键。iPhone 没有元素级全屏，全屏键走系统原生播放器，
+                字幕靠 video 上的原生 VTT 轨跟进去（见 video-player 的 pip 轨）。
 
-                纯文字胶囊：中文标签已把方向说全，箭头小图标是冗余装饰，
-                去掉后与「已完结」（本就无图标）风格统一。 */}
-            {isSeries ? (
-              <div className="flex items-center gap-2 max-md:gap-1.5">
-                {onPrev ? (
-                  <button
-                    type="button"
-                    onClick={onPrev}
-                    className="player-glass flex items-center rounded-full px-4 py-2.5 text-[14px] font-medium text-white transition-colors hover:bg-white/20 max-md:px-3 max-md:py-2 max-md:text-[13px]"
-                  >
-                    上一集
-                  </button>
-                ) : null}
-                {onNext ? (
-                  <button
-                    type="button"
-                    onClick={onNext}
-                    className="player-glass flex items-center rounded-full px-4 py-2.5 text-[14px] font-medium text-white transition-colors hover:bg-white/20 max-md:px-3 max-md:py-2 max-md:text-[13px]"
-                  >
-                    下一集
-                  </button>
-                ) : (
-                  <span className="player-glass rounded-full px-4 py-2.5 text-[14px] text-white/40 max-md:px-3 max-md:py-2 max-md:text-[13px]">
-                    已完结
-                  </span>
-                )}
-              </div>
-            ) : null}
+                原来这里是上一集/下一集，2026-09-09 按产品决定移除；片尾窗口内
+                的「下一集」卡片仍在（video-player 的 nextCard），片尾之外与
+                「上一集」改由详情页承担。 */}
+            <div className="player-glass flex items-center gap-1 rounded-full px-1.5 py-1">
+              {canRotate ? (
+                <IconButton tip={landscape ? "退出横屏" : "横屏"} onClick={onToggleLandscape}>
+                  <RotateGlyph active={landscape} />
+                </IconButton>
+              ) : null}
+              <IconButton tip={fullscreen ? "退出全屏" : "全屏"} onClick={onToggleFullscreen}>
+                {fullscreen ? <ShrinkIcon className={ICON} /> : <ExpandIcon className={ICON} />}
+              </IconButton>
+            </div>
           </div>
         </div>
       </div>
@@ -978,7 +929,7 @@ function CenterButton({
       aria-label={label}
       // 淡出后必须同时断掉命中，否则隐形的按钮会在用户想点画面时误触
       className={`player-btn drop-shadow-[0_2px_8px_rgba(0,0,0,0.65)] ${
-        primary ? "size-[68px] max-md:size-14" : "size-12 max-md:size-11"
+        primary ? "size-[68px] pointer-coarse:size-14" : "size-12 pointer-coarse:size-11"
       } ${visible ? "pointer-events-auto" : "pointer-events-none"}`}
     >
       {children}
@@ -990,15 +941,13 @@ function CenterButton({
  * 控制条上的图标按钮：换底色 + 上方说明气泡，尺寸与全站顶栏控件一致
  * （样式在 globals.css 的 .player-btn）。
  *
- * `glass` 是给**单独浮在画面上**的键用的（横屏键）：它不在那张磨砂卡片里，
- * 得自己带一层玻璃底，否则会直接糊进画面。卡片里的键不能开这个开关——
- * 那会变成「玻璃里的玻璃」。
+ * 自己不带玻璃底：控制条上的键一律装在磨砂卡片里，每个再包一层会变成
+ * 「玻璃里的玻璃」。单独浮在画面上的键（顶栏的返回/画中画）不走这个组件。
  */
 function IconButton({
   tip,
   active,
   open,
-  glass,
   onClick,
   children,
 }: {
@@ -1012,7 +961,6 @@ function IconButton({
   active?: boolean;
   /** 这个按钮的菜单正展开着 */
   open?: boolean;
-  glass?: boolean;
   onClick: () => void;
   children: React.ReactNode;
 }) {
@@ -1025,9 +973,7 @@ function IconButton({
       data-tip={tip}
       data-active={active ? "true" : undefined}
       data-open={open ? "true" : undefined}
-      className={`player-btn player-tip size-9 shrink-0 max-md:size-11 ${
-        glass ? "player-glass player-btn--glass" : ""
-      }`}
+      className="player-btn player-tip size-9 shrink-0 pointer-coarse:size-11"
     >
       {children}
     </button>

@@ -34,6 +34,7 @@ import { formatBandwidth } from "@/lib/player/bandwidth";
 import { getCapabilitySnapshot } from "@/lib/player/capability";
 import type { PlaybackEngine } from "@/lib/player/engine";
 import { createEngine, preloadHlsEngine } from "@/lib/player/engine";
+import { pipSupported } from "@/lib/player/pip";
 import { bufferedAhead } from "@/lib/player/stall";
 import {
   awaitsUserDecision,
@@ -164,8 +165,11 @@ const PING_INTERVAL_MS = 15_000;
 const IDLE_HIDE_MS = 4000;
 
 /**
- * iOS Safari 的画中画：没有 W3C 那套 API，只有带前缀的 presentationMode。
- * TS 的 DOM 类型至今没收录，本文件里多处要用，收成一个类型别名。
+ * Apple 平台带前缀的画中画 API（presentationMode）。TS 的 DOM 类型至今没收录，
+ * 本文件里多处要用，收成一个类型别名。
+ *
+ * 现在的 iOS/macOS 两套 API 都在（W3C 那套后来也补上了），但**在 Apple 平台上
+ * 这套前缀 API 才是可信的那个**，理由见下面 canPip 的探测。
  */
 interface WebkitPresentationVideo {
   webkitSupportsPresentationMode?: (mode: string) => boolean;
@@ -176,7 +180,7 @@ interface WebkitPresentationVideo {
 /** 画中画图标：一个大屏 + 右下角的小窗；退出态把小窗画到左上，表示「收回大屏」。 */
 function PipGlyph({ exit }: { exit: boolean }) {
   return (
-    <svg viewBox="0 0 24 24" className="size-[18px] max-md:size-[22px]" fill="currentColor" aria-hidden>
+    <svg viewBox="0 0 24 24" className="size-[18px] pointer-coarse:size-[22px]" fill="currentColor" aria-hidden>
       <path d="M3 5.5A1.5 1.5 0 0 1 4.5 4h15A1.5 1.5 0 0 1 21 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5v-13Zm2 .5v12h14V6H5Z" />
       <path d={exit ? "M7 8h7v5H7V8Z" : "M12 12h6v5h-6v-5Z"} />
     </svg>
@@ -2052,10 +2056,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
   }, []);
 
   /**
-   * 画中画的能力探测与状态跟随。
-   *
-   * `disablePictureInPicture` 也要看：视频自己声明了不许进小窗时，
-   * 标准 API 存在但调用必然被拒。
+   * 画中画的能力探测与状态跟随。判定规则与「为什么不能把两个信号取或」
+   * 见 lib/player/pip.ts（iOS 主屏 Web App 里标准标志会谎报）。
    */
   useEffect(() => {
     if (!video) {
@@ -2064,9 +2066,17 @@ export function VideoPlayer(props: VideoPlayerProps) {
       return;
     }
     const webkit = video as WebkitPresentationVideo;
+    const webkitProbe = webkit.webkitSupportsPresentationMode;
     setCanPip(
-      (document.pictureInPictureEnabled === true && !video.disablePictureInPicture) ||
-        webkit.webkitSupportsPresentationMode?.("picture-in-picture") === true,
+      pipSupported({
+        disabled: video.disablePictureInPicture === true,
+        // null = 压根没有前缀 API（非 Apple 浏览器），与「探测为假」是两回事
+        webkitSupports:
+          typeof webkitProbe === "function"
+            ? webkitProbe.call(video, "picture-in-picture") === true
+            : null,
+        standardEnabled: document.pictureInPictureEnabled === true,
+      }),
     );
     // 小窗可以被用户从系统 UI 直接关掉，按钮状态只能跟着事件走，不能自己记
     const sync = () =>
@@ -2096,16 +2106,21 @@ export function VideoPlayer(props: VideoPlayerProps) {
   const togglePip = useCallback(() => {
     if (!video) return;
     const webkit = video as WebkitPresentationVideo;
-    if (webkit.webkitSetPresentationMode && document.pictureInPictureEnabled !== true) {
+    // 与上面的探测同一条口径：Apple 平台走前缀 API。原来这里附加了
+    // `pictureInPictureEnabled !== true`，而现在的 iOS/macOS 两个标志都为真，
+    // 于是 Safari 上反而绕去了标准 API——判据要和探测的那一条对上。
+    if (typeof webkit.webkitSetPresentationMode === "function") {
       const target =
         webkit.webkitPresentationMode === "picture-in-picture" ? "inline" : "picture-in-picture";
       webkit.webkitSetPresentationMode(target);
       // 这个调用是同步 void：被系统拒绝时**什么都不发生**（模式不变、无异常、
       // 无事件），按钮看起来就是「点了没反应」——真机上没法排查。稍等半秒查
       // 模式有没有真的切过去，没切就把拒绝这件事说出来。
-      // 最常见的拒绝就是 iOS 的桌面网页应用（PWA）形态：WebKit 的独立容器
-      // 不给网页画中画的通路，webkitSupportsPresentationMode 却照样报 true，
-      // 网页侧无解——能做的只有把去处说清楚（Safari 里打开就能用）。
+      //
+      // 正常情况下 iOS 主屏 Web App 已经被上面的探测挡在门外（那里
+      // webkitSupportsPresentationMode 报 false，按钮根本不渲染），这条 standalone
+      // 分支是留给「某个 iOS 版本连前缀 API 也谎报 true」的兜底。剩下的常见
+      // 拒绝是低电量模式。
       if (target === "picture-in-picture") {
         window.setTimeout(() => {
           if (webkit.webkitPresentationMode !== "picture-in-picture") {
@@ -2453,8 +2468,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 能拦与拦不了要分清：**PWA（添加到主屏）里**，iOS 把历史滑动交给页面
    * 先裁决，边缘触摸的 touchstart 上 preventDefault 就能拦下——这是标准
    * 手段（也是各视频类 PWA 的通行做法）；**Safari 标签页里**该手势属于
-   * 浏览器 chrome，网页无权禁用，只能靠进度条让位（.player-scrub-inset）
-   * 把可拖元素挪出手势区。桌面触控板的双指历史滑动由下面的
+   * 浏览器 chrome，网页无权禁用，只能靠进度条让位（.player-inset-x 的窄屏
+   * 那档）把可拖元素挪出手势区。桌面触控板的双指历史滑动由下面的
    * overscroll-behavior 规则（globals.css）负责。
    *
    * 两个刻意的细节：
@@ -3015,12 +3030,12 @@ export function VideoPlayer(props: VideoPlayerProps) {
             type="button"
             onClick={goBack}
             // 淡出后必须同时断掉命中：隐形却仍能点的按钮会在用户想点画面时误触
-            className={`grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] max-md:size-11 ${
+            className={`grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] pointer-coarse:size-11 ${
               chromeVisible ? "pointer-events-auto" : "pointer-events-none"
             }`}
             aria-label={landscape ? "退出横屏" : "退出播放"}
           >
-            <ChevronLeftIcon className="size-[18px] max-md:size-[22px]" />
+            <ChevronLeftIcon className="size-[18px] pointer-coarse:size-[22px]" />
           </button>
           <div className="min-w-0">
             <h1 className="truncate text-[17px] font-semibold text-white drop-shadow">{title}</h1>
@@ -3029,43 +3044,68 @@ export function VideoPlayer(props: VideoPlayerProps) {
             ) : null}
           </div>
 
-          {/* 画中画放顶栏右上角，不回控制条：它不是「控制这次播放」的动作，
-              而是「把这次播放带走」——和左上角的退出键成对，一个离开播放、
-              一个带着继续。控制条右簇留给字幕/设置/全屏那批真正的播放控制。
+          {/* 顶栏右簇。整簇一起 ml-auto 顶到右边，而不是让成员各自挂——
+              成员是按条件出现的（锁屏只在横屏、画中画看浏览器支持），谁排头
+              不固定，挂在成员上就得每加一个东西给所有人的三元再添一个分支。 */}
+          <div className="ml-auto flex shrink-0 items-center gap-4">
+            {/* 实测取流速度（docs/design/player-feel.md §2.G3）。放顶栏右上角
+                而不是控制条的时间旁边：它是**读数**不是控制项，和左上角的片名
+                同属「这次播放是什么」那一层，与下方那排「你能做什么」分开。
 
-              浏览器不支持由网页发起时整颗不渲染（Firefox 的画中画只在它自己
-              的界面里，留着就是个死按钮）。 */}
-          {/* 锁屏只在触屏的横屏里出现：横躺着看片时手掌压在屏幕上是常态，
-              而竖屏握持时误触少得多，多一颗按钮反而是噪音。 */}
-          {canRotate && (landscape || fakeLandscape || deviceLandscape) ? (
-            <button
-              type="button"
-              onClick={() => {
-                setLocked(true);
-                revealLock();
-              }}
-              className={`ml-auto grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] max-md:size-11 ${
-                chromeVisible ? "pointer-events-auto" : "pointer-events-none"
-              }`}
-              aria-label="锁屏"
-              title="锁屏（防误触）"
-            >
-              <LockIcon className="size-[18px] max-md:size-[22px]" />
-            </button>
-          ) : null}
-          {canPip ? (
-            <button
-              type="button"
-              onClick={togglePip}
-              className={`grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] max-md:size-11 ${
-                canRotate && (landscape || fakeLandscape || deviceLandscape) ? "" : "ml-auto"
-              } ${chromeVisible ? "pointer-events-auto" : "pointer-events-none"}`}
-              aria-label={pipActive ? "退出画中画" : "画中画"}
-              title={pipActive ? "退出画中画" : "画中画"}
-            >
-              <PipGlyph exit={pipActive} />
-            </button>
-          ) : null}
+                裸文字，不套控制条那种玻璃药丸，两个理由：
+                - 圆角实底是「可点」的暗示，而右侧这一排全是按钮，做成药丸会
+                  让人伸手去点一个点不动的东西。
+                - 顶栏本来就压着一条 from-black/80 的渐变，这个位置自带底色，
+                  不需要再糊一块 backdrop-filter 才读得清。而每一块磨砂都要
+                  逐帧对视频重采样（见 globals.css 的 .player-glass 注释，
+                  实测掉帧的头号大户）——一个用来量卡顿的读数不该自己制造卡顿。
+
+                样本不够时整格不出现：空着比「-- MB/s」干净，这一格本来也不是
+                每个人都需要盯的东西。字号/弱色与转圈下方那行取同一档，同一个
+                读数在两处长得一样。 */}
+            {speedLabel ? (
+              <span className="tnum text-[12px] text-white/45">↓ {speedLabel}</span>
+            ) : null}
+
+            {/* 锁屏只在触屏的横屏里出现：横躺着看片时手掌压在屏幕上是常态，
+                而竖屏握持时误触少得多，多一颗按钮反而是噪音。 */}
+            {canRotate && (landscape || fakeLandscape || deviceLandscape) ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setLocked(true);
+                  revealLock();
+                }}
+                className={`grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] pointer-coarse:size-11 ${
+                  chromeVisible ? "pointer-events-auto" : "pointer-events-none"
+                }`}
+                aria-label="锁屏"
+                title="锁屏（防误触）"
+              >
+                <LockIcon className="size-[18px] pointer-coarse:size-[22px]" />
+              </button>
+            ) : null}
+
+            {/* 画中画放顶栏右上角，不回控制条：它不是「控制这次播放」的动作，
+                而是「把这次播放带走」——和左上角的退出键成对，一个离开播放、
+                一个带着继续。控制条右簇留给字幕/设置/全屏那批真正的播放控制。
+
+                浏览器不支持由网页发起时整颗不渲染（Firefox 的画中画只在它自己
+                的界面里，留着就是个死按钮）。 */}
+            {canPip ? (
+              <button
+                type="button"
+                onClick={togglePip}
+                className={`grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] pointer-coarse:size-11 ${
+                  chromeVisible ? "pointer-events-auto" : "pointer-events-none"
+                }`}
+                aria-label={pipActive ? "退出画中画" : "画中画"}
+                title={pipActive ? "退出画中画" : "画中画"}
+              >
+                <PipGlyph exit={pipActive} />
+              </button>
+            ) : null}
+          </div>
         </div>
 
         {/* 锁屏中的解锁键：画面左侧居中（拇指够得到，又不压在中央播放键上）。
@@ -3370,7 +3410,6 @@ export function VideoPlayer(props: VideoPlayerProps) {
             overrideMs={overrideMs}
             durationMs={durationMs}
             bufferedEndMs={bufferedEndMs}
-            networkSpeed={speedLabel}
             chromeVisible={chromeVisible}
             onSeek={commitSeek}
             onScrub={scrubTo}
@@ -3388,9 +3427,6 @@ export function VideoPlayer(props: VideoPlayerProps) {
             diagnosticsOpen={diagnosticsOpen}
             onToggleDiagnostics={() => setDiagnosticsOpen((open) => !open)}
             // 剧集才有右下角那个切集位；电影 episodeLabel 为 null
-            isSeries={episodeLabel !== null}
-            onNext={next ? onPlayNext : null}
-            onPrev={prev ? onPlayPrev : null}
             landscape={landscape}
             canRotate={canRotate}
             onToggleLandscape={toggleLandscape}
