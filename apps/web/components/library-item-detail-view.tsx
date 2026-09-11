@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import { Children, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
@@ -8,6 +9,7 @@ import type { Route } from "next";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
+import { AddToCollectionDialog } from "@/components/add-to-collection-dialog";
 import { ArtworkPickerDialog } from "@/components/artwork-picker-dialog";
 import { CastRow } from "@/components/cast-row";
 import { ChapterStrip } from "@/components/chapter-strip";
@@ -72,11 +74,12 @@ import { formatClock } from "@/lib/player/timeline";
 import { USER_LOWEST_SOURCE, mediaSourceDisplayLabel } from "@/lib/media-source-annotation";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
 import { useBackdrop } from "@/lib/backdrop";
+import { useIsMobile } from "@/lib/use-media-query";
 import { resolveRequestUrl } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { languageLabel } from "@/lib/language-labels";
 import { invalidateLibraryDetailSnapshot } from "@/lib/library-detail-snapshot";
-import { refreshItemConfirm } from "@/lib/library-confirm";
+import { refreshItemConfirm, rereadItemNfoConfirm } from "@/lib/library-confirm";
 import { usePermissions } from "@/lib/permissions";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
 import { usePageTitle } from "@/lib/use-page-title";
@@ -164,6 +167,7 @@ export function LibraryItemDetailView({
   const [artworkOpen, setArtworkOpen] = useState(false);
   // 分享弹窗（docs/design/media-share.md）：打开前先查当前有效分享，按有无决定形态
   const [shareOpen, setShareOpen] = useState(false);
+  const [addToCollectionOpen, setAddToCollectionOpen] = useState(false);
   const [shareInitial, setShareInitial] = useState<ShareView | null>(null);
   // 删除确认弹窗
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -316,12 +320,26 @@ export function LibraryItemDetailView({
   // 不再只铺详情卡片的局部），离开即恢复用户配置的背景——见 lib/backdrop.tsx
   // 的 setOverrideBackdrop。没有横幅剧照时退回海报，覆盖层自己会铺满作氛围色。
   const { setOverrideBackdrop } = useBackdrop();
+  const isMobile = useIsMobile();
   const immersiveUrl = detail ? imageUrl(detail.backdrop_url ?? detail.poster_url) : "";
+  // 手机也换全站背景，但页面本身不靠它显示：横版剧照铺满又高又窄的整屏只能按高度放大、
+  // 从正中裁一条竖条，所以手机上看到的剧照是页内 Hero（mobileHeroSrc），滚动容器铺黑把
+  // 全站背景整个挡住。仍然要换，是因为侧栏的液态玻璃折射的就是全站背景
+  // （useBackdrop().backdrop）：不换的话展开侧栏透出的是用户自己的壁纸，与页面上的剧照
+  // 断成两截。两处是同一个 URL，浏览器只下载一次
   useEffect(() => {
     if (!immersiveUrl) return;
     setOverrideBackdrop(immersiveUrl);
     return () => setOverrideBackdrop(null);
   }, [immersiveUrl, setOverrideBackdrop]);
+  // 手机 Hero 用剧照，与桌面同一张：海报在外面的海报墙上已经看过了，进详情页要的是另一张
+  // 画面。没有剧照时才退回主图（其他库的抓帧、极少数没刮到剧照的条目）
+  const mobileHeroSrc = immersiveUrl;
+  // Hero 的框比剧照高：宽度撑满、高约 1.15 倍宽（封顶 62svh，390px 宽的屏上约 448px）。
+  // 横版剧照按高度铺满、上下不裁，左右裁掉两边、居中留下人物主体——比按宽度塞下整张
+  // （只有 219px 高）多一倍画面，又不像铺满整屏那样只剩中间一条
+  const mobileHeroHeight = "min(115vw, 62svh)";
+  const showMobileHero = isMobile && mobileHeroSrc !== "";
 
   // 待回收行的恢复 / 立即清理（library-file-recycle.md §7）。
   // 恢复是可逆动作直接执行；清理真删磁盘，做种保护形态额外讲清断种风险
@@ -487,6 +505,8 @@ export function LibraryItemDetailView({
   const itemFacts = [
     detail.year ? String(detail.year) : null,
     runtimeMinutes != null ? formatRuntimeMinutes(runtimeMinutes) : null,
+    // 评分：海报墙上默认不印，点进来想知道"这部好不好看"时，这里必须有
+    meta?.rating ? `★ ${meta.rating.toFixed(1)}` : null,
   ].filter((fact): fact is string => Boolean(fact));
   const directorCast =
     meta
@@ -505,7 +525,9 @@ export function LibraryItemDetailView({
 
   const runMetadataRefresh = async () => {
     // 重操作先确认：单条目刷新是 force 语义（图片覆盖重下），说清再动手
-    if (!(await confirm(refreshItemConfirm(detail?.title ?? "此条目")))) return;
+    // 其他库的视频条目：刷新是重读 NFO + 重新生成封面，不套 TMDB 那份文案
+    const ask = detail?.kind === "video" ? rereadItemNfoConfirm : refreshItemConfirm;
+    if (!(await confirm(ask(detail?.title ?? "此条目")))) return;
     setKicking(true);
     try {
       await refreshItemMetadata(libraryId, mediaItemId);
@@ -531,7 +553,11 @@ export function LibraryItemDetailView({
     // 满屏布局，没有留白，圆角直接压在屏幕边上：顶栏的吸顶雾层被这层
     // overflow 一裁，就成了贴在屏幕顶上的一块圆角色块（手机上肉眼可见的
     // 两个缺角），底边同理被 Home 指示条切掉。手机上一律方角、真通栏。
-    <div className="detail-ambient scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl max-md:rounded-none">
+    <div
+      className={`detail-ambient scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl max-md:rounded-none ${
+        showMobileHero ? "detail-ambient--hero" : ""
+      }`}
+    >
       {/* 没有任何 Hero 图层：全站背景此刻就是本片剧照（沉浸覆盖 + 本页豁免
           全局蒙版，见 app-shell 的 isHome），大图直出、零边界；.detail-ambient
           在滚动容器上铺「透明 → 纯黑」的渐变板托住下方内容（见 globals.css）。
@@ -558,8 +584,11 @@ export function LibraryItemDetailView({
               }}
               identifiable={scrapedLibrary}
               scraped={detail.source === "tmdb"}
+              readsNfo={detail.kind === "video"}
               scraping={scrapingNow}
               searchHref={`/search?q=${encodeURIComponent(detail.title)}` as Route}
+              // 加入合集：任何能看到这部片的人都能把它扔进自己的单子
+              onAddToCollection={() => setAddToCollectionOpen(true)}
               // 分享仅超管（media-share.md §2.1）；照片库条目不分享（分享页是影片页）
               onShare={
                 isAdmin && detail.kind !== "photo"
@@ -627,8 +656,32 @@ export function LibraryItemDetailView({
         }
       />
 
-      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸 */}
-      <div className="h-[30vh] min-h-[180px] max-md:h-[22vh] max-md:min-h-[120px]" />
+      {/* 手机 Hero（剧照）：宽度撑满，从状态栏底下起铺（绝对定位在滚动内容顶端，PageNav
+          的返回键与吸顶雾层浮在它上面），随内容一起滚走，不固定在背景上。顶部一抹暗让状态栏
+          与返回键落在亮图上也读得清；底部从中段开始压暗，到底边落成纯黑，与下方黑底无缝接上 */}
+      {showMobileHero && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 top-0 z-0 overflow-hidden"
+          style={{ height: mobileHeroHeight }}
+        >
+          <img src={mobileHeroSrc} alt="" decoding="async" className="size-full object-cover object-center" />
+          <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-black/45 to-transparent" />
+          <div className="absolute inset-x-0 bottom-0 h-[55%] bg-gradient-to-b from-transparent via-black/55 to-black" />
+        </div>
+      )}
+
+      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。手机有 Hero 时 = Hero 高度减去吸顶
+          顶栏的占位（52px + 安全区）与片名压进图里的那一截（150px），片名与信息落在剧照
+          底部的渐变上；视口很矮时减到负数就不留白 */}
+      <div
+        className={showMobileHero ? undefined : "h-[30vh] min-h-[180px] max-md:h-[22vh] max-md:min-h-[120px]"}
+        style={
+          showMobileHero
+            ? { height: `max(0px, calc(${mobileHeroHeight} - 52px - var(--safe-top) - 150px))` }
+            : undefined
+        }
+      />
 
       {/* 内容层：-mt-28/pt-28 与 .detail-ambient 的渐变起点对齐——渐变从标题
           上方开始压暗，音轨附近已接近纯黑，下面保持全黑。 */}
@@ -680,6 +733,53 @@ export function LibraryItemDetailView({
             <p className="text-on-image mt-3 text-ui leading-6 text-white/72 max-md:mt-2 max-md:text-sub">
               {meta.genres.join(" · ")}
             </p>
+          )}
+          {/* 系列与合集**分两行、各带一个标签词**。两者长得一模一样、意思
+              完全不同：系列是这部片的事实（片方就这么拍的，你改不了），合集
+              是用户自己的归类。不加标签的话「新海诚系列」和「周末清单」在
+              视觉上没有任何区别，读者分不清哪个是哪个。
+
+              都用文字而不是海报卡：合集的身份是它的名字，不是封面——而封面
+              恰恰是从成员海报里借的，在这部片的页面上很可能借到它自己。
+              Netflix 的「关于本片」、Plex 的 COLLECTIONS 行都是同一个判断：
+              归属用文字，推荐才用卡片。 */}
+          {detail?.series_name && (
+            <MetaLinkRow label="系列">
+              {/* 只有本库真的生成了那个合集才给链接——一个点了 404 的入口比
+                  不给更糟；没有合集时仍然把系列名说出来，那是这部片的事实 */}
+              {detail.series_collection_id ? (
+                <Link
+                  href={`/library/${libraryId}/c/${detail.series_collection_id}` as Route}
+                  className="underline-offset-4 hover:underline"
+                >
+                  {detail.series_name}
+                </Link>
+              ) : (
+                <span>{detail.series_name}</span>
+              )}
+            </MetaLinkRow>
+          )}
+          {detail && detail.collections.length > 0 && (
+            <MetaLinkRow label="合集">
+              {detail.collections.slice(0, COLLECTION_ROW_LIMIT).map((row) => (
+                <Link
+                  key={row.id}
+                  href={`/library/${libraryId}/c/${row.id}` as Route}
+                  className="underline-offset-4 hover:underline"
+                >
+                  {row.name}
+                </Link>
+              ))}
+              {/* 一部片进了八个合集也不该把这一行撑爆；余下的交给合集视图 */}
+              {detail.collections.length > COLLECTION_ROW_LIMIT && (
+                <Link
+                  href={`/library/${libraryId}?view=collections` as Route}
+                  className="text-white/50 underline-offset-4 hover:underline"
+                >
+                  还有 {detail.collections.length - COLLECTION_ROW_LIMIT} 个
+                </Link>
+              )}
+            </MetaLinkRow>
           )}
           <MediaTrackRows
             files={trackFiles}
@@ -948,6 +1048,15 @@ export function LibraryItemDetailView({
           initialShare={shareInitial}
         />
       )}
+
+      {addToCollectionOpen && (
+        <AddToCollectionDialog
+          libraryId={libraryId}
+          mediaItemId={mediaItemId}
+          title={detail.title}
+          onClose={() => setAddToCollectionOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1142,6 +1251,7 @@ function ItemActionsMenu({
   canManage,
   identifiable,
   scraped,
+  readsNfo,
   scraping,
   searchHref,
   onReidentify,
@@ -1154,6 +1264,7 @@ function ItemActionsMenu({
   onUpgrade,
   onClearHistory,
   onShare,
+  onAddToCollection,
 }: {
   /** 媒体库管理权限：识别/刮削/图片/转移/删除这些条目管理项按它显隐 */
   canManage: boolean;
@@ -1163,6 +1274,8 @@ function ItemActionsMenu({
   identifiable: boolean;
   /** 条目本身来自 TMDB：给刷新元数据/更换图片；本地条目只有封面 */
   scraped: boolean;
+  /** 其他库的视频条目：刷新会先重读视频旁的 NFO（照片、影视库里的临时条目只重建封面） */
+  readsNfo: boolean;
   scraping: boolean;
   /** 站点资源搜索直达（预填片名）：手动补版本/换版本的入口 */
   searchHref: Route;
@@ -1179,6 +1292,8 @@ function ItemActionsMenu({
   onUpgrade?: () => void;
   /** 清除当前登录身份自己对这部作品的观看记录：个人数据，与管理权无关 */
   onClearHistory: () => void;
+  /** 加进手动合集（F4）：这是"我要把这部片扔进那个单子"最自然的落点 */
+  onAddToCollection?: () => void;
 }) {
   const router = useRouter();
   const itemClass =
@@ -1217,6 +1332,11 @@ function ItemActionsMenu({
               搜索资源
             </DropdownMenu.Item>
           )}
+          {onAddToCollection && (
+            <DropdownMenu.Item onSelect={onAddToCollection} className={itemClass}>
+              加入合集…
+            </DropdownMenu.Item>
+          )}
           {onShare && (
             <DropdownMenu.Item onSelect={onShare} className={itemClass}>
               分享…
@@ -1250,7 +1370,13 @@ function ItemActionsMenu({
                   disabled={scraping}
                   className={itemClass}
                 >
-                  {scraping ? "正在生成封面…" : "重新生成封面"}
+                  {scraping
+                    ? readsNfo
+                      ? "正在读取 NFO…"
+                      : "正在生成封面…"
+                    : readsNfo
+                      ? "重新读取 NFO 与封面"
+                      : "重新生成封面"}
                 </DropdownMenu.Item>
               )}
               {onRegenerateChapterImages && (
@@ -2620,5 +2746,34 @@ function DeleteFileDialog({
         )}
       </div>
     </Modal>
+  );
+}
+
+/** 「合集」那一行最多摆几个，再多的收进「还有 N 个」。 */
+const COLLECTION_ROW_LIMIT = 3;
+
+/**
+ * 元数据区的一行「标签 + 若干链接」：系列、合集共用。
+ *
+ * 标签列宽与紧随其后的音轨 / 字幕行**逐字同款**（`w-10` + `gap-4` +
+ * `text-sub text-[var(--text-faint)]`）——这四行是连着排的，标签列差几个像素
+ * 就会看出来。第一版自作主张用了另一套间距，截图上四行分成两段，一眼就歪。
+ *
+ * 值之间用 `·` 分隔，与上方的类型行同一套读法。
+ */
+function MetaLinkRow({ label, children }: { label: string; children: ReactNode }) {
+  const items = Children.toArray(children);
+  return (
+    <div className="text-on-image mt-2 flex items-baseline gap-4 text-ui leading-6 text-white/72 max-md:text-sub">
+      <span className="w-10 shrink-0 text-sub text-[var(--text-faint)]">{label}</span>
+      <span className="min-w-0">
+        {items.map((child, index) => (
+          <Fragment key={index}>
+            {index > 0 && <span className="text-white/30"> · </span>}
+            {child}
+          </Fragment>
+        ))}
+      </span>
+    </div>
   );
 }

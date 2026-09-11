@@ -80,6 +80,8 @@ export interface MediaLibrary {
   extract_chapter_images: boolean;
   /** 是否从首页「最近添加」等汇总里排除 */
   exclude_from_home: boolean;
+  /** 是否按作品系列自动生成合集（展示偏好，不影响落库与写 NFO） */
+  auto_series_collections: boolean;
   /** 可见范围（docs/design/library-access.md）：everyone / selected */
   access_mode: LibraryAccessMode;
   /** 超管本人是否在浏览范围内（管理权不受影响） */
@@ -255,6 +257,8 @@ export interface OrganizePreview {
 export interface LibraryItem {
   media_item_id: number;
   kind: LibraryKind;
+  /** 这一格属于哪个库。单库墙上恒等于那个库；跨库合集里每一格各归各的 */
+  library_id: number | null;
   /** 身份来源：local=其他库条目，或影视库里尚未识别、按文件名展示的临时条目 */
   source: ItemSource;
   /** TMDB 条目 ID；本地来源条目为 null */
@@ -266,6 +270,8 @@ export interface LibraryItem {
   primary_aspect: number;
   /** 内容日期（ISO 日期）：影视为上映/首播日，本地条目为拍摄/录制日 */
   release_date: string | null;
+  /** 评分（0~10，TMDB 或 NFO）；海报墙默认不印，悬停层与按评分排序/筛选时才显示 */
+  rating: number | null;
   /** 主图的微缩占位图 data URI（约 300 字节）：缩略图到达前铺一层模糊色块 */
   poster_blur: string | null;
   /** 条目的首个在位文件 id：图片库取原图/回收站用 */
@@ -382,6 +388,7 @@ export interface LibraryPayload {
   extract_chapter_images?: boolean;
   /** 是否从首页汇总里排除该库；不传=不改动（新建时默认关） */
   exclude_from_home?: boolean;
+  auto_series_collections?: boolean;
   /** 可见范围模式；不传=不改动（新建时默认 everyone） */
   access_mode?: LibraryAccessMode;
   /** 超管本人是否可浏览；不传=不改动（新建时默认可浏览） */
@@ -504,8 +511,42 @@ export function deleteLibrary(id: number): Promise<Record<string, never>> {
   return unwrap(request<ApiEnvelope<Record<string, never>>>(`/libraries/${id}`, { method: "DELETE" }));
 }
 
-/** 海报墙排序：按标题 / 最近入账 / 按内容时间倒序（其他库默认）/ 待补探优先（扫描补探阶段）。 */
-export type LibraryItemSort = "title" | "added_at" | "release_date" | "probing";
+/** 海报墙排序：按标题 / 最近入账 / 按内容时间倒序（其他库默认）/ 待补探优先（扫描补探阶段）
+ *  / 评分高的在前 / 片长短的在前 / 占地大的在前 / 最近看过的在前。 */
+export type LibraryItemSort =
+  | "title"
+  | "added_at"
+  | "release_date"
+  | "probing"
+  | "rating"
+  | "runtime"
+  | "size"
+  | "last_played";
+
+/** 排序方向。不给 = 该排序的自然方向（标题 A→Z、片长短→长，其余大的/新的在前）。 */
+export type LibraryItemOrder = "asc" | "desc";
+
+// 筛选的纯逻辑放独立模块（与 lib/discovery-filters.ts 同一惯例）：那边不带
+// `@/` 别名，node --test 能直接 import，逻辑才测得到。这里原样再导出，
+// 调用方仍然只认 "@/lib/api/libraries" 一个入口。
+import {
+  type LibraryFilter,
+  type WatchFilter,
+  filterCount,
+  filterKey,
+  filterQuery,
+  isFilterEmpty,
+} from "@/lib/library-filter";
+
+export {
+  type LibraryFilter,
+  type WatchFilter,
+  filterCount,
+  filterKey,
+  filterQuery,
+  isFilterEmpty,
+};
+
 
 /**
  * 库内媒体条目的库存聚合（单库海报墙数据源）。
@@ -521,23 +562,23 @@ export function listLibraryItems(
   id: number,
   params?: {
     sort?: LibraryItemSort;
+    /** 排序方向；不给 = 自然方向。与 listLibraryItemIndex 必须传同一个值，索引的 offset 才对得上 */
+    order?: LibraryItemOrder;
     limit?: number;
     offset?: number;
     identity?: LibraryItemIdentity;
+    filter?: LibraryFilter;
   },
 ): Promise<LibraryItem[]> {
   const query = new URLSearchParams();
   if (params?.sort) query.set("sort", params.sort);
+  if (params?.order) query.set("order", params.order);
   if (params?.identity) query.set("identity", params.identity);
   if (params?.limit !== undefined) query.set("limit", String(params.limit));
   if (params?.offset) query.set("offset", String(params.offset));
+  filterQuery(params?.filter, query);
   const suffix = query.size > 0 ? `?${query}` : "";
   return unwrap(request<ApiEnvelope<LibraryItem[]>>(`/libraries/${id}/items${suffix}`));
-}
-
-/** 库内条目 id 集合：海报墙分页后仍要整份「已入库」名单（判定订阅是否还在追踪中）。 */
-export function listLibraryItemIds(id: number): Promise<number[]> {
-  return unwrap(request<ApiEnvelope<number[]>>(`/libraries/${id}/item-ids`));
 }
 
 /** 媒体库搜索结果的一组：一个库内命中关键词的条目（组内按标题拼音排序）。 */
@@ -550,7 +591,8 @@ export interface LibrarySearchGroup {
 
 /** 海报墙 A-Z 索引条的一档（按标题排序下的首字母分组）。 */
 export interface LibraryIndexEntry {
-  /** 档名：按标题排序是首字母 A-Z（落不进的归 #）；按内容时间排序是月份 2026-08（缺日期归「未知」） */
+  /** 档名：按标题排序是首字母 A-Z（落不进的归 #）；按内容时间排序是月份 2026-08（缺日期归「未知」）；
+   *  按评分排序是评分档 9+ / 8+ / 7+ / 更低 / 未评分 */
   initial: string;
   count: number;
   /** 该档第一格的位置——即 listLibraryItems 的 offset 取值 */
@@ -560,12 +602,85 @@ export interface LibraryIndexEntry {
 /** 海报墙的首字母索引（只回非空档）。中文按拼音首字母分档，与按标题排序同源。 */
 export function listLibraryItemIndex(
   id: number,
-  sort: "title" | "release_date" = "title",
+  sort: "title" | "release_date" | "rating" = "title",
+  filter?: LibraryFilter,
+  /** 与 listLibraryItems 的 order 同一个值：档位是在同一份排好的序列上分段的 */
+  order?: LibraryItemOrder,
 ): Promise<LibraryIndexEntry[]> {
-  const suffix = sort === "title" ? "" : `?sort=${sort}`;
+  const query = new URLSearchParams();
+  if (sort !== "title") query.set("sort", sort);
+  if (order) query.set("order", order);
+  filterQuery(filter, query);
+  const suffix = query.size > 0 ? `?${query}` : "";
   return unwrap(
     request<ApiEnvelope<LibraryIndexEntry[]>>(`/libraries/${id}/item-index${suffix}`),
   );
+}
+
+/** 筛空时的一条放宽建议。 */
+export interface RelaxSuggestion {
+  dim: string;
+  dim_label: string;
+  value: string;
+  label: string;
+  /** 去掉它之后能找回多少部（恒 > 0——救不回的条件根本不会出现在这里） */
+  count: number;
+}
+
+/** 筛空之后的出路。 */
+export interface LibraryRelax {
+  total: number;
+  suggestions: RelaxSuggestion[];
+}
+
+/** 筛空时问服务端「放宽哪一条能救回多少部」——与 listLibraryItems 同参。 */
+export function getLibraryRelax(id: number, filter?: LibraryFilter): Promise<LibraryRelax> {
+  const query = new URLSearchParams();
+  filterQuery(filter, query);
+  const suffix = query.size > 0 ? `?${query}` : "";
+  return unwrap(request<ApiEnvelope<LibraryRelax>>(`/libraries/${id}/relax${suffix}`));
+}
+
+/** 筛选面板里的一个候选值（计数已排除本维自身的条件）。 */
+export interface FacetValue {
+  value: string;
+  label: string;
+  /** 在**其他维度**已选条件下勾上本值还剩几部；0 的照常返回，前端置灰不可点 */
+  count: number;
+}
+
+/** 一次筛选下的全部候选值与计数。 */
+export interface LibraryFacets {
+  total: number;
+  genres: FacetValue[];
+  countries: FacetValue[];
+  decades: FacetValue[];
+  watch: FacetValue[];
+  // 以下只在 tier="all" 时非空（「更多筛选」面板打开才算）
+  ratings: FacetValue[];
+  runtimes: FacetValue[];
+  languages: FacetValue[];
+  resolutions: FacetValue[];
+  hdr: FacetValue[];
+  stock: FacetValue[];
+}
+
+/**
+ * 筛选面板的候选值与计数——与 listLibraryItems 同参。
+ *
+ * 因此"面板上显示多少部、点下去墙上就是多少部"是结构保证的：两处传的是
+ * 同一个 filter 对象，走的是同一个 filterQuery。
+ */
+export function getLibraryFacets(
+  id: number,
+  filter?: LibraryFilter,
+  tier: "primary" | "all" = "primary",
+): Promise<LibraryFacets> {
+  const query = new URLSearchParams();
+  if (tier === "all") query.set("tier", "all");
+  filterQuery(filter, query);
+  const suffix = query.size > 0 ? `?${query}` : "";
+  return unwrap(request<ApiEnvelope<LibraryFacets>>(`/libraries/${id}/facets${suffix}`));
 }
 
 /** 图廊里的一张图：海报 / 横幅剧照 / 分集剧照 / 章节场景图之一。 */
@@ -606,13 +721,15 @@ export interface LibraryGalleryGroup {
  */
 export function listLibraryGallery(
   id: number,
-  params?: { limit?: number; offset?: number; sort?: "added_at" },
+  params?: { limit?: number; offset?: number; sort?: "added_at"; filter?: LibraryFilter },
 ): Promise<LibraryGalleryGroup[]> {
   const query = new URLSearchParams();
   if (params?.limit !== undefined) query.set("limit", String(params.limit));
   if (params?.offset) query.set("offset", String(params.offset));
   // 不给 sort 就是服务端默认的标题序（与海报墙同一份名单）
   if (params?.sort) query.set("sort", params.sort);
+  // 图廊与海报墙是同一份名单的两种画法，筛选自然也是同一份
+  filterQuery(params?.filter, query);
   const suffix = query.size > 0 ? `?${query}` : "";
   return unwrap(request<ApiEnvelope<LibraryGalleryGroup[]>>(`/libraries/${id}/gallery${suffix}`));
 }
@@ -1250,6 +1367,16 @@ export interface LibraryItemDetail {
   scraping_phase: string | null;
   /** 章节场景图正在后台生成（打开详情页时懒触发）；前端据此轮询几轮 */
   chapters_pending: boolean;
+  /** 所属作品系列名；不属于任何系列为 null */
+  series_name: string | null;
+  /** 所属系列合集的 id；本库没生成该合集（或用户藏了它）时为 null */
+  series_collection_id: number | null;
+  /**
+   * 这部片所属的合集。**不含系列与「我的收藏」**：前者单独一行（它是作品的
+   * 事实，不是你的归类），后者那颗心就在几十像素之外。
+   * 只给名字和落点——封面是从成员海报里借的，在这部片的页面上摆它自己的海报没有意义。
+   */
+  collections: { id: number; name: string }[];
 }
 
 /** 剧集分集区的一集（季集结构 + 本地分集刮削 + TMDB 兜底的合并结果）。 */

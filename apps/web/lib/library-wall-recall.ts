@@ -98,8 +98,16 @@ function writeAll(store: KeyValueStorage, rows: Record<string, WallRecall>) {
  * 与会话内滚动恢复用的键同一副长相（lib/use-scroll-restoration.ts），两处一眼
  * 对得上；收藏墙不是某个库，所以这里收一个 "favorites" 字面量而不是库 id。
  */
-export function wallRecallScope(libraryId: number | "favorites"): string {
-  return `library:${libraryId}`;
+export function wallRecallScope(
+  libraryId: number | "favorites",
+  /** 筛选态的规范化键（lib/library-filter.ts 的 filterKey）：每种筛选各记各的
+   *  位置。不加的话，从「动画 + 日本」那面 42 格的墙返回时，会拿着一个针对
+   *  1,284 格全库的 offset 去跳，落点毫无意义。空串=未筛选，退回不带后缀的
+   *  原键，老记录因此不会失效 */
+  filterKey?: string,
+): string {
+  const base = `library:${libraryId}`;
+  return filterKey ? `${base}:${filterKey}` : base;
 }
 
 /**

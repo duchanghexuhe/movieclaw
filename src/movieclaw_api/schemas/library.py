@@ -43,6 +43,15 @@ class LibraryPayload(BaseModel):
         default=None,
         description="是否从首页「最近添加」等汇总里排除该库；不传表示不改动，新建时默认关闭",
     )
+    auto_series_collections: bool | None = Field(
+        default=None,
+        description=(
+            "是否按作品系列自动生成合集（《哈利·波特》这种）。这是**展示**偏好："
+            "关掉之后系列信息照常落库、NFO 的 <set> 照常写，只是合集页不自动多出"
+            "几十个系列；重新打开会把已有的系列补齐，不重新联网刮削。"
+            "不传表示不改动，新建时默认开启"
+        ),
+    )
     # —— 可见范围（docs/design/library-access.md）：三个字段都是"不传 = 不改动"
     access_mode: Literal["everyone", "selected"] | None = Field(
         default=None,
@@ -264,6 +273,9 @@ class LibraryView(BaseModel):
     )
     extract_chapter_images: bool = Field(default=True, description="是否为视频章节抓取场景图")
     exclude_from_home: bool = Field(default=False, description="是否从首页汇总里排除")
+    auto_series_collections: bool = Field(
+        default=True, description="是否按作品系列自动生成合集（展示偏好）"
+    )
     access_mode: Literal["everyone", "selected"] = Field(
         default="everyone", description="可见范围：everyone=所有成员 / selected=指定成员"
     )
@@ -342,6 +354,7 @@ class LibraryView(BaseModel):
             generate_thumbnails=row.generate_thumbnails,
             extract_chapter_images=row.extract_chapter_images,
             exclude_from_home=row.exclude_from_home,
+            auto_series_collections=row.auto_series_collections,
             access_mode=row.access_mode,  # type: ignore[arg-type]
             admin_visible=row.admin_visible,
             member_ids=list(member_ids or []),
@@ -388,6 +401,173 @@ def derive_air_status(status: str | None) -> Literal["airing", "ended"] | None:
     if status in _ENDED_STATUSES:
         return "ended"
     return None
+
+
+class FacetValueView(BaseModel):
+    """筛选面板里的一个候选值（docs/design/library-filtering.md 3.3）。"""
+
+    value: str = Field(description="取值（类型是 TMDB genre id、地区是国家码、年代是档名）")
+    label: str = Field(description="展示名（类型/地区走内置映射表，未知取值原样显示）")
+    count: int = Field(
+        description=(
+            "在**其他维度**已选条件下勾上本值还剩几部——算本维时排除本维自身"
+            "的条件，否则勾了「动画」之后其他类型全变 0，多选就废了"
+        )
+    )
+
+
+class LibraryFacetsView(BaseModel):
+    """一次筛选下的全部候选值与计数。
+
+    与 /items 共用同一组筛选参数，因此两者口径天然一致：面板上显示多少部，
+    点下去墙上就是多少部。为 0 的候选值仍然返回（前端置灰不可点），
+    这是"永不空货架"的第一道闸。
+    """
+
+    total: int = Field(description="当前条件下的命中总数")
+    genres: list[FacetValueView] = Field(default_factory=list, description="类型，按数量倒序")
+    countries: list[FacetValueView] = Field(default_factory=list, description="地区，按数量倒序")
+    decades: list[FacetValueView] = Field(default_factory=list, description="年代，按时间倒序")
+    watch: list[FacetValueView] = Field(
+        default_factory=list, description="观看状态：未看/在看/已看完是一个划分，另加我收藏的"
+    )
+    # —— 以下只在 tier=all 时返回（「更多筛选」面板打开才要）——
+    ratings: list[FacetValueView] = Field(default_factory=list, description="评分档（找片）")
+    runtimes: list[FacetValueView] = Field(default_factory=list, description="片长档（找片）")
+    languages: list[FacetValueView] = Field(default_factory=list, description="原始语言（找片）")
+    resolutions: list[FacetValueView] = Field(default_factory=list, description="分辨率（查库）")
+    hdr: list[FacetValueView] = Field(default_factory=list, description="动态范围（查库）")
+    stock: list[FacetValueView] = Field(default_factory=list, description="库存状态（查库）")
+
+
+class CollectionCover(BaseModel):
+    """合集卡片的一张封面图。
+
+    合集自己没有图，封面就是成员的海报。由服务端在列合集时一并给出——否则
+    客户端要为每个合集再请求一次成员才画得出卡片，一屏合集就是一屏请求。
+    """
+
+    url: str
+    blur: str | None = None
+
+
+class CollectionView(BaseModel):
+    """一个合集。形态（规则驱动 / 名单驱动、可不可改）是**推导**出来的，不是存的。"""
+
+    id: int
+    name: str
+    library_id: int | None = Field(description="所属库；null=跨库合集")
+    rules: list = Field(default_factory=list, description="收录规则，与 library.match_rules 同构")
+    sort: str = Field(description="合集内默认排序")
+    visibility: str = Field(description="household=全家可见 / private=只有我")
+    builtin: str | None = Field(default=None, description="内置合集标识；null=用户创建")
+    editable: bool = Field(description="能不能改规则（builtin 为 null 才能）")
+    rule_driven: bool = Field(description="规则驱动（会自己长）还是名单驱动（固定）")
+    item_count: int = Field(description="当前可见成员数")
+    cover_item_id: int | None = Field(default=None, description="封面取哪部作品；null=取首个成员")
+    covers: list[CollectionCover] = Field(
+        default_factory=list,
+        description="封面素材（前若干个成员的海报）；由服务端取，客户端不必为每个合集再请求一次成员",
+    )
+    kind: Literal["user", "builtin", "series"] = Field(
+        default="user",
+        description="合集从哪来：user=用户自建 / builtin=内置 / series=按作品系列自动生成",
+    )
+    hidden: bool = Field(default=False, description="已隐藏（自动合集的「删除」落成墓碑）")
+    position: int
+
+
+class CollectionItemsPayload(BaseModel):
+    """手动合集的成员操作：加入与排序共用这一个形状。"""
+
+    media_item_ids: list[int] = Field(
+        default_factory=list,
+        description="作品 id 列表。加入时是「要加的这些」，排序时是「新的先后顺序」",
+    )
+
+
+class SeriesPartView(BaseModel):
+    """系列里的一部作品：库里有没有、在追没在追。"""
+
+    tmdb_id: int
+    title: str
+    release_date: date | None = None
+    poster_url: str | None = None
+    media_item_id: int | None = Field(
+        default=None, description="库里已有的那条；null=缺这一部"
+    )
+    subscribed: bool = Field(default=False, description="已经在追（有订阅工单）")
+
+
+class CollectionSeriesView(BaseModel):
+    """系列合集的「已有 N / 共 M」与缺片名单（docs/design/library-series-collections.md 6.5）。
+
+    只在合集详情页展示，**不上卡片**——一屏几十个红色角标是压迫感不是帮助。
+    """
+
+    series_name: str | None = None
+    owned_count: int = Field(default=0, description="库里已有几部")
+    total: int = Field(default=0, description="这个系列一共几部（TMDB 档案）")
+    image_url: str | None = Field(default=None, description="系列官方海报")
+    parts: list[SeriesPartView] = Field(default_factory=list)
+    available: bool = Field(
+        default=True,
+        description="拉到上游档案了吗；false=没配 TMDB / 网络不通 / 本地系列没有上游档案",
+    )
+
+
+class CollectionPayload(BaseModel):
+    """创建 / 更新合集的请求体。不传的字段一律「不改动」。"""
+
+    name: str | None = Field(default=None, description="展示名")
+    library_id: int | None = Field(default=None, description="所属库（创建时必给）")
+    rules: list | None = Field(
+        default=None, description="收录规则；给空表 = 改成名单驱动（配合 item_ids 快照）"
+    )
+    sort: str | None = Field(default=None, description="合集内默认排序")
+    visibility: Literal["household", "private"] | None = Field(default=None)
+    hidden: bool | None = Field(
+        default=None, description="隐藏 / 取消隐藏（自动合集删不掉，只能藏；藏了要能放回来）"
+    )
+    item_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "固定名单（「固定当前这 N 部」就是把此刻的命中集快照过来）；"
+            "给了它就是名单驱动的合集"
+        ),
+    )
+    snapshot: bool = Field(
+        default=False,
+        description=(
+            "创建时把 rules 此刻的命中集固化成名单（此后不再自动收录）。"
+            "客户端因此不必把上千个 id 回传一遍——它要表达的本来就是"
+            "「就这一批」，而不是「这一批具体是哪些」"
+        ),
+    )
+
+
+class RelaxSuggestionView(BaseModel):
+    """筛空时的一条放宽建议（docs/design/library-filtering.md 3.3）。"""
+
+    dim: str = Field(description="维度：genres / countries / decades / watch")
+    dim_label: str = Field(description="维度展示名：类型 / 地区 / 年代 / 观看")
+    value: str = Field(description="要去掉的那个取值")
+    label: str = Field(description="该取值的展示名")
+    count: int = Field(description="去掉它之后能找回多少部（恒 > 0）")
+
+
+class LibraryRelaxView(BaseModel):
+    """筛空之后的出路。
+
+    不渲染空墙，而是告诉用户「放宽哪一条能救回多少部」。**只列救得回内容的
+    条件**——多维交叉时经常出现"去掉它还是 0 部"的剔除项，把它们摆出来是
+    噪音不是建议；一条都救不回时 suggestions 为空，前端只留「清空全部条件」。
+    """
+
+    total: int = Field(description="当前条件下的命中数（调用方通常在它为 0 时才用本接口）")
+    suggestions: list[RelaxSuggestionView] = Field(
+        default_factory=list, description="按能救回的数量倒序，最多三条"
+    )
 
 
 class LibraryIndexEntryView(BaseModel):
@@ -470,6 +650,9 @@ class LibraryItemView(BaseModel):
 
     media_item_id: int
     kind: MediaKind
+    #: 这一格属于哪个库。单库墙上恒等于那个库（前端本来就知道），**跨库合集
+    #: 里才真正用得上**：每一格要落回它自己那个库的详情页
+    library_id: int | None = Field(default=None, description="所属库；单库墙上恒为该库")
     source: str = Field(
         default="tmdb", description="身份来源：tmdb / local（local=未识别或其他库）"
     )
@@ -483,6 +666,10 @@ class LibraryItemView(BaseModel):
     release_date: date | None = Field(
         default=None,
         description="内容日期：影视为上映/首播日，本地条目为拍摄/录制日（图片库按月分组与悬停日期用）",
+    )
+    rating: float | None = Field(
+        default=None,
+        description="评分（0~10，TMDB 或 NFO）；海报墙默认不印，悬停层与按评分排序/筛选时才显示",
     )
     poster_blur: str | None = Field(
         default=None,
@@ -766,6 +953,33 @@ class LibraryItemDetailView(BaseModel):
     # 章节场景图懒触发（docs/design/video-chapters.md §4.5）：打开详情页时发现
     # 有文件没抓过图就后台抓，这里告诉前端"图还在生成"，前端据此轮询几轮
     chapters_pending: bool = Field(default=False, description="章节场景图正在后台生成")
+    # 所属系列：从影片页直接跳进那个系列合集（《哈利·波特》→ 整个系列）。
+    # 只在这个库真的生成了那个合集时给 collection_id——给一个点了 404 的入口
+    # 比不给更糟
+    series_name: str | None = Field(
+        default=None, description="所属作品系列名；不属于任何系列为 null"
+    )
+    series_collection_id: int | None = Field(
+        default=None, description="所属系列合集的 id；本库没生成该合集时为 null"
+    )
+    # 所属合集：与系列**分两行**说。系列是这部片的事实（片方就这么拍的），
+    # 合集是用户自己的归类；两者长得一样但意思完全不同，混在一行读者分不清。
+    # 不含系列合集与「我的收藏」——前者已单独一行，后者那颗心就在几十像素外
+    collections: list[ItemCollectionRef] = Field(
+        default_factory=list, description="这部片所属的合集（不含系列与「我的收藏」）"
+    )
+
+
+class ItemCollectionRef(BaseModel):
+    """作品详情页那一行「合集」的一项：只要名字和落点。
+
+    **刻意不带封面与成员数**。合集封面是从成员海报里借的——在《千与千寻》
+    的页面上摆「日本动画」的封面卡，那张图很可能就是《千与千寻》自己；
+    而成员数属于合集卡片，这一行回答的是"它在哪儿"，不是"那儿有多大"。
+    """
+
+    id: int
+    name: str
 
 
 class EpisodeView(BaseModel):

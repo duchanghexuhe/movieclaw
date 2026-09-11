@@ -25,9 +25,11 @@ from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy.orm import Load, load_only
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from movieclaw_api.services.library.access import ContentLimit
 from movieclaw_api.services.library.chapters import chapter_image_map, effective_chapters
 from movieclaw_api.services.library.thumbs import primary_aspect
 from movieclaw_db.models import (
+    Collection,
     Library,
     LibraryFile,
     MediaEpisode,
@@ -40,6 +42,8 @@ from movieclaw_db.models import (
 )
 from movieclaw_jellyfin.identity import format_datetime
 from movieclaw_jellyfin.ids import (
+    collection_guid,
+    collections_view_guid,
     episode_guid,
     item_guid,
     library_guid,
@@ -425,6 +429,7 @@ async def load_bundles(
     member_id: int = 0,
     library_id: int | None = None,
     visible_library_ids: set[int] | None = None,
+    content_limit: ContentLimit | None = None,
     include_people: bool = False,
     include_fileless: bool = False,
     dto_options: DtoOptions | None = None,
@@ -482,6 +487,14 @@ async def load_bundles(
     items: list[MediaItem] = []
     bundles: dict[int, ItemBundle] = {}
     for item, meta in (await session.execute(item_q)).all():
+        # 内容分级约束（儿童档案）：超出上限的条目在这里就不进 bundles，
+        # 于是它在电视端的**每一条**路径上都不存在——列表、单条详情、
+        # 继续观看、最近添加、BoxSet 成员全都要经过这里拿素材。
+        # 档案行本来就在同一条 LEFT JOIN 里，判定不额外花一次查询
+        if content_limit is not None and not content_limit.allows(
+            meta.content_rating if meta is not None else None
+        ):
+            continue
         items.append(item)
         bundles[item.id] = ItemBundle(item=item, metadata=meta)
 
@@ -632,6 +645,7 @@ async def latest_unit_candidates(
     member_id: int = 0,
     library_id: int | None = None,
     visible_library_ids: set[int] | None = None,
+    content_limit: ContentLimit | None = None,
     is_played: bool | None = None,
     row_limit: int | None = None,
 ) -> list[LatestUnitCandidate]:
@@ -676,6 +690,9 @@ async def latest_unit_candidates(
         )
     if visible_library_ids is not None:
         q = q.where(LibraryFile.library_id.in_(visible_library_ids))
+    if content_limit is not None and not content_limit.unrestricted:
+        # 「最近添加」在选页之前就要滤掉超限的，否则这一行会凭空少几格
+        q = q.where(LibraryFile.media_item_id.in_(_allowed_item_ids(content_limit)))
     if is_played is not None:
         q = q.outerjoin(
             PlaybackState,
@@ -839,15 +856,39 @@ async def movie_library_page(
     return total, list((await session.execute(q)).scalars())
 
 
+def _allowed_item_ids(content_limit: ContentLimit):
+    """分级约束允许的条目 id 子查询。
+
+    折算放在 Python 里做一次（``ratings_at_or_below``），SQL 只做一次 IN——
+    把折算写进 SQL 的 CASE 既难读又走不了索引，而分级取值就那么几十个。
+    """
+    from movieclaw_api.services.library.content_rating import ratings_at_or_below
+
+    allowed = MediaMetadata.content_rating.in_(ratings_at_or_below(content_limit.max_age or 0))
+    if content_limit.allow_unrated:
+        allowed = or_(allowed, MediaMetadata.content_rating.is_(None))
+    return (
+        select(MediaItem.id)
+        .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)
+        .where(allowed)
+    )
+
+
 async def item_ids_with_files(
     session: AsyncSession,
     *,
     kind: str | None = None,
     library_id: int | None = None,
     visible_library_ids: set[int] | None = None,
+    content_limit: ContentLimit | None = None,
 ) -> list[int]:
     """有在位文件的条目 id 集合（粗筛）。``visible_library_ids`` 限定成员
-    可见库（None=不受限）——跨库递归查询的可见性收口点。"""
+    可见库（None=不受限）——跨库递归查询的可见性收口点。
+
+    ``content_limit`` 是观看者的分级约束：这里滤掉之后，后面的分页与总数
+    才是对的（只靠 load_bundles 兜底的话，页是先切好的，超限的片会让这一页
+    凭空少几行）。
+    """
     q = (
         select(LibraryFile.media_item_id)
         .where(LibraryFile.media_item_id.is_not(None), LibraryFile.in_place())
@@ -857,6 +898,8 @@ async def item_ids_with_files(
         q = q.where(LibraryFile.library_id == library_id)
     if visible_library_ids is not None:
         q = q.where(LibraryFile.library_id.in_(visible_library_ids))
+    if content_limit is not None and not content_limit.unrestricted:
+        q = q.where(LibraryFile.media_item_id.in_(_allowed_item_ids(content_limit)))
     ids = [row for row in (await session.execute(q)).scalars()]
     if kind is None or not ids:
         return ids
@@ -1542,6 +1585,77 @@ def library_view_dto(
     )
     # 库视图不做已看聚合（CollectionFolder.SupportsPlayedStatus=false）
     guid = library_guid(library.id)
+    dto["UserData"] = {
+        "PlaybackPositionTicks": 0,
+        "PlayCount": 0,
+        "IsFavorite": False,
+        "Played": False,
+        "Key": guid,
+        "ItemId": guid,
+    }
+    return dto
+
+
+def collections_view_dto(ctx: DtoContext) -> dict[str, Any]:
+    """「合集」聚合视图（docs/design/library-collections.md 4.3）。
+
+    **协议侧不照搬产品侧的「合集挂在库下面」**，而是走 Jellyfin 惯例的一个顶层
+    视图。理由：客户端对库视图的子级有固定预期（Movie / Series / Season /
+    Episode），把 BoxSet 塞进某个库的子级，各家客户端表现不可预期——有的不
+    渲染，有的渲染成空文件夹。协议兼容的价值恰恰在于"表现可预期"。
+
+    这不是不一致，是两个受众的正确答案不同：网页端用户在管自己的库，心智是
+    "我的电影库里有一批诺兰"；电视端用户在找片看，心智是"有哪些片单"。
+    库归属信息并不丢失——它决定合集对谁可见，只是不体现为协议层级。
+    """
+    guid = collections_view_guid()
+    dto = _common(ctx, guid, "合集", "CollectionFolder", "Unknown")
+    dto["IsFolder"] = True
+    dto["CollectionType"] = "boxsets"
+    dto["ImageTags"] = {}
+    dto["BackdropImageTags"] = []
+    dto["ParentId"] = root_guid()
+    dto["UserData"] = {
+        "PlaybackPositionTicks": 0,
+        "PlayCount": 0,
+        "IsFavorite": False,
+        "Played": False,
+        "Key": guid,
+        "ItemId": guid,
+    }
+    return dto
+
+
+def boxset_dto(
+    ctx: DtoContext,
+    collection: Collection,
+    *,
+    child_count: int | None = None,
+    cover_item_id: int | None = None,
+) -> dict[str, Any]:
+    """一个合集 → Jellyfin 的 BoxSet。
+
+    ``ChildCount`` 只在"把合集列出来"的请求里给（``/Items?ParentId=<合集视图>``）；
+    ``/UserViews`` 那种高频接口不算它——协议允许缺省该字段，客户端不会出错，
+    而为它在视图列表里逐个解析成员是纯粹的浪费（设计文档 2.4）。
+
+    封面直接复用**首个成员的海报**：网页端合集封面本来就是"首个成员海报 +
+    背后露两片边"，那两片边是 CSS 不是图片资产。为协议侧单独生成拼贴图要多一
+    套资产、多一个失效通道，换来的只是电视端封面好看一点点（设计文档 4.6）。
+
+    不做已看聚合，与库视图保持一致——那是 ``/UserViews`` 最不该背的成本。
+    """
+    guid = collection_guid(collection.id or 0)
+    dto = _common(ctx, guid, collection.name, "BoxSet", "Unknown")
+    dto["IsFolder"] = True
+    # CollectionType 是 CollectionFolder 的字段，BoxSet 不该有——多给一个
+    # 客户端不认识的字段，比少给一个更容易触发各家的兼容分支
+    dto["ParentId"] = collections_view_guid()
+    dto["ImageTags"] = {"Primary": item_guid(cover_item_id)} if cover_item_id else {}
+    dto["BackdropImageTags"] = []
+    if child_count is not None:
+        dto["ChildCount"] = child_count
+        dto["RecursiveItemCount"] = child_count
     dto["UserData"] = {
         "PlaybackPositionTicks": 0,
         "PlayCount": 0,

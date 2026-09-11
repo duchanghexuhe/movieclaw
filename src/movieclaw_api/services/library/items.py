@@ -30,30 +30,36 @@ import os
 import re
 import shutil
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import Integer, and_, func, not_, nullslast, or_, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_api.schemas.library import (
     EpisodeView,
+    FacetValueView,
+    LibraryFacetsView,
     LibraryGalleryGroupView,
     LibraryGalleryImageView,
     LibraryInventorySummaryView,
     LibraryItemView,
     LibraryRecentAdditionView,
+    LibraryRelaxView,
+    RelaxSuggestionView,
     derive_air_status,
 )
+from movieclaw_api.services.library.access import ContentLimit
 from movieclaw_api.services.library.artwork import ART_EXTS, find_artwork
 from movieclaw_api.services.library.bluray import (
     enrich_spec_with_clpi,
     read_clpi_languages,
     streams_have_clpi_metadata,
 )
+from movieclaw_api.services.library.content_rating import ratings_at_or_below
 from movieclaw_api.services.library.layout import STRM_EXT, entry_dir_of
 from movieclaw_api.services.library.nfo import (
     EntryMetadata,
@@ -79,9 +85,11 @@ from movieclaw_db.models import (
     MediaItem,
     MediaMetadata,
     MediaSeason,
+    PlaybackState,
     utcnow,
 )
 from movieclaw_db.repositories.library_repo import LibraryRepository
+from movieclaw_media.genres import country_label, genre_label
 from movieclaw_media.models import MediaKind
 
 logger = logging.getLogger("movieclaw_api.library_items")
@@ -156,10 +164,11 @@ def _external_subtitles(video: Path) -> list[str]:
 
 
 class _FileFacts(NamedTuple):
-    """海报墙聚合用到的九个台账字段（顺序与查询列一致）。
+    """海报墙聚合用到的十个台账字段（顺序与查询列一致）。
 
     代码读起来与整行取时一模一样，只是不再拖着四十列（含三列 JSON）走。"""
 
+    library_id: int
     id: int
     season_number: int
     episode_number: int
@@ -243,7 +252,323 @@ def _build_inventory_summary(
     )
 
 
-WallSort = Literal["title", "added_at", "release_date", "probing"]
+WallSort = Literal[
+    "title",
+    "added_at",
+    "release_date",
+    # 上映**正序**。墙上的默认方向是倒序（新的在前，那是浏览的语义），
+    # 但**系列要按上映顺序看**——《死亡圣器(上)》排在《混血王子》前面这种事，
+    # 用户会当成 bug。它不进筛选栏的排序下拉，只作为系列合集的 sort 存在
+    "release_date_asc",
+    "probing",
+    # 以下四档随筛选一起加（docs/design/library-filtering.md 3.1「排序」）。
+    # 方向的取舍：评分/体积/最近观看都是「大的在前」，唯独片长是**升序**
+    # ——「今晚只有 90 分钟」是真实诉求，「最长的在前」几乎没人要。
+    "rating",
+    "runtime",
+    "size",
+    "last_played",
+]
+
+#: 排序方向（2026-09-11 起可切换）。不给方向 = 该档的**自然方向**（见 ``_NATURAL_ASC``），
+#: 与加方向之前逐字等价——老调用方、合集的 sort、首页「最近添加」都不受影响。
+WallOrder = Literal["asc", "desc"]
+
+#: 各档的自然方向是不是升序：标题 A→Z、片长短→长、上映正序档是升序；
+#: 其余都是「大的 / 新的 / 近的在前」。补探序是临时接管，方向无意义
+_NATURAL_ASC: dict[str, bool] = {
+    "title": True,
+    "added_at": False,
+    "release_date": False,
+    "release_date_asc": True,
+    "probing": True,
+    "rating": False,
+    "runtime": True,
+    "size": False,
+    "last_played": False,
+}
+
+
+def _ascending(sort: WallSort, order: WallOrder | None) -> bool:
+    """这一次按升序排还是降序排：没指定方向就用该档的自然方向。"""
+    return _NATURAL_ASC[sort] if order is None else order == "asc"
+
+
+# ── 筛选（docs/design/library-filtering.md 3.1/3.2）──────────────────────
+# 维内 OR、维间 AND。取值与合集规则同构（library-routing.md 1.1 的
+# [{field, op, values}]），所以「筛完存为合集」是一次纯粹的形状转换。
+
+#: 观看状态。前三者是一个**划分**：任何条目恰好落在其中一档，三档计数之和
+#: 等于总数（facet 计数因此永远对得上）。favorite 与它们正交，单选而已。
+WatchFilter = Literal["unwatched", "watching", "played", "favorite"]
+
+#: 年代档 → 年份闭区间；None 表示不设下界。缺年份的条目（release_date 与
+#: media_item.year 都为空）不属于任何一档——「未知年份」不是年代，硬塞进
+#: 「更早」是编数据。它们只在不筛年代时出现。
+#: 片长档 → 分钟闭区间；None 表示不设该侧界。缺片长的条目不属于任何档
+#: （同「未知年份」，见 _DECADE_RANGES）。
+_RUNTIME_RANGES: dict[str, tuple[int | None, int | None]] = {
+    "lte60": (None, 60),
+    "60to90": (60, 90),
+    "90to120": (90, 120),
+    "gt120": (120, None),
+}
+
+_DECADE_RANGES: dict[str, tuple[int | None, int]] = {
+    "2020s": (2020, 2029),
+    "2010s": (2010, 2019),
+    "2000s": (2000, 2009),
+    "1990s": (1990, 1999),
+    "earlier": (None, 1989),
+}
+
+
+@dataclass(frozen=True)
+class LibraryFilter:
+    """单库墙的收窄条件。
+
+    全空 = 不收窄（``is_empty`` 为真时 ``_filter_subquery`` 返回 None，
+    调用方原样不动，零成本）。字段按维度分，**维内 OR、维间 AND**——
+    勾「动画」再勾「科幻」是两者都要看到，再勾「日本」才是收窄。
+    """
+
+    # —— 一级（常驻 chips，找片）——
+    genres: tuple[int, ...] = ()  # TMDB genre id（语言无关，见 metadata.genre_ids）
+    countries: tuple[str, ...] = ()  # ISO 3166-1 二字码
+    decades: tuple[str, ...] = ()  # _DECADE_RANGES 的键
+    watch: WatchFilter | None = None  # 按观看者算，需要 member_id
+    # —— 二级·找片（作品是什么样的，来自刮削档案）——
+    rating_gte: float | None = None  # 评分下限
+    runtimes: tuple[str, ...] = ()  # _RUNTIME_RANGES 的键
+    languages: tuple[str, ...] = ()  # 原始语言码
+    # —— 二级·查库（文件是什么规格，来自库存台账）——
+    resolutions: tuple[str, ...] = ()  # 2160p / 1080p / …
+    hdr: bool | None = None  # True=只看 HDR；False=只看 SDR
+    #: 库存状态：missing=有文件失联 / unscraped=没刮到档案
+    stock: tuple[str, ...] = ()
+    #: 作品系列（``media_metadata.series_key``）。**界面上没有这一维的下拉**——
+    #: 一个库几百个系列，下拉根本没法用，合集才是它正确的呈现形态。它存在是
+    #: 因为系列合集就是一条规则驱动的合集，规则正是「series_key = X」
+    series_keys: tuple[str, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        return not (
+            self.genres
+            or self.countries
+            or self.decades
+            or self.watch
+            or self.rating_gte is not None
+            or self.runtimes
+            or self.languages
+            or self.resolutions
+            or self.hdr is not None
+            or self.stock
+            or self.series_keys
+        )
+
+
+def _last_played_at(member_id: int):
+    """本人在该条目上的最近一次播放活动（标量子查询）。
+
+    不 join playback_state：那张表按 (成员, 条目, 季, 集) 一行，join 会把
+    一部 200 集的剧炸成 200 行，再靠 group_by 收回来——子查询直接给一个值。
+    """
+    return (
+        select(func.max(PlaybackState.last_played_at))
+        .where(
+            PlaybackState.media_item_id == MediaItem.id,
+            PlaybackState.member_id == member_id,
+        )
+        .scalar_subquery()
+    )
+
+
+def _year_expr():
+    """条目的年份：优先刮削档案的上映/首播日期，回落 media_item.year。
+
+    两者都为空 = 未知年份，任何年代档都不命中（见 _DECADE_RANGES 注释）。
+    """
+    return func.coalesce(
+        func.cast(func.strftime("%Y", MediaMetadata.release_date), Integer),
+        MediaItem.year,
+    )
+
+
+def _json_any_of(column, values: Sequence) -> Any:
+    """JSON 数组列与给定取值有交集——SQLite 的 ``json_each`` 展开后 IN。
+
+    ``genre_ids`` / ``origin_countries`` 都是小数组（个位数元素），展开的代价
+    可以忽略；相比在 Python 里把整库档案读回来过滤，它让筛选留在 SQL 里、
+    与分页和计数共用同一条路径。
+    """
+    each = func.json_each(column).table_valued("value")
+    return select(1).select_from(each).where(each.c.value.in_(list(values))).exists()
+
+
+def _watch_clause(watch: WatchFilter, member_id: int):
+    """观看状态的判定（按 member_id 隔离，与 playback_state 的成员维度一致）。
+
+    「已看完」对剧集是近似：真正的"看完"要对齐 TMDB 全集结构逐集比对，
+    代价与收益不成比例。这里用的口径是「有看完的单元，且没有看到一半的
+    单元」——对电影精确，对剧集与用户口中的"看完了"足够接近，且保证
+    未看/在看/已看完三档是一个划分。
+    """
+    mine = (PlaybackState.media_item_id == MediaItem.id, PlaybackState.member_id == member_id)
+
+    def _exists(*conds):
+        return select(1).select_from(PlaybackState).where(*mine, *conds).exists()
+
+    watching = _exists(PlaybackState.position_ms > 0, PlaybackState.played.is_(False))
+    played = _exists(PlaybackState.played.is_(True))
+    if watch == "watching":
+        return watching
+    if watch == "played":
+        return and_(not_(watching), played)
+    if watch == "unwatched":
+        return and_(not_(watching), not_(played))
+    # favorite：条目级收藏落在哨兵单元上（剧 (-1,-1) / 电影 (0,0)），
+    # 与 services/playback/marks.item_favorite_unit 同一份约定
+    is_tv = MediaItem.kind == MediaKind.TV.value
+    return _exists(
+        PlaybackState.is_favorite.is_(True),
+        or_(
+            and_(is_tv, PlaybackState.season_number == -1, PlaybackState.episode_number == -1),
+            and_(not_(is_tv), PlaybackState.season_number == 0, PlaybackState.episode_number == 0),
+        ),
+    )
+
+
+def _filter_subquery(
+    filters: LibraryFilter | None,
+    member_id: int | None,
+    skip: str | None = None,
+    library_id: int | None = None,
+    content_limit: ContentLimit | None = None,
+):
+    """命中筛选条件的 ``media_item_id`` 子查询；不收窄时返回 None。
+
+    **这是整个筛选功能在服务端唯一的收窄点。** 做成子查询而不是往各个排序
+    分支上加 WHERE，是因为那四个分支 join 的表各不相同（按标题只 join
+    media_item、按内容时间还要 outerjoin media_metadata、最近添加谁都不 join）；
+    收敛成一句 ``media_item_id IN (…)`` 之后，排序、分页、索引条、图廊全都
+    不必知道筛选的存在。
+
+    ``skip`` 排除某一个维度自身的条件——算某维的 facet 计数时必须这么做，
+    否则勾了「动画」之后其他类型全变 0，多选就废了（library-filtering.md 3.3）。
+    """
+    limited = content_limit is not None and not content_limit.unrestricted
+    if (filters is None or filters.is_empty) and not limited:
+        return None
+    # 只有分级约束、没有筛选条件时 filters 可能是 None：给一份全空的，
+    # 下面的每一条都自然不成立，省掉十几个 `filters is not None and`
+    filters = filters or LibraryFilter()
+    conds = []
+    if filters.genres and skip != "genres":
+        conds.append(_json_any_of(MediaMetadata.genre_ids, filters.genres))
+    if filters.countries and skip != "countries":
+        conds.append(_json_any_of(MediaMetadata.origin_countries, filters.countries))
+    if filters.decades and skip != "decades":
+        year = _year_expr()
+        spans = [
+            (year <= hi) if lo is None else and_(year >= lo, year <= hi)
+            for lo, hi in (_DECADE_RANGES[d] for d in filters.decades if d in _DECADE_RANGES)
+        ]
+        if spans:
+            conds.append(or_(*spans))
+    if filters.watch and skip != "watch":
+        # 观看状态是按人算的；不认人的调用（内部任务、CLI）落到超管哨兵 0
+        conds.append(_watch_clause(filters.watch, member_id or 0))
+    if filters.rating_gte is not None and skip != "rating_gte":
+        conds.append(MediaMetadata.vote_average >= filters.rating_gte)
+    if filters.runtimes and skip != "runtimes":
+        spans = []
+        for key in filters.runtimes:
+            if key not in _RUNTIME_RANGES:
+                continue
+            lo, hi = _RUNTIME_RANGES[key]
+            parts = [MediaMetadata.runtime_minutes.is_not(None)]  # type: ignore[union-attr]
+            if lo is not None:
+                parts.append(MediaMetadata.runtime_minutes > lo)
+            if hi is not None:
+                parts.append(MediaMetadata.runtime_minutes <= hi)
+            spans.append(and_(*parts))
+        if spans:
+            conds.append(or_(*spans))
+    if filters.languages and skip != "languages":
+        conds.append(MediaMetadata.original_language.in_(filters.languages))
+    if filters.resolutions and skip != "resolutions":
+        conds.append(_file_exists(library_id, LibraryFile.resolution.in_(filters.resolutions)))
+    if filters.hdr is not None and skip != "hdr":
+        clause = _file_exists(library_id, LibraryFile.hdr.is_not(None))  # type: ignore[union-attr]
+        conds.append(clause if filters.hdr else not_(clause))
+    if filters.series_keys and skip != "series_keys":
+        conds.append(MediaMetadata.series_key.in_(filters.series_keys))
+    if filters.stock and skip != "stock":
+        spans = []
+        if "missing" in filters.stock:
+            # 有文件失联：台账还在、盘上没了（missing_since 非空）
+            spans.append(
+                _file_exists(library_id, LibraryFile.missing_since.is_not(None))  # type: ignore[union-attr]
+            )
+        if "unscraped" in filters.stock:
+            # 没刮到档案：详情页只能降级展示，也是「元数据刷新」该处理的那批
+            spans.append(MediaMetadata.scraped_at.is_(None))
+        if spans:
+            conds.append(or_(*spans))
+    if content_limit is not None and not content_limit.unrestricted:
+        # **强制收窄**，与上面那些"用户自己选的"条件不同：它不受 skip 影响
+        # （facet 算某一维时排除的是那一维自己的条件，不是观看者的约束），
+        # 也不会被"清空筛选"清掉。判定收口在 access.content_limit_for()
+        allowed = MediaMetadata.content_rating.in_(  # type: ignore[union-attr]
+            ratings_at_or_below(content_limit.max_age or 0)
+        )
+        if content_limit.allow_unrated:
+            # 没有档案行时 outerjoin 出来也是 NULL，这一条同时覆盖两种"未分级"
+            allowed = or_(allowed, MediaMetadata.content_rating.is_(None))  # type: ignore[union-attr]
+        conds.append(allowed)
+    if not conds:
+        return None
+    return (
+        select(MediaItem.id)
+        .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
+        .where(and_(*conds))
+    )
+
+
+def _file_exists(library_id: int | None, *conds):
+    """本库内存在满足条件的文件——画质/HDR/失联这类**文件级**条件的判定。
+
+    必须限定 ``library_id``：同一部片散在两个库时，「本库有没有 4K」问的是
+    这个库，不是全世界。不给 library_id（内部调用）则跨库判定。
+    """
+    where = [LibraryFile.media_item_id == MediaItem.id, *conds]
+    if library_id is not None:
+        where.append(LibraryFile.library_id == library_id)
+    return select(1).select_from(LibraryFile).where(*where).exists()
+
+
+def _narrow(
+    filters: LibraryFilter | None,
+    member_id: int | None,
+    skip: str | None = None,
+    library_id: int | None = None,
+    content_limit: ContentLimit | None = None,
+) -> tuple:
+    """筛选收窄的 WHERE 片段（**含观看者的内容分级约束**）。
+
+    不收窄时是空元组，调用处 ``*_narrow(...)`` 展开后等于什么都没加——
+    未筛选、且观看者不受限的路径与改造前逐字相同，不多一次 join、
+    不多一个子查询。
+
+    分级约束走同一处的理由：海报墙、筛选 facet、索引条、合集成员求值全都
+    经过 ``_narrow``，收窄点只有一个，就不存在"某一处忘了加"这种洞——
+    而这个功能一旦漏一处就是假的（孩子照样能从那一处看到）。
+    """
+    subq = _filter_subquery(filters, member_id, skip, library_id, content_limit=content_limit)
+    return () if subq is None else (LibraryFile.media_item_id.in_(subq),)  # type: ignore[union-attr]
+
+
 # 海报墙口径：confirmed=正式条目（默认，首页/搜索/索引同口径）；provisional=
 # 影视库里认不出、按文件名挂着的临时条目（库页单独一段展示）。其他库没有
 # 临时条目，两口径下 provisional 恒空
@@ -256,8 +581,42 @@ def _identity_clause(identity: WallIdentity):
     return column.is_(None) if identity == "confirmed" else column.is_not(None)  # type: ignore[union-attr]
 
 
+def _wall_scope(
+    library_id: int, identity: WallIdentity = "confirmed", only_item_id: int | None = None
+):
+    """海报墙的成员口径：本库、挂了条目、**在架**（没进回收站）、指定身份档。
+
+    ``only_item_id`` 把候选集收窄成**一个条目**——"这部片在不在这个合集里"
+    走的就是这条路。它收窄的是"谁是候选"，不是"要满足什么条件"，所以
+    放在这里而不是 ``LibraryFilter``：后者是用户能表达的维度，这个不是。
+    反查合集因此与正查成员**逐字同一条查询**，不存在两处答案不一致。
+
+    ``on_shelf()`` 这一条是补上去的。在此之前墙的成员查询完全不看文件状态，
+    于是用户把最后一个文件移进回收站之后，库卡片上的作品数已经减一
+    （``refresh_stats`` 只算在位文件），墙上那部片却还摆着——同一个库两个数字。
+
+    口径只能有一处：墙、筛选 facet、合集、Jellyfin 兼容层现在全部经过这里，
+    「墙上有什么，合集里就有什么」这条结构性保证因此仍然成立。失联的片仍然
+    在架（见 ``LibraryFile.on_shelf`` 的说明），回收站里的片恢复之后自己回到
+    墙上——成员永远是现算的，没有补偿逻辑要写。
+    """
+    scope = (
+        LibraryFile.library_id == library_id,
+        LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
+        LibraryFile.on_shelf(),
+        _identity_clause(identity),
+    )
+    return scope if only_item_id is None else (*scope, LibraryFile.media_item_id == only_item_id)
+
+
 async def _titles_sorted(
-    session: AsyncSession, library_id: int, identity: WallIdentity = "confirmed"
+    session: AsyncSession,
+    library_id: int,
+    identity: WallIdentity = "confirmed",
+    filters: LibraryFilter | None = None,
+    member_id: int | None = None,
+    content_limit: ContentLimit | None = None,
+    only_item_id: int | None = None,
 ) -> list[tuple[int, str]]:
     """本库全部条目的 (id, 标题)，按拼音序排好。
 
@@ -271,9 +630,8 @@ async def _titles_sorted(
             select(LibraryFile.media_item_id, MediaItem.title)
             .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
             .where(
-                LibraryFile.library_id == library_id,
-                LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
-                _identity_clause(identity),
+                *_wall_scope(library_id, identity, only_item_id),
+                *_narrow(filters, member_id, library_id=library_id, content_limit=content_limit),
             )
             .distinct()
         )
@@ -285,21 +643,83 @@ async def _titles_sorted(
 
 
 async def build_library_index(
-    session: AsyncSession, library_id: int, sort: WallSort = "title"
+    session: AsyncSession,
+    library_id: int,
+    sort: WallSort = "title",
+    *,
+    filters: LibraryFilter | None = None,
+    member_id: int | None = None,
+    content_limit: ContentLimit | None = None,
+    order: WallOrder | None = None,
 ) -> list[tuple[str, int, int]]:
     """海报墙跳转索引：[(档, 条目数, 起始 offset)]，只回非空档。
 
     - ``sort=title``：按标题排序下的首字母分档（A-Z / #）；
+    - ``sort=rating``：评分档（9+ / 8+ / 7+ / 更低 / 未评分）；
     - ``sort=release_date``：按内容时间倒序下的月份分档（``2026-08``），缺日期的
       归到 ``未知`` 档并排在最后——图片库/其他库的时间线靠它按月分组与跳转
       （docs/design/library-photo-kind.md 2.6）。
 
     起始 offset 就是海报墙 ``?sort=<同一排序>&offset=`` 的取值——前端点一下
     档名即可跳到该档第一格；两种排序与分页共用同一份排序，口径天然一致。
+
+    ``order`` 与墙的 ``order`` 必须是同一个值：档位是在排好的序列上就地分段的，
+    倒过来排，档的先后与 offset 就一起倒过来（Z→A、低分档在前），不需要另算。
     """
     buckets: list[tuple[str, int, int]] = []
+    if sort == "rating":
+        # 与墙读同一份有序名单：档位是在已排好的序列上就地分段，
+        # 因此点档名拿到的 offset 一定指向该档第一格
+        ids = await _wall_page_ids(
+            session,
+            library_id,
+            "rating",
+            None,
+            0,
+            filters=filters,
+            member_id=member_id,
+            content_limit=content_limit,
+            order=order,
+        )
+        scored = dict(
+            (
+                await session.execute(
+                    select(MediaMetadata.media_item_id, MediaMetadata.vote_average).where(
+                        MediaMetadata.media_item_id.in_(ids)  # type: ignore[attr-defined]
+                    )
+                )
+            ).all()
+        )
+        for index, item_id in enumerate(ids):
+            score = scored.get(item_id)
+            if score is None:
+                label = "未评分"
+            elif score >= 9:
+                label = "9+"
+            elif score >= 8:
+                label = "8+"
+            elif score >= 7:
+                label = "7+"
+            else:
+                label = "更低"
+            if buckets and buckets[-1][0] == label:
+                head, count, start = buckets[-1]
+                buckets[-1] = (head, count + 1, start)
+            else:
+                buckets.append((label, 1, index))
+        return buckets
     if sort == "release_date":
-        ids = await _wall_page_ids(session, library_id, "release_date", None, 0)
+        ids = await _wall_page_ids(
+            session,
+            library_id,
+            "release_date",
+            None,
+            0,
+            filters=filters,
+            member_id=member_id,
+            content_limit=content_limit,
+            order=order,
+        )
         dated = dict(
             (
                 await session.execute(
@@ -318,7 +738,11 @@ async def build_library_index(
             else:
                 buckets.append((label, 1, index))
         return buckets
-    ordered = await _titles_sorted(session, library_id)
+    ordered = await _titles_sorted(
+        session, library_id, "confirmed", filters, member_id, content_limit
+    )
+    if not _ascending("title", order):
+        ordered.reverse()
     for index, (_, title) in enumerate(ordered):
         initial = title_initial(title)
         if buckets and buckets[-1][0] == initial:
@@ -329,6 +753,480 @@ async def build_library_index(
     return buckets
 
 
+#: 观看维度的四个候选值与展示名（前三者是一个划分，见 WatchFilter）
+_WATCH_LABELS: list[tuple[WatchFilter, str]] = [
+    ("unwatched", "未看"),
+    ("watching", "在看"),
+    ("played", "已看完"),
+    ("favorite", "我收藏的"),
+]
+
+
+def _facet_scope(
+    library_id: int,
+    filters: LibraryFilter | None,
+    member_id: int | None,
+    skip: str,
+    content_limit: ContentLimit | None = None,
+):
+    """算某一维 facet 时的库内范围：本库、已识别、其他维度的条件都算上。
+
+    观看者的分级约束**不受 skip 影响**：skip 排除的是"这一维自己的筛选条件"，
+    而分级不是用户选的。面板上的计数因此与墙上真能看到的数量一致。
+    """
+    return (
+        *_wall_scope(library_id),
+        *_narrow(filters, member_id, skip=skip, library_id=library_id, content_limit=content_limit),
+    )
+
+
+def _with_selected(rows, selected: tuple) -> list[FacetValueView]:
+    """分组结果 → 候选列表，并补齐当前选中但一条都没数到的取值（计数 0）。
+
+    这些维度的取值是**从数据里长出来的**（语言码、分辨率），所以别的维度一
+    收窄，用户勾着的那个值可能整个消失——下拉里看不见也就取消不掉。
+    """
+    counts = [(str(v), int(c)) for v, c in rows if v is not None]
+    present = {value for value, _ in counts}
+    counts.extend((str(v), 0) for v in selected if str(v) not in present)
+    return [
+        FacetValueView(value=value, label=value, count=count)
+        for value, count in sorted(counts, key=lambda r: (-r[1], r[0]))
+    ]
+
+
+async def _json_facet(
+    session: AsyncSession,
+    column,
+    library_id: int,
+    filters: LibraryFilter | None,
+    member_id: int | None,
+    skip: str,
+    selected: tuple = (),
+    content_limit: ContentLimit | None = None,
+) -> list[tuple[str, int]]:
+    """JSON 数组列的取值分布：展开后按值分组数条目（类型、地区共用）。
+
+    ``selected`` 里的取值**一定出现在结果里**（数不到就补一条 0）。不补的话，
+    别的维度一收窄，用户自己勾着的那个值会从本维的候选里消失：下拉里看不见它，
+    也就取消不掉；条件行找不到它的展示名，只能把裸值印出来（「科幻」变成
+    「878」）。为 0 的候选照常返回本来就是这里的约定，选中的更不能少。
+    """
+    each = func.json_each(column).table_valued("value")
+    rows = (
+        await session.execute(
+            select(each.c.value, func.count(func.distinct(LibraryFile.media_item_id)))
+            .select_from(LibraryFile)
+            .join(MediaMetadata, MediaMetadata.media_item_id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+            .join(each, true())
+            .where(*_facet_scope(library_id, filters, member_id, skip, content_limit=content_limit))
+            .group_by(each.c.value)
+        )
+    ).all()
+    counts = [(str(value), count) for value, count in rows if value is not None]
+    present = {value for value, _ in counts}
+    counts.extend((str(value), 0) for value in selected if str(value) not in present)
+    return counts
+
+
+async def _bucket_facet(
+    session: AsyncSession,
+    library_id: int,
+    filters: LibraryFilter | None,
+    member_id: int | None,
+    skip: str,
+    options: list[tuple[str, str, LibraryFilter]],
+    content_limit: ContentLimit | None = None,
+) -> list[FacetValueView]:
+    """一组固定档位的计数：逐档带着「本档条件」重数一次。
+
+    档位不是从数据里长出来的（评分/片长/库存状态都是人定的分界），所以不能
+    像类型/地区那样 group by，只能逐档数。每档一条带索引的 COUNT，档位个位数。
+    """
+    out: list[FacetValueView] = []
+    for value, label, probe in options:
+        count = (
+            await session.execute(
+                select(func.count(func.distinct(LibraryFile.media_item_id)))
+                .select_from(LibraryFile)
+                .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+                .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
+                .where(
+                    *_facet_scope(
+                        library_id,
+                        filters,
+                        member_id,
+                        skip,
+                        content_limit=content_limit,
+                    ),
+                    *_narrow(probe, member_id, library_id=library_id),
+                )
+            )
+        ).scalar_one()
+        out.append(FacetValueView(value=value, label=label, count=int(count)))
+    return out
+
+
+async def _second_tier_facets(
+    session: AsyncSession,
+    library_id: int,
+    filters: LibraryFilter | None,
+    member_id: int | None,
+    content_limit: ContentLimit | None = None,
+) -> dict:
+    """「更多筛选」面板的候选值与计数（找片二级 + 查库）。"""
+    ratings = await _bucket_facet(
+        session,
+        library_id,
+        filters,
+        member_id,
+        "rating_gte",
+        [(str(v), f"≥ {v:g}", LibraryFilter(rating_gte=v)) for v in (9, 8, 7)],
+        content_limit,
+    )
+    runtimes = await _bucket_facet(
+        session,
+        library_id,
+        filters,
+        member_id,
+        "runtimes",
+        [
+            ("lte60", "≤ 60′", LibraryFilter(runtimes=("lte60",))),
+            ("60to90", "60–90′", LibraryFilter(runtimes=("60to90",))),
+            ("90to120", "90–120′", LibraryFilter(runtimes=("90to120",))),
+            ("gt120", "> 120′", LibraryFilter(runtimes=("gt120",))),
+        ],
+        content_limit,
+    )
+    hdr = await _bucket_facet(
+        session,
+        library_id,
+        filters,
+        member_id,
+        "hdr",
+        [("1", "HDR", LibraryFilter(hdr=True)), ("0", "SDR", LibraryFilter(hdr=False))],
+        content_limit,
+    )
+    stock = await _bucket_facet(
+        session,
+        library_id,
+        filters,
+        member_id,
+        "stock",
+        [
+            ("missing", "文件失联", LibraryFilter(stock=("missing",))),
+            ("unscraped", "没刮到档案", LibraryFilter(stock=("unscraped",))),
+        ],
+        content_limit,
+    )
+
+    # 语言与分辨率是**从数据里长出来的**取值，可以直接分组数
+    lang_rows = (
+        await session.execute(
+            select(
+                MediaMetadata.original_language,
+                func.count(func.distinct(LibraryFile.media_item_id)),
+            )
+            .select_from(LibraryFile)
+            .join(MediaMetadata, MediaMetadata.media_item_id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+            .where(
+                *_facet_scope(
+                    library_id,
+                    filters,
+                    member_id,
+                    "languages",
+                    content_limit=content_limit,
+                ),
+                MediaMetadata.original_language.is_not(None),  # type: ignore[union-attr]
+            )
+            .group_by(MediaMetadata.original_language)
+        )
+    ).all()
+    res_rows = (
+        await session.execute(
+            select(LibraryFile.resolution, func.count(func.distinct(LibraryFile.media_item_id)))
+            .select_from(LibraryFile)
+            .where(
+                *_facet_scope(
+                    library_id,
+                    filters,
+                    member_id,
+                    "resolutions",
+                    content_limit=content_limit,
+                ),
+                LibraryFile.resolution.is_not(None),  # type: ignore[union-attr]
+            )
+            .group_by(LibraryFile.resolution)
+        )
+    ).all()
+    return {
+        "ratings": ratings,
+        "runtimes": runtimes,
+        "hdr": hdr,
+        "stock": stock,
+        # 语言与画质同理：选中的取值补一条 0，别让它从自己那一维里消失
+        "languages": _with_selected(lang_rows, filters.languages if filters else ()),
+        "resolutions": _with_selected(res_rows, filters.resolutions if filters else ()),
+    }
+
+
+async def build_library_facets(
+    session: AsyncSession,
+    library_id: int,
+    kind: str,
+    *,
+    filters: LibraryFilter | None = None,
+    member_id: int | None = None,
+    tier: str = "primary",
+    content_limit: ContentLimit | None = None,
+) -> LibraryFacetsView:
+    """筛选面板的候选值与计数（docs/design/library-filtering.md 3.3）。
+
+    每一维的计数都在**排除该维自身条件**的前提下算（``skip``）——否则勾了
+    「动画」之后其他类型全变 0，多选就废了。与 ``build_library_wall`` 共用
+    同一个 ``filters``，所以「面板上显示多少部、点下去墙上就是多少部」是
+    结构保证的，不靠两处各写一遍。
+
+    为 0 的候选值照常返回（前端置灰不可点），这是「永不空货架」的第一道闸。
+    """
+    total = (
+        await session.execute(
+            select(func.count(func.distinct(LibraryFile.media_item_id))).where(
+                *_facet_scope(library_id, filters, member_id, skip="", content_limit=content_limit)
+            )
+        )
+    ).scalar_one()
+
+    genres = await _json_facet(
+        session,
+        MediaMetadata.genre_ids,
+        library_id,
+        filters,
+        member_id,
+        "genres",
+        selected=filters.genres if filters else (),
+        content_limit=content_limit,
+    )
+    countries = await _json_facet(
+        session,
+        MediaMetadata.origin_countries,
+        library_id,
+        filters,
+        member_id,
+        "countries",
+        selected=filters.countries if filters else (),
+        content_limit=content_limit,
+    )
+
+    # 年代：取（条目, 年份）后在 Python 里分档——档位是闭区间常量，用 SQL 的
+    # CASE 表达只会让这段更难读，而行数与库内条目数同量级
+    year_rows = (
+        await session.execute(
+            select(LibraryFile.media_item_id, _year_expr())
+            .select_from(LibraryFile)
+            .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+            .outerjoin(MediaMetadata, MediaMetadata.media_item_id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+            .where(
+                *_facet_scope(
+                    library_id,
+                    filters,
+                    member_id,
+                    "decades",
+                    content_limit=content_limit,
+                )
+            )
+            .distinct()
+        )
+    ).all()
+    decade_counts: dict[str, int] = {key: 0 for key in _DECADE_RANGES}
+    for _, year in year_rows:
+        if year is None:
+            continue  # 未知年份不属于任何档（见 _DECADE_RANGES）
+        for key, (lo, hi) in _DECADE_RANGES.items():
+            if (lo is None or year >= lo) and year <= hi:
+                decade_counts[key] += 1
+                break
+
+    watch_counts: list[tuple[str, str, int]] = []
+    for value, label in _WATCH_LABELS:
+        count = (
+            await session.execute(
+                select(func.count(func.distinct(LibraryFile.media_item_id)))
+                .select_from(LibraryFile)
+                .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+                .where(
+                    *_facet_scope(
+                        library_id,
+                        filters,
+                        member_id,
+                        "watch",
+                        content_limit=content_limit,
+                    ),
+                    _watch_clause(value, member_id or 0),
+                )
+            )
+        ).scalar_one()
+        watch_counts.append((value, label, count))
+
+    # 二级维度只在「更多筛选」面板打开时才算：它们是十几条 COUNT，
+    # 常用路径（四个一级 chips）不该为一个用户还没打开的面板买单
+    second: dict = {}
+    if tier == "all":
+        second = await _second_tier_facets(session, library_id, filters, member_id, content_limit)
+
+    return LibraryFacetsView(
+        total=int(total),
+        # 类型与地区按数量倒序：用户扫的是「这个库里主要有什么」，不是字典序
+        genres=[
+            FacetValueView(value=v, label=genre_label(kind, int(v)) if v.isdigit() else v, count=c)
+            for v, c in sorted(genres, key=lambda r: (-r[1], r[0]))
+        ],
+        countries=[
+            FacetValueView(value=v, label=country_label(v), count=c)
+            for v, c in sorted(countries, key=lambda r: (-r[1], r[0]))
+        ],
+        # 年代按时间倒序（_DECADE_RANGES 本就是这个顺序），空档也回
+        decades=[
+            FacetValueView(value=key, label="更早" if key == "earlier" else key, count=count)
+            for key, count in decade_counts.items()
+        ],
+        watch=[FacetValueView(value=v, label=lb, count=c) for v, lb, c in watch_counts],
+        **second,
+    )
+
+
+#: 维度名 → 展示名（放宽建议的文案用）
+_DIM_LABELS = {
+    "genres": "类型",
+    "countries": "地区",
+    "decades": "年代",
+    "watch": "观看",
+    "rating_gte": "评分",
+    "runtimes": "片长",
+    "languages": "语言",
+    "resolutions": "画质",
+    "hdr": "动态范围",
+    "stock": "库存",
+}
+
+#: 放宽建议要逐个取值评估的「多值」维度（单值的 watch / rating_gte / hdr 另处理）
+_RELAX_LIST_DIMS = (
+    "genres",
+    "countries",
+    "decades",
+    "runtimes",
+    "languages",
+    "resolutions",
+    "stock",
+)
+
+#: 二级维度里那些取值本身不可读的档位，展示名与「更多筛选」面板保持一致
+_RELAX_VALUE_LABELS = {
+    "lte60": "≤ 60′",
+    "60to90": "60–90′",
+    "90to120": "90–120′",
+    "gt120": "> 120′",
+    "missing": "文件失联",
+    "unscraped": "没刮到档案",
+}
+
+
+async def _count_matching(
+    session: AsyncSession,
+    library_id: int,
+    filters: LibraryFilter | None,
+    member_id: int | None,
+    content_limit: ContentLimit | None = None,
+) -> int:
+    """当前条件下的命中数（与墙同口径：本库、已识别、有在位文件）。"""
+    return int(
+        (
+            await session.execute(
+                select(func.count(func.distinct(LibraryFile.media_item_id))).where(
+                    *_facet_scope(
+                        library_id,
+                        filters,
+                        member_id,
+                        skip="",
+                        content_limit=content_limit,
+                    )
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def build_library_relax(
+    session: AsyncSession,
+    library_id: int,
+    kind: str,
+    *,
+    filters: LibraryFilter,
+    member_id: int | None = None,
+    content_limit: ContentLimit | None = None,
+) -> LibraryRelaxView:
+    """筛空时的放宽建议：逐条剔除已选条件后重算命中数，取最大的前三条。
+
+    **只列命中数 > 0 的条件。** 多维交叉时经常出现"去掉它还是 0 部"的剔除项
+    （比如同时选了纪录片、日韩、已看完，去掉任意一条仍然是 0），把它们摆出来
+    是噪音不是建议——用户要的是一条真能救回内容的出路，不是一份无效操作清单。
+    一条都救不回时返回空表，前端只留「清空全部条件」。
+    """
+    total = await _count_matching(session, library_id, filters, member_id, content_limit)
+    rows: list[tuple[str, str, int]] = []
+    # 每一个**已选**的取值都要评估——包括二级维度。只看一级四维的话，用户
+    # 用「4K + 评分≥9」筛空时一条建议都给不出，界面却会说"去掉任意一条也
+    # 救不回来"——那是句假话：去掉评分就救回来了
+    for dim in _RELAX_LIST_DIMS:
+        for value in getattr(filters, dim):
+            kept = tuple(v for v in getattr(filters, dim) if v != value)
+            trimmed = replace(filters, **{dim: kept})
+            left = await _count_matching(session, library_id, trimmed, member_id, content_limit)
+            rows.append((dim, str(value), left))
+    for dim, current in (
+        ("watch", filters.watch),
+        ("rating_gte", filters.rating_gte),
+        ("hdr", filters.hdr),
+    ):
+        if current is None:
+            continue
+        trimmed = replace(filters, **{dim: None})
+        left = await _count_matching(session, library_id, trimmed, member_id, content_limit)
+        rows.append((dim, str(current), left))
+
+    watch_labels = dict(_WATCH_LABELS)
+
+    def _label(dim: str, value: str) -> str:
+        if dim == "genres":
+            return genre_label(kind, int(value)) if value.lstrip("-").isdigit() else value
+        if dim == "countries":
+            return country_label(value)
+        if dim == "decades":
+            return "更早" if value == "earlier" else value
+        if dim == "watch":
+            return watch_labels.get(value, value)  # type: ignore[arg-type]
+        if dim == "rating_gte":
+            return f"≥ {float(value):g}"
+        if dim == "hdr":
+            return "HDR" if value == "True" else "SDR"
+        return _RELAX_VALUE_LABELS.get(value, value)
+
+    best = sorted((r for r in rows if r[2] > 0), key=lambda r: -r[2])[:3]
+    return LibraryRelaxView(
+        total=total,
+        suggestions=[
+            RelaxSuggestionView(
+                dim=dim,
+                dim_label=_DIM_LABELS.get(dim, dim),
+                value=value,
+                label=_label(dim, value),
+                count=count,
+            )
+            for dim, value, count in best
+        ],
+    )
+
+
 async def _wall_page_ids(
     session: AsyncSession,
     library_id: int,
@@ -336,37 +1234,60 @@ async def _wall_page_ids(
     limit: int | None,
     offset: int,
     identity: WallIdentity = "confirmed",
+    filters: LibraryFilter | None = None,
+    member_id: int | None = None,
+    content_limit: ContentLimit | None = None,
+    order: WallOrder | None = None,
+    only_item_id: int | None = None,
 ) -> list[int]:
     """按 sort 排好序的本页条目 id（无 limit 时是全库）。
+
+    ``only_item_id`` 把候选集收窄成一个条目（见 ``_wall_scope``）：反查
+    "这部片属于哪些合集"时，每个合集走的是与列成员**同一条**查询，
+    只是候选集只有一个。
 
     先把「这一页是哪些条目」定下来，后面的聚合才能只算这几十个条目。
     每个排序都以 media_item_id 收尾——排序键相等时顺序必须稳定，
     否则翻页会出现某条目重复出现、另一条目永远刷不到的漏项。
+
+    ``order`` 反转方向时，**收尾的 id 跟着一起反**：反向后的序列恰好是自然序列
+    倒过来，翻页、索引、「回到上次位置」的 offset 口径都不必另算。
+    度量为空（没评分、没看过）的条目两个方向都沉底——它们不是"最小值"，是"没数据"。
     """
+    narrow = _narrow(filters, member_id, library_id=library_id, content_limit=content_limit)
+
     if sort == "title":
-        ids = [i for i, _ in await _titles_sorted(session, library_id, identity)]
+        ids = [
+            i
+            for i, _ in await _titles_sorted(
+                session, library_id, identity, filters, member_id, content_limit, only_item_id
+            )
+        ]
+        if not _ascending(sort, order):
+            ids.reverse()
         return ids if limit is None else ids[offset : offset + limit]
 
     if sort == "added_at":
         # 「最近添加」：条目的入账时间取它名下最新的一次文件入账
+        ascending = _ascending(sort, order)
+        added = func.max(LibraryFile.created_at)
         query = (
             select(LibraryFile.media_item_id)
             .where(
-                LibraryFile.library_id == library_id,
-                LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
-                _identity_clause(identity),
+                *_wall_scope(library_id, identity, only_item_id),
+                *narrow,
             )
             .group_by(LibraryFile.media_item_id)  # type: ignore[arg-type]
             .order_by(
-                func.max(LibraryFile.created_at).desc(),
-                LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
+                added.asc() if ascending else added.desc(),
+                LibraryFile.media_item_id.asc() if ascending else LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
             )
         )
         if limit is not None:
             query = query.limit(limit).offset(offset)
         return [i for i in (await session.execute(query)).scalars().all() if i is not None]
 
-    if sort == "release_date":
+    if sort in ("release_date", "release_date_asc"):
         # 「按内容时间」：其他库的家庭录像按拍摄日期倒序最自然（release_date 由
         # 扫描从 sidecar NFO / 容器日期标签 / 文件 mtime 回落而来，见
         # local_identity）；影视库则是上映/首播日期。缺日期的退到年份、再到 id
@@ -375,12 +1296,24 @@ async def _wall_page_ids(
             .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
             .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
             .where(
-                LibraryFile.library_id == library_id,
-                LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
-                _identity_clause(identity),
+                *_wall_scope(library_id, identity, only_item_id),
+                *narrow,
             )
             .group_by(LibraryFile.media_item_id)  # type: ignore[arg-type]
-            .order_by(
+        )
+        if _ascending(sort, order):
+            # 正序：系列合集的 release_date_asc 档、或用户把「按上映时间」切成旧→新。
+            # 三个键一起翻向，只翻主键会让同年的片仍按倒序，读起来更乱。
+            # 缺日期的沉底（SQLite 升序默认把 NULL 排最前）：与倒序一致，
+            # 索引条的「未知」档因此两个方向都在最后
+            query = query.order_by(
+                nullslast(func.max(MediaMetadata.release_date).asc()),
+                func.max(MediaItem.year).asc(),
+                func.max(MediaItem.title).asc(),
+                LibraryFile.media_item_id.asc(),  # type: ignore[union-attr]
+            )
+        else:
+            query = query.order_by(
                 func.max(MediaMetadata.release_date).desc(),
                 func.max(MediaItem.year).desc(),
                 # release_date 只有日期没有时分：同一天的照片/录像按标题（文件名
@@ -388,6 +1321,41 @@ async def _wall_page_ids(
                 func.max(MediaItem.title).desc(),
                 LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
             )
+        if limit is not None:
+            query = query.limit(limit).offset(offset)
+        return [i for i in (await session.execute(query)).scalars().all() if i is not None]
+
+    # —— 以下四档共用同一个形状：按某个度量聚合后倒/正序，末尾一律以
+    #    media_item_id 收尾保证稳定分页；度量为空的条目靠 NULLS LAST 沉底，
+    #    而不是随排序方向在头尾之间跳
+    if sort in ("rating", "runtime", "size", "last_played"):
+        query = (
+            select(LibraryFile.media_item_id)
+            .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+            .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
+            .where(
+                *_wall_scope(library_id, identity, only_item_id),
+                *narrow,
+            )
+            .group_by(LibraryFile.media_item_id)  # type: ignore[arg-type]
+        )
+        if sort == "rating":
+            measure = func.max(MediaMetadata.vote_average)
+        elif sort == "runtime":
+            measure = func.max(MediaMetadata.runtime_minutes)
+        elif sort == "size":
+            # 体积按本库内的在位文件求和：同一部片散在两个库时，
+            # 这面墙上显示的应该是它在**这个库**占多少地方
+            measure = func.sum(LibraryFile.size_bytes)
+        else:
+            measure = func.max(_last_played_at(member_id or 0))
+        ascending = _ascending(sort, order)
+        # 自然方向下收尾一律是 id 倒序（加方向之前的行为）；反向时整条序列倒过来，
+        # 收尾也跟着变 id 正序——否则同分的片在两个方向里是同一个先后，不是"倒过来"
+        flipped = ascending != _NATURAL_ASC[sort]
+        query = query.order_by(
+            nullslast(measure.asc() if ascending else measure.desc()),
+            LibraryFile.media_item_id.asc() if flipped else LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
         )
         if limit is not None:
             query = query.limit(limit).offset(offset)
@@ -397,7 +1365,9 @@ async def _wall_page_ids(
     # 用户能看见"在处理哪几部"；两段各自保持拼音序（sorted 稳定排序）。
     # strm 占位文件不算"没读出"——它永远探不出规格，算进来会让网盘库
     # 每轮扫描都全墙置顶、永不落位
-    ordered = await _titles_sorted(session, library_id, identity)
+    ordered = await _titles_sorted(
+        session, library_id, identity, filters, member_id, content_limit
+    )
     unprobed = {
         i
         for i in (
@@ -418,6 +1388,40 @@ async def _wall_page_ids(
     }
     ids = [i for i, _ in sorted(ordered, key=lambda row: row[0] not in unprobed)]
     return ids if limit is None else ids[offset : offset + limit]
+
+
+async def _wall_count(
+    session: AsyncSession,
+    library_id: int,
+    identity: WallIdentity = "confirmed",
+    filters: LibraryFilter | None = None,
+    member_id: int | None = None,
+    content_limit: ContentLimit | None = None,
+) -> int:
+    """符合条件的条目**数量**——与 ``_wall_page_ids`` 同一套收窄，只是不取 id。
+
+    排序不影响数量，所以这里没有 sort 参数：一条 ``COUNT(DISTINCT)`` 覆盖全部
+    档位。存在的理由是合集列表——那里只要"这个合集有几部"，走 ``_wall_page_ids``
+    则要把整批 id 取出来（按标题排序时还要在 Python 里做一次全库拼音排序），
+    一个库几十个自动生成的系列合集时这就是那道性能悬崖。
+
+    **收窄条件仍然只有一处**（``_narrow`` + 这几行 WHERE），换的只是投影，
+    所以它不构成"合集自己的查询"。口径一致由回归用例压着：
+    ``_wall_count == len(_wall_page_ids)``。
+    """
+    return int(
+        (
+            await session.execute(
+                select(func.count(func.distinct(LibraryFile.media_item_id))).where(
+                    *_wall_scope(library_id, identity),
+                    *_narrow(
+                        filters, member_id, library_id=library_id, content_limit=content_limit
+                    ),
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
 
 
 async def favorite_item_ids(
@@ -472,6 +1476,9 @@ async def build_library_wall(
     offset: int = 0,
     identity: WallIdentity = "confirmed",
     member_id: int | None = None,
+    filters: LibraryFilter | None = None,
+    content_limit: ContentLimit | None = None,
+    order: WallOrder | None = None,
 ) -> list[LibraryItemView]:
     """库内媒体条目的库存聚合（单库海报墙数据源）。
 
@@ -487,7 +1494,9 @@ async def build_library_wall(
 
     调用方需自行完成库存在性检查（404）。
     """
-    page_ids = await _wall_page_ids(session, library_id, sort, limit, offset, identity)
+    page_ids = await _wall_page_ids(
+        session, library_id, sort, limit, offset, identity, filters, member_id, content_limit, order
+    )
     if not page_ids:
         return []
     # 分页时按 id 列表收窄（一页几十个，绑定变量绰绰有余）；全库时走子查询
@@ -496,6 +1505,7 @@ async def build_library_wall(
         select(LibraryFile.media_item_id).where(
             LibraryFile.library_id == library_id,
             LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
+            *_narrow(filters, member_id, library_id=library_id, content_limit=content_limit),
         )
         if limit is None
         else page_ids
@@ -508,19 +1518,82 @@ async def build_library_wall(
     return views
 
 
+@dataclass(frozen=True, slots=True)
+class PosterFacts:
+    """一个条目的海报事实：最终 URL、模糊占位图、本地资产像素尺寸、上映日、评分。"""
+
+    url: str | None = None
+    blur: str | None = None
+    #: 本地刮削资产的像素尺寸；没有本地资产时为 None（比例只能回落到文件探测值）
+    asset_size: tuple[int | None, int | None] | None = None
+    release_date: date | None = None
+    #: 评分（0~10，TMDB 或 NFO）；没有档案或没评过为 None。与上映日同一条查询顺带取，不多一次往返
+    rating: float | None = None
+
+
+async def poster_facts_many(
+    session: AsyncSession, item_ids: Sequence[int]
+) -> dict[int, PosterFacts]:
+    """一批条目的海报事实——**海报墙与合集封面共用的唯一实现**。
+
+    「本地刮削资产优先（断网可用），没有资产才回落 TMDB 图床」这条规则只在
+    这里写一次。合集卡片上的封面与海报墙上的那张图必须是同一张：共用一个
+    函数是结构性保证，两处各写一遍再靠人记得同步则是纪律，纪律会松。
+
+    一条查询覆盖整批（``MediaItem`` 左连 ``MediaMetadata``）。合集列表正是
+    靠它把封面代价从「每个合集一次完整墙聚合」压成**整页一条查询**——
+    否则一个库自动生成几十个系列合集之后，打开合集页就是几百条查询。
+    """
+    from movieclaw_api.core.config import get_settings
+
+    ids = [i for i in item_ids if i is not None]
+    if not ids:
+        return {}
+    base = get_settings().tmdb_image_base_url.rstrip("/")
+    out: dict[int, PosterFacts] = {}
+    for item_id, poster_path, poster_file, width, height, released, blur, rating in (
+        await session.execute(
+            select(
+                MediaItem.id,
+                MediaItem.poster_path,
+                MediaMetadata.poster_file,
+                MediaMetadata.poster_width,
+                MediaMetadata.poster_height,
+                MediaMetadata.release_date,
+                MediaMetadata.poster_blur,
+                MediaMetadata.vote_average,
+            )
+            .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
+            .where(MediaItem.id.in_(ids))  # type: ignore[attr-defined]
+        )
+    ).all():
+        if poster_file:
+            # ?v=<mtime>：换图原地覆盖同一路径，不带版本海报墙会一直显示旧图
+            url = f"/images/assets/{poster_file}?v={asset_version(poster_file)}"
+            out[item_id] = PosterFacts(url, blur or None, (width, height), released, rating)
+        else:
+            url = f"{base}/w500{poster_path}" if poster_path else None
+            out[item_id] = PosterFacts(url, None, None, released, rating)
+    return out
+
+
 async def _aggregate_wall_views(
     session: AsyncSession,
-    library_id: int,
+    library_id: int | None,
     in_page,
     ordered_ids: list[int],
+    *,
+    library_ids: set[int] | None = None,
 ) -> list[LibraryItemView]:
     """把一批条目在某个库内的台账行聚合成海报墙视图，按 ``ordered_ids`` 排列。
 
     海报墙分页与媒体库搜索共用这份聚合（口径必须一致：库存概况、缺集数、
     海报的本地资产优先级）。``in_page`` 是条目 id 列表或等价子查询。
+
+    ``library_id=None`` 是**跨库合集**那一支：同一部片可能散在两个库，这时
+    "几个文件、占多大"问的是它总共，而不是某一个库里。``library_ids`` 把范围
+    收在观看者可见的库上——不给的话跨库聚合会把不可见库里的文件也算进来。
     """
-    from movieclaw_api.core.config import get_settings
-    from movieclaw_db.models import MediaMetadata
     from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
     from movieclaw_db.repositories.media_repo import MediaItemRepository
 
@@ -531,6 +1604,7 @@ async def _aggregate_wall_views(
         await session.execute(
             select(
                 LibraryFile.media_item_id,
+                LibraryFile.library_id,
                 LibraryFile.id,
                 LibraryFile.season_number,
                 LibraryFile.episode_number,
@@ -545,7 +1619,15 @@ async def _aggregate_wall_views(
                     LibraryFile.file_path.not_like(f"%{STRM_EXT}"),  # type: ignore[union-attr]
                 ),
             ).where(
-                LibraryFile.library_id == library_id,
+                (
+                    LibraryFile.library_id == library_id
+                    if library_id is not None
+                    else (
+                        LibraryFile.library_id.in_(library_ids)  # type: ignore[union-attr]
+                        if library_ids is not None
+                        else true()
+                    )
+                ),
                 LibraryFile.media_item_id.in_(in_page),  # type: ignore[union-attr]
             )
         )
@@ -588,32 +1670,9 @@ async def _aggregate_wall_views(
     for item_id, season_number, episode_count in season_rows:
         season_episode_counts_by_item.setdefault(item_id, {})[season_number] = episode_count
 
-    base = get_settings().tmdb_image_base_url.rstrip("/")
-    # 海报优先本地刮削资产（断网可用），没有资产的回落 TMDB 图床
-    poster_assets: dict[int, str] = {}
-    poster_sizes: dict[int, tuple[int | None, int | None]] = {}
-    poster_blurs: dict[int, str] = {}
-    release_dates: dict[int, date | None] = {}
-    for item_id, poster_file, width, height, released, blur in (
-        await session.execute(
-            select(
-                MediaMetadata.media_item_id,
-                MediaMetadata.poster_file,
-                MediaMetadata.poster_width,
-                MediaMetadata.poster_height,
-                MediaMetadata.release_date,
-                MediaMetadata.poster_blur,
-            ).where(
-                MediaMetadata.media_item_id.in_(grouped.keys()),  # type: ignore[attr-defined]
-            )
-        )
-    ).all():
-        release_dates[item_id] = released
-        if poster_file:
-            poster_assets[item_id] = poster_file
-            poster_sizes[item_id] = (width, height)
-            if blur:
-                poster_blurs[item_id] = blur
+    # 海报优先本地刮削资产（断网可用），没有资产的回落 TMDB 图床——
+    # 这条规则的唯一实现在 poster_facts_many，合集封面走的是同一处
+    posters = await poster_facts_many(session, list(grouped.keys()))
     by_id: dict[int, LibraryItemView] = {}
     for item, files in grouped.values():
         season_episode_counts = season_episode_counts_by_item.get(item.id, {})  # type: ignore[arg-type]
@@ -666,27 +1725,24 @@ async def _aggregate_wall_views(
             )
         else:
             missing_episodes = 0
-        if item.id in poster_assets:
-            # ?v=<mtime>：换图原地覆盖同一路径，不带版本海报墙会一直显示旧图
-            rel = poster_assets[item.id]
-            poster_url = f"/images/assets/{rel}?v={asset_version(rel)}"
-        else:
-            poster_url = f"{base}/w500{item.poster_path}" if item.poster_path else None
+        poster = posters.get(item.id) or PosterFacts()
         by_id[item.id] = LibraryItemView(  # type: ignore[index]
             media_item_id=item.id,  # type: ignore[arg-type]
             kind=MediaKind(item.kind),
+            # 跨库合集里每一格要落回它自己那个库；单库墙上就是那个库。
+            # 多库都有这部片时取台账行里的第一个，与文件聚合同一份来源
+            library_id=library_id if library_id is not None else files[0].library_id,
             source=item.source,
             tmdb_id=item.tmdb_id,
             title=item.title,
             year=item.year,
-            poster_url=poster_url,
+            poster_url=poster.url,
             # 缩略图还没生成时用扫描入账记下的原图尺寸定比例：墙一开始就是最终
             # 布局，缩略图到达不会引起重排（渐进式加载的第 0 级）
-            primary_aspect=primary_aspect(
-                item, *(poster_sizes.get(item.id) or _pixel_size_of(files))
-            ),
-            poster_blur=poster_blurs.get(item.id),
-            release_date=release_dates.get(item.id),
+            primary_aspect=primary_aspect(item, *(poster.asset_size or _pixel_size_of(files))),
+            poster_blur=poster.blur,
+            release_date=poster.release_date,
+            rating=poster.rating,
             # 首个在位文件：一文件一条目的库就是那一个；多文件条目取最早入账的
             primary_file_id=min(
                 (f.id for f in files if f.state == FileState.IN_PLACE), default=None
@@ -727,6 +1783,8 @@ async def build_library_gallery(
     limit: int | None = None,
     offset: int = 0,
     sort: WallSort = "title",
+    filters: LibraryFilter | None = None,
+    content_limit: ContentLimit | None = None,
 ) -> list[LibraryGalleryGroupView]:
     """影视库 / 其他库的「图床浏览模式」数据源：条目的图铺平成组。
 
@@ -736,7 +1794,9 @@ async def build_library_gallery(
     「最近添加」——两面墙同一个 ``offset`` 口径，切了排序「回到上次位置」
     仍然跳得准（前端把排序写进位置记录的形态里，见 lib/library-wall-recall.ts）。
     """
-    page_ids = await _wall_page_ids(session, library_id, sort, limit, offset)
+    page_ids = await _wall_page_ids(
+        session, library_id, sort, limit, offset, "confirmed", filters, member_id, content_limit
+    )
     return await build_gallery_groups(
         session, [(item_id, library_id) for item_id in page_ids], member_id=member_id
     )
@@ -946,13 +2006,20 @@ async def build_gallery_groups(
 
 
 async def search_library_items(
-    session: AsyncSession, keyword: str
+    session: AsyncSession,
+    keyword: str,
+    *,
+    member_id: int | None = None,
+    content_limit: ContentLimit | None = None,
 ) -> dict[int, list[LibraryItemView]]:
     """按关键词搜索全部媒体库的已识别条目：library_id -> 命中条目视图。
 
     搜索弹窗「媒体库」垂直的数据源。标题/原名子串匹配（忽略英文大小写），
     只搜已识别入库的条目——待识别文件没有可靠的标题可匹配，去待识别清单
     处理更合适。组内按标题拼音排序，与海报墙同一套排序规则。
+
+    **观看者的分级约束在这里同样生效**：搜得到就等于看得到（点进去是详情页），
+    墙上藏起来而搜索里搜得出来，那道约束只是障眼法。
     """
     pattern = f"%{keyword.strip().lower()}%"
     rows = (
@@ -966,6 +2033,7 @@ async def search_library_items(
                     func.lower(MediaItem.title).like(pattern),
                     func.lower(MediaItem.original_title).like(pattern),
                 ),
+                *_narrow(None, member_id, content_limit=content_limit),
             )
             .distinct()
         )
@@ -1536,9 +2604,7 @@ async def backfill_streams(
         # 正常视频至少能取得其中一项，避免个别元数据缺失的文件每轮重复 ffprobe。
         needs_visual_details = row.frame_rate is None and row.color_space is None
         if (
-            row.audio_streams is not None
-            and not needs_clpi
-            and not needs_visual_details
+            row.audio_streams is not None and not needs_clpi and not needs_visual_details
         ) or row.state != FileState.IN_PLACE:
             if not await keep_going():
                 break
@@ -1774,8 +2840,7 @@ async def delete_single_file(
     if path.is_dir():
         prefix = str(path).rstrip("/") + "/"
         if any(
-            other.id != row.id and other.file_path.startswith(prefix)
-            for other in all_library_files
+            other.id != row.id and other.file_path.startswith(prefix) for other in all_library_files
         ):
             result.errors.append(
                 f"「{path}」目录内还有其他在案文件（可能是新入库的版本），已跳过整目录删除"

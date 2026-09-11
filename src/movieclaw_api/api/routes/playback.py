@@ -54,8 +54,8 @@ from movieclaw_api.schemas.playback import (
     PlaybackStateView,
     PlaybackStatsView,
     PlaybackWatchStatsView,
-    RecentWatchView,
     TrickplayView,
+    UpNextView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import media_scrape
@@ -121,8 +121,8 @@ from movieclaw_api.services.playback_activity import (
     revoke_device,
 )
 from movieclaw_api.services.playback_favorites import favorite_gallery, favorite_items
-from movieclaw_api.services.playback_recent import recent_watch_items
 from movieclaw_api.services.playback_stats import playback_history, playback_stats
+from movieclaw_api.services.playback_up_next import up_next_items
 from movieclaw_api.settings import PlaybackPolicySetting
 from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.engine import get_database, get_session
@@ -355,27 +355,30 @@ def _build_playback_diagnostics(
 
 
 @router.get(
-    "/recent",
-    response_model=ApiResponse[RecentWatchView],
-    summary="最近观看",
-    operation_id="playback.recent",
+    "/up-next",
+    response_model=ApiResponse[UpNextView],
+    summary="接下来继续",
+    operation_id="playback.up-next",
     openapi_extra={"x-cli-hidden": True},
 )
-async def list_recent_watch(
+async def list_up_next(
     limit: Annotated[int, Query(ge=1, le=50)] = 20,
     principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[RecentWatchView]:
-    """列出当前账号在可见媒体库中的最近观看作品。"""
+) -> ApiResponse[UpNextView]:
+    """当前账号在可见媒体库中"接下来该接着看"的作品。
+
+    每张卡都指向一个还没看完的单元；看完的作品不出现在这里。
+    """
     visible_ids = await visible_library_ids(session, principal)
     member_id = principal.member_id if principal.member_id is not None else 0
-    items = await recent_watch_items(
+    items = await up_next_items(
         session,
         member_id=member_id,
         visible_library_ids=visible_ids,
         limit=limit,
     )
-    return ok(RecentWatchView(items=items))
+    return ok(UpNextView(items=items))
 
 
 @router.get(
@@ -388,11 +391,15 @@ async def list_recent_watch(
 async def list_favorites(
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
     offset: Annotated[int, Query(ge=0, description="跳过的作品数（全部收藏页滚动加载用）")] = 0,
+    unwatched_first: Annotated[
+        bool, Query(description="把还没看完的整体提前（首页横滚行用；全量页不传）")
+    ] = False,
     principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[FavoritesView]:
     """列出当前账号在可见媒体库中收藏的作品（网页与 Jellyfin 客户端点的心同一份），
-    最近收藏在前。首页横滚行取前 20；「全部收藏」海报墙按 offset 滚动加载。"""
+    最近收藏在前。首页横滚行取前 20 且把没看完的提前；「全部收藏」海报墙按
+    offset 滚动加载，保持纯收藏时间序。"""
     visible_ids = await visible_library_ids(session, principal)
     member_id = principal.member_id if principal.member_id is not None else 0
     items, total = await favorite_items(
@@ -401,6 +408,7 @@ async def list_favorites(
         visible_library_ids=visible_ids,
         limit=limit,
         offset=offset,
+        unwatched_first=unwatched_first,
     )
     return ok(FavoritesView(items=items, total=total))
 
@@ -797,8 +805,23 @@ async def _decide(
     principal: Principal,
     session: AsyncSession,
 ):
-    """decide 与开会话共用的取数与判定。"""
+    """decide 与开会话共用的取数与判定。
+
+    **可见性在这里收口两次**：库范围（``visible_library_ids``）之外，还要过
+    ``assert_item_visible``——它带着成员的内容分级约束。少了这一道，儿童档案
+    只是看不到超分级的片，直链一个 ``media_item_id`` 过来照样起播；收窄只做在
+    列表上，等于挡住了浏览、没挡住播放。
+
+    ``_decide`` 是 decide、开会话与两处降级重试共用的唯一入口，所以这一道
+    只需要写在这里。
+    """
     visible = await visible_library_ids(session, principal)
+    guard_item_id = payload.media_item_id
+    if guard_item_id is None and payload.file_id is not None:
+        file_row = await session.get(LibraryFile, payload.file_id)
+        guard_item_id = file_row.media_item_id if file_row is not None else None
+    if guard_item_id is not None:
+        await assert_item_visible(session, principal, guard_item_id)
     capability = playback_plan.capability_from_request(payload.capability)
     failed = frozenset(Tier(t) for t in payload.failed_tiers if t in Tier._value2member_map_)
     if payload.file_id is not None:

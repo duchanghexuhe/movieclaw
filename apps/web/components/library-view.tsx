@@ -15,7 +15,7 @@ import {
 } from "@/components/icons";
 import { MediaRow } from "@/components/media-row";
 import type { PosterCardAction } from "@/components/poster-card";
-import { RecentWatchRow } from "@/components/recent-watch-row";
+import { UpNextRow } from "@/components/up-next-row";
 import {
   type LibraryItem,
   type MediaLibrary,
@@ -23,12 +23,13 @@ import {
   listLibraryItems,
   SCAN_PHASE_LABELS,
 } from "@/lib/api/libraries";
+import { listCollections } from "@/lib/api/collections";
 import {
   type FavoriteItem,
   type FavoritesPage,
   listFavorites,
-  listRecentWatch,
-  type RecentWatchItem,
+  listUpNext,
+  type UpNextItem,
 } from "@/lib/api/playback";
 import type { Subscription } from "@/lib/api/subscriptions";
 import { publicEnv } from "@/lib/env";
@@ -45,6 +46,8 @@ import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /** 每个库「最近添加」行的格数（也是本页向服务端要的条目数上限）。 */
 const RECENT_COUNT = 20;
+/** 「接下来继续」横滚行最多几张卡。 */
+const UP_NEXT_COUNT = 20;
 /** 「我的收藏」横滚行只放最近收藏的这么多部，更多的到 /library/favorites 看。 */
 const FAVORITES_COUNT = 20;
 
@@ -110,9 +113,14 @@ export function LibraryView() {
   const [itemsByLibrary, setItemsByLibrary] = useState<Map<number, LibraryItem[]>>(
     new Map(),
   );
-  const [recentWatch, setRecentWatch] = useState<RecentWatchItem[] | null>(null);
+  const [upNext, setUpNext] = useState<UpNextItem[] | null>(null);
   // 我的收藏：与最近观看同一轮拉取、同一套失败策略（拉不到保留旧数据）
   const [favorites, setFavorites] = useState<FavoritesPage | null>(null);
+  // 只用来决定「全部合集」这个入口露不露；空合集后端已经滤掉了，所以
+  // 数字大于零就意味着"点进去真有东西"
+  const [collectionCount, setCollectionCount] = useState(0);
+  // 推荐行按**库**取：每个库的观看记录各算各的（在电影库常看动画，不代表
+  // 剧集库也要推动画）。记录不足的库返回空表，那一行就不出现
   const [failed, setFailed] = useState(false);
 
   // 轮询乱序守卫：扫描期间后端响应时间抖动大，上一轮的慢响应可能晚于
@@ -127,14 +135,18 @@ export function LibraryView() {
     Promise.all([
       listLibraries(),
       // 最近观看 / 我的收藏失败不拖垮媒体库首页；保留旧数据，下一轮轮询自动重试。
-      listRecentWatch(RECENT_COUNT).catch(() => null),
-      listFavorites(FAVORITES_COUNT).catch(() => null),
+      listUpNext(UP_NEXT_COUNT).catch(() => null),
+      // 首页这一行是「我想看的」：没看完的提前（全量页不传，保持收藏时间序）
+      listFavorites(FAVORITES_COUNT, 0, true).catch(() => null),
+      // 合集数只决定一个入口露不露，拿不到就当没有——不拖垮首页
+      listCollections().catch(() => null),
     ])
-      .then(async ([libs, latestWatch, latestFavorites]) => {
+      .then(async ([libs, latestUpNext, latestFavorites, allCollections]) => {
         if (seq !== reloadSeq.current) return;
+        setCollectionCount(allCollections?.length ?? 0);
         setFailed(false);
-        if (latestWatch !== null) setRecentWatch(latestWatch);
-        else setRecentWatch((previous) => previous ?? []);
+        if (latestUpNext !== null) setUpNext(latestUpNext);
+        else setUpNext((previous) => previous ?? []);
         if (latestFavorites !== null) setFavorites(latestFavorites);
         else setFavorites((previous) => previous ?? { items: [], total: 0 });
         const snapshot = JSON.stringify(libs);
@@ -314,7 +326,7 @@ export function LibraryView() {
       {/* 当前账号跨可见库聚合的播放状态；空列表时组件整段隐藏。
           清空观看记录的入口就在这一行的标题右侧，清完重新拉一次数据。 */}
       {(!failed || libraries !== null) && (
-        <RecentWatchRow items={recentWatch} libraries={visibleLibraries} onCleared={reload} />
+        <UpNextRow items={upNext} libraries={visibleLibraries} onCleared={reload} />
       )}
 
       {/* 「我的收藏」跟在最近观看之下：先接着看、再挑想看的。只横滚最近收藏的
@@ -367,6 +379,16 @@ export function LibraryView() {
             >
               我的媒体库
             </h3>
+            {/* 「全部合集」的入口等到真有合集了才露出：一开始就摆在这儿，
+                用户点进去只有一片空白，那个位置就白占了（IA 那条决策） */}
+            {collectionCount > 0 && (
+              <Link
+                href={"/library/collections" as Route}
+                className="shrink-0 text-ui text-[var(--text-faint)] transition hover:text-[var(--text)]"
+              >
+                全部合集 ›
+              </Link>
+            )}
           </div>
           <HScroller className="mt-3 gap-5 px-6 pb-1 pt-1 max-md:gap-3.5 max-md:px-4">
             {visibleLibraries.map((library) => (
@@ -381,6 +403,7 @@ export function LibraryView() {
           </HScroller>
         </section>
       )}
+
 
       {/* —— 最近添加：Emby 首页式分区，每个非空库一行横滚海报 —— */}
       {recentRows.length > 0 && (

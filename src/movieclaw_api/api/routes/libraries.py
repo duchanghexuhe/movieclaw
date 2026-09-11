@@ -26,15 +26,18 @@ from movieclaw_api.schemas.library import (
     DetachPayload,
     DirectorView,
     IdentityReviewDecision,
+    ItemCollectionRef,
     ItemDeleteResultView,
     LastOrganizeView,
     LastScanView,
+    LibraryFacetsView,
     LibraryFileView,
     LibraryGalleryGroupView,
     LibraryIndexEntryView,
     LibraryItemDetailView,
     LibraryItemView,
     LibraryPayload,
+    LibraryRelaxView,
     LibraryReorderPayload,
     LibrarySearchGroupView,
     LibraryView,
@@ -87,14 +90,20 @@ from movieclaw_api.services.library import chapters as chapters_mod
 from movieclaw_api.services.library import claim as library_claim
 from movieclaw_api.services.library import source_annotation
 from movieclaw_api.services.library.access import (
+    assert_item_visible,
     assert_library_visible,
+    content_limit_for,
     visible_library_ids,
 )
+from movieclaw_api.services.library.collections import collections_containing
 from movieclaw_api.services.library.config import LibraryConfigService
 from movieclaw_api.services.library.items import (
+    LibraryFilter,
     build_item_detail,
+    build_library_facets,
     build_library_gallery,
     build_library_index,
+    build_library_relax,
     build_library_wall,
     build_season_episodes,
     delete_item_files,
@@ -125,6 +134,10 @@ from movieclaw_api.services.library.scan import (
     reidentify_item,
     request_stop_scan,
     scan_progress,
+)
+from movieclaw_api.services.library.series import (
+    ensure_series_collections_for_library,
+    series_collection_id_for,
 )
 from movieclaw_api.services.library.subtitle_preview import (
     SubtitlePreviewError,
@@ -885,7 +898,12 @@ async def search_library_items(
     不是一次对外搜索，历史里混进它只会淹没真正要回放的记录。
     成员的结果按库可见性白名单过滤。
     """
-    matched = await search_visible_library_items(session, keyword)
+    matched = await search_visible_library_items(
+        session,
+        keyword,
+        member_id=principal.member_id if principal.member_id is not None else 0,
+        content_limit=await content_limit_for(session, principal),
+    )
     libraries = await LibraryConfigService(session).list_all()
     visible = await visible_library_ids(session, principal)
     libraries = [lib for lib in libraries if lib.id in visible]
@@ -979,6 +997,7 @@ async def create_library(
         generate_thumbnails=payload.generate_thumbnails,
         extract_chapter_images=payload.extract_chapter_images,
         exclude_from_home=payload.exclude_from_home,
+        auto_series_collections=payload.auto_series_collections,
         access_mode=payload.access_mode,
         admin_visible=payload.admin_visible,
         member_ids=payload.member_ids,
@@ -1139,10 +1158,16 @@ async def update_library(
         generate_thumbnails=payload.generate_thumbnails,
         extract_chapter_images=payload.extract_chapter_images,
         exclude_from_home=payload.exclude_from_home,
+        auto_series_collections=payload.auto_series_collections,
         access_mode=payload.access_mode,
         admin_visible=payload.admin_visible,
         member_ids=payload.member_ids,
     )
+    if payload.auto_series_collections:
+        # 开关打开：把这个库里已有的系列一次补齐（一条 GROUP BY series_key），
+        # **不重新联网、不重新刮削**——数据早就在 media_metadata 的列里了
+        await ensure_series_collections_for_library(session, library_id)
+        await session.commit()
     member_ids = await MemberRepository(session).get_library_member_ids(library_id)
     # 根路径变了就自动补扫：新目录的存量立刻入账，移除目录下的文件标记 missing
     if roots_changed:
@@ -1797,6 +1822,157 @@ async def start_organize(
     )
 
 
+def _filter_params(
+    g: Annotated[
+        str | None,
+        Query(description="类型：TMDB genre id，逗号分隔（维内 OR）。例：16,878"),
+    ] = None,
+    c: Annotated[
+        str | None,
+        Query(description="地区：ISO 3166-1 国家码，逗号分隔（维内 OR）。例：JP,KR"),
+    ] = None,
+    d: Annotated[
+        str | None,
+        Query(description="年代档：2020s/2010s/2000s/1990s/earlier，逗号分隔（维内 OR）"),
+    ] = None,
+    w: Annotated[
+        Literal["unwatched", "watching", "played", "favorite"] | None,
+        Query(description="观看状态（单选）：未看/在看/已看完是一个划分，favorite 与之正交"),
+    ] = None,
+    rating_gte: Annotated[
+        float | None, Query(ge=0, le=10, description="评分下限（找片）")
+    ] = None,
+    rt: Annotated[
+        str | None,
+        Query(description="片长档：lte60/60to90/90to120/gt120，逗号分隔（找片）"),
+    ] = None,
+    lang: Annotated[
+        str | None, Query(description="原始语言码，逗号分隔（找片）")
+    ] = None,
+    res: Annotated[
+        str | None, Query(description="分辨率：2160p/1080p/…，逗号分隔（查库）")
+    ] = None,
+    hdr: Annotated[
+        bool | None, Query(description="true=只看 HDR / false=只看 SDR（查库）")
+    ] = None,
+    stock: Annotated[
+        str | None,
+        Query(description="库存状态：missing=有文件失联 / unscraped=没刮到档案，逗号分隔（查库）"),
+    ] = None,
+    series_keys: Annotated[
+        str | None,
+        Query(
+            description=(
+                "作品系列键（tmdb:1241 / name:xxx），逗号分隔。"
+                "**界面上没有这一维的下拉**——一个库几百个系列，下拉根本没法用，"
+                "合集才是它正确的呈现形态；这个参数服务的是系列合集与可分享的链接"
+            )
+        ),
+    ] = None,
+) -> LibraryFilter:
+    """筛选参数 → LibraryFilter。
+
+    ``/items``、``/facets``、``/item-index`` **共用这一个依赖**：口径分叉是
+    这类功能最常见的 bug 源（面板说 42 部、墙上只有 39 部），共用之后
+    分叉在结构上就不可能发生。
+
+    维内 OR、维间 AND；解析不出的取值静默丢弃（宽容语义，老链接不至于 422）。
+    """
+
+    def _split(raw: str | None) -> list[str]:
+        return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+    genres = tuple(int(x) for x in _split(g) if x.lstrip("-").isdigit())
+    return LibraryFilter(
+        genres=genres,
+        countries=tuple(x.upper() for x in _split(c)),
+        decades=tuple(_split(d)),
+        watch=w,
+        rating_gte=rating_gte,
+        runtimes=tuple(_split(rt)),
+        languages=tuple(x.lower() for x in _split(lang)),
+        resolutions=tuple(_split(res)),
+        hdr=hdr,
+        stock=tuple(_split(stock)),
+        series_keys=tuple(_split(series_keys)),
+    )
+
+
+@router.get(
+    "/{library_id}/facets",
+    response_model=ApiResponse[LibraryFacetsView],
+    summary="筛选面板的候选值与计数（每一维排除自身条件后算）",
+    operation_id="library.items.facets",
+    dependencies=[Depends(require_library_visible)],
+)
+async def get_library_facets(
+    library_id: int,
+    filters: Annotated[LibraryFilter, Depends(_filter_params)],
+    tier: Annotated[
+        Literal["primary", "all"],
+        Query(
+            description=(
+                "primary=只算一级四维（默认）/ all=连「更多筛选」面板的维度一起算。"
+                "二级维度是十几条 COUNT，常用路径不该为没打开的面板买单"
+            )
+        ),
+    ] = "primary",
+    session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_library_visible),
+) -> ApiResponse[LibraryFacetsView]:
+    """与 ``/items`` 同参：面板上显示多少部，点下去墙上就是多少部。
+
+    为 0 的候选值照常返回（前端置灰不可点）——「永不空货架」的第一道闸。
+    """
+
+    library = await LibraryConfigService(session).get(library_id)  # 404 检查
+    member_id = principal.member_id if principal.member_id is not None else 0
+    return ok(
+        await build_library_facets(
+            session,
+            library_id,
+            library.kind,
+            filters=filters,
+            member_id=member_id,
+            tier=tier,
+            content_limit=await content_limit_for(session, principal),
+        )
+    )
+
+
+@router.get(
+    "/{library_id}/relax",
+    response_model=ApiResponse[LibraryRelaxView],
+    summary="筛空时的放宽建议（只列救得回内容的条件）",
+    operation_id="library.items.relax",
+    dependencies=[Depends(require_library_visible)],
+)
+async def get_library_relax(
+    library_id: int,
+    filters: Annotated[LibraryFilter, Depends(_filter_params)],
+    session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_library_visible),
+) -> ApiResponse[LibraryRelaxView]:
+    """与 ``/items`` 同参。前端在墙筛空时调它，拿到「放宽哪一条能救回多少部」。
+
+    不渲染空墙是产品铁律（docs/design/library-filtering.md 铁律 2）：
+    Netflix 的货架永远不空，这不是美学，是留存。
+    """
+
+    library = await LibraryConfigService(session).get(library_id)  # 404 检查
+    member_id = principal.member_id if principal.member_id is not None else 0
+    return ok(
+        await build_library_relax(
+            session,
+            library_id,
+            library.kind,
+            filters=filters,
+            member_id=member_id,
+            content_limit=await content_limit_for(session, principal),
+        )
+    )
+
+
 @router.get(
     "/{library_id}/items",
     response_model=ApiResponse[list[LibraryItemView]],
@@ -1808,14 +1984,36 @@ async def list_library_items(
     # 这三个参数用 Annotated 写法（而非 `= Query(...)`）：函数被直接调用时
     # 拿到的是真实默认值而不是 Query 对象——测试与内部调用都走这条路
     sort: Annotated[
-        Literal["title", "added_at", "release_date", "probing"],
+        Literal[
+            "title",
+            "added_at",
+            "release_date",
+            "release_date_asc",
+            "probing",
+            "rating",
+            "runtime",
+            "size",
+            "last_played",
+        ],
         Query(
             description=(
                 "排序：title=按标题 / added_at=最近入账优先 / "
-                "release_date=按内容时间倒序 / probing=待补探优先"
+                "release_date=按内容时间倒序 / release_date_asc=按上映正序"
+                "（系列合集用它，筛选栏里不出现）/ probing=待补探优先 / "
+                "rating=评分高的在前 / runtime=片长短的在前 / "
+                "size=占地大的在前 / last_played=最近看过的在前"
             )
         ),
     ] = "title",
+    order: Annotated[
+        Literal["asc", "desc"] | None,
+        Query(
+            description=(
+                "排序方向：asc=升序 / desc=降序；不给则用该排序的自然方向"
+                "（标题 A→Z、片长短→长，其余大的/新的在前）"
+            )
+        ),
+    ] = None,
     limit: Annotated[
         int | None, Query(ge=1, le=200, description="本页条目数；不给则返回整库")
     ] = None,
@@ -1829,6 +2027,7 @@ async def list_library_items(
             )
         ),
     ] = "confirmed",
+    filters: Annotated[LibraryFilter, Depends(_filter_params)] = None,  # type: ignore[assignment]
     session: AsyncSession = Depends(get_session),
     principal: Principal = Depends(require_library_visible),
 ) -> ApiResponse[list[LibraryItemView]]:
@@ -1845,6 +2044,9 @@ async def list_library_items(
             offset=offset,
             identity=identity,
             member_id=member_id,
+            filters=filters,
+            content_limit=await content_limit_for(session, principal),
+            order=order,
         )
     )
 
@@ -1886,10 +2088,22 @@ async def list_library_item_ids(
 )
 async def list_library_item_index(
     library_id: int,
-    sort: Literal["title", "release_date"] = Query(
-        default="title", description="title=首字母档；release_date=月份档（图片库/其他库时间线）"
+    sort: Literal["title", "release_date", "rating"] = Query(
+        default="title",
+        description=(
+            "title=首字母档；release_date=月份档（图片库/其他库时间线）；rating=评分档。"
+            "其余排序没有有意义的分档，索引条不显示"
+        ),
     ),
+    # Annotated 写法：函数被直接调用时拿到真实的 None，而不是一个真值的 Query 对象
+    # ——否则不传方向也会被当成 "desc"，按标题的 A-Z 索引整条倒过来
+    order: Annotated[
+        Literal["asc", "desc"] | None,
+        Query(description="排序方向，与 /items 的 order 同义；两边必须传同一个值，offset 才对得上"),
+    ] = None,
+    filters: Annotated[LibraryFilter, Depends(_filter_params)] = None,  # type: ignore[assignment]
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_library_visible),
 ) -> ApiResponse[list[LibraryIndexEntryView]]:
     """索引条数据：每档的条目数与起始 offset，只回非空档。
 
@@ -1899,7 +2113,16 @@ async def list_library_item_index(
     """
 
     await LibraryConfigService(session).get(library_id)  # 404 检查
-    buckets = await build_library_index(session, library_id, sort)
+    member_id = principal.member_id if principal.member_id is not None else 0
+    buckets = await build_library_index(
+        session,
+        library_id,
+        sort,
+        filters=filters,
+        member_id=member_id,
+        content_limit=await content_limit_for(session, principal),
+        order=order,
+    )
     return ok(
         [
             LibraryIndexEntryView(initial=initial, count=count, offset=offset)
@@ -1925,6 +2148,7 @@ async def list_library_gallery(
         Literal["title", "added_at"],
         Query(description="排序：title=按标题（默认）/ added_at=最近入账优先"),
     ] = "title",
+    filters: Annotated[LibraryFilter, Depends(_filter_params)] = None,  # type: ignore[assignment]
     session: AsyncSession = Depends(get_session),
     principal: Principal = Depends(require_library_visible),
 ) -> ApiResponse[list[LibraryGalleryGroupView]]:
@@ -1937,7 +2161,14 @@ async def list_library_gallery(
     member_id = principal.member_id if principal.member_id is not None else 0
     return ok(
         await build_library_gallery(
-            session, library_id, member_id=member_id, limit=limit, offset=offset, sort=sort
+            session,
+            library_id,
+            member_id=member_id,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            filters=filters,
+            content_limit=await content_limit_for(session, principal),
         )
     )
 
@@ -2143,6 +2374,9 @@ async def get_library_item(
 
     service = LibraryConfigService(session)
     library = await service.get(library_id)
+    # 分级约束（儿童档案）：墙上藏起来但详情页点得进去，那道约束就是障眼法。
+    # 判定走 access 的收口，超出上限与"条目不存在"不可区分
+    await assert_item_visible(session, principal, media_item_id)
     item, rows = await _item_rows(session, library_id, media_item_id)
     # 起播预热：用户在详情页看简介的这几秒，正好把关键帧采样与默认字幕
     # 抽掉——点播放时缓存直接命中，首播不再现场探测（§6.10）。后台任务，
@@ -2170,6 +2404,26 @@ async def get_library_item(
     ):
         chapters_pending = chapters_mod.schedule_item_chapter_images(media_item_id)
     bundle = await build_item_detail(session, library, item, rows)
+    # 所属系列：影片页给一个跳进整个系列的入口。只有本库真的生成了那个合集
+    # 才给 id——给一个点了 404 的入口比不给更糟（合集可能被用户隐藏了，
+    # 或者这个库把自动生成关掉了）
+    series_collection_id = await series_collection_id_for(session, library_id, media_item_id)
+    # 所属合集：与系列分两行说——系列是这部片的事实，合集是用户自己的归类。
+    # 反查走 resolve_members 同一条路径（见 collections_containing 的说明），
+    # 不另写一套判定；系列合集与「我的收藏」不重复出现在这一行
+    member_id, visible, content_limit = (
+        principal.member_id if principal.member_id is not None else 0,
+        await visible_library_ids(session, principal),
+        await content_limit_for(session, principal),
+    )
+    in_collections = await collections_containing(
+        session,
+        media_item_id,
+        library_id=library_id,
+        member_id=member_id,
+        visible_library_ids=visible,
+        content_limit=content_limit,
+    )
 
     base = get_settings().tmdb_image_base_url.rstrip("/")
     art_base = f"/libraries/{library_id}/items/{media_item_id}/artwork"
@@ -2286,6 +2540,11 @@ async def get_library_item(
             scraping=media_scrape.is_scraping(media_item_id),
             scraping_phase=media_scrape.scraping_phase(media_item_id),
             chapters_pending=chapters_pending,
+            series_name=meta_row.series_name if meta_row else None,
+            series_collection_id=series_collection_id,
+            collections=[
+                ItemCollectionRef(id=row.id or 0, name=row.name) for row in in_collections
+            ],
         )
     )
 
@@ -2309,6 +2568,7 @@ async def list_item_episodes(
     随集带回当前观看者的进度（进度条/已看对勾的数据源）。"""
     service = LibraryConfigService(session)
     await service.get(library_id)  # 404 检查
+    await assert_item_visible(session, principal, media_item_id)
     item, rows = await _item_rows(session, library_id, media_item_id)
     episodes = await build_season_episodes(
         session,

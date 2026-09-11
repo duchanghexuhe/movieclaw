@@ -459,11 +459,11 @@ def test_library_visibility_whitelist(client: TestClient) -> None:
 
 
 def test_recent_playback_is_a_member_browsing_route(client: TestClient) -> None:
-    """最近观看属于成员浏览面；新账号没有记录时返回空列表而不是拒绝访问。"""
+    """「接下来继续」属于成员浏览面；新账号没有记录时返回空列表而不是拒绝访问。"""
     _admin_cookie, member_cookie, _ = _setup_admin_and_member(client)
     _use(client, member_cookie)
 
-    response = client.get("/api/v1/playback/recent")
+    response = client.get("/api/v1/playback/up-next")
 
     assert response.status_code == 200
     assert response.json()["data"] == {"items": []}
@@ -508,6 +508,7 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/share/{slug}"),
     ("POST", "/api/v1/share/{slug}/unlock"),
     ("GET", "/api/v1/share/{slug}/item"),
+    ("GET", "/api/v1/share/{slug}/collection"),
     ("GET", "/api/v1/share/{slug}/episodes"),
     ("GET", "/api/v1/share/{slug}/artwork"),
     ("GET", "/api/v1/share/{slug}/images/assets/{path}"),
@@ -553,14 +554,35 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/libraries/{library_id}/cover"),
     # 图床浏览模式的数据源：与 /items 同一浏览面，同样按库可见性鉴权
     ("GET", "/api/v1/libraries/{library_id}/gallery"),
+    # 筛选面板的候选值与计数、筛空时的放宽建议：与 /items 同参、同一份收窄，
+    # 数出来的就是该成员在这个库里筛得到的部数
+    ("GET", "/api/v1/libraries/{library_id}/facets"),
+    ("GET", "/api/v1/libraries/{library_id}/relax"),
     ("GET", "/api/v1/libraries/{library_id}/item-ids"),
     ("GET", "/api/v1/libraries/{library_id}/item-index"),
     ("GET", "/api/v1/libraries/{library_id}/items"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/artwork"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/episodes"),
-    # 最近观看是按成员隔离的个人播放数据，并继续受媒体库白名单过滤。
-    ("GET", "/api/v1/playback/recent"),
+    # 合集是成员的浏览面：列表按三层可见性收口（私有只对本人、库不可见就不下发、
+    # 成员条目再过一遍），私有合集与不可见库里的合集一律按 404 拒绝而不是空列表。
+    # 写操作（建/改/删）同样开放给成员——那是他自己的合集，household 的合集
+    # 本来就是全家共用的东西；apply-to-library 改的是库配置，另挂管理员闸
+    ("GET", "/api/v1/collections"),
+    ("POST", "/api/v1/collections"),
+    ("GET", "/api/v1/collections/{collection_id}"),
+    ("PUT", "/api/v1/collections/{collection_id}"),
+    ("DELETE", "/api/v1/collections/{collection_id}"),
+    ("GET", "/api/v1/collections/{collection_id}/items"),
+    # 系列合集的「已有 N / 共 M」与缺片名单：成员浏览合集时就要看见它
+    ("GET", "/api/v1/collections/{collection_id}/series"),
+    # 推荐行是按人算的，成员看的是自己那份
+    # 手动合集的成员增删与排序：成员管自己的合集（可见性另有三层收口）
+    ("POST", "/api/v1/collections/{collection_id}/items"),
+    ("DELETE", "/api/v1/collections/{collection_id}/items/{media_item_id}"),
+    ("PUT", "/api/v1/collections/{collection_id}/order"),
+    # 「接下来继续」是按成员隔离的个人播放数据，并继续受媒体库白名单过滤。
+    ("GET", "/api/v1/playback/up-next"),
     # 清除观看记录只作用于当前成员自己的行（超管删超管的），跨成员不提供；
     # 按条目/按库清除还要求目标在可浏览范围内（docs/design/library-access.md 2.6）
     ("DELETE", "/api/v1/playback/history"),
