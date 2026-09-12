@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from movieclaw_api.settings.schemas import get_jellyfin_compat
@@ -46,10 +45,8 @@ def dto_options(
 
 
 async def dto_context() -> DtoContext:
-    from movieclaw_api.services.media_scrape import assets_root
-
     setting = await get_jellyfin_compat()
-    return DtoContext(server_id=setting.server_id, assets_root=Path(assets_root()))
+    return DtoContext(server_id=setting.server_id)
 
 
 async def require_enabled() -> None:
