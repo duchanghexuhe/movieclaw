@@ -17,6 +17,8 @@ import { SearchCommand, type SearchSubmitOptions } from "@/components/search-com
 import { SettingsSidebar } from "@/components/settings-view";
 import { Sidebar } from "@/components/sidebar";
 import { SubscribeEntryProvider } from "@/components/subscribe-entry";
+import { NetflixMySheet, NetflixSettingsNav, NetflixTabBar } from "@/components/netflix/tab-bar";
+import { NetflixTopNav } from "@/components/netflix/top-nav";
 import { AgentConversationsProvider } from "@/lib/agent-conversations";
 import { useAppNavigationTracking } from "@/lib/back-navigation";
 import { BackdropProvider } from "@/lib/backdrop";
@@ -24,17 +26,18 @@ import type { SearchScope } from "@/lib/categories";
 import { PageChromeProvider } from "@/lib/page-chrome";
 import { SearchPrefsProvider } from "@/lib/search-prefs";
 import { buildSearchPath } from "@/lib/search-url";
-import { UiPrefsProvider } from "@/lib/ui-prefs";
+import { UiPrefsProvider, useTheme } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
 import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
 import { usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
 
 /**
- * 应用外壳：全站骨架布局（左栏 + 右区），所有导航态由 URL 驱动。
+ * 应用外壳：全站骨架布局，所有导航态由 URL 驱动。
  *
  * 每个页面都是真实路由——刷新保留、可分享、前进后退可用：
- *   /                    新任务（氛围首页）
+ *   /                    内容首页（银玻璃=新任务氛围页；Netflix=billboard + 行）
+ *   /new                 AI 新任务（Netflix 主题的顶栏「＋ 新任务」落点）
  *   /discover/movie|tv   发现电影 / 剧集
  *   /subscriptions       我的订阅
  *   /activity            活动（观看 / 任务）
@@ -43,45 +46,43 @@ import { useSession } from "@/lib/session";
  *   /sessions/[id]       AI 会话
  *   /settings/[section]  设置各分区
  *
- * 布局参考 Codex / Claude Code：两种模式共用「左栏 + 右区」两栏结构：
- *   - workspace（工作台）：左 = 常规侧边栏，右 = 当前路由页面
- *   - settings（设置）  ：左 = 设置分区菜单（含返回按钮），右 = 分区内容
- * 设置不是弹窗，而是整体替换左栏内容；模式由 pathname 是否在 /settings 下推导。
+ * 外壳按主题分两副骨架（docs/design/web-themes.md）：
+ *   - 银玻璃（默认）：左栏玻璃侧栏 + 右区（对齐 Codex / Claude Code 的两栏结构）
+ *   - Netflix（结构级主题）：桌面 = 顶栏 + 全宽内容；移动 = 底部标签栏 + 全宽内容
+ *
+ * 主题值读自 UiPrefsProvider（ui.preferences.theme），因此 Provider 必须挂在
+ * 壳层之外——本文件即按「AppShell 挂 Provider、AppShellBody 消费主题」拆分。
  */
-
-/** pathname → 侧栏选中项 id（找不到对应项时返回空串，侧栏无高亮） */
-function navIdFromPath(pathname: string): string {
-  if (pathname === "/") return "new";
-  if (pathname.startsWith("/library")) return "library";
-  if (pathname.startsWith("/subscriptions")) return "subscriptions";
-  if (pathname.startsWith("/activity")) return "tasks";
-  if (pathname.startsWith("/discover/movie")) return "explore-movies";
-  if (pathname.startsWith("/discover/tv")) return "explore-tv";
-  const session = /^\/sessions\/([^/]+)$/.exec(pathname);
-  return session ? session[1] : "";
-}
-
-/** 侧栏项 id → 路由地址（与 navIdFromPath 互逆） */
-function pathOfNavId(id: string): Route {
-  switch (id) {
-    case "new":
-      return "/";
-    case "library":
-      return "/library" as Route;
-    case "subscriptions":
-      return "/subscriptions";
-    case "tasks":
-      return "/activity" as Route;
-    case "explore-movies":
-      return "/discover/movie" as Route;
-    case "explore-tv":
-      return "/discover/tv" as Route;
-    default:
-      return `/sessions/${id}` as Route;
-  }
-}
-
 export function AppShell({ children }: { children: React.ReactNode }) {
+  return (
+    // BackdropProvider 提供全站唯一的背景图数据源（CSS 大图 + 玻璃折射纹理），
+    // 让「外观」设置里上传的图能同步作用到 body::before 与所有玻璃面板。
+    // Netflix 主题下 body::before 由 CSS 不渲染，Provider 照常工作、仅闲置。
+    <BackdropProvider>
+    {/* FeedbackProvider：Toast 回执与确认/输入弹窗的全站唯一挂载点
+      （见 components/feedback.tsx），取代原生 alert/confirm/prompt。 */}
+    <FeedbackProvider>
+    {/* SearchPrefsProvider / UiPrefsProvider：搜索偏好与界面样式的全站唯一数据源，
+      应用启动各拉取一次、Context 共享，设置页的改动即时同步到所有消费页面。 */}
+    <SearchPrefsProvider>
+    <UiPrefsProvider>
+    {/* AgentConversationsProvider：AI 会话的全站状态（侧栏最近会话 +
+      /sessions/[id] 会话页共用），刷新后按会话编号自动回放未完成任务。 */}
+    <AgentConversationsProvider>
+    {/* SubscribeEntryProvider：海报卡片「订阅影片」按钮的全站入口，
+      订阅弹层只在这里挂一份（见 components/subscribe-entry.tsx）。 */}
+    <SubscribeEntryProvider>
+    <AppShellBody>{children}</AppShellBody>
+    </SubscribeEntryProvider>
+    </AgentConversationsProvider>
+    </UiPrefsProvider>
+    </SearchPrefsProvider>
+    </FeedbackProvider>
+    </BackdropProvider>
+  );
+}
+
+function AppShellBody({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   // PageNav 用这份会话标记在 Safari 判断「真实上一页是否仍在站内」；Chromium
@@ -89,8 +90,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   useAppNavigationTracking(pathname);
   // 移动端（< 768px）走另一套骨架：单栏 + 顶栏 + 抽屉式侧栏，见文件末尾的分支渲染
   const isMobile = useIsMobile();
-  // 抽屉开合（仅移动端有意义）
+  // 结构层主题：netflix 主题换外壳（顶栏 / 底部标签栏 / 内容首页）
+  const theme = useTheme();
+  const isNetflix = theme.id === "netflix";
+  // 抽屉开合（银玻璃移动端）/「我的」面板开合（Netflix 移动端）
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [mySheetOpen, setMySheetOpen] = useState(false);
   // 本页是否自带顶栏（详情类页面的 PageNav 会自登记，见 lib/page-chrome.tsx）。
   // 计数而非布尔：路由切换时新旧页面短暂共存，先卸载的那个不能把状态清零。
   const [pageNavCount, setPageNavCount] = useState(0);
@@ -202,7 +207,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   // 突出页面主题内容；例外是「氛围页」——「新任务」首页（路由 /）与两个影片
   // 详情页（媒体库条目 /library/x/item/y 与发现页条目 /media/...）。两类详情都用
   // 页面内部的有限高度剧照，并由自身渐变保证内容可读。新增路由无需登记，
-  // 自动继承蒙版。
+  // 自动继承蒙版。Netflix 主题是纯色平铺设计，蒙版整体不渲染（§3.5）。
   const isHome =
     pathname === "/" ||
     /^\/library\/\d+\/item\/\d+/.test(pathname) ||
@@ -221,8 +226,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   // 移动端顶栏归属：详情类页面自带 PageNav（返回 + 标题 + 页面操作），
   // 全局顶栏再叠一条就成了两层顶栏，于是把这一行让给页面自己（见 lib/page-chrome.tsx）。
   const showMobileTopBar = isMobile && pageNavCount === 0;
-  const openDrawer = useCallback(() => setDrawerOpen(true), []);
-  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
+  // 导航浮层的唤起：银玻璃移动端开抽屉；Netflix 移动端开「我的」面板
+  // （原抽屉体系在该主题下退役，chrome 契约不变，页面无感）。
+  const openDrawer = useCallback(() => {
+    if (isNetflix) setMySheetOpen(true);
+    else setDrawerOpen(true);
+  }, [isNetflix]);
+  const closeDrawer = useCallback(() => {
+    setDrawerOpen(false);
+    setMySheetOpen(false);
+  }, []);
   const pageChrome = useMemo(
     () => ({
       registerPageNav,
@@ -235,24 +248,29 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     [registerPageNav, handleSearch, openDrawer, closeDrawer, setTopBarActions, setTopBarTitle],
   );
 
-  // 移动端抽屉：切换路由即自动收起（点导航项跳走后抽屉不该还盖着新页面），
-  // 回到桌面版式时也一并复位，避免再切回窄屏时抽屉莫名其妙已经开着。
+  // 移动端抽屉 /「我的」面板：切换路由即自动收起（点导航项跳走后浮层不该还
+  // 盖着新页面），回到桌面版式时也一并复位，避免再切回窄屏时莫名其妙已经开着。
   useEffect(() => {
     setDrawerOpen(false);
+    setMySheetOpen(false);
   }, [pathname, isMobile]);
 
-  // 抽屉打开时按 Esc 关闭（外接键盘 / 平板场景）
+  // 抽屉 / 面板打开时按 Esc 关闭（外接键盘 / 平板场景）
   useEffect(() => {
-    if (!drawerOpen) return;
+    if (!drawerOpen && !mySheetOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setDrawerOpen(false);
+      if (e.key === "Escape") {
+        setDrawerOpen(false);
+        setMySheetOpen(false);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [drawerOpen]);
+  }, [drawerOpen, mySheetOpen]);
 
   // 侧栏本体：桌面常驻左栏、移动端装进抽屉，两处共用同一份实例。
   // 必须只渲染一份——面板是真实 WebGL 液态玻璃，多一份就多吃一个 WebGL 上下文。
+  // （Netflix 主题下玻璃已停用，但侧栏仍只在设置模式出现，同样单实例。）
   const sidebarNode = isSettings ? (
     <SettingsSidebar
       active={activeSettings}
@@ -272,25 +290,75 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     />
   );
 
+  // ============ Netflix 主题的结构层分支（§3.3 第 3 层） ============
+  if (isNetflix) {
+    return (
+      <PageChromeProvider value={pageChrome}>
+        {isMobile ? (
+          /* —— Netflix 移动端：底部标签栏 +「我的」面板 ——
+             详情页 PageNav（返回键 + 吸顶雾）保留（App 详情页同样有返回）；
+             无 PageNav 的页面继续用原雾层顶栏承载页面级控件与搜索。 */
+          <div
+            className="app-shell viewport-app-height relative z-10 w-full"
+            data-topbar={showMobileTopBar}
+          >
+            {showMobileTopBar && (
+              <MobileTopBar
+                onMenu={openDrawer}
+                onSearch={handleSearch}
+                actions={topBarActions}
+                title={topBarTitle?.text}
+              />
+            )}
+            <main className="absolute inset-0">
+              {isSettings ? (
+                /* 设置页在银玻璃移动端靠抽屉侧栏切分区；该主题抽屉退役，
+                   分区导航改由页顶下拉承接（可达性不回退）。 */
+                <div className="flex h-full flex-col">
+                  <NetflixSettingsNav
+                    active={activeSettings}
+                    onSelect={(id) => router.push(`/settings/${id}` as Route)}
+                  />
+                  <div className="min-h-0 flex-1">{children}</div>
+                </div>
+              ) : (
+                children
+              )}
+            </main>
+            <NetflixTabBar onOpenMy={() => setMySheetOpen(true)} />
+            <NetflixMySheet
+              open={mySheetOpen}
+              onClose={() => setMySheetOpen(false)}
+              onOpenSettings={openSettings}
+            />
+          </div>
+        ) : (
+          /* —— Netflix 桌面：顶栏 + 全宽内容 ——
+             氛围页（首页 billboard / 详情 hero）全出血、内容从透明顶栏底下穿过；
+             其余页面由 .nf-nav-offset 为顶栏让位。设置模式保留「分区菜单 + 内容」
+             的信息架构（§0 决策 2：控制台页只换皮肤、不重排）。 */
+          <div className="app-shell viewport-app-height relative z-10 w-full">
+            <NetflixTopNav onSearch={handleSearch} onOpenSettings={openSettings} />
+            {isSettings ? (
+              <div className="nf-nav-offset absolute inset-0 flex">
+                <aside className="h-full w-[300px] shrink-0 pl-3.5">
+                  {sidebarNode}
+                </aside>
+                <main className="h-full min-w-0 flex-1">{children}</main>
+              </div>
+            ) : (
+              <main className={`absolute inset-0 ${isHome ? "" : "nf-nav-offset"}`}>
+                {children}
+              </main>
+            )}
+          </div>
+        )}
+      </PageChromeProvider>
+    );
+  }
+
+  // ============ 银玻璃（默认）主题：侧栏 + 抽屉的既有骨架 ============
   return (
-    // BackdropProvider 提供全站唯一的背景图数据源（CSS 大图 + 玻璃折射纹理），
-    // 让「外观」设置里上传的图能同步作用到 body::before 与所有玻璃面板。
-    <BackdropProvider>
-    {/* FeedbackProvider：Toast 回执与确认/输入弹窗的全站唯一挂载点
-      （见 components/feedback.tsx），取代原生 alert/confirm/prompt。 */}
-    <FeedbackProvider>
-    {/* SearchPrefsProvider / UiPrefsProvider：搜索偏好与界面样式的全站唯一数据源，
-      应用启动各拉取一次、Context 共享，设置页的改动即时同步到所有消费页面。 */}
-    <SearchPrefsProvider>
-    <UiPrefsProvider>
-    {/* AgentConversationsProvider：AI 会话的全站状态（侧栏最近会话 +
-      /sessions/[id] 会话页共用），刷新后按会话编号自动回放未完成任务。 */}
-    <AgentConversationsProvider>
-    {/* SubscribeEntryProvider：海报卡片「订阅影片」按钮的全站入口，
-      订阅弹层只在这里挂一份（见 components/subscribe-entry.tsx）。 */}
-    <SubscribeEntryProvider>
-    {/* PageChromeProvider：移动端顶栏的归属协商——页面自带 PageNav 时由它接管
-      这一行，外壳撤掉自己的全局顶栏（见 lib/page-chrome.tsx）。 */}
     <PageChromeProvider value={pageChrome}>
     {/* 全屏背景蒙版（.page-scrim）：作为 .app-shell 的兄弟节点、
       z 介于 body::before(0) 与 app-shell(10) 之间：压住背景大图、托住内容。
@@ -377,17 +445,43 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </>
     )}
     </PageChromeProvider>
-    </SubscribeEntryProvider>
-    </AgentConversationsProvider>
-    </UiPrefsProvider>
-    </SearchPrefsProvider>
-    </FeedbackProvider>
-    </BackdropProvider>
   );
 }
 
+/** pathname → 侧栏选中项 id（找不到对应项时返回空串，侧栏无高亮） */
+function navIdFromPath(pathname: string): string {
+  if (pathname === "/" || pathname === "/new") return "new";
+  if (pathname.startsWith("/library")) return "library";
+  if (pathname.startsWith("/subscriptions")) return "subscriptions";
+  if (pathname.startsWith("/activity")) return "tasks";
+  if (pathname.startsWith("/discover/movie")) return "explore-movies";
+  if (pathname.startsWith("/discover/tv")) return "explore-tv";
+  const session = /^\/sessions\/([^/]+)$/.exec(pathname);
+  return session ? session[1] : "";
+}
+
+/** 侧栏项 id → 路由地址（与 navIdFromPath 互逆） */
+function pathOfNavId(id: string): Route {
+  switch (id) {
+    case "new":
+      return "/";
+    case "library":
+      return "/library" as Route;
+    case "subscriptions":
+      return "/subscriptions";
+    case "tasks":
+      return "/activity" as Route;
+    case "explore-movies":
+      return "/discover/movie" as Route;
+    case "explore-tv":
+      return "/discover/tv" as Route;
+    default:
+      return `/sessions/${id}` as Route;
+  }
+}
+
 /**
- * 移动端顶栏：汉堡（唤起抽屉）+ 品牌字标（回首页）+ 搜索。
+ * 移动端顶栏：汉堡（唤起抽屉/我的面板）+ 品牌字标（回首页）+ 搜索。
  *
  * 为什么是「浮在内容之上」而不是「占一行把内容推下去」：全站有一半页面是
  * 大图氛围页与 Hero 大剧照，顶栏若占位会在画面顶端切出一条硬边。这里做成

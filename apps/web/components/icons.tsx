@@ -106,6 +106,14 @@ export const XIcon = (p: IconProps) => (
   </Base>
 );
 
+/** 房子：Netflix 主题底部标签栏的「首页」页签（流媒体通用的首页图标） */
+export const HouseIcon = (p: IconProps) => (
+  <Base {...p}>
+    <path d="M4 11.5 12 4l8 7.5" />
+    <path d="M6 10v9.5h12V10" />
+  </Base>
+);
+
 export const FilmIcon = (p: IconProps) => (
   <Base {...p}>
     <rect x="3" y="4" width="18" height="16" rx="2" />

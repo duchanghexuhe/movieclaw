@@ -37,6 +37,7 @@ import {
 } from "@/lib/discovery-filters";
 import { useMediaDetail } from "@/lib/media-detail";
 import { usePageChrome } from "@/lib/page-chrome";
+import { useTheme } from "@/lib/ui-prefs";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 import { useIsMobile } from "@/lib/use-media-query";
 import { useTapGuard } from "@/lib/use-tap-guard";
@@ -252,13 +253,19 @@ export function DiscoverView({
   // （字标与搜索之间本来就空着），桌面端维持原来的吸顶工具栏不变。
   const chrome = usePageChrome();
   const isMobile = useIsMobile();
+  // Netflix 主题：工具栏悬浮在 Hero 上（不自占一条）、Hero 全出血（§5.3 构图）
+  const isNf = useTheme().id === "netflix";
   const setTopBarActions = chrome?.setTopBarActions;
   useEffect(() => {
     if (!isMobile || !setTopBarActions) return;
     return setTopBarActions(controls);
   }, [controls, isMobile, setTopBarActions]);
 
-  const toolbar = isMobile ? null : (
+  const toolbar = isMobile ? null : isNf ? (
+    // Netflix：绝对定位在滚动内容顶部右上（容器 relative），悬浮于 Hero 之上、
+    // 随 Hero 一起滚走；银玻璃维持原吸顶工具栏不变
+    <div className="absolute right-[4vw] top-3 z-20 flex items-center gap-2">{controls}</div>
+  ) : (
     <div className="sticky top-0 z-20 flex items-center justify-end px-6 pb-3 pt-7">
       {controls}
     </div>
@@ -284,7 +291,7 @@ export function DiscoverView({
 
   if (error) {
     return (
-      <div className="flex flex-1 flex-col max-md:pt-4">
+      <div className={`flex flex-1 flex-col max-md:pt-4 ${isNf ? "relative" : ""}`}>
         {toolbar}
         <DiscoverError error={error} onRetry={() => setReloadKey((k) => k + 1)} />
       </div>
@@ -292,27 +299,30 @@ export function DiscoverView({
   }
   if (!page) {
     return (
-      <div className="flex flex-1 flex-col max-md:pt-4">
+      <div className={`flex flex-1 flex-col max-md:pt-4 ${isNf ? "relative" : ""}`}>
         {toolbar}
-        <DiscoverSkeleton />
+        <DiscoverSkeleton fullBleed={isNf} />
       </div>
     );
   }
   return (
     <div
       ref={scrollRef}
-      className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4"
+      className={`scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4 ${
+        isNf ? "relative" : ""
+      }`}
     >
       {toolbar}
-      {/* Hero 区：展示清单声明 Hero 时先占位，数据到达后换成轮播。 */}
+      {/* Hero 区：展示清单声明 Hero 时先占位，数据到达后换成轮播。
+          Netflix 主题全出血（无左右留白、无圆角描边），银玻璃维持圆角卡片。 */}
       {page.sections.some((section) => section.presentation === "hero") && hero === undefined && (
-        <div className="px-6 max-md:px-4">
-          <HeroSkeleton />
+        <div className={isNf ? undefined : "px-6 max-md:px-4"}>
+          <HeroSkeleton fullBleed={isNf} />
         </div>
       )}
       {hero && hero.length > 0 && (
-        <div className="px-6 max-md:px-4">
-          <HeroBanner items={hero} />
+        <div className={isNf ? undefined : "px-6 max-md:px-4"}>
+          <HeroBanner items={hero} fullBleed={isNf} />
         </div>
       )}
       <div className="mt-8 space-y-8">
@@ -321,7 +331,7 @@ export function DiscoverView({
           // 失败或条目太少（空 items）的行整行收起
           if (row === "error") return null;
           if (row && row.items.length === 0) return null;
-          if (!row) return <RowSkeleton key={section.collectionRef} stub={section} />;
+          if (!row) return <RowSkeleton key={section.collectionRef} stub={section} fullBleed={isNf} />;
           const href = section.supportsFullListing
             ? collectionHref(section.collectionRef)
             : undefined;
@@ -331,6 +341,7 @@ export function DiscoverView({
               key={row.id}
               row={moreHref ? { ...row, items: row.items.slice(0, 10) } : row}
               moreHref={moreHref}
+              insetClassName={isNf ? "px-[4vw]" : undefined}
             />
           );
         })}
@@ -372,10 +383,14 @@ function SourceSwitcher({
 }
 
 /** 布局到达前的整页骨架（Hero 大块 + 两行海报）；布局是毫秒级的，一闪而过。 */
-function DiscoverSkeleton() {
+function DiscoverSkeleton({ fullBleed = false }: { fullBleed?: boolean }) {
   return (
-    <div className="flex-1 overflow-hidden px-6 pb-10 max-md:px-4" aria-busy="true" aria-label="发现页加载中">
-      <HeroSkeleton />
+    <div
+      className={`flex-1 overflow-hidden pb-10 ${fullBleed ? "" : "px-6 max-md:px-4"}`}
+      aria-busy="true"
+      aria-label="发现页加载中"
+    >
+      <HeroSkeleton fullBleed={fullBleed} />
       {[0, 1].map((row) => (
         <div key={row} className="mt-10">
           <div className="h-4 w-28 animate-pulse rounded bg-white/[0.08]" />
@@ -389,9 +404,13 @@ function DiscoverSkeleton() {
 }
 
 /** Hero 大横幅的占位块（与真实 Hero 同尺寸，数据到达后原位替换不跳版）。 */
-function HeroSkeleton() {
+function HeroSkeleton({ fullBleed = false }: { fullBleed?: boolean }) {
   return (
-    <div className="h-[46vh] min-h-[320px] animate-pulse rounded-2xl bg-white/[0.05] ring-1 ring-white/10 max-md:h-[38vh] max-md:min-h-[230px]" />
+    <div
+      className={`h-[46vh] min-h-[320px] animate-pulse bg-white/[0.05] max-md:h-[38vh] max-md:min-h-[230px] ${
+        fullBleed ? "" : "rounded-2xl ring-1 ring-white/10"
+      }`}
+    />
   );
 }
 
@@ -400,15 +419,16 @@ function HeroSkeleton() {
  * 标题栏与横滚区的留白复刻 MediaRow 的布局，数据到达后原位替换不跳版；
  * 这一行行「亮着名字等数据」的骨架就是页面的分区加载进度。
  */
-function RowSkeleton({ stub }: { stub: { title: string } }) {
+function RowSkeleton({ stub, fullBleed = false }: { stub: { title: string }; fullBleed?: boolean }) {
+  const inset = fullBleed ? "px-[4vw]" : "px-6 max-md:px-4";
   return (
     <section aria-busy="true" aria-label={`「${stub.title}」加载中`}>
-      <div className="mb-3 px-6 max-md:mb-2 max-md:px-4">
+      <div className={`mb-3 max-md:mb-2 ${inset}`}>
         <h3 className="text-on-image text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
           {stub.title}
         </h3>
       </div>
-      <div className="flex gap-4 overflow-hidden px-6 pb-1 pt-1 max-md:gap-3 max-md:px-4">
+      <div className={`flex gap-4 overflow-hidden pb-1 pt-1 max-md:gap-3 ${inset}`}>
         <RowItemsSkeleton />
       </div>
     </section>
@@ -484,7 +504,7 @@ const HERO_INTERVAL = 8000;
  * 图片按需装载：帧壳常驻，但 w1280 大图只有轮到（当前帧/下一帧）才写入 src，
  * 首屏不必一次下载解码全部 6 张；已展示过的帧保持已加载，交叉淡出不闪白。
  */
-function HeroBanner({ items }: { items: MediaItem[] }) {
+function HeroBanner({ items, fullBleed = false }: { items: MediaItem[]; fullBleed?: boolean }) {
   const [index, setIndex] = useState(0);
   // 触屏滑动切换的起点（无悬停设备不显示箭头，滑动是唯一的大面积切换手势）
   const touchStart = useRef<{ x: number; y: number } | null>(null);
@@ -507,7 +527,11 @@ function HeroBanner({ items }: { items: MediaItem[] }) {
   const next = (index + 1) % items.length;
   return (
     <div
-      className="group relative h-[46vh] min-h-[320px] w-full overflow-hidden rounded-2xl shadow-[0_24px_70px_-18px_rgba(0,0,0,0.62)] ring-1 ring-white/10 max-md:h-[38vh] max-md:min-h-[230px]"
+      className={`group relative h-[46vh] min-h-[320px] w-full overflow-hidden max-md:h-[38vh] max-md:min-h-[230px] ${
+        fullBleed
+          ? ""
+          : "rounded-2xl shadow-[0_24px_70px_-18px_rgba(0,0,0,0.62)] ring-1 ring-white/10"
+      }`}
       onTouchStart={(e) => {
         const t = e.touches[0];
         touchStart.current = { x: t.clientX, y: t.clientY };

@@ -90,6 +90,19 @@ export const viewport: Viewport = {
  */
 const RESTORE_BACKDROP_SCRIPT = `try{if(location.pathname.indexOf("/sessions/")===0){document.documentElement.classList.add("immersive-route")}else{var u=localStorage.getItem("movieclaw.backdrop");if(u&&u.charAt(0)==="/")document.documentElement.style.setProperty("--backdrop-image",'url("'+u+'")')}}catch(e){}`;
 
+/**
+ * 主题防闪烁（FOUC）：与 next-themes 的标准做法同构——首帧绘制前读 ui.prefs
+ * 的 localStorage 首帧缓存（lib/ui-prefs-cache.ts），把主题 id 写上 <html> 的
+ * data-theme 属性。token 层（globals.css 的变量覆盖组）与 Tailwind 圆角换档
+ * 都挂在 html[data-theme] 作用域上，属性就位即全站换肤，强刷不会先画银玻璃
+ * 再跳成 Netflix。白名单只认 "netflix"（silver = 无属性即默认），缓存被改坏
+ * 也注入不了任意属性值。登录后服务端偏好拉回、以及设置页切换主题时的后续
+ * 同步由 lib/ui-prefs.tsx 的 effect 负责（AppShell 只在登录后渲染）。
+ *
+ * /play/*、/s/[slug] 不套 AppShell，同样吃到这段脚本与 token 层（结构层除外）。
+ */
+const RESTORE_THEME_SCRIPT = `try{var p=JSON.parse(localStorage.getItem("movieclaw.ui-prefs")||"null");if(p&&p.theme==="netflix")document.documentElement.setAttribute("data-theme","netflix")}catch(e){}`;
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -97,13 +110,15 @@ export default function RootLayout({
 }>) {
   return (
     // suppressHydrationWarning：body 最前的内联脚本会在水合前就给 <html> 写上
-    // --backdrop-image 内联样式（见下方 RESTORE_BACKDROP_SCRIPT），服务端首帧 HTML
-    // 里没有这个 style，两边必然不一致。这是「首帧防闪烁」的固有代价，用它抑制这一处
-    // 预期内的告警（只作用于 <html> 自身属性，不影响子树里真正的水合问题被暴露）。
+    // --backdrop-image 内联样式与 data-theme 属性（见上方两个 RESTORE_* 脚本），
+    // 服务端首帧 HTML 里没有这些，两边必然不一致。这是「首帧防闪烁」的固有代价，
+    // 用它抑制这一处预期内的告警（只作用于 <html> 自身属性，不影响子树里真正的
+    // 水合问题被暴露）。
     <html lang="zh-CN" className={inter.variable} suppressHydrationWarning>
       <body>
         {/* 必须是 body 最前的同步内联脚本：解析即执行，赶在首帧绘制之前 */}
         <script dangerouslySetInnerHTML={{ __html: RESTORE_BACKDROP_SCRIPT }} />
+        <script dangerouslySetInnerHTML={{ __html: RESTORE_THEME_SCRIPT }} />
         {/* 挂在根布局：登录页等 AppShell 之外的页面也有输入框，同样需要键盘适配 */}
         <ViewportKeyboard />
         {children}

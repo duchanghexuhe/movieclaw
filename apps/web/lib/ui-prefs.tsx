@@ -15,6 +15,7 @@ import {
   updateUiPreferences,
   type UiPreferences,
 } from "@/lib/api/ui";
+import { DEFAULT_THEME_ID, normalizeThemeId, themeMeta, type ThemeMeta } from "@/lib/themes";
 import { readUiPrefsCache, writeUiPrefsCache } from "@/lib/ui-prefs-cache";
 
 /**
@@ -90,6 +91,18 @@ export function UiPrefsProvider({ children }: { children: React.ReactNode }) {
     root.style.setProperty("--scrim-dark", `${effectiveScrim.dark}`);
   }, [effectiveScrim.blur, effectiveScrim.dark]);
 
+  // 主题同步：把生效主题（含设置页的预览草稿——点主题卡实时预览就靠它）写到
+  // <html> 的 data-theme 属性上。token 层与圆角换档都挂在这个作用域，属性一改
+  // 全站换肤；结构层（外壳分支）由 useTheme() 的消费方跟随同一份值渲染。
+  // 默认主题移除属性而不是写 data-theme="silver"，与防闪烁脚本（只认 netflix）
+  // 的落点保持一致，SSR 首屏也无需任何属性。
+  const effectiveTheme = normalizeThemeId((preview ?? prefs).theme);
+  useEffect(() => {
+    const root = document.documentElement;
+    if (effectiveTheme === DEFAULT_THEME_ID) root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", effectiveTheme);
+  }, [effectiveTheme]);
+
   const savePrefs = useCallback(
     async (next: UiPreferences) => {
       const previous = prefs;
@@ -122,4 +135,17 @@ export function useUiPrefs(): UiPrefsContextValue {
   const ctx = useContext(UiPrefsContext);
   if (!ctx) throw new Error("useUiPrefs 必须在 <UiPrefsProvider> 内使用");
   return ctx;
+}
+
+/**
+ * 读取当前主题（含设置页未保存的预览草稿）。
+ *
+ * 在 UiPrefsProvider 外调用（登录 / 初始化页的 GlassPanel 等前置页面）不抛错、
+ * 按默认主题渲染：那些页面还没有账号上下文，主题本就未知；token 层不受影响
+ * ——layout.tsx 的内联脚本已按 localStorage 缓存把 data-theme 写上 <html>，
+ * 纯 CSS 换肤在任意页面都生效，这里兜底的只是结构层的分支选择。
+ */
+export function useTheme(): ThemeMeta {
+  const ctx = useContext(UiPrefsContext);
+  return themeMeta(ctx ? ctx.prefs.theme : DEFAULT_THEME_ID);
 }

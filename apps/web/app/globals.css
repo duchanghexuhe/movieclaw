@@ -1922,3 +1922,354 @@ html:has(.player-root) {
     transform: none;
   }
 }
+
+/*
+ * ============================================================================
+ * 「Netflix」主题（html[data-theme="netflix"]）
+ * ============================================================================
+ * 规格来源：docs/design/web-themes.md（§4 token 全表 / §2 设计语言调研）。
+ *
+ * 生效分三层，全部挂在本作用域上：
+ *   1. token 层：语义变量整组覆盖，全站组件消费变量、皮肤自动跟随；
+ *   2. Tailwind v4 圆角换档：rounded-* 工具类编译产物是 var(--radius-*) 引用，
+ *      在根节点覆盖变量即可全站把圆角压到 Netflix 的 2/4/6 档，无需重编译
+ *      （rounded-full / rounded-none 与任意值 rounded-[10px] 是静态值，不受影响
+ *      ——前者本来就该圆，后者按「验收清单内替换、清单外接受」策略处理）；
+ *   3. 结构层：外壳（顶栏 / 底部标签栏 / 内容首页）由 React 按 useTheme() 分支
+ *      渲染，见 components/netflix/*；这里只承载它们的样式。
+ *
+ * 与现有氛围体系的兼容（§3.5）：Netflix 是纯色平铺设计，body::before 背景大图
+ * 在本主题下整体不渲染；全站蒙版（.page-scrim）由外壳不渲染（netflix 分支里
+ * 根本不挂）；WebGL 液态玻璃由 GlassPanel 读主题后不挂 canvas，走 flat 形态。
+ */
+html[data-theme="netflix"] {
+  color-scheme: dark;
+
+  /* —— 分层表面（§4） —— */
+  /* Netflix 画布是纯黑 #000（官网 body 直出纯黑），#141414 只做卡片/行悬浮面 —— */
+  --bg: #000000;
+  --surface-main: #141414;
+  --surface-raised: #181818; /* 卡片 / 弹层 / 信息面板 */
+  --surface-inset: #2f2f2f; /* 输入框内嵌（存疑值，P6 对照定稿） */
+
+  /* —— 文本层级 —— */
+  --text: #ffffff;
+  --text-muted: #b3b3b3;
+  --text-faint: #808080;
+
+  /* —— 描边：Netflix 用实线（存疑值 #404040，P6 定稿） —— */
+  --line: #404040;
+  --line-strong: #808080;
+
+  /* —— 强调：品牌红。纪律（§4）：红只出现在字标 / 进度条 / 匹配度高亮 /
+        激活指示上；主按钮是白底黑字（见 .btn-accent 覆盖）。 —— */
+  --accent: #e50914;
+  --accent-strong: #c11119; /* hover 红：Netflix 的红是 hover 变暗，不是变亮 */
+  --accent-2: #b20710; /* pressed / 品牌暗红 */
+  --accent-soft: rgba(229, 9, 20, 0.15);
+  /* Netflix 焦点环 = 2px 白描边（生产 CSS 证实），不是冷光 */
+  --accent-ring: rgba(255, 255, 255, 0.7);
+
+  /* —— 行内填充（hover / active） —— */
+  --glass-fill: rgba(255, 255, 255, 0.06);
+  --glass-fill-hover: rgba(255, 255, 255, 0.12); /* ≈ #2f2f2f on #141414 */
+  --glass-fill-active: rgba(255, 255, 255, 0.2);
+
+  /* —— 状态语义色（Netflix 化；--danger 刻意不等于品牌红，红点/红字是状态
+        信号，与品牌色混用会让满屏红失去语义，见 §4 备注） —— */
+  --ok: #46d369;
+  --info: #6ba6ff;
+  --warn: #e87c03;
+  --danger: #eb3942;
+  --danger-solid: #b20710;
+  --danger-solid-hover: #c11119;
+
+  /* —— Tailwind v4 圆角换档（默认值表：xs 2 / sm 4 / md 6 / lg 8 / xl 12 /
+        2xl 16 / 3xl 24 / 4xl 32）：压到 Netflix 的 2/4/6 档 —— */
+  --radius-xs: 2px; /* 徽章 */
+  --radius-sm: 4px; /* 按钮、输入框、卡片、磁贴（生产 CSS 证实 4px） */
+  --radius-md: 4px;
+  --radius-lg: 4px;
+  --radius-xl: 6px; /* 弹窗、展开卡 */
+  --radius-2xl: 6px;
+  --radius-3xl: 8px; /* 个别大面留一档 */
+  --radius-4xl: 8px;
+}
+
+/* —— 氛围体系停用：背景大图伪元素整体不渲染，纯 #141414 直出（§3.5） —— */
+html[data-theme="netflix"] body::before {
+  display: none;
+}
+
+/*
+ * —— 画面类元素去白边 ——
+ * 银玻璃语言给每张海报/封面容器一圈白色 ring 勾轮廓（ring-white/[0.06~0.4]），
+ * 在纯黑画布上成了一圈亮白细框，hover 放大时尤其刺眼——Netflix 的卡片没有任何
+ * 描边，分隔全靠卡片间隙。ring 工具类的颜色经 --tw-ring-color 落在字面量 #fff
+ * 上（无共享变量可改），这里按类名子串一次性把颜色打穿为透明：凡 class 里带
+ * ring-white 的元素（含 hover:/focus-visible: 变体）在主题下全部失效。
+ * 键盘焦点不受影响——全站 :focus-visible 的 outline（var(--accent-ring)，主题下
+ * 为白环）是独立于 box-shadow ring 的另一条通路。
+ * 本条必须在无层 CSS 里（本文件默认环境），无层规则优先于 @layer utilities，
+ * 一条规则覆盖静息与 hover 两种状态。
+ */
+html[data-theme="netflix"] [class*="ring-white"] {
+  --tw-ring-color: transparent;
+}
+
+/* 圆角行（菜单项 / 设置分区行）：glass-row 的无层 14px 圆角换 Netflix 4px 档 */
+html[data-theme="netflix"] .glass-row {
+  border-radius: 4px;
+}
+
+/* —— 品牌红扩大使用面（§4 纪律：红只出现在品牌标识 / 主 CTA / 进度条 /
+      激活指示上） —— */
+/* 头像徽标（无上传图时的首字底）：银玻璃 → 品牌红 */
+html[data-theme="netflix"] .brand-badge {
+  background: linear-gradient(145deg, #e50914 0%, #b00710 100%);
+  color: #ffffff;
+  box-shadow: none;
+}
+/* 设置页滑杆的圆钮：亮银 → 品牌红（轨道不变） */
+html[data-theme="netflix"] .range-glass::-webkit-slider-thumb {
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+html[data-theme="netflix"] .range-glass::-moz-range-thumb {
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+/* 沉浸层（AI 会话页）取 Netflix 播放器/沉浸语言的纯黑（§5.7） */
+html[data-theme="netflix"] .page-solid {
+  background: #000;
+}
+
+/* —— 玻璃面板 flat 形态（GlassPanel 读主题后不再挂 canvas，容器只剩实色卡） —— */
+html[data-theme="netflix"] .glass-panel {
+  box-shadow: none;
+}
+html[data-theme="netflix"] .glass-panel--flat {
+  background: var(--surface-raised);
+}
+html[data-theme="netflix"] .glass-panel--flat .glass-panel__content::before {
+  /* 发丝内线换成 Netflix 实线描边 */
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+/* 兜底底色统一抬到卡片面（原为更深的面板色） */
+html[data-theme="netflix"] .panel--sidebar,
+html[data-theme="netflix"] .panel--main {
+  background: var(--surface-raised);
+}
+html[data-theme="netflix"] .panel--sidebar-flat {
+  background: #181818;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+/* —— 浮层表面：#181818 实底 + Netflix 弹窗阴影（§4「中心化类同步覆盖」） —— */
+html[data-theme="netflix"] .surface-raised,
+html[data-theme="netflix"] .menu-surface {
+  background: #181818;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.9);
+}
+html[data-theme="netflix"] .surface-raised {
+  border-radius: 6px;
+}
+/* 菜单的「深底叠深底」发丝内线换成实线描边 */
+html[data-theme="netflix"] .menu-surface {
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.9),
+    inset 0 0 0 1px var(--line);
+}
+html[data-theme="netflix"] .notice-surface {
+  background: rgb(24 24 24 / 0.92);
+  backdrop-filter: none;
+}
+/* 设置子卡片：玻璃磨砂内嵌 → 实色卡 + 实线描边（§5.7 控制台换皮） */
+html[data-theme="netflix"] .css-glass {
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+  box-shadow: none;
+}
+
+/* —— 主操作按钮：白底黑字三态（生产 CSS：1 / hover 0.75 / 按下 0.5） —— */
+html[data-theme="netflix"] .btn-accent {
+  background: #ffffff;
+  color: #000000;
+  box-shadow: none;
+}
+html[data-theme="netflix"] .btn-accent:hover {
+  filter: none;
+  background: rgb(255 255 255 / 0.75);
+}
+html[data-theme="netflix"] .btn-accent:active {
+  transform: none;
+  background: rgb(255 255 255 / 0.5);
+}
+
+/* —— 次级按钮：灰半透方角（生产 CSS：rgba(109,109,110,0.7)，hover 0.4） —— */
+html[data-theme="netflix"] .btn-glass {
+  border: 0;
+  background: rgba(109, 109, 110, 0.7);
+  color: #ffffff;
+  box-shadow: none;
+}
+html[data-theme="netflix"] .btn-glass:hover {
+  background: rgba(109, 109, 110, 0.4);
+  border-color: transparent;
+}
+
+/* —— 选中胶囊：白系（§4；侧栏在 netflix 主题只服务于设置模式） —— */
+html[data-theme="netflix"] .nav-item[data-active="true"] {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: transparent;
+  box-shadow: none;
+}
+html[data-theme="netflix"] .nav-item[data-active="true"] .icon-chip {
+  background: #ffffff;
+  color: #141414;
+  box-shadow: none;
+}
+
+/* 原生 select 弹层底色跟随卡片面（Windows Chromium 不吃 color-scheme，见上方原注释） */
+html[data-theme="netflix"] select option,
+html[data-theme="netflix"] select optgroup {
+  background-color: #181818;
+}
+
+/* —— 详情页「剧照 → 纯黑」渐变板的落点改 #141414（§5.5），其余色阶不变 —— */
+html[data-theme="netflix"] .detail-ambient {
+  background-image: linear-gradient(
+    180deg,
+    rgba(20, 20, 20, 0) 0,
+    rgba(20, 20, 20, 0) var(--detail-ambient-top),
+    rgba(20, 20, 20, 0.16) calc(var(--detail-ambient-top) + 42px),
+    rgba(20, 20, 20, 0.34) calc(var(--detail-ambient-top) + 78px),
+    rgba(20, 20, 20, 0.55) calc(var(--detail-ambient-top) + 120px),
+    rgba(20, 20, 20, 0.73) calc(var(--detail-ambient-top) + 165px),
+    rgba(20, 20, 20, 0.87) calc(var(--detail-ambient-top) + 210px),
+    rgba(20, 20, 20, 0.96) calc(var(--detail-ambient-top) + 255px),
+    #141414 calc(var(--detail-ambient-top) + 315px),
+    #141414 100%
+  );
+}
+html[data-theme="netflix"] .detail-ambient.detail-ambient--hero {
+  background: #141414;
+}
+html[data-theme="netflix"] .ambient-fallback {
+  background: rgb(20 20 20 / 0.8);
+  backdrop-filter: none;
+}
+
+/* ============================ Netflix 结构组件 ============================ */
+
+/* 顶栏高度：外壳与各页面让位的统一基准（§5.1，社区共识值 68px） */
+:root {
+  --nf-nav-h: 68px;
+}
+
+/* 顶栏图标按钮（搜索 / 铃 / 头像下拉箭头等共用） */
+.nf-icon-btn {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  border-radius: 4px;
+  color: #ffffff;
+  transition: background 150ms ease, color 150ms ease;
+}
+.nf-icon-btn:hover {
+  background: var(--glass-fill-hover);
+}
+
+/* 桌面外壳：主区为绝对定位画布，非氛围页为顶栏让位（氛围页全出血、
+   内容从顶栏底下穿过，观感即 Netflix 的 billboard / 详情 hero） */
+html[data-theme="netflix"] .nf-nav-offset {
+  padding-top: var(--nf-nav-h);
+}
+
+/*
+ * 横版卡片行的宽度体系（§5.4 断点表）：行左右内边距 4vw、卡间距 8px，
+ * 每行张数按断点换档，卡宽由 CSS 变量推导——组件里不写魔法宽度。
+ */
+.nf-row {
+  --nf-cols: 5;
+  --nf-inset: 4vw;
+  --nf-gap: 8px;
+}
+@media (min-width: 1400px) {
+  .nf-row {
+    --nf-cols: 6;
+  }
+}
+@media (max-width: 950px) {
+  .nf-row {
+    --nf-cols: 4;
+  }
+}
+.nf-card-land {
+  width: calc(
+    (100vw - 2 * var(--nf-inset) - (var(--nf-cols) - 1) * var(--nf-gap)) / var(--nf-cols)
+  );
+}
+
+/* 移动端底部标签栏（§5.2）：栏高 49px + 底部安全区，主区让位收口在这一条 */
+.nf-tabbar {
+  background: rgba(10, 10, 10, 0.95);
+  backdrop-filter: blur(12px);
+}
+@media (max-width: 767px) {
+  html[data-theme="netflix"] .app-shell > main {
+    padding-bottom: calc(49px + var(--safe-bottom));
+  }
+}
+
+/* hover 展开卡（Portal + fixed，§5.4）：z 取 500 档——高于内容行、
+   低于全局浮层（菜单 70 / 抽屉 60 / 命令面板 50 档是外壳内的；
+   Portal 到 body 后与它们同层比较，取 500 稳压内容与外壳浮层） */
+.nf-hovercard {
+  z-index: 500;
+  transform-origin: center top;
+  /* 官方技术博客《Delivering Meaning with Previews on Web》：展开画布 400ms */
+  animation: nf-expand 400ms cubic-bezier(0, 0, 0.2, 1) both;
+}
+@keyframes nf-expand {
+  from {
+    transform: scale(1);
+    opacity: 0.4;
+  }
+  to {
+    transform: scale(1.5);
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nf-hovercard {
+    animation: none;
+    transform: scale(1.5);
+  }
+}
+
+/* 移动端「我的」页签的抽屉式面板：覆盖式浮层，自右侧滑入 */
+.nf-mysheet {
+  position: fixed;
+  z-index: 60;
+  top: 0;
+  bottom: calc(-1 * var(--vp-overshoot));
+  right: 0;
+  width: 86vw;
+  max-width: 320px;
+  padding: calc(var(--safe-top) + 10px) 0
+    calc(var(--safe-bottom) + var(--vp-overshoot) + 10px) 0;
+  transition: transform 280ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  will-change: transform;
+}
+.nf-mysheet[data-open="false"] {
+  transform: translateX(104%);
+  pointer-events: none;
+}
+.nf-mysheet[data-open="true"] {
+  transform: translateX(0);
+}
+
