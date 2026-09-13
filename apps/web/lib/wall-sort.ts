@@ -41,7 +41,10 @@ export const PREF_TO_SORT: Record<
 };
 
 /** 非默认档的展示名，各面墙拼自己的选项列表时取用（与筛选条的 SORT_LABELS 同一套叫法）。 */
-export const SORT_PREF_LABELS: Record<Exclude<WallSortPref, "default">, string> = {
+export const SORT_PREF_LABELS: Record<
+  Exclude<WallSortPref, "default">,
+  string
+> = {
   title: "按标题",
   // 一次导入的内容入账时间都挤在一起，所以这一档对"陆续往库里添东西"才有意义
   added_at: "最近添加",
@@ -71,6 +74,10 @@ export const SORT_DIRECTIONS: Record<
   runtime: { naturalAsc: true, asc: "短→长", desc: "长→短" },
   size: { naturalAsc: false, asc: "小→大", desc: "大→小" },
   last_played: { naturalAsc: false, asc: "远→近", desc: "近→远" },
+  // 下面两档不进墙的排序下拉（上映正序只作系列合集的 sort；随机只作首页自定义行的
+  // 排序，按天换一批），这里补上只是让 Record 完整；方向文案不会被读到
+  release_date_asc: { naturalAsc: true, asc: "旧→新", desc: "新→旧" },
+  random: { naturalAsc: true, asc: "随机", desc: "随机" },
 };
 
 /** 单库页的偏好键：全站共用一个（在哪个库里选的「按评分」，换个库还是按评分）。 */
@@ -106,7 +113,10 @@ export interface WallSortState {
 export function useWallSortPref(
   storageKey: string = WALL_SORT_STORAGE_KEY,
 ): [WallSortState, (next: WallSortPref) => void, () => void, boolean] {
-  const [state, setState] = useState<WallSortState>({ pref: "default", reversed: false });
+  const [state, setState] = useState<WallSortState>({
+    pref: "default",
+    reversed: false,
+  });
   // 读完的是哪个键：合集页的键随合集 id 变，换合集的那一帧手上还是上一个合集的
   // 偏好，「读完了没有」必须按键算，否则会先按错的排序拉一页再重拉
   const [readyFor, setReadyFor] = useState<string | null>(null);
@@ -115,7 +125,9 @@ export function useWallSortPref(
   useEffect(() => {
     let next: WallSortState = { pref: "default", reversed: false };
     try {
-      const [pref, flag] = (window.localStorage.getItem(storageKey) ?? "").split(":");
+      const [pref, flag] = (
+        window.localStorage.getItem(storageKey) ?? ""
+      ).split(":");
       if (WALL_SORT_PREFS.includes(pref as WallSortPref)) {
         next = { pref: pref as WallSortPref, reversed: flag === "rev" };
       }
@@ -130,16 +142,23 @@ export function useWallSortPref(
     (next: WallSortState) => {
       setState(next);
       try {
-        window.localStorage.setItem(storageKey, next.reversed ? `${next.pref}:rev` : next.pref);
+        window.localStorage.setItem(
+          storageKey,
+          next.reversed ? `${next.pref}:rev` : next.pref,
+        );
       } catch {
         /* 同上 */
       }
     },
     [storageKey],
   );
-  const update = useCallback((pref: WallSortPref) => persist({ pref, reversed: false }), [persist]);
+  const update = useCallback(
+    (pref: WallSortPref) => persist({ pref, reversed: false }),
+    [persist],
+  );
   const toggleReversed = useCallback(
-    () => persist({ ...stateRef.current, reversed: !stateRef.current.reversed }),
+    () =>
+      persist({ ...stateRef.current, reversed: !stateRef.current.reversed }),
     [persist],
   );
   return [state, update, toggleReversed, ready];
@@ -149,7 +168,10 @@ export function useWallSortPref(
  * 一档排序 + 方向 → 请求里该带什么 `order`：与自然方向一致就不带（服务端按自然
  * 方向排，与加方向之前逐字相同），反转了才带。三面墙都按这一条算，不各自判。
  */
-export function orderParam(sort: LibraryItemSort, reversed: boolean): "asc" | "desc" | undefined {
+export function orderParam(
+  sort: LibraryItemSort,
+  reversed: boolean,
+): "asc" | "desc" | undefined {
   if (!reversed) return undefined;
   return SORT_DIRECTIONS[sort].naturalAsc ? "desc" : "asc";
 }

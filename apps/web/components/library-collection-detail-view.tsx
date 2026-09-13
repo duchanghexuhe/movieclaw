@@ -12,7 +12,11 @@ import { WallSortControl } from "@/components/library-filter-bar";
 import { PAGE_NAV_BUTTON_CLASS, PageNav } from "@/components/page-nav";
 import { usePhotoWallDensity } from "@/components/photo-wall";
 import { PosterCard } from "@/components/poster-card";
-import { InventoryCell, PosterWall, WALL_GRID_POSTER } from "@/components/poster-wall";
+import {
+  InventoryCell,
+  PosterWall,
+  WALL_GRID_POSTER,
+} from "@/components/poster-wall";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import {
   GALLERY_LOAD_MARGIN,
@@ -33,6 +37,7 @@ import {
   getCollectionSeries,
   listCollectionGallery,
   listCollectionItems,
+  listCollections,
   updateCollection,
   type Collection,
   type CollectionSeries,
@@ -45,14 +50,22 @@ import {
   type LibraryFacets,
   type LibraryGalleryGroup,
   type LibraryItem,
+  listLibraries,
 } from "@/lib/api/libraries";
 import { setPlaybackMarks } from "@/lib/api/playback";
 import { imageUrl } from "@/lib/image-proxy";
 import type { MediaItem } from "@/lib/media-types";
 import { LibraryFilterBar } from "@/components/library-filter-bar";
-import { filterToRules, isFilterEmpty, rulesToFilter, type LibraryFilter } from "@/lib/library-filter";
+import {
+  filterToRules,
+  isFilterEmpty,
+  rulesToFilter,
+  type LibraryFilter,
+} from "@/lib/library-filter";
 import { usePageTitle } from "@/lib/use-page-title";
 import { usePermissions } from "@/lib/permissions";
+import { buildHomeRows, newCollectionRow, rowsToPrefs } from "@/lib/home-rows";
+import { useUiPrefs } from "@/lib/ui-prefs";
 import {
   PREF_TO_SORT,
   SORT_DIRECTIONS,
@@ -88,7 +101,13 @@ function defaultSortOf(collection: Collection | null): {
   desc: string;
 } {
   if (!collection || !collection.rule_driven) {
-    return { label: "自定顺序", equivalent: null, naturalAsc: true, asc: "正序", desc: "倒序" };
+    return {
+      label: "自定顺序",
+      equivalent: null,
+      naturalAsc: true,
+      asc: "正序",
+      desc: "倒序",
+    };
   }
   if (collection.kind === "series" || collection.sort === "release_date_asc") {
     // 方向的人话沿用「按上映时间」那档（旧→新 / 新→旧），只是自然方向反过来
@@ -102,7 +121,11 @@ function defaultSortOf(collection: Collection | null): {
   const key = (
     collection.sort in PREF_TO_SORT ? collection.sort : "title"
   ) as Exclude<WallSortPref, "default">;
-  return { label: SORT_PREF_LABELS[key], equivalent: key, ...SORT_DIRECTIONS[PREF_TO_SORT[key]] };
+  return {
+    label: SORT_PREF_LABELS[key],
+    equivalent: key,
+    ...SORT_DIRECTIONS[PREF_TO_SORT[key]],
+  };
 }
 
 /**
@@ -156,18 +179,33 @@ export function LibraryCollectionDetailView({
   // —— 排序 —— //
   // 偏好按合集各记各的：默认档因合集而异（自定顺序 / 上映顺序 / 合集存的序），
   // 全站共用一个键的话，在别的合集里选的「按评分」会把系列合集的上映顺序也排乱
-  const [{ pref: sortPref, reversed: sortReversed }, setSortPref, toggleSortReversed, sortReady] =
-    useWallSortPref(`movieclaw.collection.wall-sort:${collectionId}`);
+  const [
+    { pref: sortPref, reversed: sortReversed },
+    setSortPref,
+    toggleSortReversed,
+    sortReady,
+  ] = useWallSortPref(`movieclaw.collection.wall-sort:${collectionId}`);
   const defaultSort = defaultSortOf(collection);
   const direction =
-    sortPref === "default" ? defaultSort : SORT_DIRECTIONS[PREF_TO_SORT[sortPref]];
+    sortPref === "default"
+      ? defaultSort
+      : SORT_DIRECTIONS[PREF_TO_SORT[sortPref]];
   const sortAscending = direction.naturalAsc !== sortReversed;
   // 两种形态的请求都带同一份：默认档不带 sort（服务端按合集自己的序），不反转不带 order
   const sortParams = useMemo<CollectionSortParams>(
     () =>
       sortPref === "default"
-        ? { order: sortReversed ? (defaultSort.naturalAsc ? "desc" : "asc") : undefined }
-        : { sort: PREF_TO_SORT[sortPref], order: orderParam(PREF_TO_SORT[sortPref], sortReversed) },
+        ? {
+            order: sortReversed
+              ? defaultSort.naturalAsc
+                ? "desc"
+                : "asc"
+              : undefined,
+          }
+        : {
+            sort: PREF_TO_SORT[sortPref],
+            order: orderParam(PREF_TO_SORT[sortPref], sortReversed),
+          },
     [sortPref, sortReversed, defaultSort.naturalAsc],
   );
   // ref 版：翻页 / 重取的回调每轮读最新值，不必为换排序重建回调链
@@ -199,7 +237,10 @@ export function LibraryCollectionDetailView({
 
   /** 第一页重取并整体替换：换排序、改条件、整理顺序之后都走这里。 */
   const reloadItems = useCallback(async () => {
-    const rows = await listCollectionItems(collectionId, { limit: PAGE_SIZE, ...sortRef.current });
+    const rows = await listCollectionItems(collectionId, {
+      limit: PAGE_SIZE,
+      ...sortRef.current,
+    });
     setItems(rows);
     setHasMore(rows.length === PAGE_SIZE);
   }, [collectionId]);
@@ -277,7 +318,10 @@ export function LibraryCollectionDetailView({
   const galleryLoading = useRef(false);
   // 成员变过几次（改条件、整理顺序）：图廊窗口跟着作废，下次进图廊重拉
   const [membersEpoch, setMembersEpoch] = useState(0);
-  const galleryEntries = useMemo(() => flattenGallery(galleryGroups), [galleryGroups]);
+  const galleryEntries = useMemo(
+    () => flattenGallery(galleryGroups),
+    [galleryGroups],
+  );
   // 合集一部都没有时不给切换键：两种形态都是空页，多一颗键只会让人以为点了没反应
   const gallery = galleryPreferred && rows.length > 0;
 
@@ -285,10 +329,16 @@ export function LibraryCollectionDetailView({
     if (galleryLoading.current) return;
     galleryLoading.current = true;
     const offset = galleryLoaded.current;
-    listCollectionGallery(collectionId, { limit: GALLERY_PAGE_SIZE, offset, ...sortRef.current })
+    listCollectionGallery(collectionId, {
+      limit: GALLERY_PAGE_SIZE,
+      offset,
+      ...sortRef.current,
+    })
       .then((page) => {
         galleryLoaded.current = offset + page.length;
-        setGalleryGroups((current) => dedupeGalleryGroups([...current, ...page]));
+        setGalleryGroups((current) =>
+          dedupeGalleryGroups([...current, ...page]),
+        );
         setGalleryHasMore(page.length >= GALLERY_PAGE_SIZE);
       })
       .catch(() => setGalleryHasMore(false))
@@ -309,7 +359,14 @@ export function LibraryCollectionDetailView({
     setGalleryGroups([]);
     setGalleryHasMore(false);
     loadMoreGallery();
-  }, [galleryPreferred, sortReady, sortKey, membersEpoch, collectionId, loadMoreGallery]);
+  }, [
+    galleryPreferred,
+    sortReady,
+    sortKey,
+    membersEpoch,
+    collectionId,
+    loadMoreGallery,
+  ]);
 
   /**
    * 灯箱里点心：与收藏页、单库页同一处理——收藏态挂在分组上，灯箱的心与墙上
@@ -319,11 +376,16 @@ export function LibraryCollectionDetailView({
     async (mediaItemId: number, next: boolean) => {
       const patch = (value: boolean) =>
         setGalleryGroups((current) =>
-          current.map((g) => (g.media_item_id === mediaItemId ? { ...g, is_favorite: value } : g)),
+          current.map((g) =>
+            g.media_item_id === mediaItemId ? { ...g, is_favorite: value } : g,
+          ),
         );
       patch(next);
       try {
-        const marks = await setPlaybackMarks({ media_item_id: mediaItemId }, { favorite: next });
+        const marks = await setPlaybackMarks(
+          { media_item_id: mediaItemId },
+          { favorite: next },
+        );
         patch(marks.is_favorite);
       } catch (e) {
         patch(!next);
@@ -354,12 +416,16 @@ export function LibraryCollectionDetailView({
     }
     listCollectionItems(collectionId, { limit: PAGE_SIZE })
       .then(setOrdering)
-      .catch((err) => toast.error(err instanceof Error ? err.message : "取不到名单"));
+      .catch((err) =>
+        toast.error(err instanceof Error ? err.message : "取不到名单"),
+      );
   }, [collectionId, rows, sortKey, toast]);
 
   const rename = useCallback(async () => {
     if (!collection) return;
-    const name = (await prompt({ title: "合集名", initialValue: collection.name }))?.trim();
+    const name = (
+      await prompt({ title: "合集名", initialValue: collection.name })
+    )?.trim();
     if (!name || name === collection.name) return;
     try {
       setCollection(await updateCollection(collection.id, { name }));
@@ -372,12 +438,50 @@ export function LibraryCollectionDetailView({
   // 同一颗按钮两种归宿：自建的真删，自动生成的落墓碑（真删了下次扫描
   // 又会长回来，用户会觉得"删不掉"）。归宿由后端按 builtin 推导，前端只是
   // 把话说对——文案说"删除"而实际藏起来，比藏起来本身更让人迷惑
+  // 首页行清单存在界面偏好里（成员各存各的）：这个合集有没有一行、那一行藏没藏
+  const { prefs, savePrefs } = useUiPrefs();
+  const homeRow = collection
+    ? prefs.home.rows.find((row) => row.collection_id === collection.id)
+    : undefined;
+  const onHome = Boolean(homeRow && !homeRow.hidden);
+  const toggleOnHome = useCallback(async () => {
+    if (!collection) return;
+    try {
+      let rows;
+      if (homeRow) {
+        rows = prefs.home.rows.map((row) =>
+          row.collection_id === collection.id
+            ? { ...row, hidden: onHome }
+            : row,
+        );
+      } else {
+        // 与自定义页同一条路：先按当前的库与合集合并出整份清单，再把新行追加在末尾。
+        // 直接往存的清单里塞一条，在从没存过清单的人那里会排到首页最前面；
+        // newCollectionRow 还会把合集自己的排序收窄到首页支持的档
+        const [libraries, collections] = await Promise.all([
+          listLibraries(),
+          listCollections(),
+        ]);
+        rows = rowsToPrefs([
+          ...buildHomeRows(prefs.home, libraries, collections),
+          newCollectionRow(collection),
+        ]);
+      }
+      await savePrefs({ ...prefs, home: { rows } });
+      toast.success(onHome ? "已从首页移除" : "已显示在首页");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "保存失败");
+    }
+  }, [collection, homeRow, onHome, prefs, savePrefs, toast]);
+
   const auto = collection ? collection.kind !== "user" : false;
   const remove = useCallback(async () => {
     if (!collection) return;
     const automatic = collection.kind !== "user";
     const ok = await confirm({
-      title: automatic ? `隐藏「${collection.name}」？` : `删除合集「${collection.name}」？`,
+      title: automatic
+        ? `隐藏「${collection.name}」？`
+        : `删除合集「${collection.name}」？`,
       // 这句一定要说：合集从来不拥有作品，删它不会少一部片。不说的话，
       // 用户会因为怕删掉影片而不敢清理合集
       description: automatic
@@ -394,14 +498,24 @@ export function LibraryCollectionDetailView({
       toast.success(automatic ? "已隐藏" : "已删除");
       window.history.back();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : automatic ? "隐藏失败" : "删除失败");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : automatic
+            ? "隐藏失败"
+            : "删除失败",
+      );
     }
   }, [collection, confirm, toast]);
 
   const saveRules = useCallback(async () => {
     if (!collection || editing === null) return;
     try {
-      setCollection(await updateCollection(collection.id, { rules: filterToRules(editing) }));
+      setCollection(
+        await updateCollection(collection.id, {
+          rules: filterToRules(editing),
+        }),
+      );
       setEditing(null);
       // 条件变了成员就变了：把这一页重取，别让用户对着旧名单猜
       await reloadItems();
@@ -442,11 +556,18 @@ export function LibraryCollectionDetailView({
   if (error) {
     return (
       <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
-        <PageNav title="合集" fallback={{
-          label: "媒体库",
-          href: (libraryId === null ? "/library/collections" : `/library/${libraryId}`) as Route,
-        }} />
-        <p className="mt-16 text-center text-ui leading-7 text-[var(--text-muted)]">{error}</p>
+        <PageNav
+          title="合集"
+          fallback={{
+            label: "媒体库",
+            href: (libraryId === null
+              ? "/library/collections"
+              : `/library/${libraryId}`) as Route,
+          }}
+        />
+        <p className="mt-16 text-center text-ui leading-7 text-[var(--text-muted)]">
+          {error}
+        </p>
       </div>
     );
   }
@@ -455,7 +576,9 @@ export function LibraryCollectionDetailView({
   // 墙按评分、按片长排着时那个位置不存在——硬插只会插错地方。换了排序就退回
   // 普通海报墙，页头的「已有 N / 共 M」照样在，缺哪几部切回默认序一眼就看到
   const showSeries =
-    !sortKey && series?.available && series.parts.some((part) => part.media_item_id === null);
+    !sortKey &&
+    series?.available &&
+    series.parts.some((part) => part.media_item_id === null);
 
   // 页面自己出滚动容器：外壳的 main 不滚动（与收藏页、单库页同一约定），
   // 少了这一层，海报墙超出一屏就滑不动
@@ -465,7 +588,9 @@ export function LibraryCollectionDetailView({
         title={collection?.name ?? "合集"}
         fallback={{
           label: "媒体库",
-          href: (libraryId === null ? "/library/collections" : `/library/${libraryId}`) as Route,
+          href: (libraryId === null
+            ? "/library/collections"
+            : `/library/${libraryId}`) as Route,
         }}
         actions={
           // 收进 ⋯，与单库页一致：顶栏那几个位子是 36px 的圆钮，塞中文标签会
@@ -523,7 +648,10 @@ export function LibraryCollectionDetailView({
                         <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
                       </>
                     )}
-                    <DropdownMenu.Item onSelect={rename} className={MENU_ITEM_CLASS}>
+                    <DropdownMenu.Item
+                      onSelect={rename}
+                      className={MENU_ITEM_CLASS}
+                    >
                       改名
                     </DropdownMenu.Item>
                     {/* 分享整个合集：链接对外可看，成员每次访问现算——
@@ -537,7 +665,11 @@ export function LibraryCollectionDetailView({
                               setShareOpen(true);
                             })
                             .catch((err) =>
-                              toast.error(err instanceof Error ? err.message : "打不开分享"),
+                              toast.error(
+                                err instanceof Error
+                                  ? err.message
+                                  : "打不开分享",
+                              ),
                             );
                         }}
                         className={MENU_ITEM_CLASS}
@@ -547,18 +679,25 @@ export function LibraryCollectionDetailView({
                     )}
                     {/* 规则就是这个合集的定义，改它是最要紧的一件事——此前只读，
                         看得见改不了（F4 把它补上）*/}
-                    {libraryId !== null && collection.editable && collection.rule_driven && (
-                      <DropdownMenu.Item
-                        onSelect={() => setEditing(rulesToFilter(collection.rules))}
-                        className={MENU_ITEM_CLASS}
-                      >
-                        改条件…
-                      </DropdownMenu.Item>
-                    )}
+                    {libraryId !== null &&
+                      collection.editable &&
+                      collection.rule_driven && (
+                        <DropdownMenu.Item
+                          onSelect={() =>
+                            setEditing(rulesToFilter(collection.rules))
+                          }
+                          className={MENU_ITEM_CLASS}
+                        >
+                          改条件…
+                        </DropdownMenu.Item>
+                      )}
                     {/* 手动合集才谈得上"顺序"：规则驱动的成员是求值出来的，
                         它的先后由 sort 决定，拖不动也不该拖 */}
                     {collection.editable && !collection.rule_driven && (
-                      <DropdownMenu.Item onSelect={openOrdering} className={MENU_ITEM_CLASS}>
+                      <DropdownMenu.Item
+                        onSelect={openOrdering}
+                        className={MENU_ITEM_CLASS}
+                      >
                         整理顺序…
                       </DropdownMenu.Item>
                     )}
@@ -566,17 +705,34 @@ export function LibraryCollectionDetailView({
                       canManageLibraries &&
                       collection.editable &&
                       collection.rule_driven && (
-                        <DropdownMenu.Item onSelect={applyToLibrary} className={MENU_ITEM_CLASS}>
+                        <DropdownMenu.Item
+                          onSelect={applyToLibrary}
+                          className={MENU_ITEM_CLASS}
+                        >
                           设为本库的收藏范围
                         </DropdownMenu.Item>
                       )}
+                    {/* 「显示在首页」：把这个合集加成媒体库首页的一行（与 Plex 的 Pin to Home
+                        一致），写的是与自定义页同一份偏好；再点一次是隐藏那一行，不删 */}
+                    <DropdownMenu.Item
+                      onSelect={toggleOnHome}
+                      className={MENU_ITEM_CLASS}
+                    >
+                      {onHome ? "从首页移除" : "显示在首页"}
+                    </DropdownMenu.Item>
                     <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
                     {collection.hidden ? (
-                      <DropdownMenu.Item onSelect={unhide} className={MENU_ITEM_CLASS}>
+                      <DropdownMenu.Item
+                        onSelect={unhide}
+                        className={MENU_ITEM_CLASS}
+                      >
                         恢复显示
                       </DropdownMenu.Item>
                     ) : (
-                      <DropdownMenu.Item onSelect={remove} className={MENU_ITEM_CLASS}>
+                      <DropdownMenu.Item
+                        onSelect={remove}
+                        className={MENU_ITEM_CLASS}
+                      >
                         {auto ? "隐藏这个合集" : "删除合集"}
                       </DropdownMenu.Item>
                     )}
@@ -600,10 +756,14 @@ export function LibraryCollectionDetailView({
               ? `已有 ${series.owned_count} / 共 ${series.total} 部`
               : `${collection.item_count} 部`
             : ""}
-          {collection?.visibility === "private" && <span className="ml-2">· 只有我可见</span>}
+          {collection?.visibility === "private" && (
+            <span className="ml-2">· 只有我可见</span>
+          )}
           {collection?.hidden && <span className="ml-2">· 已隐藏</span>}
         </p>
-        {collection && editing === null && <RuleRow collection={collection} facets={facets} />}
+        {collection && editing === null && (
+          <RuleRow collection={collection} facets={facets} />
+        )}
         {/* 排序：与单库页、收藏页同一颗控件、同一套档位，默认档叫合集自己的序。
             「按什么排」看墙是看不出来的，所以当前值挂在外面，不收进 ⋯ 菜单。
             改条件时收起——那一行已经被筛选条占了，且改完条件成员会整个换掉 */}
@@ -780,7 +940,9 @@ function SeriesWall({
   libraryIdOf: (item: LibraryItem) => number;
 }) {
   const { subscriptionOf } = useSubscribeEntry();
-  const missing = complete ? parts.filter((part) => part.media_item_id === null) : [];
+  const missing = complete
+    ? parts.filter((part) => part.media_item_id === null)
+    : [];
   return (
     <div data-testid="series-wall" className={WALL_GRID_POSTER}>
       {interleaveByRelease(items, missing).map((cell) =>
@@ -790,7 +952,12 @@ function SeriesWall({
             part={cell.part}
             tracked={
               cell.part.subscribed ||
-              Boolean(subscriptionOf({ id: String(cell.part.tmdb_id), type: "movie" }))
+              Boolean(
+                subscriptionOf({
+                  id: String(cell.part.tmdb_id),
+                  type: "movie",
+                }),
+              )
             }
           />
         ) : (
@@ -808,7 +975,10 @@ function SeriesWall({
 type SeriesCell = { item: LibraryItem } | { part: SeriesPart };
 
 /** 两列都已按上映正序：归并成一列。没有日期的排最后，与后端 parts 的排序同一口径。 */
-function interleaveByRelease(items: LibraryItem[], missing: SeriesPart[]): SeriesCell[] {
+function interleaveByRelease(
+  items: LibraryItem[],
+  missing: SeriesPart[],
+): SeriesCell[] {
   const dateOf = (value: string | null) => value ?? "9999-12-31";
   const cells: SeriesCell[] = [];
   let next = 0;
@@ -832,7 +1002,13 @@ function interleaveByRelease(items: LibraryItem[], missing: SeriesPart[]): Serie
  * 走全站的订阅弹窗。已经在追的副行写「追踪中」，卡片自己也会把订阅键换成
  * 「管理订阅」，不会让人再订一遍。
  */
-function MissingPartCell({ part, tracked }: { part: SeriesPart; tracked: boolean }) {
+function MissingPartCell({
+  part,
+  tracked,
+}: {
+  part: SeriesPart;
+  tracked: boolean;
+}) {
   // 点海报走发现页同一条 TMDB 详情路径，所以要给完整的 MediaItem；列表拿不到的
   // 字段（类型、简介）留空，进详情后由详情接口回填
   const visual: MediaItem = {
@@ -905,13 +1081,20 @@ function RuleRow({
   const filter = rulesToFilter(collection.rules);
   // 查不到展示名就给省略号：规则里存的是 TMDB id 与国家码，界面上冒出「16」
   // 「JP」比空着更糟。查不到只意味着 facet 还在路上，到了自然补上
-  const labelOf = (pool: { value: string; label: string }[] | undefined, value: string) =>
-    pool?.find((row) => row.value === value)?.label ?? "…";
+  const labelOf = (
+    pool: { value: string; label: string }[] | undefined,
+    value: string,
+  ) => pool?.find((row) => row.value === value)?.label ?? "…";
   const groups = DIMS.map(({ key, label }) => {
     const values =
       key === "watch"
         ? filter.watch
-          ? [{ value: filter.watch, label: labelOf(facets?.watch, filter.watch) }]
+          ? [
+              {
+                value: filter.watch,
+                label: labelOf(facets?.watch, filter.watch),
+              },
+            ]
           : []
         : (((filter[key] ?? []) as (string | number)[]) ?? []).map((raw) => {
             const value = String(raw);
@@ -928,7 +1111,9 @@ function RuleRow({
 
   if (groups.length === 0) {
     return (
-      <p className="mt-3 text-sub text-[var(--text-faint)]">自动收录 · 收录本库全部作品</p>
+      <p className="mt-3 text-sub text-[var(--text-faint)]">
+        自动收录 · 收录本库全部作品
+      </p>
     );
   }
 
@@ -938,15 +1123,21 @@ function RuleRow({
       {groups.map((group, index) => (
         <div key={group.label} className="flex items-center gap-2">
           {/* 维度之间是「且」，维度内是「或」——与库页筛选条同一套语言 */}
-          {index > 0 && <span className="text-caption tracking-wide text-white/30">且</span>}
+          {index > 0 && (
+            <span className="text-caption tracking-wide text-white/30">且</span>
+          )}
           <span className="glass-row flex h-7 !w-auto items-center gap-1.5 rounded-lg !bg-[var(--glass-fill-active)] !px-2 py-0">
             <span className="rounded bg-black/25 px-1.5 py-0.5 text-caption text-white/40">
               {group.label}
             </span>
             {group.values.map((value, i) => (
               <span key={value.value} className="flex items-center gap-1.5">
-                {i > 0 && <span className="text-caption text-white/30">或</span>}
-                <span className="text-caption font-semibold text-white">{value.label}</span>
+                {i > 0 && (
+                  <span className="text-caption text-white/30">或</span>
+                )}
+                <span className="text-caption font-semibold text-white">
+                  {value.label}
+                </span>
               </span>
             ))}
           </span>

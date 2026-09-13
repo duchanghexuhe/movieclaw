@@ -35,11 +35,11 @@ import shutil
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path, PurePath
 from typing import Any, Literal, NamedTuple
 
-from sqlalchemy import Integer, and_, func, not_, nullslast, or_, true
+from sqlalchemy import BigInteger, Integer, and_, func, not_, nullslast, or_, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -305,6 +305,10 @@ WallSort = Literal[
     "runtime",
     "size",
     "last_played",
+    # 「随便看看」：媒体库首页自定义行独有（docs/design/library-home-perspective.md 4.2）。
+    # 按 UTC 日期做种子，同一天内稳定——轮询刷新、翻页都不换批，明天再换一批。
+    # 它不进筛选栏的排序下拉（前端 sortOptions 是显式列表），A-Z 索引对它返回空
+    "random",
 ]
 
 #: 排序方向（2026-09-11 起可切换）。不给方向 = 该档的**自然方向**（见 ``_NATURAL_ASC``），
@@ -323,7 +327,20 @@ _NATURAL_ASC: dict[str, bool] = {
     "runtime": True,
     "size": False,
     "last_played": False,
+    "random": True,
 }
+
+#: 「随便看看」的哈希：``(media_item_id * 当日乘数) % 模``，当日乘数 =
+#: ``黄金比例常数 × (2 × 种子 + 1)`` 取模（奇 × 奇仍是奇数，乘法哈希才是置换）。
+#: 种子必须进乘数而不是加在后面：加常数只是整体平移，模意义下顺序几乎不变，
+#: 换了天也换不了批。模取 2^32，SQLite 与 PostgreSQL 都是普通整数算术，不需要扩展
+_RANDOM_MULTIPLIER = 2654435761
+_RANDOM_MODULUS = 1 << 32
+
+
+def _random_seed() -> int:
+    """「随便看看」的种子：UTC 日期序数。测试里 monkeypatch 它来验证"跨日换一批"。"""
+    return datetime.now(UTC).date().toordinal()
 
 
 def _ascending(sort: WallSort, order: WallOrder | None) -> bool:
@@ -337,7 +354,10 @@ def _ascending(sort: WallSort, order: WallOrder | None) -> bool:
 
 #: 观看状态。前三者是一个**划分**：任何条目恰好落在其中一档，三档计数之和
 #: 等于总数（facet 计数因此永远对得上）。favorite 与它们正交，单选而已。
-WatchFilter = Literal["unwatched", "watching", "played", "favorite"]
+#: ``seen`` = watching ∪ played（"不是 unwatched"）：只是接口取值，不进筛选条、不进 facet
+#: 计数——媒体库首页「最近观看的 X」行用它把从没播过的片挡在外面（度量档把空度量
+#: 沉底而不是排除，取 20 条时看过的排完就轮到没播过的，首页那一行不能这样）
+WatchFilter = Literal["unwatched", "watching", "played", "favorite", "seen"]
 
 #: 年代档 → 年份闭区间；None 表示不设下界。缺年份的条目（release_date 与
 #: media_item.year 都为空）不属于任何一档——「未知年份」不是年代，硬塞进
@@ -464,6 +484,8 @@ def _watch_clause(watch: WatchFilter, member_id: int):
         return and_(not_(watching), played)
     if watch == "unwatched":
         return and_(not_(watching), not_(played))
+    if watch == "seen":
+        return or_(watching, played)
     # favorite：条目级收藏落在哨兵单元上（剧 (-1,-1) / 电影 (0,0)），
     # 与 services/playback/marks.item_favorite_unit 同一份约定
     is_tv = MediaItem.kind == MediaKind.TV.value
@@ -1331,6 +1353,14 @@ def _sorted_ids_query(scope: tuple, sort: WallSort, order: WallOrder | None, mem
         # 体积按口径内的在架文件求和：单库墙上是它在**这个库**占多少地方，
         # 跨库的一面墙（收藏、跨库合集）问的才是它总共占多少
         measure = func.sum(LibraryFile.size_bytes)
+    elif sort == "random":
+        # 每条目一个当日固定的伪随机数；GROUP BY 之后取 max 只是为了满足聚合形状。
+        # 随机档没有方向可言：order 参数对它忽略，永远按哈希升序
+        multiplier = (_RANDOM_MULTIPLIER * (2 * _random_seed() + 1)) % _RANDOM_MODULUS
+        measure = func.max(
+            (func.cast(LibraryFile.media_item_id, BigInteger) * multiplier) % _RANDOM_MODULUS
+        )
+        ascending = True
     else:
         measure = func.max(_last_played_at(member_id or 0))
     # 自然方向下收尾一律是 id 倒序（加方向之前的行为）；反向时整条序列倒过来，
