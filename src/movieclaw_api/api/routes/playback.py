@@ -73,6 +73,7 @@ from movieclaw_api.services.playback import metrics, trickplay
 from movieclaw_api.services.playback import plan as playback_plan
 from movieclaw_api.services.playback import warmup as playback_warmup
 from movieclaw_api.services.playback import watch as playback_watch
+from movieclaw_api.services.playback.adaptive import adapt_to_downlink
 from movieclaw_api.services.playback.embedded_subs import (
     extract_embedded_fonts,
     extract_embedded_subtitle_async,
@@ -340,6 +341,10 @@ def _build_playback_diagnostics(
         job_stderr_tail=job_stderr_tail,
         head_segment=session.head_segment if session.segment_plan is not None else None,
         highest_produced_segment=highest_produced,
+        lead_seconds=manager.lead_seconds(session),
+        pause_reasons=sorted(session.pause_reasons),
+        cache_hit=session.cache_hit,
+        cached_segments=session.cached_segments,
         requested_segment=session.last_requested_segment,
         served_segment=session.last_served_segment,
         segment_wait_ms=session.last_segment_wait_ms,
@@ -1073,6 +1078,20 @@ async def start_playback_session(
         ]
         execution_backend = None
         use_remote = False
+    # 按实测线路带宽收紧转码码率（docs/design/player-pipeline-optimization.md §C）。
+    # 用户手动选了画质上限时不动——他的选择优先于自动。
+    if payload.max_height is None:
+        adapted = adapt_to_downlink(decision, payload.downlink_bps)
+        if adapted is not decision:
+            decision = adapted
+            view = playback_plan.to_view(decision)
+            logger.info(
+                "按线路带宽收紧转码：downlink=%s bps → 高度 %s 码率上限 %s bps（file_id=%s）",
+                payload.downlink_bps,
+                view.video.height if view.video else None,
+                view.video.bitrate_cap_bps if view.video else None,
+                file.id,
+            )
     hw_used = (
         effective_hw_backend(decision, execution_backend)
         if execution_backend and view.video and view.video.action == "transcode"
@@ -1123,6 +1142,7 @@ async def start_playback_session(
             # 但统一带上省得两条路径分叉
             display_name=PathLib(file.file_path).name,
             device_id=device_id,
+            cache=policy.transcode_cache_enabled,
         )
     except (SessionLimitError, DiskQuotaError) as exc:
         raise ServiceUnavailableException(str(exc)) from exc
@@ -1145,7 +1165,7 @@ async def start_playback_session(
     # 用户报「起播慢」时这一行直接指认方向。
     logger.info(
         "播放会话就绪：档 %s · 决策 %d 毫秒 · 准备 %d 毫秒 · ffmpeg %d 毫秒 · 共 %d 毫秒"
-        "（file_id=%s hw=%s session=%s）",
+        "（file_id=%s hw=%s session=%s 缓存=%s）",
         view.tier,
         decide_ms,
         prep_ms,
@@ -1154,6 +1174,7 @@ async def start_playback_session(
         file.id,
         hw_used or "无",
         transcode.id,
+        f"命中 {transcode.cached_segments} 段" if transcode.cache_hit else "未命中",
     )
     return ok(
         PlaybackSessionView(

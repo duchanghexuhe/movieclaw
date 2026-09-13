@@ -507,6 +507,8 @@ export interface VideoPlan {
    * 「字幕压制」）。前端据此：不再旁挂渲染这条轨、菜单选中态指向它、
    * 画中画补丁轨跳过、诊断面板显示「字幕压制」。 */
   burn_subtitle: string | null;
+  /** 按实测带宽收紧后的码率上限（bps）；null = 只按分辨率阶梯 */
+  bitrate_cap_bps?: number | null;
 }
 
 export interface AudioPlan {
@@ -620,6 +622,13 @@ export interface PlaybackDiagnostics {
   recent_uploads: PlaybackArtifactUpload[];
   cache_bytes: number;
   total_segments: number | null;
+  /** 转码头领先播放头的秒数（闭环供片节流的输入，§A）；非 VOD 会话为 null */
+  lead_seconds?: number | null;
+  /** 当前挂起原因："lead" 领先过多 / "disk" 磁盘低水位；空 = 在跑 */
+  pause_reasons?: string[];
+  /** 开会话时认领到了同指纹的转码缓存（§B），以及当时可用的分片数 */
+  cache_hit?: boolean;
+  cached_segments?: number;
 }
 
 /** 进度条上的章节刻度（docs/design/player-feel.md §2.C1）。合成章节不下发 */
@@ -675,6 +684,11 @@ interface DecideBody extends PlaybackUnit {
   subtitle_track?: string;
   /** 画质上限（如 720）。上限而非目标：源不超就照常直通。省略 = 自动 */
   max_height?: number;
+  /**
+   * 实测下行速度（bps，bandwidth.ts 的传输期口径）。服务端只对转码视频
+   * 用它压码率、必要时降高度；手动选了画质上限时服务端忽略。样本不够时省略。
+   */
+  downlink_bps?: number;
 }
 
 /** 只问「该怎么放」，不起会话。用于播放前的档位预览与诊断。 */
@@ -1001,6 +1015,8 @@ export function reportPlaybackProgressOnUnload(
 export interface PlaybackPolicy {
   software_transcode_enabled: boolean;
   trickplay_enabled: boolean;
+  /** 转码产物保留供续播、重看复用（§B）；关闭即会话结束即删 */
+  transcode_cache_enabled: boolean;
   /** 实测结果而非配置项——用户改不了自己有没有显卡 */
   hardware_available: boolean;
   hw_backends: string[];
