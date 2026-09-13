@@ -344,6 +344,12 @@ Netflix 阴影，`.brand-badge` / `.nav-item` 选中胶囊 → 白系，播放�
   吸顶雾）保留——App 详情页同样有返回。
 - 现有页面级滚动容器的 `.scroll-safe` 让位机制照用；主区底部为标签栏让位的收口
   写在一条 `[data-theme="netflix"] .app-shell > main` 规则里，页面不逐个登记。
+- **（2026-09-13 修订）**「mobile-topbar 退役」修订为**保留但换 Netflix 皮**：
+  发现页排序、活动页筛选、订阅管理等 4+ 个页面把页面级控件挂在全局顶栏上
+  （`setTopBarActions` 通道），移动端搜索入口也靠它——彻底退役需逐页重新安置、
+  伤可达性。Netflix App 三 tab 期首页顶部同样有搜索入口浮在内容上，保留一条
+  透明黑雾顶栏（纯黑系雾 + 红色字标）不违和。详见
+  `docs/design/web-themes-mobile/01-外壳与导航.md`。
 
 ### 5.3 内容首页 `NetflixHome`（路由 `/`）
 
@@ -407,7 +413,11 @@ Netflix 阴影，`.brand-badge` / `.nav-item` 选中胶囊 → 白系，播放�
   移动端照旧保留 PageNav（§5.2）。② 剧照横幅加高：氛围留白高度收敛为
   `--detail-hero-h` / `--detail-hero-min-h` 变量（spacer 与渐变起点同源取值），
   Netflix 桌面 `50vh / 300px`（对齐 billboard 构图），银玻璃与移动端维持
-  `30vh/180px`、`22vh/120px`。③ 滚动条轨道给实色 `#000`：剧照是 fixed 全屏
+  `30vh/180px`、`22vh/120px`。
+  （2026-09-13 移动端收口修订：Netflix 主题的**移动端** hero 提档为
+  `40vh / 220px` 专属档，银玻璃移动端维持 `22vh/120px`——此前两主题移动端
+  共用低档，Netflix 观感与银玻璃无差别。详见
+  `docs/design/web-themes-mobile/02-内容页与卡片行.md`。）③ 滚动条轨道给实色 `#000`：剧照是 fixed 全屏
   覆盖层，透明轨道会在页面右缘漏出一条未压暗的原图。④ 标题块上移 +
   「左 → 右」渐变遮罩（内容层上提 220px；左缘 92%、30% 宽度处仍 55% 的双
   遮罩护住横幅左上区，同 Netflix billboard）。⑤ 艺术片名已回退：TMDB logo

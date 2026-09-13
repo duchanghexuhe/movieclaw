@@ -81,7 +81,7 @@ function dropPosition(e: React.DragEvent): "before" | "after" {
  * 状态列），不逐库拉条目——首页为了封面拼图才要拉，这里的缩略图走服务端拼贴图。
  */
 export function LibraryManageView() {
-  const { canManageLibraries } = usePermissions();
+  const { canManageLibraries, canUseLibrary } = usePermissions();
   const router = useRouter();
   const confirm = useConfirm();
   const toast = useToast();
@@ -89,7 +89,10 @@ export function LibraryManageView() {
 
   // 标签栏：「媒体库」与「回收站」（docs/design/library-recycle-bin.md §2）；
   // ?tab=recycle 深链直达，切换写回地址栏
-  const [tab, setTab] = useTabParam(["libraries", "recycle", "shares"] as const, "libraries");
+  const [tabParam, setTab] = useTabParam(["libraries", "recycle", "shares"] as const, "libraries");
+  // 「分享」是网页播放的延伸，网页媒体库关闭时标签不存在、接口也已下线；
+  // 旧的 ?tab=shares 深链归一到默认 tab，避免挂出一个只会 404 的列表
+  const tab = tabParam === "shares" && !canUseLibrary ? "libraries" : tabParam;
   // 回收站标签上的计数：一次 limit=1 的列表请求只为拿 total_files（一条索引计数查询），
   // 不给库统计快照加列——进出回收站的写路径都不在统计重算之列，加列必陈旧
   const [recycleCount, setRecycleCount] = useState<number | null>(null);
@@ -104,7 +107,8 @@ export function LibraryManageView() {
   // 回收站标签激活时列表本身会回报计数，这里只在看库列表时低频轮询
   useVisiblePolling(reloadRecycleCount, tab === "recycle" ? null : 30_000);
   // 「分享」标签计数（docs/design/media-share.md §5.4）：有效分享一共几条，
-  // 与回收站同款——列表激活时由列表回报，其余时候低频轮询
+  // 与回收站同款——列表激活时由列表回报，其余时候低频轮询；
+  // 网页媒体库关闭时分享接口已下线，不发起轮询
   const [shareCount, setShareCount] = useState<number | null>(null);
   const reloadShareCount = useCallback(() => {
     listShares()
@@ -112,9 +116,9 @@ export function LibraryManageView() {
       .catch(() => {});
   }, []);
   useEffect(() => {
-    reloadShareCount();
-  }, [reloadShareCount]);
-  useVisiblePolling(reloadShareCount, tab === "shares" ? null : 30_000);
+    if (canUseLibrary) reloadShareCount();
+  }, [canUseLibrary, reloadShareCount]);
+  useVisiblePolling(reloadShareCount, !canUseLibrary || tab === "shares" ? null : 30_000);
 
   const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
   const [failed, setFailed] = useState(false);
@@ -446,7 +450,8 @@ export function LibraryManageView() {
         </div>
       </div>
 
-      {/* 标签栏：媒体库 / 回收站。回收站计数为 0 时标签照常渲染（入口要被看见），只是不带数字 */}
+      {/* 标签栏：媒体库 / 回收站（分享=网页播放的延伸，网页媒体库关闭时隐藏，
+          其接口也已下线）。回收站计数为 0 时标签照常渲染（入口要被看见），只是不带数字 */}
       <div className="mt-4 flex gap-1.5 px-6 max-md:px-4" role="tablist">
         {(
           [
@@ -454,7 +459,9 @@ export function LibraryManageView() {
             { id: "recycle" as const, label: "回收站", count: recycleCount },
             { id: "shares" as const, label: "分享", count: shareCount },
           ] as const
-        ).map((t) => (
+        )
+          .filter((t) => t.id !== "shares" || canUseLibrary)
+          .map((t) => (
           <button
             key={t.id}
             type="button"

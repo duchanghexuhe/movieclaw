@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends
 from movieclaw_api.api.deps import (
     require_admin,
     require_direct_download_capability,
+    require_library_enabled,
     require_login,
 )
 from movieclaw_api.api.routes.agent import router as session_router
@@ -79,7 +80,8 @@ api_router.include_router(auth_router)
 # 影片分享的访客通道（docs/design/media-share.md §4.3）：每个端点自带
 # require_share_access（分享有效 + 密码已解锁），产出的分享主体进不了
 # require_login，所以既有业务接口对分享凭据一律 401
-api_router.include_router(shares_public_router)
+# ---- 影片分享公开面：网页媒体库关 → 分享（访客观影）一并关 ----
+api_router.include_router(shares_public_router, dependencies=[Depends(require_library_enabled)])
 
 # ---- 插件区（鉴权在各路由上自行声明：插件侧 sync token / 管理侧 login）----
 api_router.include_router(extension_router)
@@ -100,24 +102,37 @@ _MEMBER_ROUTERS = [
     title_search_router,
     images_router,
     search_router,
-    library_search_router,
     subscriptions_router,
     # 回收站 /libraries/trashed-files 必须排在 /libraries/{library_id} 之前，
     # 否则 "trashed-files" 会被当成 library_id 校验失败（422）
     library_recycle_router,
+    # libraries_router 混载浏览面与整理面：浏览端点在文件内逐个挂
+    # require_library_enabled，管理/扫描/整理端点不挂（订阅→下载→入库链路依赖）
     libraries_router,
-    collections_router,
-    people_router,
-    playback_router,
 ]
 for _router in _MEMBER_ROUTERS:
     api_router.include_router(_router, dependencies=[Depends(require_login)])
 
+# ---- 媒体库浏览/播放面：登录之上再叠网页媒体库总开关（library.web）----
+# 关闭后这些路由整体 404，前端同步隐藏全部入口：跨库条目搜索、合集、
+# 库内影人页、播放会话/进度/收藏/继续观看/统计。必须挂在 playback_stream_router
+# 之前（同下方注释：分片兜底路由不能抢走成员区路径）
+for _router in (
+    library_search_router,
+    collections_router,
+    people_router,
+    playback_router,
+):
+    api_router.include_router(
+        _router, dependencies=[Depends(require_login), Depends(require_library_enabled)]
+    )
+
 # 取流字节面（公开区）：只认查询参数里的签名 token（<video src> / hls.js /
 # iOS 原生 HLS 都带不了 header），影片分享的访客也走这里；无 token 或不符一律
 # 404。必须挂在成员区的 playback_router **之后**：它的 /sessions/{id}/{name}
-# 是分片兜底路由，先挂会把成员区的 /sessions/{id}/diagnostics 抢走
-api_router.include_router(playback_stream_router)
+# 是分片兜底路由，先挂会把成员区的 /sessions/{id}/diagnostics 抢走。
+# 网页媒体库关闭后取流随之 404（外部播放器走 Jellyfin 兼容层，不经这里）
+api_router.include_router(playback_stream_router, dependencies=[Depends(require_library_enabled)])
 
 # 一键下载：从下载器配置面单独拆出，按 allow_direct_download 放行成员；
 # 成员版在处理器内强制自动路由（拒绝手选目录/指定下载器，不回显路径）
@@ -161,8 +176,13 @@ _ADMIN_ROUTERS = [
     # G2 额度护栏一起评估（docs/design/subtitle-ai-translate.md §6）
     subtitle_gen_router,
     webhook_router,
-    # 影片分享是把内容放到登录边界之外的动作，仅超管（media-share.md §2.1）
-    shares_admin_router,
 ]
 for _router in _ADMIN_ROUTERS:
     api_router.include_router(_router, dependencies=[Depends(require_admin)])
+
+# 影片分享管理面：仅超管（media-share.md §2.1），且分享本身是网页播放的
+# 公开延伸——网页媒体库关闭时生成/列出分享一并 404（已发出的分享链接
+# 由公开面的 require_library_enabled 同步失效）
+api_router.include_router(
+    shares_admin_router, dependencies=[Depends(require_admin), Depends(require_library_enabled)]
+)

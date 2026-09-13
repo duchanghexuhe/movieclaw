@@ -51,6 +51,16 @@ interface UiPrefsContextValue {
 
 const UiPrefsContext = createContext<UiPrefsContextValue | null>(null);
 
+/**
+ * 浏览器 UI 框（移动端地址栏 / PWA 状态栏）随主题取的画布色：与 <meta
+ * name="theme-color"> 同步写入。manifest 的静态 theme_color 保持银玻璃
+ * （只影响安装过渡帧，动态化需 cookie 路由，不值得）。
+ */
+const THEME_BROWSER_CHROME: Record<string, string> = {
+  netflix: "#000000",
+  [DEFAULT_THEME_ID]: "#0a0b10",
+};
+
 export function UiPrefsProvider({ children }: { children: React.ReactNode }) {
   // 惰性初始化读缓存：本 Provider 只在 AuthGate 确认登录后于客户端渲染
   // （见 components/app-shell.tsx），不参与 SSR，故可直接读 localStorage。
@@ -101,6 +111,23 @@ export function UiPrefsProvider({ children }: { children: React.ReactNode }) {
     const root = document.documentElement;
     if (effectiveTheme === DEFAULT_THEME_ID) root.removeAttribute("data-theme");
     else root.setAttribute("data-theme", effectiveTheme);
+    // 浏览器 UI 框颜色与画布同源跟随（含设置页实时预览切主题的瞬间）。
+    // Next 的路由元数据机制可能在客户端导航时把 viewport 导出的静态
+    // themeColor（银玻璃值）写回 meta——用观察器持续断言当前主题的画布色，
+    // 无论被谁改写都拉回，避免主题与浏览器框颜色脱节。
+    const desired =
+      THEME_BROWSER_CHROME[effectiveTheme] ?? THEME_BROWSER_CHROME[DEFAULT_THEME_ID];
+    const apply = () => {
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta && meta.getAttribute("content") !== desired) {
+        meta.setAttribute("content", desired);
+      }
+      return meta;
+    };
+    const meta = apply();
+    const observer = new MutationObserver(apply);
+    if (meta) observer.observe(meta, { attributes: true, attributeFilter: ["content"] });
+    return () => observer.disconnect();
   }, [effectiveTheme]);
 
   const savePrefs = useCallback(

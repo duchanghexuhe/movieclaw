@@ -61,7 +61,7 @@ export function NetflixTopNav({
 }) {
   const router = useRouter();
   const pathname = usePathname();
-  const { canSearch, canSubscribe, isAdmin } = usePermissions();
+  const { canSearch, canSubscribe, canUseLibrary, isAdmin } = usePermissions();
   const active = activeNavId(pathname);
 
   // 顶栏透明 → 实底的滚动判定：全站页面都是「外壳固定 + 内部容器滚动」，
@@ -95,7 +95,15 @@ export function NetflixTopNav({
     rootRef.current?.style.setProperty("--nf-nav-dim", "0");
   }, [pathname]);
 
-  const visibleLinks = NAV_LINKS.filter((link) => link.id !== "subscriptions" || canSubscribe);
+  // 权限过滤对齐侧栏可见性判定（useVisibleNavItems 同口径）；网页媒体库
+  // 关闭时「媒体库」对成员隐藏，管理员保留整理入口并改指库管理页
+  const visibleLinks = NAV_LINKS.filter((link) => link.id !== "subscriptions" || canSubscribe)
+    .filter((link) => link.id !== "library" || canUseLibrary || isAdmin)
+    .map((link) =>
+      link.id === "library" && !canUseLibrary
+        ? { ...link, label: "库管理", href: "/library/manage" as Route }
+        : link,
+    );
 
   return (
     <header ref={rootRef} className="nf-topnav fixed inset-x-0 top-0 z-40">

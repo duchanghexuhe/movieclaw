@@ -45,25 +45,43 @@ const TABS = [
 ] as const;
 
 /** pathname → 当前页签 id（详情等子页落在所属的顶层页签上）。 */
-function activeTabId(pathname: string): string {
+function activeTabId(pathname: string, libraryOpen: boolean): string {
   if (pathname === "/" || pathname.startsWith("/new") || pathname.startsWith("/sessions/")) {
     return "home";
   }
   if (pathname.startsWith("/discover")) return "discover";
-  if (pathname.startsWith("/library") || pathname.startsWith("/media")) return "library";
+  // 发现详情页（/media）：开媒体库时归「媒体库」页签，关闭后归「发现」
+  if (pathname.startsWith("/media")) return libraryOpen ? "library" : "discover";
+  if (pathname.startsWith("/library")) return "library";
   return "";
 }
 
-export function NetflixTabBar({ onOpenMy }: { onOpenMy: () => void }) {
+export function NetflixTabBar({
+  onOpenMy,
+  myOpen = false,
+}: {
+  onOpenMy: () => void;
+  /** 「我的」面板当前开合：开着时页签保持高亮、aria-expanded 如实上报 */
+  myOpen?: boolean;
+}) {
   const pathname = usePathname();
-  const active = activeTabId(pathname);
+  const { canUseLibrary, isAdmin } = usePermissions();
+  // 网页媒体库关闭时「媒体库」页签对成员隐藏；管理员保留整理入口，
+  // 改指库管理页（与侧栏/顶栏同一口径）
+  const tabs = TABS.filter((tab) => tab.id !== "library" || canUseLibrary || isAdmin).map(
+    (tab) =>
+      tab.id === "library" && !canUseLibrary
+        ? { ...tab, label: "库管理", href: "/library/manage" as Route }
+        : tab,
+  );
+  const active = myOpen ? "my" : activeTabId(pathname, canUseLibrary);
 
   return (
     <nav
       aria-label="主导航"
-      className="nf-tabbar fixed inset-x-0 bottom-0 z-40 flex h-[49px] items-stretch border-t border-white/[0.06] pb-[var(--safe-bottom)]"
+      className="nf-tabbar fixed inset-x-0 bottom-0 z-40 flex h-[calc(49px+var(--safe-bottom))] items-stretch border-t border-white/[0.06] pb-[var(--safe-bottom)]"
     >
-      {TABS.map(({ id, label, href, Icon }) => (
+      {tabs.map(({ id, label, href, Icon }) => (
         <Link
           key={id}
           href={href}
@@ -80,7 +98,7 @@ export function NetflixTabBar({ onOpenMy }: { onOpenMy: () => void }) {
       <button
         type="button"
         onClick={onOpenMy}
-        aria-expanded="true"
+        aria-expanded={myOpen}
         className={`flex flex-1 flex-col items-center justify-center gap-0.5 ${
           active === "my" ? "text-white" : "text-[#808080]"
         }`}
@@ -284,7 +302,15 @@ export function NetflixSettingsNav({
     const onPointer = (e: MouseEvent) => {
       if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
     };
-    return () => document.removeEventListener("mousedown", onPointer);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
   }, [open]);
 
   if (!current) return null;

@@ -151,6 +151,16 @@
   /* 移动端顶栏高度：抽屉、页面吸顶元素都以它为基准让位 */
   --mobile-topbar-h: 52px;
 
+  /* PageNav 吸顶雾的渐变（银玻璃蓝黑）：page-nav.tsx 的内联 style 引用它，
+     Netflix 主题在覆盖组里换成纯黑系——内联 style 无法被 CSS 选择器压过，
+     必须走变量（docs/design/web-themes-mobile/01-外壳与导航.md §3） */
+  --page-fog: linear-gradient(
+    180deg,
+    rgba(9, 11, 16, 0.72) 0%,
+    rgba(9, 11, 16, 0.46) 46%,
+    rgba(9, 11, 16, 0) 100%
+  );
+
   /* —— iOS 独立 App 的「视口比屏幕矮一截」补偿量 ——
      iOS 在 apple-mobile-web-app-status-bar-style=black-translucent 下，
      把整个文档**整体上移**到状态栏底下（这正是顶部沉浸的实现方式），但视口
@@ -2000,6 +2010,15 @@ html[data-theme="netflix"] {
   --radius-2xl: 6px;
   --radius-3xl: 8px; /* 个别大面留一档 */
   --radius-4xl: 8px;
+
+  /* PageNav 吸顶雾换纯黑系（浓度档与银玻璃一致，只换色相——雾的「压字
+     不糊」手感是全站调过的，不因主题重调） */
+  --page-fog: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.72) 0%,
+    rgba(0, 0, 0, 0.46) 46%,
+    rgba(0, 0, 0, 0) 100%
+  );
 }
 
 /* —— 氛围体系停用：背景大图伪元素整体不渲染，纯 #141414 直出（§3.5） —— */
@@ -2458,5 +2477,54 @@ html[data-theme="netflix"] .nf-nav-offset {
 }
 .nf-mysheet[data-open="true"] {
   transform: translateX(0);
+}
+
+/* —— 移动端收口（docs/design/web-themes-mobile/）—— */
+
+/* 移动全局顶栏雾层换纯黑系：Netflix 画布是纯黑，银玻璃蓝黑雾在其上会读出色偏。
+   blur 与 mask 保留——雾下滚过的海报墙仍要被压糊，这是雾的职责。 */
+html[data-theme="netflix"] .mobile-topbar {
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.8) 0%,
+    rgba(0, 0, 0, 0.55) 58%,
+    rgba(0, 0, 0, 0) 100%
+  );
+}
+
+/* 搜索命令面板：Netflix 弹层语言——#181818 实底、方角、无玻璃模糊
+   （§5.1「浮层换 Netflix 皮」）。无层 CSS 特异性 0,2,0 压过工具类的
+   bg-[rgba(...)] / rounded-2xl / backdrop-blur-2xl（任意值不走 token，
+   只能这样压），与上面 40 处 netflix 覆盖同型。遮罩同步换 Netflix 的
+   70% 纯黑（§2.5 详情弹层规格）——不走银玻璃的可调 scrim 变量（蓝黑
+   色相 + blur 与纯色平铺的世界不符）。 */
+html[data-theme="netflix"] .search-palette-overlay {
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: none;
+}
+html[data-theme="netflix"] .search-palette-panel {
+  background: #181818;
+  border-color: rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  backdrop-filter: none;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.9);
+}
+
+/* 详情页移动端 hero 提档为 Netflix 专属档（§5.5 修订：约 40vh，对齐 App
+   详情构图；银玻璃移动端维持 22vh/120px 不动）。spacer 与渐变起点同源取
+   这两个变量，改一处全链路跟随。 */
+@media (max-width: 767px) {
+  html[data-theme="netflix"] {
+    --detail-hero-h: 40vh;
+    --detail-hero-min-h: 220px;
+  }
+
+  /* 移动行张数断点（§7 表 500-767 / <500 两档）：Netflix 主题下竖版海报卡
+     从银玻璃的固定 126px 换为视口宽公式——375px ≈ 3 张可见 + 半张 peek、
+     320px ≈ 2~3 张，一条规则覆盖首页 / 发现 / 库的全部行（都走 MediaRow 的
+     .m-row），银玻璃不受作用域影响。 */
+  html[data-theme="netflix"] .m-row > div {
+    width: clamp(100px, 30vw, 156px);
+  }
 }
 

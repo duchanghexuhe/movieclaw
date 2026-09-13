@@ -19,6 +19,7 @@ import { Sidebar } from "@/components/sidebar";
 import { SubscribeEntryProvider } from "@/components/subscribe-entry";
 import { NetflixMySheet, NetflixSettingsNav, NetflixTabBar } from "@/components/netflix/tab-bar";
 import { NetflixTopNav } from "@/components/netflix/top-nav";
+import { MovieclawMark, MovieclawWordmark } from "@/components/netflix/brand";
 import { AgentConversationsProvider } from "@/lib/agent-conversations";
 import { useAppNavigationTracking } from "@/lib/back-navigation";
 import { BackdropProvider } from "@/lib/backdrop";
@@ -29,7 +30,7 @@ import { buildSearchPath } from "@/lib/search-url";
 import { UiPrefsProvider, useTheme } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
 import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
-import { usePermissions } from "@/lib/permissions";
+import { libraryDisabledHomePath, usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
 
 /**
@@ -152,6 +153,13 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
 
   /** 选中侧栏导航项：跳对应路由（离开搜索结果/详情页由路由切换自然完成）。 */
   const handleSelect = (id: string) => {
+    // 网页媒体库关闭：「媒体库」导航只服务整理——管理员落到库管理页；
+    // 成员的该项已在 useVisibleNavItems 里隐藏，这里兜住 BrandHome 等
+    // 直传 id 的入口，避免把成员送进一个会被重定向的 /library
+    if (id === "library" && !canUseLibrary) {
+      router.push(libraryDisabledHomePath(session) as Route);
+      return;
+    }
     router.push(pathOfNavId(id));
   };
 
@@ -178,6 +186,7 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
   // 设置入口的默认分区按角色取可见清单的第一项：管理员落「概览」，
   // 成员的清单里没有概览，落「个人信息」——避免把成员送进一个 403 分区
   const { session } = useSession();
+  const { canUseLibrary } = usePermissions();
   const defaultSettingsSection =
     settingsSectionGroupsFor(session.role)[0]?.items[0]?.id ?? settingsSections[0].id;
   const openSettings = (sectionId: string = defaultSettingsSection) => {
@@ -325,7 +334,7 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
                 children
               )}
             </main>
-            <NetflixTabBar onOpenMy={() => setMySheetOpen(true)} />
+            <NetflixTabBar onOpenMy={() => setMySheetOpen(true)} myOpen={mySheetOpen} />
             <NetflixMySheet
               open={mySheetOpen}
               onClose={() => setMySheetOpen(false)}
@@ -507,6 +516,10 @@ function MobileTopBar({
 }) {
   const router = useRouter();
   const { canSearch } = usePermissions();
+  // 品牌与 ☰ 落点随主题分叉：Netflix 用红色 SVG 字标、☰ 开「我的」面板
+  // （银玻璃 = rotor 图片 logo + 侧栏抽屉）。雾层色由 globals.css 的
+  // html[data-theme="netflix"] .mobile-topbar 覆盖，组件里不用管。
+  const isNetflix = useTheme().id === "netflix";
   return (
     <header className="mobile-topbar pointer-events-none absolute inset-x-0 top-0 z-40">
       <div className="pointer-events-auto flex h-[52px] items-center gap-2 px-3">
@@ -519,7 +532,7 @@ function MobileTopBar({
         <button
           type="button"
           onClick={onMenu}
-          aria-label="打开侧边栏"
+          aria-label={isNetflix ? "打开我的面板" : "打开侧边栏"}
           className={PAGE_NAV_BUTTON_CLASS}
         >
           <MenuIcon className="size-[22px]" />
@@ -530,6 +543,22 @@ function MobileTopBar({
           <h1 className="min-w-0 flex-1 truncate text-body font-semibold tracking-[-0.01em] text-[var(--text)]">
             {title}
           </h1>
+        ) : isNetflix ? (
+          /* 字标可点区拉到 44px 高（与图标键同标准）——红色内联 SVG 本身保持
+             h-7 的视觉大小（无 actions 时整词 ≈175px 宽、窄屏仍放得下），
+             命中区靠按钮撑起，否则 28px 高的字标在触屏上很难点中 */
+          <button
+            type="button"
+            onClick={() => router.push("/")}
+            aria-label="回到首页"
+            className="flex h-11 shrink-0 items-center transition-opacity active:opacity-60"
+          >
+            {actions ? (
+              <MovieclawMark className="size-7" />
+            ) : (
+              <MovieclawWordmark className="h-7 w-auto" />
+            )}
+          </button>
         ) : (
           /* 字标可点区拉到 44px 高（与图标键同标准）——图片本身保持 h-7 的视觉
              大小，命中区靠按钮撑起，否则 28px 高的字标在触屏上很难点中 */

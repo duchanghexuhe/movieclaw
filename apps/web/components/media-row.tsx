@@ -66,7 +66,10 @@ export function MediaRow({
         )}
       </div>
 
-      <HScroller className={`gap-4 pb-1 pt-1 max-md:gap-3 ${insetClassName}`}>
+      {/* m-row：稳定钩子类，供 Netflix 主题的移动端行卡宽断点规则定位
+          （globals.css 的 html[data-theme="netflix"] .m-row > div）；
+          银玻璃不命中该作用域，卡宽维持下方工具类取值 */}
+      <HScroller className={`m-row gap-4 pb-1 pt-1 max-md:gap-3 ${insetClassName}`}>
         {row.items.map((item) => (
           <div
             key={`${row.id}-${item.id}`}

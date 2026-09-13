@@ -33,6 +33,7 @@ import { formatBytes } from "@/lib/format";
 import { cachedImageUrl, imageUrl } from "@/lib/image-proxy";
 import type { LibraryKind, MediaItem } from "@/lib/media-types";
 import { playHref, rememberPlayerReturnPath } from "@/lib/player/play-links";
+import { usePermissions } from "@/lib/permissions";
 import { useTapGuard } from "@/lib/use-tap-guard";
 
 /**
@@ -233,6 +234,9 @@ const LibraryItemPlayCard = memo(function LibraryItemPlayCard({
 }: {
   spec: Extract<MediaCardSpec, { kind: "library_item" }>;
 }) {
+  // 网页媒体库关闭：卡片的数据源（条目详情/播放状态）已全部下线，整卡不渲染。
+  // useCardData 是 hook，判断必须放在它之后，保证 hook 顺序稳定
+  const { canUseLibrary } = usePermissions();
   const state = useCardData(spec.key, async (): Promise<LibraryItemCardData> => {
     // 条目页信息只认 media_item_id（库归属服务端按可见性解析）；拿到库 id 后
     // 再并行取详情（剧照/规格）与观看状态。后两者失败不拖垮卡片——没有
@@ -248,6 +252,7 @@ const LibraryItemPlayCard = memo(function LibraryItemPlayCard({
     ]);
     return { info, detail, watch };
   });
+  if (!canUseLibrary) return null;
   const box = "w-[248px] shrink-0 max-md:w-[212px]";
   if (state.status !== "ready") {
     return (

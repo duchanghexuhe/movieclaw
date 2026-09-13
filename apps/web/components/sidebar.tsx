@@ -84,18 +84,26 @@ const memberNavItems = SIDEBAR_NAV_ITEMS.filter((item) => item.id !== "new");
 /**
  * 当前用户实际可见的主导航项（未排序）。侧栏与设置页的排序列表必须用同一套
  * 可见性判定，否则会出现"设置页能排、侧栏没有"这种对不上的项。
+ *
+ * 网页媒体库关闭时：「媒体库」项对成员隐藏；管理员保留（还有库要扫描/
+ * 整理），label 换成「库管理」——落点由 app-shell 的 handleSelect 改写。
  */
 export function useVisibleNavItems() {
   const { session } = useSession();
-  const { isAdmin, canSubscribe } = usePermissions();
+  const { isAdmin, canSubscribe, canUseLibrary } = usePermissions();
   const items = session.role === "member" ? memberNavItems : SIDEBAR_NAV_ITEMS;
-  return items.filter((item) => {
-    if (item.id === "subscriptions") return canSubscribe;
-    // 活动页与任务数据都是管理员专属（JobCenter 自身也有这道判断，成员侧渲染为空），
-    // 这里必须同样挡掉，否则设置页会列出一条侧栏根本没有的可排序项
-    if (item.id === "tasks") return isAdmin;
-    return true;
-  });
+  return items
+    .filter((item) => {
+      if (item.id === "library") return canUseLibrary || isAdmin;
+      if (item.id === "subscriptions") return canSubscribe;
+      // 活动页与任务数据都是管理员专属（JobCenter 自身也有这道判断，成员侧渲染为空），
+      // 这里必须同样挡掉，否则设置页会列出一条侧栏根本没有的可排序项
+      if (item.id === "tasks") return isAdmin;
+      return true;
+    })
+    .map((item) =>
+      item.id === "library" && !canUseLibrary ? { ...item, label: "库管理" } : item,
+    );
 }
 
 export function Sidebar({

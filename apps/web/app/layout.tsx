@@ -100,8 +100,12 @@ const RESTORE_BACKDROP_SCRIPT = `try{if(location.pathname.indexOf("/sessions/")=
  * 同步由 lib/ui-prefs.tsx 的 effect 负责（AppShell 只在登录后渲染）。
  *
  * /play/*、/s/[slug] 不套 AppShell，同样吃到这段脚本与 token 层（结构层除外）。
+ * Netflix 命中时顺带把 <meta name="theme-color"> 改成纯黑——强刷后浏览器地址
+ * 栏 / PWA 状态栏不先闪一段银玻璃色（meta 由 viewport 导出注入，head 同步
+ * 解析、脚本执行时已在；找不到时静默跳过。银玻璃不命中白名单，meta 维持
+ * layout.tsx viewport 导出的 #0a0b10 原值，无需恢复动作）。
  */
-const RESTORE_THEME_SCRIPT = `try{var p=JSON.parse(localStorage.getItem("movieclaw.ui-prefs")||"null");if(p&&p.theme==="netflix")document.documentElement.setAttribute("data-theme","netflix")}catch(e){}`;
+const RESTORE_THEME_SCRIPT = `try{var p=JSON.parse(localStorage.getItem("movieclaw.ui-prefs")||"null");if(p&&p.theme==="netflix"){document.documentElement.setAttribute("data-theme","netflix");var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content","#000000")}}catch(e){}`;
 
 export default function RootLayout({
   children,

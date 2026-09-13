@@ -84,6 +84,10 @@ class SessionView(BaseModel):
         default_factory=SessionCapabilities,
         description="能力开关快照；管理员恒为全开",
     )
+    library_enabled: bool = Field(
+        default=True,
+        description="系统级「网页媒体库」开关快照；关闭时前端隐藏媒体库浏览与网页播放的全部入口",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1872,3 +1872,26 @@ export function restoreTrashedFiles(ids: number[]): Promise<TrashedBatchResult> 
     }),
   );
 }
+
+/** 网页媒体库开关（设置 → 播放与媒体库）。 */
+export interface LibraryWebFeature {
+  enabled: boolean;
+}
+
+/** 读取网页媒体库开关（管理员）。 */
+export function fetchLibraryWebFeature(): Promise<LibraryWebFeature> {
+  return unwrap(request<ApiEnvelope<LibraryWebFeature>>("/libraries/feature"));
+}
+
+/**
+ * 保存网页媒体库开关（管理员，即时生效）。关闭后海报墙/详情/网页播放/
+ * 影片分享整体下线；订阅、下载、整理、刮削不受影响。
+ */
+export function saveLibraryWebFeature(enabled: boolean): Promise<LibraryWebFeature> {
+  return unwrap(
+    request<ApiEnvelope<LibraryWebFeature>>("/libraries/feature", {
+      method: "PUT",
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}

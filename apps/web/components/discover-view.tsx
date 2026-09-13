@@ -266,7 +266,9 @@ export function DiscoverView({
     // Netflix：fixed 悬浮在视口右上（顶栏下方），不随页面滚动移位——发现页
     // 一滚数屏，筛选/数据源入口跟着内容滚走后想换源就得滚回顶部；银玻璃维持
     // 原吸顶工具栏不变。right 对齐行内边距 4vw，top 让出顶栏高度。
-    <div className="fixed right-[4vw] top-[calc(var(--nf-nav-h)+12px)] z-20 flex items-center gap-2">
+    // calc 任意值里 +/- 两侧必须空白（用下划线转义），无空格是无效 CSS、
+    // top 整条被丢掉，控件会落回静态位置钻进顶栏底下点不到。
+    <div className="fixed right-[4vw] top-[calc(var(--nf-nav-h)_+_12px)] z-20 flex items-center gap-2">
       {controls}
     </div>
   ) : (

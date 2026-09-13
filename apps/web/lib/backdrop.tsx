@@ -230,8 +230,8 @@ export function BackdropProvider({ children }: { children: React.ReactNode }) {
           opacity: overrideVisible ? 1 : 0,
           backgroundImage: overrideReady ? `url("${overrideReady}")` : undefined,
           /* 尺寸/定位都不在内联样式写死（内联会压过 globals.css 的类级规则）：
-             默认 cover + center top，Netflix 详情页（nf-hero-live）放大到 150%
-             左对齐、把画面重心右移 */
+             默认 cover + center top；Netflix 详情页（nf-hero-live）由类级规则
+             改为「左黑右图」构图（left:25% + 左缘渐隐 mask，见 globals.css） */
           backgroundRepeat: "no-repeat",
         }}
       />

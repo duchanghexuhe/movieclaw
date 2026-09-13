@@ -88,7 +88,7 @@ export function MediaDetailView({
   id: string;
   source?: MediaSource;
 }) {
-  const { canSearch } = usePermissions();
+  const { canSearch, canUseLibrary } = usePermissions();
   const [detail, setDetail] = useState<MediaDetailData | null>(null);
   // 详情拉取失败状态：仅在无 seed（硬刷新/分享直达）时才需要整页兜底
   const [loadFailed, setLoadFailed] = useState(false);
@@ -420,15 +420,26 @@ export function MediaDetailView({
                   <FolderIcon className="size-4" />
                   在库
                 </span>
-                {libraryLinks.map((libraryLink) => (
-                  <Link
-                    key={`${libraryLink.libraryId}:${libraryLink.mediaItemId}`}
-                    href={`/library/${libraryLink.libraryId}/item/${libraryLink.mediaItemId}?returnTo=${encodeURIComponent(libraryReturnTo)}` as Route}
-                    className="min-w-0 max-w-full break-words font-medium text-emerald-100 underline decoration-emerald-200/45 underline-offset-4 transition-colors hover:text-white hover:decoration-emerald-100"
-                  >
-                    {libraryLink.libraryName}
-                  </Link>
-                ))}
+                {libraryLinks.map((libraryLink) =>
+                  canUseLibrary ? (
+                    <Link
+                      key={`${libraryLink.libraryId}:${libraryLink.mediaItemId}`}
+                      href={`/library/${libraryLink.libraryId}/item/${libraryLink.mediaItemId}?returnTo=${encodeURIComponent(libraryReturnTo)}` as Route}
+                      className="min-w-0 max-w-full break-words font-medium text-emerald-100 underline decoration-emerald-200/45 underline-offset-4 transition-colors hover:text-white hover:decoration-emerald-100"
+                    >
+                      {libraryLink.libraryName}
+                    </Link>
+                  ) : (
+                    /* 网页媒体库关闭：条目页已下线，库名退化为纯文本——
+                       「已拥有」的事实仍然要告诉用户，避免重复订阅/下载 */
+                    <span
+                      key={`${libraryLink.libraryId}:${libraryLink.mediaItemId}`}
+                      className="min-w-0 max-w-full break-words font-medium text-emerald-100"
+                    >
+                      {libraryLink.libraryName}
+                    </span>
+                  ),
+                )}
               </div>
             </div>
           )}
@@ -1006,7 +1017,8 @@ function NetflixBackButton({ onBack }: { onBack: () => void }) {
       onClick={onBack}
       aria-label="返回上一页"
       title="返回上一页"
-      className="fixed left-[4vw] top-[calc(var(--nf-nav-h)+12px)] z-30 flex size-10 items-center justify-center rounded-full text-white/85 transition hover:bg-white/10 hover:text-white"
+      // calc 任意值的 +/- 两侧必须空白（下划线转义），无空格是无效 CSS
+      className="fixed left-[4vw] top-[calc(var(--nf-nav-h)_+_12px)] z-30 flex size-10 items-center justify-center rounded-full text-white/85 transition hover:bg-white/10 hover:text-white"
     >
       <ChevronLeftIcon className="size-6 drop-shadow-[0_1px_3px_rgba(0,0,0,0.8)]" />
     </button>

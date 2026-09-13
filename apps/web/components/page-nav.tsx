@@ -7,6 +7,7 @@ import { ChevronLeftIcon, MenuIcon } from "@/components/icons";
 import { SearchCommand } from "@/components/search-command";
 import { useBackNavigation } from "@/lib/back-navigation";
 import { usePageChrome } from "@/lib/page-chrome";
+import { useTheme } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
 
 /** 没有可用站内历史时的结构父级；只作兜底，不覆盖真实来路。 */
@@ -98,6 +99,8 @@ export function PageNav({
   const back = useBackNavigation(fallback.href);
   const rootRef = useRef<HTMLDivElement>(null);
   const chrome = usePageChrome();
+  // ☰ 键的落点随主题分叉：银玻璃开抽屉、Netflix 开「我的」面板——aria 如实上报
+  const isNetflix = useTheme().id === "netflix";
   const isMobile = useIsMobile();
 
   // 向外壳登记「本页自带顶栏」：移动端据此撤掉全局顶栏，两条顶栏不再摞在一起
@@ -148,8 +151,9 @@ export function PageNav({
         className="pointer-events-none absolute inset-x-0 -bottom-5 top-0 backdrop-blur-md"
         style={{
           opacity: "var(--nav-reveal, 0)",
-          background:
-            "linear-gradient(180deg, rgba(9,11,16,0.72) 0%, rgba(9,11,16,0.46) 46%, rgba(9,11,16,0) 100%)",
+          /* 雾层色相走 --page-fog（:root 银玻璃 / netflix 覆盖组纯黑）：
+             内联 style 无法被 CSS 选择器压过，主题换肤必须经变量 */
+          background: "var(--page-fog)",
           maskImage: "linear-gradient(180deg, #000 0%, #000 38%, transparent 92%)",
           WebkitMaskImage: "linear-gradient(180deg, #000 0%, #000 38%, transparent 92%)",
         }}
@@ -163,7 +167,7 @@ export function PageNav({
             <button
               type="button"
               onClick={chrome.openDrawer}
-              aria-label="打开侧边栏"
+              aria-label={isNetflix ? "打开我的面板" : "打开侧边栏"}
               className={backClass}
             >
               <MenuIcon className="size-[18px] max-md:size-[22px]" />

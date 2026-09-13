@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.api.deps import require_admin, require_login
+from movieclaw_api.api.deps import require_admin, require_library_enabled, require_login
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, ConflictException, NotFoundException
 from movieclaw_api.schemas.library import (
@@ -46,6 +46,8 @@ from movieclaw_api.schemas.library import (
     LibraryReorderPayload,
     LibrarySearchGroupView,
     LibraryView,
+    LibraryWebFeaturePayload,
+    LibraryWebFeatureView,
     LocalMetaView,
     MediaSourceAnnotationCandidateView,
     MediaSourceAnnotationPayload,
@@ -186,6 +188,8 @@ from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.media_server_notify import notify_media_server_refresh
 from movieclaw_api.services.playback import warmup as playback_warmup
 from movieclaw_api.services.scrape_config import resolve_scrape_library
+from movieclaw_api.settings.schemas import LibraryWebSetting, get_library_web
+from movieclaw_api.settings.store import get_setting_store
 from movieclaw_api.services.subscription import SubscriptionService
 from movieclaw_api.services.title_discovery import parse_title_ref
 from movieclaw_db.engine import get_database, get_session
@@ -748,6 +752,34 @@ async def _group_by_entry_dir(
         group.code = group.code or file_view.code
         group.candidates = group.candidates or file_view.candidates
     return list(groups.values())
+
+
+@router.get(
+    "/feature",
+    response_model=ApiResponse[LibraryWebFeatureView],
+    summary="读取网页媒体库开关（设置 → 播放与媒体库）",
+    operation_id="library.web.show",
+    dependencies=[Depends(require_admin)],
+)
+async def get_library_web_feature() -> ApiResponse[LibraryWebFeatureView]:
+    return ok(LibraryWebFeatureView(enabled=(await get_library_web()).enabled))
+
+
+@router.put(
+    "/feature",
+    response_model=ApiResponse[LibraryWebFeatureView],
+    summary="保存网页媒体库开关（即时生效，管理/整理链路不受影响）",
+    operation_id="library.web.set",
+    dependencies=[Depends(require_admin)],
+)
+async def save_library_web_feature(
+    payload: LibraryWebFeaturePayload,
+) -> ApiResponse[LibraryWebFeatureView]:
+    await get_setting_store().set(LibraryWebSetting(enabled=payload.enabled))
+    return ok(
+        LibraryWebFeatureView(enabled=payload.enabled),
+        message="网页媒体库已开启" if payload.enabled else "网页媒体库已关闭，相关页面与接口已下线",
+    )
 
 
 @router.get(
@@ -1927,7 +1959,7 @@ def _filter_params(
     response_model=ApiResponse[LibraryFacetsView],
     summary="筛选面板的候选值与计数（每一维排除自身条件后算）",
     operation_id="library.items.facets",
-    dependencies=[Depends(require_library_visible)],
+    dependencies=[Depends(require_library_enabled), Depends(require_library_visible)],
 )
 async def get_library_facets(
     library_id: int,
@@ -1969,7 +2001,7 @@ async def get_library_facets(
     response_model=ApiResponse[LibraryRelaxView],
     summary="筛空时的放宽建议（只列救得回内容的条件）",
     operation_id="library.items.relax",
-    dependencies=[Depends(require_library_visible)],
+    dependencies=[Depends(require_library_enabled), Depends(require_library_visible)],
 )
 async def get_library_relax(
     library_id: int,
@@ -2002,6 +2034,7 @@ async def get_library_relax(
     response_model=ApiResponse[list[LibraryItemView]],
     summary="库内媒体条目的库存聚合（单库海报墙数据源）",
     operation_id="library.items.list",
+    dependencies=[Depends(require_library_enabled)],
 )
 async def list_library_items(
     library_id: int,
@@ -2081,7 +2114,7 @@ async def list_library_items(
     summary="库内条目 id 集合（前端判定「已入库」用）",
     operation_id="ui.library.items.ids",
     openapi_extra={"x-cli-hidden": True},
-    dependencies=[Depends(require_library_visible)],
+    dependencies=[Depends(require_library_enabled), Depends(require_library_visible)],
 )
 async def list_library_item_ids(
     library_id: int,
@@ -2108,7 +2141,7 @@ async def list_library_item_ids(
     summary="海报墙的跳转索引（按标题：A-Z 首字母档；按内容时间：月份档）",
     operation_id="ui.library.items.index",
     openapi_extra={"x-cli-hidden": True},
-    dependencies=[Depends(require_library_visible)],
+    dependencies=[Depends(require_library_enabled), Depends(require_library_visible)],
 )
 async def list_library_item_index(
     library_id: int,
@@ -2160,6 +2193,7 @@ async def list_library_item_index(
     response_model=ApiResponse[list[LibraryGalleryGroupView]],
     summary="库内条目的图廊：海报 / 剧照 / 章节场景图按条目分组铺平（图床浏览模式数据源）",
     operation_id="ui.library.gallery",
+    dependencies=[Depends(require_library_enabled)],
     openapi_extra={"x-cli-hidden": True},
 )
 async def list_library_gallery(
@@ -2382,7 +2416,7 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
     response_model=ApiResponse[LibraryItemDetailView],
     summary="条目详情：基本信息 + NFO 本地刮削元数据 + 逐文件真实介质规格",
     operation_id="library.items.get",
-    dependencies=[Depends(require_library_visible)],
+    dependencies=[Depends(require_library_enabled), Depends(require_library_visible)],
 )
 async def get_library_item(
     library_id: int,
@@ -2578,7 +2612,7 @@ async def get_library_item(
     response_model=ApiResponse[SeasonEpisodesView],
     summary="剧集条目一季的分集清单（集名/简介/剧照 + 拥有状态，分集横滚区数据源）",
     operation_id="library.items.list-episodes",
-    dependencies=[Depends(require_library_visible)],
+    dependencies=[Depends(require_library_enabled), Depends(require_library_visible)],
 )
 async def list_item_episodes(
     library_id: int,
@@ -2614,6 +2648,7 @@ async def list_item_episodes(
     response_class=FileResponse,
     summary="分集本地缩略图（视频同名 -thumb.jpg，Kodi 惯例）",
     operation_id="ui.library.files.thumb",
+    dependencies=[Depends(require_library_enabled)],
     openapi_extra={"x-cli-hidden": True},
 )
 async def get_file_thumb(
@@ -2641,6 +2676,7 @@ async def get_file_thumb(
     response_class=FileResponse,
     summary="图片库的原图（灯箱全屏查看与下载；按台账行推导路径、按库可见性鉴权）",
     operation_id="ui.library.files.original",
+    dependencies=[Depends(require_library_enabled)],
     openapi_extra={"x-cli-hidden": True},
 )
 async def get_file_original(
@@ -2700,6 +2736,7 @@ async def get_file_original(
     response_model=ApiResponse[SubtitlePreviewView],
     summary="预览一条外挂或文本内封字幕的时间轴内容",
     operation_id="ui.library.files.preview-subtitles",
+    dependencies=[Depends(require_library_enabled)],
     openapi_extra={"x-cli-hidden": True},
 )
 async def preview_file_subtitle(
@@ -2745,7 +2782,7 @@ async def preview_file_subtitle(
     response_model=ApiResponse[SubtitleDeleteResultView],
     summary="删除该文件的一个外挂字幕（含 AI 生成的字幕；内封轨在容器内，不可删）",
     operation_id="library.subtitles.delete",
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_library_enabled), Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "destructive"},
 )
 async def delete_file_subtitle(
@@ -2773,7 +2810,7 @@ async def delete_file_subtitle(
     response_class=FileResponse,
     summary="条目目录里的本地美术图（poster/fanart，Kodi/Emby 命名惯例）",
     operation_id="library.artwork.download",
-    dependencies=[Depends(require_library_visible)],
+    dependencies=[Depends(require_library_enabled), Depends(require_library_visible)],
 )
 async def get_item_artwork(
     library_id: int,

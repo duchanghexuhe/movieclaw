@@ -30,6 +30,8 @@ export interface SessionView {
   role: "admin" | "member";
   /** 能力开关快照；管理员恒为全开 */
   capabilities: SessionCapabilities;
+  /** 系统级「网页媒体库」开关快照；关闭时前端隐藏媒体库浏览与网页播放的全部入口 */
+  library_enabled: boolean;
 }
 
 /** 首次初始化状态：未初始化时前端应进 /setup 引导页。 */

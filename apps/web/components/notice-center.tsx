@@ -201,7 +201,9 @@ function NoticeCenterInner({
           className="nf-icon-btn relative"
         >
           <BellIcon className="size-[20px]" />
-          {/* 红点即状态信号：顶栏密度高，只点一颗点、不摆计数徽标 */}
+          {/* 红点即状态信号：顶栏密度高，只点一颗点、不摆计数徽标。无需条件
+              渲染：本组件在 visible.length === 0 时整个 return null（见上），
+              铃铛出现即必有事项 */}
           <span className="absolute right-1 top-1 size-2 rounded-full bg-[var(--danger)]" />
         </button>
         {noticeModal}
