@@ -146,6 +146,9 @@ ssh nas "sudo -n mv /share/Container/movieclaw/data/updates/current \
 ## 五、已知欠账
 
 - 仓库未配 CI 镜像发布机密（见「二」）；配好后本 skill 的构建/传输段可整体替换。
-- 仓库无 `.gitattributes`，每个新克隆的 Windows 工作区都会复现坑 A；加上
-  `*.sh text eol=lf`（必要时含 entrypoint.sh）可根治，届时第 1 步可改回普通
-  `docker build .`，但 archive 方式仍更贴近 CI 行为，建议保留。
+- 坑 A 已根治（2026-09-13）：仓库已加 `.gitattributes` 固定 `*.sh text eol=lf`，
+  archive 烧出的脚本不再受 autocrlf 影响。第 1 步的 `-c core.autocrlf=false`
+  可留作双保险；仍不建议改回 `docker build .`（archive 更贴近 CI 行为）。
+- 前端产物在容器内的路径是 `/app/web/apps/web/.next`（不是 `/app/.next`），
+  验证清单第 4 步 grep 前端标志位时用这个路径；且 TS 常量名会被压缩混淆，
+  应选 CSS 变量名或颜色字面量这类能存活到产物里的标志位。
