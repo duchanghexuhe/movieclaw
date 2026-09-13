@@ -1806,13 +1806,3 @@ class TrashedBatchResultView(BaseModel):
     done: int = Field(description="成功处理的文件数")
     failed: list[TrashedBatchFailureView] = Field(default_factory=list)
     remaining: int = Field(default=0, description="按筛选清理时超出单次上限、尚未处理的文件数")
-
-
-class LibraryWebFeatureView(BaseModel):
-    """网页媒体库开关的当前状态（设置 → 播放与媒体库 分区的总开关）。"""
-
-    enabled: bool = Field(description="是否启用 movieclaw 自带的网页媒体库浏览与播放")
-
-
-class LibraryWebFeaturePayload(BaseModel):
-    enabled: bool = Field(description="是否启用 movieclaw 自带的网页媒体库浏览与播放")

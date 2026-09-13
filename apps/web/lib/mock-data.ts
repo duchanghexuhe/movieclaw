@@ -169,12 +169,12 @@ export const settingsSectionGroups: SettingsSectionGroup[] = [
   },
   {
     // 刮削的每库级覆盖在「编辑库 → 刮削设置」里，这里是全局默认口味；
-    // 「播放与媒体库」承载网页媒体库总开关与播放域设置——总开关决定
-    // movieclaw 自带的浏览/播放面是否存在，关闭时只剩开关本身常驻。
+    // 「播放」按功能命名而非按当前唯一的实现叫「远程转码」——给未来的
+    // 转码策略、字幕偏好等播放域设置留好家。
     label: "媒体库",
     items: [
       { id: "scrape", label: "刮削与整理", description: "海报、简介、命名与目录整理的全局默认", icon: PhotoIcon },
-      { id: "playback", label: "播放与媒体库", description: "网页媒体库总开关、远程转码与播放体验", icon: PlayIcon },
+      { id: "playback", label: "播放", description: "远程转码与播放体验", icon: PlayIcon },
     ],
   },
   {

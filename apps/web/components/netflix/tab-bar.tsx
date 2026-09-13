@@ -45,14 +45,12 @@ const TABS = [
 ] as const;
 
 /** pathname → 当前页签 id（详情等子页落在所属的顶层页签上）。 */
-function activeTabId(pathname: string, libraryOpen: boolean): string {
+function activeTabId(pathname: string): string {
   if (pathname === "/" || pathname.startsWith("/new") || pathname.startsWith("/sessions/")) {
     return "home";
   }
   if (pathname.startsWith("/discover")) return "discover";
-  // 发现详情页（/media）：开媒体库时归「媒体库」页签，关闭后归「发现」
-  if (pathname.startsWith("/media")) return libraryOpen ? "library" : "discover";
-  if (pathname.startsWith("/library")) return "library";
+  if (pathname.startsWith("/library") || pathname.startsWith("/media")) return "library";
   return "";
 }
 
@@ -65,23 +63,14 @@ export function NetflixTabBar({
   myOpen?: boolean;
 }) {
   const pathname = usePathname();
-  const { canUseLibrary, isAdmin } = usePermissions();
-  // 网页媒体库关闭时「媒体库」页签对成员隐藏；管理员保留整理入口，
-  // 改指库管理页（与侧栏/顶栏同一口径）
-  const tabs = TABS.filter((tab) => tab.id !== "library" || canUseLibrary || isAdmin).map(
-    (tab) =>
-      tab.id === "library" && !canUseLibrary
-        ? { ...tab, label: "库管理", href: "/library/manage" as Route }
-        : tab,
-  );
-  const active = myOpen ? "my" : activeTabId(pathname, canUseLibrary);
+  const active = myOpen ? "my" : activeTabId(pathname);
 
   return (
     <nav
       aria-label="主导航"
       className="nf-tabbar fixed inset-x-0 bottom-0 z-40 flex h-[calc(49px+var(--safe-bottom))] items-stretch border-t border-white/[0.06] pb-[var(--safe-bottom)]"
     >
-      {tabs.map(({ id, label, href, Icon }) => (
+      {TABS.map(({ id, label, href, Icon }) => (
         <Link
           key={id}
           href={href}

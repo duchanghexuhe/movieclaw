@@ -61,7 +61,6 @@ from movieclaw_api.settings import (
     get_setting_store,
     mark_initialized,
 )
-from movieclaw_api.settings.schemas import get_library_web
 from movieclaw_db.engine import get_session
 from movieclaw_db.models.member import Member
 
@@ -84,7 +83,7 @@ def _avatar_url(stem: str | None = None) -> str | None:
     return f"{get_settings().api_v1_prefix}/auth/avatar?v={version}"
 
 
-async def _session_view(account: AdminAccountSetting) -> SessionView:
+def _session_view(account: AdminAccountSetting) -> SessionView:
     """超管账号 → 会话视图。老账号可能没存过昵称（字段后加的），回退到用户名。"""
     return SessionView(
         username=account.username,
@@ -92,11 +91,10 @@ async def _session_view(account: AdminAccountSetting) -> SessionView:
         avatar_url=_avatar_url(),
         role="admin",
         capabilities=SessionCapabilities(),
-        library_enabled=(await get_library_web()).enabled,
     )
 
 
-async def _member_session_view(member: Member) -> SessionView:
+def _member_session_view(member: Member) -> SessionView:
     """成员行 → 会话视图（能力开关快照供前端裁剪入口，安全边界仍在后端）。"""
     return SessionView(
         username=member.username,
@@ -108,15 +106,14 @@ async def _member_session_view(member: Member) -> SessionView:
             allow_search=member.allow_search,
             allow_direct_download=member.allow_direct_download,
         ),
-        library_enabled=(await get_library_web()).enabled,
     )
 
 
 async def _principal_session_view(principal: Principal) -> SessionView:
     """请求主体 → 会话视图。成员主体已携带成员行；其余（含 PAT/Agent）按超管展示。"""
     if principal.kind == "member" and principal.member is not None:
-        return await _member_session_view(principal.member)
-    return await _session_view(await auth_service.get_admin_account())
+        return _member_session_view(principal.member)
+    return _session_view(await auth_service.get_admin_account())
 
 
 def _set_session_cookie(response: Response, token: str, max_age: int) -> None:
@@ -246,7 +243,7 @@ async def bootstrap_create(
     await _remember_login(
         request, response, token, max_age, Principal(kind="admin", name=account.username)
     )
-    return ok(await _session_view(account), message="初始化完成，已自动登录")
+    return ok(_session_view(account), message="初始化完成，已自动登录")
 
 
 @router.post(
@@ -279,7 +276,7 @@ async def login(
             member=identity,
         )
         await _remember_login(request, response, token, max_age, principal)
-        return ok(await _member_session_view(identity), message="登录成功")
+        return ok(_member_session_view(identity), message="登录成功")
 
     token, max_age = await auth_service.issue_session_token(
         identity.username, remember=payload.remember
@@ -287,7 +284,7 @@ async def login(
     await _remember_login(
         request, response, token, max_age, Principal(kind="admin", name=identity.username)
     )
-    return ok(await _session_view(identity), message="登录成功")
+    return ok(_session_view(identity), message="登录成功")
 
 
 @router.post(
@@ -346,9 +343,9 @@ async def update_profile(
         member = await members_service.update_own_nickname(
             session, principal.member_id, payload.nickname
         )
-        return ok(await _member_session_view(member), message="个人信息已更新")
+        return ok(_member_session_view(member), message="个人信息已更新")
     account = await auth_service.update_nickname(payload.nickname.strip())
-    return ok(await _session_view(account), message="个人信息已更新")
+    return ok(_session_view(account), message="个人信息已更新")
 
 
 def _avatar_stem_for(principal: Principal) -> str | None:
@@ -463,7 +460,7 @@ async def change_password(
             member=member,
         )
         await _remember_login(request, response, token, max_age, refreshed)
-        return ok(await _member_session_view(member), message="密码已修改，其他设备已全部下线")
+        return ok(_member_session_view(member), message="密码已修改，其他设备已全部下线")
 
     await auth_service.change_password(payload.old_password, payload.new_password)
     token, max_age = await auth_service.issue_session_token(str(principal))
@@ -471,7 +468,7 @@ async def change_password(
         request, response, token, max_age, Principal(kind="admin", name=str(principal))
     )
     return ok(
-        await _session_view(await auth_service.get_admin_account()),
+        _session_view(await auth_service.get_admin_account()),
         message="密码已修改，其他设备已全部下线",
     )
 

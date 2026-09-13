@@ -570,26 +570,6 @@ async def get_jellyfin_compat() -> JellyfinCompatSetting:
     return setting
 
 
-@register_setting(namespace="library.web", title="网页媒体库")
-class LibraryWebSetting(SettingSchema):
-    """movieclaw 自带网页媒体库（浏览海报墙、条目详情、网页播放、影片分享）的总开关。
-
-    面向「只用 movieclaw 管订阅/下载/整理/刮削，看片用 Plex / VidHub /
-    Infuse 等外部播放器」的部署：关闭后相关页面与接口一律 404，前端隐藏
-    全部入口。订阅、寻种、下载、入库整理、刮削链路不受影响；库管理页
-    （建库/扫描/整理/回收站）对管理员保留；外部播放器经 Jellyfin 兼容
-    接口（jellyfin.compat，独立开关）访问不受影响。观看进度/收藏等播放
-    域数据不删除，重新打开即恢复。
-    """
-
-    enabled: bool = Field(default=True, description="是否启用网页媒体库浏览与播放")
-
-
-async def get_library_web() -> LibraryWebSetting:
-    """读取网页媒体库开关。"""
-    return await get_setting_store().get(LibraryWebSetting)
-
-
 @register_setting(namespace="subtitle.gen", title="AI 字幕生成")
 class SubtitleGenSetting(SettingSchema):
     """AI 字幕生成配置（docs/design/subtitle-ai-translate.md §6）。

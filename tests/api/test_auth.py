@@ -179,7 +179,6 @@ _ADMIN_VIEW_EXTRAS = {
         "allow_search": True,
         "allow_direct_download": True,
     },
-    "library_enabled": True,
 }
 
 

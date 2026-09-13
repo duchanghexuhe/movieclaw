@@ -14,7 +14,6 @@ import { DevicesSection } from "@/components/devices-section";
 import { DownloaderConfigSection } from "@/components/downloader-config-section";
 import { useConfirm, useToast } from "@/components/feedback";
 import { ImportWatchSection } from "@/components/import-watch-section";
-import { LibraryWebToggleSection } from "@/components/library-web-toggle-section";
 import { SettingsOverviewSection } from "@/components/settings-overview-section";
 import { McpSection } from "@/components/mcp-section";
 import { MembersSection } from "@/components/members-section";
@@ -23,7 +22,6 @@ import { LlmConfigSection } from "@/components/llm-config-section";
 import { ImPushSection } from "@/components/im-push-section";
 import { NetworkConfigSection } from "@/components/network-config-section";
 import { RemoteTranscodeSection } from "@/components/remote-transcode-section";
-import { usePermissions } from "@/lib/permissions";
 import { ScrapeSettingsSection } from "@/components/scrape-settings-section";
 import { SiteConfigSection, SitesSectionSubtitle } from "@/components/site-config-section";
 import { SubscriptionSettingsSection } from "@/components/subscription-settings-section";
@@ -263,7 +261,6 @@ function SettingsGroup({ label, children }: { label: string; children: React.Rea
 /* —— 个人信息分区（真实账号数据，来自登录会话） —— */
 function ProfileSection() {
   const { session, setSession } = useSession();
-  const { canUseLibrary } = usePermissions();
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const [avatarBusy, setAvatarBusy] = useState(false);
   const [avatarError, setAvatarError] = useState<string | null>(null);
@@ -346,12 +343,9 @@ function ProfileSection() {
         <ChangePasswordCard />
       </SettingsGroup>
 
-      {/* 清空观看记录消费的是播放域接口，网页媒体库关闭时已下线 */}
-      {canUseLibrary && (
-        <SettingsGroup label="观看历史">
-          <WatchHistoryCard />
-        </SettingsGroup>
-      )}
+      <SettingsGroup label="观看历史">
+        <WatchHistoryCard />
+      </SettingsGroup>
     </div>
   );
 }
@@ -626,27 +620,21 @@ function AppSection() {
 }
 
 /**
- * —— 播放与媒体库分区（媒体库组）——
+ * —— 播放分区（媒体库组）——
  *
- * 住户：网页媒体库总开关、进度条预览的生成开关、远程转码（原「应用 →
- * 远程转码」标签迁来）。总开关置顶且**常驻**——关掉网页媒体库后下面两块
- * 隐藏（相关接口已下线），但开关本身必须还在，否则没有重新打开的入口。
- * Worker 的审批与吊销仍在「设备」分区，靠 onOpenDevices 一键直达。
+ * 住户：进度条预览的生成开关、远程转码（原「应用 → 远程转码」标签迁来）。
+ * 按功能命名为「播放」而不是按实现叫「远程转码」：转码策略、字幕偏好等
+ * 播放域设置都落在这里，分区不用再改名。Worker 的审批与吊销仍在
+ * 「设备」分区，靠 onOpenDevices 一键直达。
  */
 function PlaybackSection() {
   const router = useRouter();
-  const { canUseLibrary } = usePermissions();
   return (
     <div className="space-y-7">
-      <LibraryWebToggleSection />
-      {canUseLibrary && (
-        <>
-          <TrickplayToggleSection />
-          <RemoteTranscodeSection
-            onOpenDevices={() => router.push("/settings/devices" as Route)}
-          />
-        </>
-      )}
+      <TrickplayToggleSection />
+      <RemoteTranscodeSection
+        onOpenDevices={() => router.push("/settings/devices" as Route)}
+      />
     </div>
   );
 }

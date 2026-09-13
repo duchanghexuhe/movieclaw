@@ -44,11 +44,8 @@ export function ActivityView({
   // 轮询的话，圆点只有在你已经盯着播放卡片时才亮，等于没用。
   // 与 download-tasks / jobs 两个 Provider 同一套门控口径：接口是管理员专属，
   // 成员直接访问本页不该拉出一条 403 报错。
-  // 网页媒体库关闭时观看视角整体隐藏（接口已 404），本页只剩任务。
-  const { isAdmin, canUseLibrary } = usePermissions();
-  const mediaActivity = useMediaActivity(isAdmin && canUseLibrary);
-  // 关闭时无论 URL 带来什么初始 scope，一律落到任务视角
-  const activeScope: ActivityScope = canUseLibrary ? scope : "tasks";
+  const { isAdmin } = usePermissions();
+  const mediaActivity = useMediaActivity(isAdmin);
 
   /** 视角与切片都反映到 URL，保证刷新和分享后落回同一处。两个视角共用一个
    * `view` 参数：任务切片与观看切片的值集合不相交；观看的默认切片「正在播放」
@@ -113,17 +110,16 @@ export function ActivityView({
   const taskBadge = taskActivityBadge(taskActivity);
 
   const switcher = useMemo(
-    () =>
-      canUseLibrary ? (
-        <ScopeSwitcher
-          value={scope}
-          liveCount={liveCount}
-          taskCount={taskBadge.count}
-          taskAlert={taskBadge.alert}
-          onChange={switchScope}
-        />
-      ) : null,
-    [canUseLibrary, liveCount, scope, switchScope, taskBadge.alert, taskBadge.count],
+    () => (
+      <ScopeSwitcher
+        value={scope}
+        liveCount={liveCount}
+        taskCount={taskBadge.count}
+        taskAlert={taskBadge.alert}
+        onChange={switchScope}
+      />
+    ),
+    [liveCount, scope, switchScope, taskBadge.alert, taskBadge.count],
   );
 
   // 活动页与发现页同为侧栏一级入口、没有 PageNav：视角切换若在窄屏自己占一行，
@@ -149,7 +145,7 @@ export function ActivityView({
               </h1>
             </div>
             <p className="text-on-image mt-1.5 max-w-2xl text-ui leading-6 text-[var(--text-muted)]">
-              {activeScope === "media"
+              {scope === "media"
                 ? "谁在看什么、用哪台设备、速率如何，媒体库的实时动静都在这里。"
                 : "观察下载、入库和后台作业的完整过程，需要处理的任务会优先出现。"}
             </p>
@@ -157,7 +153,7 @@ export function ActivityView({
           {!isMobile && switcher}
         </header>
 
-        {activeScope === "media" ? (
+        {scope === "media" ? (
           <MediaActivityPanel {...mediaActivity} view={watchView} onViewChange={changeWatchView} />
         ) : (
           <TaskCenterView view={view} onViewChange={changeView} />

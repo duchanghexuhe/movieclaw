@@ -30,7 +30,7 @@ import { buildSearchPath } from "@/lib/search-url";
 import { UiPrefsProvider, useTheme } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
 import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
-import { libraryDisabledHomePath, usePermissions } from "@/lib/permissions";
+import { usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
 
 /**
@@ -153,13 +153,6 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
 
   /** 选中侧栏导航项：跳对应路由（离开搜索结果/详情页由路由切换自然完成）。 */
   const handleSelect = (id: string) => {
-    // 网页媒体库关闭：「媒体库」导航只服务整理——管理员落到库管理页；
-    // 成员的该项已在 useVisibleNavItems 里隐藏，这里兜住 BrandHome 等
-    // 直传 id 的入口，避免把成员送进一个会被重定向的 /library
-    if (id === "library" && !canUseLibrary) {
-      router.push(libraryDisabledHomePath(session) as Route);
-      return;
-    }
     router.push(pathOfNavId(id));
   };
 
@@ -186,7 +179,6 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
   // 设置入口的默认分区按角色取可见清单的第一项：管理员落「概览」，
   // 成员的清单里没有概览，落「个人信息」——避免把成员送进一个 403 分区
   const { session } = useSession();
-  const { canUseLibrary } = usePermissions();
   const defaultSettingsSection =
     settingsSectionGroupsFor(session.role)[0]?.items[0]?.id ?? settingsSections[0].id;
   const openSettings = (sectionId: string = defaultSettingsSection) => {

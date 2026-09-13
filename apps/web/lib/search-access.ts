@@ -28,16 +28,11 @@ export interface SearchAccess {
  */
 export function useSearchAccess(): SearchAccess {
   const permissions = usePermissions();
-  // 网页媒体库关闭：库条目搜索接口已下线，垂直入口直接不展示（不必再探库）
   const [libraryAvailable, setLibraryAvailable] = useState<boolean | null>(
-    permissions.isAdmin && permissions.canUseLibrary ? true : null,
+    permissions.isAdmin ? true : null,
   );
 
   useEffect(() => {
-    if (!permissions.canUseLibrary) {
-      setLibraryAvailable(false);
-      return;
-    }
     if (permissions.isAdmin) {
       setLibraryAvailable(true);
       return;
@@ -54,15 +49,12 @@ export function useSearchAccess(): SearchAccess {
     return () => {
       cancelled = true;
     };
-  }, [permissions.isAdmin, permissions.canUseLibrary]);
+  }, [permissions.isAdmin]);
 
   const canMedia = permissions.canSubscribe;
   const canTorrent = permissions.canSearch;
-  const canLibrary = permissions.canUseLibrary && (permissions.isAdmin || libraryAvailable === true);
-  const ready =
-    !permissions.canUseLibrary ||
-    permissions.isAdmin ||
-    libraryAvailable !== null;
+  const canLibrary = permissions.isAdmin || libraryAvailable === true;
+  const ready = permissions.isAdmin || libraryAvailable !== null;
 
   return useMemo(() => {
     const available = ORDERED_SEARCH_VERTICALS.filter((vertical) => {

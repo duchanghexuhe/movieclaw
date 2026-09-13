@@ -4,10 +4,10 @@ import hmac
 
 from fastapi import Cookie, Depends, Header
 
-from movieclaw_api.exceptions import ForbiddenException, NotFoundException, UnauthorizedException
+from movieclaw_api.exceptions import ForbiddenException, UnauthorizedException
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.services.auth import Principal
-from movieclaw_api.settings.schemas import get_library_web, get_sync_setting
+from movieclaw_api.settings.schemas import get_sync_setting
 
 
 def _extract_bearer(authorization: str | None) -> str | None:
@@ -144,19 +144,6 @@ async def require_admin_session(
             "签发与吊销凭证只能在网页上完成，请用管理员账号登录 movieclaw 后操作"
         )
     return principal
-
-
-async def require_library_enabled() -> None:
-    """网页媒体库总开关（settings 域 ``library.web``）：关闭时相关路由一律 404。
-
-    语义是「这套功能整体不存在」而非「无权访问」，所以用 404 不用 403，
-    与 Jellyfin 兼容层的 require_enabled 同款。罩住的是网页浏览/播放面：
-    媒体库浏览端点、播放会话与取流、合集、库内影人、影片分享；库的
-    管理/扫描/整理端点与订阅/下载/刮削链路不挂本依赖，关闭开关照常可用。
-    """
-    setting = await get_library_web()
-    if not setting.enabled:
-        raise NotFoundException("网页媒体库已关闭：请用外部播放器观看，或在 设置 → 播放与媒体库 里重新开启")
 
 
 async def require_search_capability(

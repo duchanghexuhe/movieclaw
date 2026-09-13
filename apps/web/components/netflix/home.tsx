@@ -42,47 +42,39 @@ const MAX_LIBRARY_ROWS = 4;
 
 export function NetflixHome() {
   const router = useRouter();
-  const { canSubscribe, canUseLibrary } = usePermissions();
+  const { canSubscribe } = usePermissions();
   const [upNext, setUpNext] = useState<UpNextItem[] | null>(null);
   const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
   const [itemsByLibrary, setItemsByLibrary] = useState<Map<number, LibraryItem[]>>(new Map());
   const [subscriptions, setSubscriptions] = useState<Subscription[] | null>(null);
 
   const reload = useCallback(() => {
-    // 网页媒体库关闭：up-next / 库行数据源整体下线（后端 404），直接置空，
-    // 首页只剩订阅行与订阅素材的 billboard
-    if (!canUseLibrary) {
-      setUpNext([]);
-      setLibraries([]);
-      setItemsByLibrary(new Map());
-    } else {
-      // 与媒体库首页同一套失败策略：单路失败不拖垮整页，保留旧数据
-      listUpNext(ROW_COUNT)
-        .then((items) => setUpNext(items))
-        .catch(() => setUpNext((prev) => prev ?? []));
-      listLibraries()
-        .then(async (libs) => {
-          setLibraries(libs);
-          const visible = libs.filter((l) => l.viewer_access && !l.exclude_from_home);
-          const entries = await Promise.all(
-            visible.map(async (lib) => {
-              try {
-                return [lib.id, await listLibraryItems(lib.id, { sort: "added_at", limit: ROW_COUNT })] as const;
-              } catch {
-                return [lib.id, [] as LibraryItem[]] as const;
-              }
-            }),
-          );
-          setItemsByLibrary(new Map(entries));
-        })
-        .catch(() => setLibraries((prev) => prev ?? []));
-    }
+    // 与媒体库首页同一套失败策略：单路失败不拖垮整页，保留旧数据
+    listUpNext(ROW_COUNT)
+      .then((items) => setUpNext(items))
+      .catch(() => setUpNext((prev) => prev ?? []));
+    listLibraries()
+      .then(async (libs) => {
+        setLibraries(libs);
+        const visible = libs.filter((l) => l.viewer_access && !l.exclude_from_home);
+        const entries = await Promise.all(
+          visible.map(async (lib) => {
+            try {
+              return [lib.id, await listLibraryItems(lib.id, { sort: "added_at", limit: ROW_COUNT })] as const;
+            } catch {
+              return [lib.id, [] as LibraryItem[]] as const;
+            }
+          }),
+        );
+        setItemsByLibrary(new Map(entries));
+      })
+      .catch(() => setLibraries((prev) => prev ?? []));
     if (canSubscribe) {
       listSubscriptions().catch(() => null).then((subs) => {
         if (subs) setSubscriptions(subs);
       });
     }
-  }, [canSubscribe, canUseLibrary]);
+  }, [canSubscribe]);
 
   useEffect(() => {
     reload();
@@ -100,10 +92,8 @@ export function NetflixHome() {
   const billboard = useMemo(() => {
     if (upNext?.length) return { kind: "upnext" as const, item: upNext[0] };
     if (recentSorted.length) return { kind: "library" as const, item: recentSorted[0] };
-    // 网页媒体库关闭（或库还是空）时退到订阅素材：订阅详情页有海报与进展
-    if (subscriptions?.length) return { kind: "subscription" as const, item: subscriptions[0] };
     return null;
-  }, [upNext, recentSorted, subscriptions]);
+  }, [upNext, recentSorted]);
 
   // —— 行装配（空行不渲染） ——
   const upNextRowItems = useMemo<NetflixRowItem[] | null>(() => {
@@ -152,13 +142,12 @@ export function NetflixHome() {
         <NetflixBillboard
           upNextItem={billboard.kind === "upnext" ? billboard.item : null}
           libraryItem={billboard.kind === "library" ? billboard.item : null}
-          subscriptionItem={billboard.kind === "subscription" ? billboard.item : null}
         />
       ) : loading ? (
         <div className="flex h-[56vh] items-center justify-center text-ui text-[var(--text-muted)]">
           <span className="size-5 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
         </div>
-      ) : canUseLibrary ? (
+      ) : (
         /* 全新部署空态：添加媒体库 / 发起任务的引导（复用现有空态组件） */
         <div className="mx-auto flex min-h-[70vh] max-w-2xl flex-col justify-center px-6">
           <ContentEmptyState
@@ -173,25 +162,6 @@ export function NetflixHome() {
               >
                 <SparkIcon className="size-4" />
                 让 AI 帮你找片
-              </button>
-            }
-          />
-        </div>
-      ) : (
-        /* 网页媒体库关闭时空态：引导去发现页订阅或交给 AI，不引导建库 */
-        <div className="mx-auto flex min-h-[70vh] max-w-2xl flex-col justify-center px-6">
-          <ContentEmptyState
-            variant="library"
-            title="订阅你想追的内容"
-            description="网页媒体库已关闭，看片请用外部播放器；订阅、下载与整理照常进行，去发现页把想追的片加进来。"
-            action={
-              <button
-                type="button"
-                onClick={() => router.push("/discover/movie")}
-                className="btn-accent flex items-center gap-1.5 rounded-[4px] px-4 py-2 text-ui font-semibold"
-              >
-                <SparkIcon className="size-4" />
-                去发现页逛逛
               </button>
             }
           />
@@ -253,44 +223,30 @@ export function NetflixHome() {
 function NetflixBillboard({
   upNextItem,
   libraryItem,
-  subscriptionItem,
 }: {
   upNextItem: UpNextItem | null;
   libraryItem: LibraryItem | null;
-  /** 订阅素材档（网页媒体库关闭或库为空时的 billboard 兜底） */
-  subscriptionItem: Subscription | null;
 }) {
   const router = useRouter();
-  const title = upNextItem?.title ?? libraryItem?.title ?? subscriptionItem?.media.title ?? "";
+  const title = upNextItem?.title ?? libraryItem?.title ?? "";
   const meta = upNextItem
     ? [
         upNextItem.year && upNextItem.year > 0 ? String(upNextItem.year) : null,
         upNextItem.kind === "tv" ? "剧集" : "电影",
         upNextContext(upNextItem),
       ]
-    : libraryItem
-      ? [
-          libraryItem.year ? String(libraryItem.year) : null,
-          kindLabel(libraryItem.kind),
-        ]
-      : subscriptionItem
-        ? [
-            subscriptionItem.media.year ? String(subscriptionItem.media.year) : null,
-            subscriptionItem.media.kind === "tv" ? "剧集" : "电影",
-          ]
-        : [];
+    : [
+        libraryItem && libraryItem.year ? String(libraryItem.year) : null,
+        libraryItem ? kindLabel(libraryItem.kind) : null,
+      ]
   const metaText = meta.filter(Boolean).join(" · ");
   const artworkUrl = upNextItem
     ? (upNextItem.episode_still_url ?? upNextItem.backdrop_url)
     : null;
   const playHref = upNextItem ? playHrefOf(upNextItem) : null;
-  const detailHref = upNextItem
-    ? itemHrefOf(upNextItem)
-    : libraryItem && libraryItem.library_id != null
-      ? (`/library/${libraryItem.library_id}/item/${libraryItem.media_item_id}` as Route)
-      : subscriptionItem
-        ? (`/media/${subscriptionItem.media.kind}/${subscriptionItem.media.tmdb_id}` as Route)
-        : null;
+  const detailHref = upNextItem ? itemHrefOf(upNextItem) : libraryItem && libraryItem.library_id != null
+    ? (`/library/${libraryItem.library_id}/item/${libraryItem.media_item_id}` as Route)
+    : null;
   const progress = upNextItem?.progress_percent ?? null;
   // 入库时间做副文案（最近入库兜底时回答「为什么它在这儿」）
   const addedLabel =
@@ -311,8 +267,6 @@ function NetflixBillboard({
           />
         ) : libraryItem?.poster_url ? (
           <PosterFallbackFill url={libraryItem.poster_url} aspect={libraryItem.primary_aspect} />
-        ) : subscriptionItem?.media.poster_url ? (
-          <PosterFallbackFill url={subscriptionItem.media.poster_url} aspect={2 / 3} />
         ) : null}
         {/* 底部渐隐入画布色 + 左侧可读性渐变（§2.5 构图） */}
         <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(20,20,20,0.45)_0%,rgba(20,20,20,0)_32%,rgba(20,20,20,0)_60%,#141414_100%)]" />
@@ -326,9 +280,7 @@ function NetflixBillboard({
         </h1>
         {metaText && (
           <p className="tnum text-on-image mt-2.5 flex flex-wrap items-center gap-x-2.5 text-[14px] font-medium text-[#e5e5e5] max-md:mt-2">
-            <span className="font-bold text-[var(--ok)]">
-              {subscriptionItem && !upNextItem && !libraryItem ? "订阅中" : "在库"}
-            </span>
+            <span className="font-bold text-[var(--ok)]">在库</span>
             {metaText}
           </p>
         )}

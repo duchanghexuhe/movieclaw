@@ -88,7 +88,7 @@ export function MediaDetailView({
   id: string;
   source?: MediaSource;
 }) {
-  const { canSearch, canUseLibrary } = usePermissions();
+  const { canSearch } = usePermissions();
   const [detail, setDetail] = useState<MediaDetailData | null>(null);
   // 详情拉取失败状态：仅在无 seed（硬刷新/分享直达）时才需要整页兜底
   const [loadFailed, setLoadFailed] = useState(false);
@@ -420,26 +420,15 @@ export function MediaDetailView({
                   <FolderIcon className="size-4" />
                   在库
                 </span>
-                {libraryLinks.map((libraryLink) =>
-                  canUseLibrary ? (
-                    <Link
-                      key={`${libraryLink.libraryId}:${libraryLink.mediaItemId}`}
-                      href={`/library/${libraryLink.libraryId}/item/${libraryLink.mediaItemId}?returnTo=${encodeURIComponent(libraryReturnTo)}` as Route}
-                      className="min-w-0 max-w-full break-words font-medium text-emerald-100 underline decoration-emerald-200/45 underline-offset-4 transition-colors hover:text-white hover:decoration-emerald-100"
-                    >
-                      {libraryLink.libraryName}
-                    </Link>
-                  ) : (
-                    /* 网页媒体库关闭：条目页已下线，库名退化为纯文本——
-                       「已拥有」的事实仍然要告诉用户，避免重复订阅/下载 */
-                    <span
-                      key={`${libraryLink.libraryId}:${libraryLink.mediaItemId}`}
-                      className="min-w-0 max-w-full break-words font-medium text-emerald-100"
-                    >
-                      {libraryLink.libraryName}
-                    </span>
-                  ),
-                )}
+                {libraryLinks.map((libraryLink) => (
+                  <Link
+                    key={`${libraryLink.libraryId}:${libraryLink.mediaItemId}`}
+                    href={`/library/${libraryLink.libraryId}/item/${libraryLink.mediaItemId}?returnTo=${encodeURIComponent(libraryReturnTo)}` as Route}
+                    className="min-w-0 max-w-full break-words font-medium text-emerald-100 underline decoration-emerald-200/45 underline-offset-4 transition-colors hover:text-white hover:decoration-emerald-100"
+                  >
+                    {libraryLink.libraryName}
+                  </Link>
+                ))}
               </div>
             </div>
           )}
