@@ -7,6 +7,7 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import type { Route } from "next";
 import Link from "next/link";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { useConfirm, useToast } from "@/components/feedback";
 import {
   chapterImagesConfirm,
@@ -1376,7 +1377,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       <div className="flex-1">
         <PageNav title="" fallback={navFallback} />
         <CenteredNote>
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           <p className="text-ui text-[var(--text-muted)]">正在加载媒体库…</p>
         </CenteredNote>
       </div>

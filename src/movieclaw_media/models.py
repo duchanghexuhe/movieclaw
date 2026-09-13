@@ -241,6 +241,10 @@ class MediaDetail(BaseModel):
     posters: list[MediaImage] = Field(
         default_factory=list, description="海报（2:3 竖版，配置语言优先）"
     )
+    backdrop_url: str | None = Field(
+        default=None,
+        description="主横幅剧照的原图（original 尺寸）；详情页沉浸背景用，避免 w1280 在大屏拉伸发虚",
+    )
     collection: MediaCollection | None = Field(
         default=None,
         description="电影所属系列的完整作品清单；不属于系列或剧集为 null",

@@ -17,7 +17,9 @@ import {
   StarIcon,
   XIcon,
 } from "@/components/icons";
+import { BrandLoader } from "@/components/brand-loader";
 import { CastRow } from "@/components/cast-row";
+import { DetailBackdropSlideshow } from "@/components/detail-backdrop-slideshow";
 import { HScroller } from "@/components/h-scroller";
 import { Modal } from "@/components/modal";
 import { PageNav } from "@/components/page-nav";
@@ -37,8 +39,11 @@ import { useBackNavigation } from "@/lib/back-navigation";
 import { useBackdrop } from "@/lib/backdrop";
 import { buildDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
+import { upgradedTmdbOriginalUrl } from "@/lib/image-proxy";
 import { getMediaSeed } from "@/lib/media-detail";
 import { usePageTitle } from "@/lib/use-page-title";
+import { useTheme } from "@/lib/ui-prefs";
+import { useIsMobile } from "@/lib/use-media-query";
 import { usePermissions } from "@/lib/permissions";
 import type { MediaSource, MediaType } from "@/lib/media-types";
 import {
@@ -140,8 +145,53 @@ export function MediaDetailView({
   // 豆瓣来源不换背景：豆瓣只有小尺寸海报、没有高清横幅剧照，铺成全屏背景是
   // 一片糊图，比用户自己配置的背景差得多。宁可保持原背景，也不要为了沉浸降质。
   const { setOverrideBackdrop } = useBackdrop();
+  // 沉浸背景只走高清：TMDB 的 original 地址是确定性的（w1280 同图换尺寸段，
+  // 见 upgradedTmdbOriginalUrl），进入页面即刻推导并预加载，加载**并解码**完成
+  // 才显示——不存在「先低清后高清」的换图过程，也就没有换图带来的突兀/闪烁。
+  // 低清 w1280 只作兜底：非 TMDB 图（无更高档位，地址原样返回）或高清加载
+  // 失败时才显示。没有横幅剧照时退回海报。
+  const fallbackBackdrop = item?.backdropUrl || item?.posterUrl || "";
+  const hdUrl =
+    source === "douban"
+      ? undefined
+      : (detail?.backdropOriginalUrl ??
+        (fallbackBackdrop ? upgradedTmdbOriginalUrl(fallbackBackdrop) : undefined));
+  const [hdState, setHdState] = useState<"pending" | "ok" | "failed">("pending");
+  useEffect(() => {
+    if (!hdUrl) {
+      setHdState("failed"); // 没有高清档：直接用兜底图
+      return;
+    }
+    setHdState("pending");
+    let cancelled = false;
+    const img = new Image();
+    const settle = () => {
+      img
+        .decode()
+        .catch(() => {})
+        .then(() => {
+          if (!cancelled) setHdState("ok");
+        });
+    };
+    img.onload = settle;
+    img.onerror = () => {
+      if (!cancelled) setHdState("failed");
+    };
+    img.src = hdUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [hdUrl]);
+  // 等待高清期间保持黑场（宁黑勿糊）：只有确认无高清档或高清加载失败，
+  // 才把低清图作为兜底显示出来。
   const immersiveUrl =
-    source === "douban" ? "" : item?.backdropUrl || item?.posterUrl || "";
+    source === "douban"
+      ? ""
+      : hdState === "ok"
+        ? hdUrl
+        : hdState === "failed"
+          ? fallbackBackdrop
+          : "";
   useEffect(() => {
     if (!immersiveUrl) return;
     setOverrideBackdrop(immersiveUrl);
@@ -152,6 +202,59 @@ export function MediaDetailView({
   // 装了豆瓣 App 直接拉起进词条页（桌面/未命中时为 null，回落网页地址）
   const doubanAppHref = useDoubanAppHref(source === "douban" ? id : null);
 
+  // Netflix 桌面主题的详情页定制层。银玻璃的 PageNav（圆角玻璃返回键 + 吸顶
+  // 雾）在这里退役——它是银玻璃的控件语言，浮在仿 Netflix 顶栏左端既突兀、
+  // 又被 z-40 的固定顶栏整个盖住点不到；Netflix 的返回语言是一颗裸的白色
+  // chevron（见 NetflixBackButton）。移动端仍保留 PageNav：它要向外壳登记
+  // 「本页自带顶栏」并充当返回入口（见 app-shell）。
+  // 这些 hook 必须无条件调用（短路写法会触发 rules-of-hooks）。
+  const themeId = useTheme().id;
+  const isMobile = useIsMobile();
+  const isNfDesktop = themeId === "netflix" && !isMobile;
+  const hidePageNav = isNfDesktop;
+
+  // 滚动退场：详情页下滚时剧照不是被机械地推出屏幕，而是随滚动进度渐暗 +
+  // 模糊（Netflix 海报墙的观感）。进度写到根节点 CSS 变量 --nf-hero-recede
+  // （0→1），沉浸覆盖层（globals.css 的 html.nf-hero-live .backdrop-override）
+  // 用它驱动 filter——滚动过程零 React 重渲染。rAF 合帧：一次滚动会派发多次
+  // scroll 事件，只保留最后一帧的写入。只在 Netflix 桌面启用；卸载 / 换片
+  // 重建时把变量与标记类清干净，别污染其他页面。
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const hasItem = Boolean(item);
+  useEffect(() => {
+    if (!isNfDesktop) return;
+    const root = document.documentElement;
+    root.classList.add("nf-hero-live");
+    const el = scrollRef.current;
+    if (!el) {
+      // 兜底态（数据未到）没有滚动容器：只挂标记类，清理时照常摘除
+      return () => {
+        root.classList.remove("nf-hero-live");
+        root.style.removeProperty("--nf-hero-recede");
+      };
+    }
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      // 归一化尺度取首屏的 75%：缓出的区间更长，渐暗/模糊的「过程感」更足；
+      // 变量注册了 <number> 类型并挂了过渡，滚轮大幅甩动时也是缓动跟随
+      const range = Math.max(320, el.clientHeight * 0.75);
+      const progress = Math.min(1, Math.max(0, el.scrollTop / range));
+      root.style.setProperty("--nf-hero-recede", progress.toFixed(3));
+    };
+    const onScroll = () => {
+      if (!frame) frame = window.requestAnimationFrame(sync);
+    };
+    sync();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (frame) window.cancelAnimationFrame(frame);
+      root.classList.remove("nf-hero-live");
+      root.style.removeProperty("--nf-hero-recede");
+    };
+  }, [isNfDesktop, hasItem]);
+
   // 兜底态也必须渲染 PageNav——它向外壳登记「本页自带顶栏」，否则移动端的
   // 全局顶栏（☰ + logo）会在数据到达前先显示、随后又消失，顶部闪一下；
   // 顺带让用户在转圈期间就有返回键可点。
@@ -160,7 +263,8 @@ export function MediaDetailView({
     return (
       <div className="flex h-full flex-col">
         {/* 当前页标题未知，留空——只为立起返回键并认领顶栏 */}
-        <PageNav title="" fallback={navFallback} />
+        {!hidePageNav && <PageNav title="" fallback={navFallback} />}
+        {isNfDesktop && <NetflixBackButton onBack={back} />}
         <DetailFallback failed={loadFailed} onBack={back} />
       </div>
     );
@@ -210,19 +314,39 @@ export function MediaDetailView({
     // max-md:rounded-none：圆角只在桌面成立（外壳 p-3.5 的留白托着卡片）；
     // 窄屏通栏满屏，圆角会直接压在屏幕边上，把吸顶顶栏裁成一块贴在屏幕顶上的
     // 圆角色块——与 library-item-detail-view 同一处理。
-    <div className="detail-ambient scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl max-md:rounded-none">
+    <div
+      ref={scrollRef}
+      className="detail-ambient scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl max-md:rounded-none"
+    >
       {/* 没有任何 Hero 图层：全站背景此刻就是本片剧照（沉浸覆盖 + 本页豁免
           全局蒙版，见 app-shell 的 isHome），大图直出、零边界；.detail-ambient
-          在滚动容器上铺「透明 → 纯黑」的渐变板托住下方内容（见 globals.css）。
-          顶栏首屏只有一颗返回键浮在剧照上。 */}
-      <PageNav title={item.title} fallback={navFallback} />
+          在滚动容器上铺「透明 → 纯黑」的渐变板托住下方内容（见 globals.css，
+          Netflix 主题另有左侧渐变遮罩护住标题区）。 */}
+      {!hidePageNav && <PageNav title={item.title} fallback={navFallback} />}
+      {isNfDesktop && <NetflixBackButton onBack={back} />}
+      {/* 背景轮换：Netflix 桌面且剧照多于一张时，按序叠变（见组件说明）。
+          首帧传主 backdrop 原图——与覆盖层当前显示的是同一张照片，轮换层
+          淡入接管时没有构图/内容跳变。 */}
+      {isNfDesktop && detail && detail.backdrops.length > 1 && (
+        <DetailBackdropSlideshow
+          images={detail.backdrops}
+          initialUrl={detail.backdropOriginalUrl ?? detail.backdrops[0]?.fullUrl}
+        />
+      )}
 
-      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。 */}
-      <div className="h-[30vh] min-h-[180px] max-md:h-[22vh] max-md:min-h-[120px]" />
+      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。高度由 --detail-hero-h
+          驱动（与 globals.css 的渐变起点同源，各主题自行取值）。 */}
+      <div className="h-[var(--detail-hero-h)] min-h-[var(--detail-hero-min-h)]" />
 
       {/* 内容层：-mt-28/pt-28 与 .detail-ambient 的渐变起点对齐——渐变从标题
-          上方开始压暗，基础信息附近已接近纯黑，下面保持全黑。 */}
-      <div className="relative z-10 -mt-28 pb-12 pt-28">
+          上方开始压暗，基础信息附近已接近纯黑，下面保持全黑。detail-content
+          是 Netflix 主题的标题上移钩子（globals.css 把它的 pt 收小，标题
+          借左侧遮罩直接落在剧照上）。 */}
+      <div className="detail-content relative z-10 -mt-28 pb-12 pt-28">
+      {/* 前导簇（标题 → 元信息 → 操作 → 简介）：Netflix 主题下高度固定
+          （globals.css 的 .detail-lead min-height），演职员表从横幅正下方一条
+          固定线开始，不随简介长短上下漂移——简介短时下方留黑色空档。 */}
+      <div className="detail-lead">
       {/* —— 3. 头部信息区 —— */}
       <div className="relative z-10 px-12 pt-6 max-md:px-4 max-md:pt-3">
         <div className="min-w-0 max-w-5xl pb-1">
@@ -370,6 +494,7 @@ export function MediaDetailView({
           <ExpandablePlot text={item.overview} />
         </div>
       )}
+      </div>
 
       {/* —— 5. 演职员 —— */}
       {people.length > 0 && (
@@ -869,6 +994,26 @@ function PhotoArrow({
 }
 
 /**
+ * Netflix 桌面详情页的返回键：裸的白色 chevron，fixed 悬浮在顶栏下方左上角。
+ * 这就是 Netflix 自己的返回语言——不加底、不加描边，hover 才浮一层浅白；
+ * 与银玻璃的圆角玻璃键（PageNav）刻意不同貌。飘在亮图上时靠图标投影保底，
+ * 横向对齐 4vw 栅格（与发现页悬浮工具栏、内容行同一条左基线）。
+ */
+function NetflixBackButton({ onBack }: { onBack: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onBack}
+      aria-label="返回上一页"
+      title="返回上一页"
+      className="fixed left-[4vw] top-[calc(var(--nf-nav-h)+12px)] z-30 flex size-10 items-center justify-center rounded-full text-white/85 transition hover:bg-white/10 hover:text-white"
+    >
+      <ChevronLeftIcon className="size-6 drop-shadow-[0_1px_3px_rgba(0,0,0,0.8)]" />
+    </button>
+  );
+}
+
+/**
  * 直达详情页（硬刷新 / 分享链接）时的整页兜底：
  * 站内跳转有 seed 可秒开，直达则先转圈等接口；接口失败给出错误 + 返回入口。
  */
@@ -895,7 +1040,7 @@ function DetailFallback({ failed, onBack }: { failed: boolean; onBack: () => voi
         </>
       ) : (
         <div className="flex items-center gap-2.5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在加载详情…
         </div>
       )}

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { ChevronRightIcon, DownloadIcon, PlayIcon } from "@/components/icons";
 import { useToast } from "@/components/feedback";
 import { FilterMenu } from "@/components/filter-menu";
@@ -737,7 +738,7 @@ export function MediaActivityPanel({
         <div className="mt-4">
           {loading && liveCount === 0 && hiddenLiveCount === 0 ? (
             <div className="flex items-center justify-center gap-2.5 py-16 text-ui text-[var(--text-muted)]">
-              <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+              <BrandLoader className="size-5" />
               正在读取媒体库活动…
             </div>
           ) : snapshot.sessions.length === 0 && snapshot.hidden_session_count === 0 ? (

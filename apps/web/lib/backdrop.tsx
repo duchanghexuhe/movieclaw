@@ -58,6 +58,14 @@ interface BackdropContextValue {
 
 const BackdropContext = createContext<BackdropContextValue | null>(null);
 
+/**
+ * 提取图床 URL 的「同一张图」标识：剥掉 TMDB 尺寸档前缀（/t/p/w1280/… 与
+ * /t/p/original/… 是同一张图的两个分辨率）。供升清判断用——只比路径不比尺寸。
+ */
+function backdropPathOf(url: string): string {
+  return url.replace(/\/t\/p\/[^/]+\//, "/t/p/");
+}
+
 /** 把 URL 同步到 <html> 的 CSS 变量，供 body::before 使用；传 null 则回退默认。
 
 同时把 URL 缓存进 localStorage：layout.tsx 的内联脚本会在下次刷新时于首帧
@@ -104,23 +112,36 @@ export function BackdropProvider({ children }: { children: React.ReactNode }) {
     applyCssVar(view.active_url);
   }, []);
 
-  // 覆盖图预加载：完整加载后才允许淡入
+  // 覆盖图预加载：完整加载**并解码**后才允许上屏。只等 onload 不够——
+  // 首次绘制宜先有解码好的位图，否则同图升清的瞬时替换会闪出一帧空白。
   useEffect(() => {
     if (overrideUrl === null) return; // 清除时不重置 ready——覆盖层带着旧图淡出
     let cancelled = false;
     const img = new Image();
-    img.onload = () => {
-      if (!cancelled) setOverrideReady(overrideUrl);
+    const settle = () => {
+      if (cancelled) return;
+      // decode 失败（极端情况下图已坏）不阻塞：照常上屏走 onerror 兜底
+      img
+        .decode()
+        .catch(() => {})
+        .then(() => {
+          if (!cancelled) setOverrideReady(overrideUrl);
+        });
     };
+    img.onload = settle;
     img.src = overrideUrl;
     return () => {
       cancelled = true;
     };
   }, [overrideUrl]);
 
-  // 覆盖层是否可见：目标图已加载完成才亮（首访图慢时，页面先以用户背景
-  // 示人，图到了再柔和浮现——不再有"硬切"的突兀过渡）
-  const overrideVisible = overrideUrl !== null && overrideReady === overrideUrl;
+  // 覆盖层是否可见：按「已就绪图与新目标是否同一张图」判断（只比路径、不比
+  // 尺寸档）。同图升清（w1280 → original，详情页的标准路径）时保持可见、
+  // 原图就位后瞬时替换 backgroundImage——否则 URL 一换就会先淡出再淡入，
+  // 用户看到背景「闪一下」；不同图（换了一部影片）则照旧先淡出旧图。
+  const readyPath = overrideReady ? backdropPathOf(overrideReady) : null;
+  const overrideVisible =
+    overrideUrl !== null && readyPath !== null && readyPath === backdropPathOf(overrideUrl);
 
   useEffect(() => {
     let cancelled = false;
@@ -198,13 +219,19 @@ export function BackdropProvider({ children }: { children: React.ReactNode }) {
       <div
         aria-hidden="true"
         /* bottom 向下超出视口 --vp-overshoot：与 body::before 同样铺到屏幕物理
-           底边，否则 iOS 独立 App 下底部会漏出一条底色（见 globals.css 的说明） */
-        className="pointer-events-none fixed inset-0 z-[1] [bottom:calc(-1*var(--vp-overshoot))] transition-opacity duration-700 ease-out"
+           底边，否则 iOS 独立 App 下底部会漏出一条底色（见 globals.css 的说明）。
+           backgroundImage 始终渲染最近一张就绪图：同图升清期间旧图持续显示、
+           新图就位瞬间替换（路径一致，肉眼无感）。backdrop-override：Netflix
+           详情页滚动退场的 filter 钩子（globals.css 的 html.nf-hero-live
+           .backdrop-override 规则按 --nf-hero-recede 给这层加渐暗 + 模糊；
+           其他页面无标记类、零开销） */
+        className="backdrop-override pointer-events-none fixed inset-0 z-[1] [bottom:calc(-1*var(--vp-overshoot))] transition-opacity duration-700 ease-out"
         style={{
           opacity: overrideVisible ? 1 : 0,
           backgroundImage: overrideReady ? `url("${overrideReady}")` : undefined,
-          backgroundSize: "cover",
-          backgroundPosition: "center top",
+          /* 尺寸/定位都不在内联样式写死（内联会压过 globals.css 的类级规则）：
+             默认 cover + center top，Netflix 详情页（nf-hero-live）放大到 150%
+             左对齐、把画面重心右移 */
           backgroundRepeat: "no-repeat",
         }}
       />

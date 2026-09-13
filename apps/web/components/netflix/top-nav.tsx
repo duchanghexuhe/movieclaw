@@ -68,29 +68,48 @@ export function NetflixTopNav({
   // window 本身不滚，用 capture 监听才能收到各页面滚动容器的事件。
   // 多个滚动容器并存时以最后滚动者为准——实际场景每页只有一条主滚动容器，
   // 且任何一条滚过阈值都意味着顶栏该落底了，判定足够稳。
-  const [scrolled, setScrolled] = useState(false);
+  // 过渡不做成阈值翻转（bg 在 transparent/black 间跳变，观感生硬），而是把
+  // 「滚入深度 0→1」连续写进 CSS 变量 --nf-nav-dim（24px 内保持全透明、
+  // 24~404px 线性加深），黑底层按它连续淡入——滚动过程零 React 重渲染。
+  // 变量已注册为 <number> 类型（globals.css 的 @property），.nf-topnav 上还
+  // 挂了 450ms 的变量过渡：滚轮一次甩几百像素时黑底层也是缓动跟随，不会跳变。
+  const rootRef = useRef<HTMLElement>(null);
   useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
     const onScroll = (e: Event) => {
       const target = e.target;
       const top =
         target instanceof Element ? target.scrollTop : (target as Window | null)?.scrollY ?? 0;
-      setScrolled(top > 12);
+      const progress = Math.min(1, Math.max(0, (top - 24) / 380));
+      root.style.setProperty("--nf-nav-dim", progress.toFixed(3));
     };
     document.addEventListener("scroll", onScroll, { capture: true, passive: true });
     return () => document.removeEventListener("scroll", onScroll, { capture: true });
   }, []);
+  // 顶栏常驻外壳、不随路由重建，滚动深度是跨页面残留的：上个页面滚过后跳到
+  // 详情页，新页面停在顶部却没有滚动事件来纠正，顶栏会一直保持实底黑。路由
+  // 切换即复位为页面顶端状态；目标页若带着恢复的滚动位置，随后的滚动事件自
+  // 会把变量纠正回来。
+  useEffect(() => {
+    rootRef.current?.style.setProperty("--nf-nav-dim", "0");
+  }, [pathname]);
 
   const visibleLinks = NAV_LINKS.filter((link) => link.id !== "subscriptions" || canSubscribe);
 
   return (
-    <header
-      className={`fixed inset-x-0 top-0 z-40 transition-[background-color] duration-300 ${
-        scrolled
-          ? "bg-black"
-          : "bg-[linear-gradient(180deg,rgba(0,0,0,0.72),rgba(0,0,0,0)_100%)]"
-      }`}
-    >
-      <div className="flex h-[68px] items-center gap-6 px-[4vw]">
+    <header ref={rootRef} className="nf-topnav fixed inset-x-0 top-0 z-40">
+      {/* 两层背景随 --nf-nav-dim 连续叠合：底部永远铺「向下渐隐的黑雾」
+          （页面顶端时黑字标在亮图上可读），黑实底层按滚动进度淡入盖过它。
+          变量已注册（@property <number>），过渡写在变量自身上（.nf-topnav），
+          直接给 opacity 加 transition 反而会被每帧写入的变量卡住（同
+          PageNav --nav-reveal 的既知结论）。 */}
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 bg-[linear-gradient(180deg,rgba(0,0,0,0.72),rgba(0,0,0,0)_100%)]"
+      />
+      <div aria-hidden="true" className="absolute inset-0 bg-black" style={{ opacity: "var(--nf-nav-dim, 0)" }} />
+      <div className="relative flex h-[68px] items-center gap-6 px-[4vw]">
         {/* 品牌字标：回首页（内容可点区拉满高度，与导航链接同标准） */}
         <Link
           href="/"

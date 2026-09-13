@@ -7,6 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { useConfirm, useToast } from "@/components/feedback";
 import {
   ArrowLeftIcon,
@@ -192,7 +193,7 @@ export function SubscriptionInspectorView({
       <div className="flex h-full flex-col">
         <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在加载订阅详情…
         </div>
       </div>

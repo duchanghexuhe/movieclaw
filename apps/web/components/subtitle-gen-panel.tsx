@@ -14,6 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Route } from "next";
 import { useRouter } from "next/navigation";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { Modal } from "@/components/modal";
 import { LlmCapabilityGate } from "@/components/llm-gate";
 import { Tooltip } from "@/components/tooltip";
@@ -845,7 +846,7 @@ export function SubtitleGenPanel({
 
               {previewing && (
                 <div className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-4">
-                  <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-[var(--info)]" />
+                  <BrandLoader className="size-5" />
                   <p className="text-ui font-medium text-white">正在检查参考字幕，不会调用 AI…</p>
                 </div>
               )}

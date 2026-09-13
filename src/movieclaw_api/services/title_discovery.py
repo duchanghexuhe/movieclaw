@@ -415,6 +415,7 @@ def title_details_from_legacy(
             aliases=facts.aliases,
             source_url=facts.source_url,
         ),
+        backdrop_original_url=detail.backdrop_url,
         videos=detail.videos,
         backdrops=detail.backdrops,
         posters=detail.posters,

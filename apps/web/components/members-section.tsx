@@ -12,6 +12,7 @@ import { useCallback, useEffect, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
 import { AvatarBadge } from "@/components/avatar-badge";
+import { BrandLoader } from "@/components/brand-loader";
 import { copyText } from "@/components/copy-button";
 import { useConfirm, useToast } from "@/components/feedback";
 import { CheckIcon, MoreIcon, PlusIcon } from "@/components/icons";
@@ -152,7 +153,7 @@ export function MembersSection() {
         </div>
         {members === null ? (
           <div className="flex items-center justify-center gap-2 px-5 py-10 text-ui text-[var(--text-muted)]">
-            <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+            <BrandLoader className="size-5" />
             正在加载成员…
           </div>
         ) : members.length === 0 ? (

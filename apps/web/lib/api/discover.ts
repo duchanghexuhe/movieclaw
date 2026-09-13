@@ -167,6 +167,7 @@ interface MediaVideoDto {
 interface DiscoveredTitleDetailsDto {
   title: DiscoveredTitleDto;
   metadata: DiscoveredTitleMetadataDto;
+  backdrop_original_url: string | null;
   videos?: MediaVideoDto[];
   backdrops: MediaImageDto[];
   posters: MediaImageDto[];
@@ -483,6 +484,8 @@ export interface MediaDetailData {
   videos: MediaVideo[];
   backdrops: MediaImage[];
   posters: MediaImage[];
+  /** 主横幅剧照的 original 原图；详情页沉浸背景的高清升级源 */
+  backdropOriginalUrl?: string;
   collection?: { id: string; name: string; items: MediaItem[] };
   related: MediaItem[];
   libraryLinks: MediaLibraryLink[];
@@ -555,6 +558,9 @@ export async function fetchDiscoveredTitleDetails(
       sourceUrl: dto.metadata.source_url ?? undefined,
     },
     videos: (dto.videos ?? []).map(toVideo),
+    backdropOriginalUrl: dto.backdrop_original_url
+      ? cachedImageUrl(dto.backdrop_original_url)
+      : undefined,
     backdrops: dto.backdrops.map(toImage),
     posters: dto.posters.map(toImage),
     collection: dto.collection

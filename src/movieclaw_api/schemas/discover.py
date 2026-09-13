@@ -195,6 +195,10 @@ class DiscoveredTitleDetailsView(BaseModel):
 
     title: DiscoveredTitleView
     metadata: DiscoveredTitleMetadata
+    backdrop_original_url: str | None = Field(
+        default=None,
+        description="主横幅剧照的 original 原图；详情页沉浸背景的高清升级源，缺失时为 None",
+    )
     videos: list[MediaVideo] = Field(
         default_factory=list,
         description="预告片与花絮（正式预告在前）；来源未提供时为空数组",

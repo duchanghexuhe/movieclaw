@@ -35,6 +35,7 @@ import {
   EMPTY_DISCOVERY_FILTERS,
   type DiscoveryFilters,
 } from "@/lib/discovery-filters";
+import { upgradedTmdbOriginalUrl } from "@/lib/image-proxy";
 import { useMediaDetail } from "@/lib/media-detail";
 import { usePageChrome } from "@/lib/page-chrome";
 import { useTheme } from "@/lib/ui-prefs";
@@ -262,9 +263,12 @@ export function DiscoverView({
   }, [controls, isMobile, setTopBarActions]);
 
   const toolbar = isMobile ? null : isNf ? (
-    // Netflix：绝对定位在滚动内容顶部右上（容器 relative），悬浮于 Hero 之上、
-    // 随 Hero 一起滚走；银玻璃维持原吸顶工具栏不变
-    <div className="absolute right-[4vw] top-3 z-20 flex items-center gap-2">{controls}</div>
+    // Netflix：fixed 悬浮在视口右上（顶栏下方），不随页面滚动移位——发现页
+    // 一滚数屏，筛选/数据源入口跟着内容滚走后想换源就得滚回顶部；银玻璃维持
+    // 原吸顶工具栏不变。right 对齐行内边距 4vw，top 让出顶栏高度。
+    <div className="fixed right-[4vw] top-[calc(var(--nf-nav-h)+12px)] z-20 flex items-center gap-2">
+      {controls}
+    </div>
   ) : (
     <div className="sticky top-0 z-20 flex items-center justify-end px-6 pb-3 pt-7">
       {controls}
@@ -598,6 +602,39 @@ function HeroBanner({ items, fullBleed = false }: { items: MediaItem[]; fullBlee
   );
 }
 
+/**
+ * Hero 大图的「同图升清」：列表数据只有 w1280（首屏快），这里在图 reveal 后
+ * 预加载 original 原图（大屏整幅拉伸发虚），加载**并解码**完成才替换 src——
+ * 与详情页沉浸背景同一策略；非 TMDB 图（无 w 档位）原样返回、不预加载。
+ */
+function useHeroBackdrop(revealed: boolean, w1280: string | undefined): string | undefined {
+  const original = w1280 ? upgradedTmdbOriginalUrl(w1280) : undefined;
+  const upgradable = Boolean(original && original !== w1280);
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    if (!revealed || !upgradable || !original) {
+      setReady(false);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    const settle = () => {
+      img
+        .decode()
+        .catch(() => {})
+        .then(() => {
+          if (!cancelled) setReady(true);
+        });
+    };
+    img.onload = settle;
+    img.src = original;
+    return () => {
+      cancelled = true;
+    };
+  }, [revealed, upgradable, original]);
+  return revealed ? (ready ? original : w1280) : undefined;
+}
+
 function HeroSlide({
   item,
   active,
@@ -617,6 +654,8 @@ function HeroSlide({
   useEffect(() => {
     if (preload) setRevealed(true);
   }, [preload]);
+  // reveal 后升清：w1280 先显示，original 解码就位后无感替换（不闪）
+  const backdropSrc = useHeroBackdrop(revealed, item.backdropUrl);
   // 整块 Hero 就是进详情的入口（与海报卡片「点海报进详情」一致，不再另设「更多信息」键）。
   // Hero 占满首屏，手机上「向下滑看海报墙」几乎必然从这块起手，所以点击要过一遍误触判定。
   const tapGuard = useTapGuard(() => open(item));
@@ -644,7 +683,7 @@ function HeroSlide({
     >
       {/* 宽幅剧照 + 双层渐变蒙版：左侧压暗保文字可读，底部渐隐融入页面 */}
       <PosterImage
-        src={revealed ? item.backdropUrl : undefined}
+        src={backdropSrc}
         alt={`${item.title} 剧照`}
         className={`absolute inset-0 size-full object-cover object-top transition-transform duration-[9000ms] ease-linear ${
           active ? "scale-[1.06]" : "scale-100"

@@ -432,11 +432,16 @@ body::before {
  *     的 background 覆盖的是 border-box，连轨道一起盖住；
  *   - background-attachment: local 让渐变随内容一起滚动、并以整个可滚动
  *     高度为 100%，短内容时也至少铺满容器，底部不会露出剧照。
- * 渐变起点 --detail-ambient-top = 氛围留白高度 − 内容层上提量（-mt-28 = 112px），
- * 色阶与原先内容层上的渐变完全一致。
+ * 渐变起点 --detail-ambient-top = 剧照横幅可视高度（--detail-hero-h 与
+ * --detail-hero-min-h 取大）− 内容层上提量（-mt-28 = 112px），色阶与原先
+ * 内容层上的渐变完全一致。横幅高度与渐变起点必须严格同步（起点一错，标题
+ * 就会压在亮图上或横幅下沿露出一截渐变断层），所以页面侧的氛围留白 spacer
+ * 也从同一组变量取值（h-[var(--detail-hero-h)]）——改高度只改变量，两处不会漂移。
  */
 .detail-ambient {
-  --detail-ambient-top: calc(max(30vh, 180px) - 112px);
+  --detail-hero-h: 30vh;
+  --detail-hero-min-h: 180px;
+  --detail-ambient-top: calc(max(var(--detail-hero-h), var(--detail-hero-min-h)) - 112px);
   background-image: linear-gradient(
     180deg,
     rgba(0, 0, 0, 0) 0,
@@ -455,7 +460,8 @@ body::before {
 }
 @media (max-width: 767px) {
   .detail-ambient {
-    --detail-ambient-top: calc(max(22vh, 120px) - 112px);
+    --detail-hero-h: 22vh;
+    --detail-hero-min-h: 120px;
   }
   /* 手机有页内剧照 Hero 时（library-item-detail-view 的 mobileHeroSrc）：页面上的剧照由
      Hero 来画，滚动容器直接铺黑。全站背景仍换成同一张剧照（侧栏玻璃要折射它），但它在
@@ -2137,21 +2143,202 @@ html[data-theme="netflix"] select optgroup {
   background-color: #181818;
 }
 
-/* —— 详情页「剧照 → 纯黑」渐变板的落点改 #141414（§5.5），其余色阶不变 —— */
+/* —— 详情页（§5.5） ——
+ * 渐变落点不再覆盖成 #141414：Netflix 画布本就是纯黑 #000（#141414 只做卡片/
+ * 行悬浮面），基础 .detail-ambient 的「透明 → #000」渐变直接沿用，下方内容
+ * 底色与画布同色、无接缝。
+ * 滚动条轨道必须给实色：剧照是 fixed 全屏覆盖层，而轨道默认透明——透明轨道
+ * 会在页面右缘漏出一整条未压暗的原图（轨道不被元素自身 background 覆盖）。
+ * 轨道色取画布纯黑、滑块维持全局同款半透明白。
+ * 内容层**不画任何遮罩**：横向过渡是图片层的 `--nf-blend` mask，纵向渐隐
+ * 是图片层的 ::after（见下方）——内容层的背景画在图片层之上（z-10 > z-2），
+ * 在这里铺渐变就是第二重视觉遮罩，且出现时机与图片不同步（实测两次踩坑）。
+ * hero 以下的正文可读性：图片层自身在纵向渐隐到纯黑 + 滚动时渐暗模糊。 */
 html[data-theme="netflix"] .detail-ambient {
-  background-image: linear-gradient(
-    180deg,
-    rgba(20, 20, 20, 0) 0,
-    rgba(20, 20, 20, 0) var(--detail-ambient-top),
-    rgba(20, 20, 20, 0.16) calc(var(--detail-ambient-top) + 42px),
-    rgba(20, 20, 20, 0.34) calc(var(--detail-ambient-top) + 78px),
-    rgba(20, 20, 20, 0.55) calc(var(--detail-ambient-top) + 120px),
-    rgba(20, 20, 20, 0.73) calc(var(--detail-ambient-top) + 165px),
-    rgba(20, 20, 20, 0.87) calc(var(--detail-ambient-top) + 210px),
-    rgba(20, 20, 20, 0.96) calc(var(--detail-ambient-top) + 255px),
-    #141414 calc(var(--detail-ambient-top) + 315px),
-    #141414 100%
+  scrollbar-color: rgba(255, 255, 255, 0.16) #000;
+  background-image: none;
+}
+/* 同上，给不支持 scrollbar-color 的老 Chromium 的 ::-webkit 通路兜底
+   （支持的内核会忽略 ::-webkit-*，两条并存不冲突） */
+html[data-theme="netflix"] .detail-ambient::-webkit-scrollbar-track {
+  background: #000;
+}
+/* 标题上移：银玻璃的内容层 -mt-28 + pt-28（上提与内边距互相抵消，标题停在
+   渐变板中段）；Netflix 的标题要落在横幅**左上区**（约横幅高度 1/3 处、让开
+   左上角的返回键），借左侧纯黑遮罩直接坐在剧照上——负外边距 320px、内边距
+   归零。注意底部渐变的起点（--detail-ambient-top）刻意**不**跟随上提：整幅
+   剧照不能因为标题上移就提早压暗，标题区由左侧纯黑遮罩单独护住。无层规则
+   优先于 Tailwind 的 @layer utilities，直接覆盖 -mt-28/pt-28 工具类。 */
+@media (min-width: 768px) {
+  html[data-theme="netflix"] .detail-ambient {
+    --detail-hero-h: 58vh;
+    --detail-hero-min-h: 340px;
+  }
+  html[data-theme="netflix"] .detail-content {
+    margin-top: -320px;
+    padding-top: 0;
+  }
+  /* 标题/简介这个前导簇占满到横幅底（内容起点 = 横幅底 − 320px，簇高固定
+     320px）：演职员表从横幅正下方一条固定线开始，不随简介长短上下漂移；
+     简介短时，下方留的是纯黑空档。 */
+  html[data-theme="netflix"] .detail-lead {
+    min-height: 320px;
+  }
+}
+/* 沉浸覆盖层的尺寸与定位基准（backdrop.tsx 不再内联写死，内联会压过类级规则）：
+   默认 cover + 居中顶对齐 */
+.backdrop-override {
+  background-size: cover;
+  background-position: center top;
+}
+/* Netflix 详情页的「左黑右图」构图：黑色块只占窗口左 1/4，覆盖层从窗口
+   25% 起铺（图片保持 cover 原始比例**不放大**）；25%~50% 区间从纯黑渐显，
+   窗口右半完全正常显示图片。渐变用多段缓动曲线（两端平缓、中段过渡），
+   线性 ramp 在照片上会读出一道明显的「带」。 */
+/* 渐变曲线定义在 html.nf-hero-live 上：覆盖层与轮换层（body 的子节点、
+   不是覆盖层的后代）都要继承它——定义在覆盖层上轮换层只能拿到 undefined，
+   mask 整个失效成硬边（实测踩过）。 */
+html.nf-hero-live {
+  --nf-blend: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0) 0%,
+    rgba(0, 0, 0, 0.18) 6%,
+    rgba(0, 0, 0, 0.45) 13%,
+    rgba(0, 0, 0, 0.72) 20%,
+    rgba(0, 0, 0, 0.92) 28%,
+    #000 40%
   );
+}
+html.nf-hero-live .backdrop-override {
+  left: 25%;
+  mask-image: var(--nf-blend);
+  -webkit-mask-image: var(--nf-blend);
+}
+/* 轮换层挂载时隐藏沉浸覆盖层：覆盖层永远停在主 backdrop（第一张图），
+   轮换开始后它会从半透明渐变区透出、成为「上一张的残影」。覆盖层的 opacity
+   由组件内联样式驱动（CSS 压不过内联），这里改用 visibility；首帧两层显示
+   同一张图，切换瞬间不可见。 */
+/* 轮换层存在（将要接管背景）时，覆盖层从一开始就不显示。
+   不能让两层共存哪怕一瞬：mask 是半透明的，同一张图被两层各「漏」一次，
+   渐变区亮度 = 2m − m²（m=50% 处亮 33%）；覆盖层一隐藏亮度骤降回 m——
+   这就是「图片开始动之后渐变区突然变暗」的根源。隐藏后入场只剩一条路径：
+   黑场 → 轮换层（原图）一次性淡入，中途没有任何层切换。 */
+html.nf-hero-live:has(.detail-slideshow) .backdrop-override {
+  visibility: hidden;
+}
+/* 滚动退场：详情页下滚时剧照渐暗 + 模糊（媒体详情视图把滚动进度写在根节点
+   的 --nf-hero-recede 上）。filter 只挂在标记类 nf-hero-live 存在时——即
+   Netflix 详情页挂载期间——其他页面不给全屏覆盖层强加零值 filter（那会白白
+   提升一个全屏合成层）。blur 让退场像「失焦」而不是「推走」，brightness 压到
+   45% 保证前景文字始终可读。
+   背景轮换层（DetailBackdropSlideshow）与覆盖层同一构图（右移 46% + 左缘
+   渐隐），两处规则必须一起改。 */
+html.nf-hero-live .backdrop-override,
+html.nf-hero-live .detail-slideshow {
+  filter: blur(calc(var(--nf-hero-recede, 0) * 12px))
+    brightness(calc(1 - var(--nf-hero-recede, 0) * 0.55));
+  /* 注册属性的过渡（见下方 @property）：滚轮一次甩几百像素时，进度变量
+     不再一帧跳到目标，而是按固定时长缓动过去——退场观感是连续的 */
+  transition: --nf-hero-recede 450ms linear;
+}
+/* 纵向渐隐画在图片层自己身上（::after 渐到纯黑、与画布同色）：hero 以下的
+   正文行依然落在黑底上，而变暗来源从「内容层全宽渐变」变成图片层的一部分，
+   视觉上不再多出一层遮罩。 */
+html.nf-hero-live .backdrop-override::after,
+html.nf-hero-live .detail-slideshow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0) 58%, #000 88%);
+}
+/* 滚动退场的另一半：整层随进度淡出（此前纵向渐变随内容滚上来兜底，
+   移除后改由这里接手）——深层滚动时图片只剩微光，正文完全主导。 */
+html.nf-hero-live .detail-slideshow {
+  opacity: calc(1 - var(--nf-hero-recede, 0) * 0.85);
+}
+/* 背景轮换层（DetailBackdropSlideshow，portal 到 body）：与覆盖层同一构图
+   （黑色块 1/4 + 左缘渐隐，两处规则必须一起改）。z 取 2——高于沉浸覆盖层(z-1)、
+   仍在外壳(z-10)之下，滚动容器渐变板照常把它压暗。
+   首图预加载解码就位（data-ready）前整层透明：挂载即渲染会先透黑、图到再
+   硬切出现，与覆盖层的隐藏叠加就是进详情页时的闪烁。 */
+.detail-slideshow {
+  left: 25%;
+  z-index: 2;
+  opacity: 0;
+  transition:
+    opacity 700ms ease-out,
+    --nf-hero-recede 450ms linear;
+  mask-image: var(--nf-blend);
+  -webkit-mask-image: var(--nf-blend);
+}
+.detail-slideshow[data-ready="true"] {
+  opacity: calc(1 - var(--nf-hero-recede, 0) * 0.85);
+}
+.detail-slideshow img {
+  transition: opacity 1600ms ease-in-out;
+  /* Ken Burns 缓推：覆盖整个驻留周期（轮换 9s + 溶解 1.6s）缓慢放大平移，
+     「叠变」的另一半——溶解时两层各自在动，是融接不是硬切。
+     700ms 起步延迟 = 与覆盖层交接的淡入时长：淡入期间轮换层静止在 scale 1，
+     与覆盖层逐像素重合（否则交接时两张不同缩放的同一张图叠出重影，且图片
+     边缘的移动会让左侧遮罩看起来「先小后大」）；淡入完成后缓推才启动。 */
+  animation: nf-kenburns 11.5s linear 700ms both;
+}
+@keyframes nf-kenburns {
+  from {
+    transform: scale(1);
+  }
+  to {
+    transform: scale(1.045);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .detail-slideshow img {
+    animation: none;
+  }
+}
+/* 滚动进度变量注册成 <number> 类型：Chromium 只对注册属性做插值过渡，
+   未注册的自定义属性变化永远瞬时生效（这也是 PageNav 的 --nav-reveal
+   不加 transition 的原因）。顶栏黑底层与剧照退场都靠这一机制消化
+   「滚轮大幅甩动」的跳变。 */
+@property --nf-nav-dim {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+@property --nf-hero-recede {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+/* 顶栏黑底层的缓动（变量由 components/netflix/top-nav.tsx 按滚动进度写入） */
+.nf-topnav {
+  transition: --nf-nav-dim 450ms linear;
+}
+
+/*
+ * 品牌加载动画（components/brand-loader.tsx）：M 字标缓慢呼吸——
+ * 轻微放大 + 透明度起伏，比旋转圆环安静、有品牌辨识度。
+ * 系统开启「减弱动态效果」时退化为静止 logo。
+ */
+.brand-loader {
+  animation: brand-loader-breath 1.4s ease-in-out infinite;
+}
+@keyframes brand-loader-breath {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  50% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-loader {
+    animation: none;
+    opacity: 0.75;
+  }
 }
 html[data-theme="netflix"] .detail-ambient.detail-ambient--hero {
   background: #141414;

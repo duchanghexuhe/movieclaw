@@ -1,0 +1,23 @@
+/**
+ * 全站统一的品牌加载指示：M 字标 + 呼吸动画（见 globals.css 的 .brand-loader）。
+ *
+ * 取代原页面/区块级加载位的圆形 border spinner（那些散落在二十多个文件里的
+ * `animate-spin rounded-full border-2` 手写体）。按钮内联的微型 spinner
+ * （border-current 小尺寸那种）刻意不换——M 字标塞进按钮里太吵。
+ *
+ * 尺寸由调用方给（默认 20px，约等于原 size-4/size-5 spinner 的视觉体量；
+ * M 字标细节多，比同尺寸圆环要放大一档才等观感）。动画尊重系统
+ * prefers-reduced-motion（globals.css 里降级为静止）。
+ */
+export function BrandLoader({ className = "size-5" }: { className?: string }) {
+  return (
+    <span aria-hidden="true" className={`brand-loader inline-block shrink-0 ${className}`}>
+      <img
+        src="/movieclaw-logo-mark-rotor.png"
+        alt=""
+        draggable={false}
+        className="size-full object-contain"
+      />
+    </span>
+  );
+}

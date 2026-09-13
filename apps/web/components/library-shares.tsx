@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { ContentEmptyState } from "@/components/content-empty-state";
 import { copyText } from "@/components/copy-button";
 import { useConfirm, useToast } from "@/components/feedback";
@@ -75,7 +76,7 @@ export function LibraryShares({ onCountChange }: { onCountChange?: (total: numbe
   if (shares === null) {
     return (
       <div className="flex items-center gap-2.5 px-6 py-10 text-ui text-[var(--text-muted)] max-md:px-4">
-        <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+        <BrandLoader className="size-5" />
         正在读取分享…
       </div>
     );

@@ -11,6 +11,7 @@ import { useRouter } from "next/navigation";
 
 import { AddToCollectionDialog } from "@/components/add-to-collection-dialog";
 import { ArtworkPickerDialog } from "@/components/artwork-picker-dialog";
+import { BrandLoader } from "@/components/brand-loader";
 import { CastRow } from "@/components/cast-row";
 import { ChapterStrip } from "@/components/chapter-strip";
 import { MediaTrackRows } from "@/components/media-track-rows";
@@ -443,7 +444,7 @@ export function LibraryItemDetailView({
       <div className="ambient-fallback flex h-full flex-col">
         <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在读取本地刮削信息…
         </div>
       </div>
@@ -1728,7 +1729,7 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
       )}
       {!data && !failed && (
         <div className="flex items-center gap-2.5 py-6 text-sub text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在读取分集信息…
         </div>
       )}

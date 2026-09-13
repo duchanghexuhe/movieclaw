@@ -6,6 +6,7 @@ import Link from "next/link";
 
 import type { MediaSearchItem } from "@/lib/api/discover";
 import { searchTitles } from "@/lib/api/search";
+import { BrandLoader } from "@/components/brand-loader";
 import { RuleSetsPanel } from "@/components/rule-sets-panel";
 import {
   checkSubscriptionAutomationReadiness,
@@ -146,7 +147,7 @@ export function PipelineHealthPanel() {
       )}
       {health === null && !failed && (
         <p className="flex items-center gap-2.5 rounded-xl bg-white/[0.03] px-4 py-5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在体检…
         </p>
       )}

@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { useToast } from "@/components/feedback";
 import { ChevronDownIcon } from "@/components/icons";
 import {
@@ -1406,7 +1407,7 @@ export function ScrapeSettingsSection() {
   if (!setting) {
     return (
       <p className="flex items-center gap-2.5 rounded-xl bg-white/[0.03] px-4 py-5 text-ui text-[var(--text-muted)]">
-        <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+        <BrandLoader className="size-5" />
         正在加载刮削配置…
       </p>
     );

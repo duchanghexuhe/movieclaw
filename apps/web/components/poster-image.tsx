@@ -138,7 +138,11 @@ export function PosterImage({
         referrerPolicy="no-referrer"
         onError={() => setBroken(true)}
         onLoad={() => setLoaded(true)}
-        className={`bg-[#141824] object-cover ${className}`}
+        // 加载完成前先透明、就位后 400ms 淡入：避免大图解码完成那一帧「突然出现」。
+        // 就位后不再带任何 opacity 类——不干扰调用方自己的 hover 透明度效果。
+        className={`bg-[#141824] object-cover transition-opacity duration-500 ease-out ${
+          loaded ? "" : "opacity-0"
+        } ${className}`}
       />
       {/* 脉冲占位盖在图片**之上**：<img> 自带不透明深色底，垫在下面看不见 */}
       {pulseWhileLoading && !loaded && (

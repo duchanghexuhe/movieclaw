@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { Modal } from "@/components/modal";
 import {
   type ArtworkCandidate,
@@ -135,7 +136,7 @@ export function ArtworkPickerDialog({
         )}
         {!failed && data === null && (
           <div className="flex items-center justify-center gap-2 py-14 text-ui text-[var(--text-muted)]">
-            <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+            <BrandLoader className="size-5" />
             正在拉取候选图…
           </div>
         )}
@@ -188,7 +189,7 @@ export function ArtworkPickerDialog({
                 </span>
                 {applying === c.file_path && (
                   <span className="absolute inset-0 flex items-center justify-center bg-black/55">
-                    <span className="size-5 animate-spin rounded-full border-2 border-white/25 border-t-white/85" />
+                    <BrandLoader className="size-6" />
                   </span>
                 )}
               </button>
