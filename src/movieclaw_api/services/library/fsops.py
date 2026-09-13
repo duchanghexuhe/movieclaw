@@ -35,7 +35,8 @@ _AT_FDCWD = -100
 try:
     _libc = ctypes.CDLL(None, use_errno=True)
     _renameat2 = _libc.renameat2
-except (OSError, AttributeError):  # pragma: no cover -- 非 Linux/远古 libc
+# Windows 的 ctypes.CDLL(None) 直接抛 TypeError，同属「非 Linux 无 renameat2」
+except (OSError, AttributeError, TypeError):  # pragma: no cover -- 非 Linux/远古 libc
     _renameat2 = None
 
 # 「文件系统不支持 NOREPLACE」的 errno：EINVAL（FUSE 未实现 RENAME2）、
