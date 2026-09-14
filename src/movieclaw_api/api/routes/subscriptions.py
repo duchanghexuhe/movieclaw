@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.api.deps import (
@@ -26,13 +26,17 @@ from movieclaw_api.schemas.subscription import (
     PipelineHealthView,
     PrepareView,
     ResolveCandidateView,
+    RetainedTorrentView,
     SearchNowView,
+    SeasonCleanupPayload,
     SeasonOverview,
     SubscriptionCreatePayload,
     SubscriptionCreateView,
+    SubscriptionDeleteView,
     SubscriptionDetailView,
     SubscriptionDownloadView,
     SubscriptionFollowFuturePayload,
+    SubscriptionRemovalPreviewView,
     SubscriptionTargetPreviewPayload,
     SubscriptionTrackingState,
     SubscriptionTrackingStatePayload,
@@ -43,6 +47,7 @@ from movieclaw_api.schemas.subscription import (
     UpgradeRunView,
 )
 from movieclaw_api.services.auth import Principal
+from movieclaw_api.services.library.recycle import DEFAULT_RETENTION
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.subscription import SubscriptionService
@@ -65,9 +70,21 @@ router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 #   下载器细节，路由级挂 require_admin。
 
 
+# 媒体库文件删除后的回收站保留天数：机制值在 library.recycle 里，接口只是
+# 把它如实告诉用户（"7 天内可恢复"），不另立第二个真相
+RECYCLE_RETENTION_DAYS = int(DEFAULT_RETENTION.total_seconds() // 86400)
+
+
 def _service(session: AsyncSession) -> SubscriptionService:
     library = MediaLibraryService(session, get_tmdb_client())
     return SubscriptionService(session, library)
+
+
+def _job_origin(client_name: object) -> str:
+    """从统一客户端头识别 Web/CLI；直接调用路由的测试对象安全退回 Web。"""
+    if isinstance(client_name, str) and client_name.lower() in {"web", "cli", "agent"}:
+        return client_name.lower()
+    return "web"
 
 
 async def _prepare_resolved_target(
@@ -679,18 +696,104 @@ async def unsubscribe_from_subscription(
     return ok({}, message=message)
 
 
+@router.get(
+    "/{subscription_id}/removal-preview",
+    response_model=ApiResponse[SubscriptionRemovalPreviewView],
+    summary="取消订阅前预览可一并清理的种子与媒体库文件",
+    operation_id="subscriptions.preview-removal",
+    dependencies=[Depends(require_admin)],
+)
+async def preview_subscription_removal(
+    subscription_id: int,
+    seasons: list[int] | None = Query(
+        default=None,
+        description="只预览这几季（减季后的按季清理）；不传=整条退订的范围",
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[SubscriptionRemovalPreviewView]:
+    """纯读预览：确认弹窗据此告诉用户"一起删"到底会删掉什么、有多少。"""
+    plan = await _service(session).removal_preview(subscription_id, seasons=seasons)
+    return ok(
+        SubscriptionRemovalPreviewView(
+            torrent_count=len(plan.torrents),
+            torrent_titles=[t.title for t in plan.torrents[:5]],
+            hit_and_run_count=plan.hit_and_run_count,
+            library_file_count=len(plan.files),
+            library_bytes=plan.library_bytes,
+            recycle_retention_days=RECYCLE_RETENTION_DAYS,
+            retained_cross_season=[
+                RetainedTorrentView(title=t.title, seasons=list(t.seasons))
+                for t in plan.retained
+            ],
+        )
+    )
+
+
+@router.post(
+    "/{subscription_id}/season-cleanup",
+    response_model=ApiResponse[SubscriptionDeleteView],
+    summary="清理已移出订阅范围的那几季的种子与媒体库文件",
+    operation_id="subscriptions.cleanup-seasons",
+    dependencies=[Depends(require_admin)],
+    openapi_extra={"x-cli-dangerous": "confirm"},
+)
+async def cleanup_subscription_seasons(
+    subscription_id: int,
+    payload: SeasonCleanupPayload,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[SubscriptionDeleteView]:
+    """减季之后的可选收尾：订阅继续追别的季，只清掉退出那几季的内容。
+
+    仍在订阅范围内的季会被拒绝——这个接口不是"绕过减季直接删内容"的后门。
+    两个开关同样默认关闭，实际的删种子与回收文件照旧交给后台任务。
+    """
+    outcome = await _service(session).cleanup_seasons(
+        subscription_id,
+        payload.seasons,
+        delete_torrents=payload.delete_torrents,
+        delete_library_files=payload.delete_library_files,
+        origin=_job_origin(client_name),
+    )
+    return ok(
+        SubscriptionDeleteView(cleanup_job_id=outcome.cleanup_job_id),
+        message=outcome.message,
+    )
+
+
 @router.delete(
     "/{subscription_id}",
-    response_model=ApiResponse[dict],
-    summary="管理员永久删除一条订阅及其追踪工单（不删除已下载内容）",
+    response_model=ApiResponse[SubscriptionDeleteView],
+    summary="管理员永久删除一条订阅及其追踪工单（默认不删除已下载内容）",
     operation_id="subscriptions.delete",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
 async def delete_subscription(
     subscription_id: int,
+    delete_torrents: bool = Query(
+        default=False,
+        description="同时从下载器删除该订阅投递过的种子任务及其数据文件（不可恢复）",
+    ),
+    delete_library_files: bool = Query(
+        default=False,
+        description="同时把该条目在媒体库里的文件移入回收站（保留期内可恢复）",
+    ),
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[dict]:
-    """管理员永久删除共享订阅；成员必须使用语义明确的取消关注接口。"""
-    message = await _service(session).delete_permanently(subscription_id)
-    return ok({}, message=message)
+) -> ApiResponse[SubscriptionDeleteView]:
+    """管理员永久删除共享订阅；成员必须使用语义明确的取消关注接口。
+
+    两个清理开关默认关闭——取消订阅的本义只是"不再追了"。勾选时删除仍然
+    立刻返回，实际的删种子与回收文件交给后台任务（任务中心可见进度）。
+    """
+    outcome = await _service(session).delete_permanently(
+        subscription_id,
+        delete_torrents=delete_torrents,
+        delete_library_files=delete_library_files,
+        origin=_job_origin(client_name),
+    )
+    return ok(
+        SubscriptionDeleteView(cleanup_job_id=outcome.cleanup_job_id),
+        message=outcome.message,
+    )

@@ -18,6 +18,9 @@
    混有**其他条目**的文件时退化为只删本条目的文件及其同名附属文件。
    ``delete_single_file`` 是它的文件级姊妹：只删一个版本/一集的文件及
    同名附属（多版本洗版、删某集重下），最后一个文件时升级为整条目删除。
+   磁盘回收是**两段式**的：请求内只把目标 rename 进回收站暂存目录（常数
+   时间，几十 GB 的片子也不让前端干等），真删由 ``purge_staged_deletions``
+   在响应发出之后完成（见 ``_TrashStaging``）。
 """
 
 from __future__ import annotations
@@ -29,13 +32,14 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
-from pathlib import Path
+from datetime import UTC, date, datetime
+from pathlib import Path, PurePath
 from typing import Any, Literal, NamedTuple
 
-from sqlalchemy import Integer, and_, func, not_, nullslast, or_, true
+from sqlalchemy import BigInteger, Integer, and_, func, not_, nullslast, or_, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -70,6 +74,7 @@ from movieclaw_api.services.library.nfo import (
     EntryMetadata,
     NfoActor,
 )
+from movieclaw_api.services.library.recycle import TRASH_DIR_NAME
 from movieclaw_api.services.library.sort_key import title_initial, title_sort_key
 from movieclaw_api.services.library.thumbs import primary_aspect
 from movieclaw_api.services.media_probe import (
@@ -300,6 +305,10 @@ WallSort = Literal[
     "runtime",
     "size",
     "last_played",
+    # 「随便看看」：媒体库首页自定义行独有（docs/design/library-home-perspective.md 4.2）。
+    # 按 UTC 日期做种子，同一天内稳定——轮询刷新、翻页都不换批，明天再换一批。
+    # 它不进筛选栏的排序下拉（前端 sortOptions 是显式列表），A-Z 索引对它返回空
+    "random",
 ]
 
 #: 排序方向（2026-09-11 起可切换）。不给方向 = 该档的**自然方向**（见 ``_NATURAL_ASC``），
@@ -318,7 +327,20 @@ _NATURAL_ASC: dict[str, bool] = {
     "runtime": True,
     "size": False,
     "last_played": False,
+    "random": True,
 }
+
+#: 「随便看看」的哈希：``(media_item_id * 当日乘数) % 模``，当日乘数 =
+#: ``黄金比例常数 × (2 × 种子 + 1)`` 取模（奇 × 奇仍是奇数，乘法哈希才是置换）。
+#: 种子必须进乘数而不是加在后面：加常数只是整体平移，模意义下顺序几乎不变，
+#: 换了天也换不了批。模取 2^32，SQLite 与 PostgreSQL 都是普通整数算术，不需要扩展
+_RANDOM_MULTIPLIER = 2654435761
+_RANDOM_MODULUS = 1 << 32
+
+
+def _random_seed() -> int:
+    """「随便看看」的种子：UTC 日期序数。测试里 monkeypatch 它来验证"跨日换一批"。"""
+    return datetime.now(UTC).date().toordinal()
 
 
 def _ascending(sort: WallSort, order: WallOrder | None) -> bool:
@@ -332,7 +354,10 @@ def _ascending(sort: WallSort, order: WallOrder | None) -> bool:
 
 #: 观看状态。前三者是一个**划分**：任何条目恰好落在其中一档，三档计数之和
 #: 等于总数（facet 计数因此永远对得上）。favorite 与它们正交，单选而已。
-WatchFilter = Literal["unwatched", "watching", "played", "favorite"]
+#: ``seen`` = watching ∪ played（"不是 unwatched"）：只是接口取值，不进筛选条、不进 facet
+#: 计数——媒体库首页「最近观看的 X」行用它把从没播过的片挡在外面（度量档把空度量
+#: 沉底而不是排除，取 20 条时看过的排完就轮到没播过的，首页那一行不能这样）
+WatchFilter = Literal["unwatched", "watching", "played", "favorite", "seen"]
 
 #: 年代档 → 年份闭区间；None 表示不设下界。缺年份的条目（release_date 与
 #: media_item.year 都为空）不属于任何一档——「未知年份」不是年代，硬塞进
@@ -459,6 +484,8 @@ def _watch_clause(watch: WatchFilter, member_id: int):
         return and_(not_(watching), played)
     if watch == "unwatched":
         return and_(not_(watching), not_(played))
+    if watch == "seen":
+        return or_(watching, played)
     # favorite：条目级收藏落在哨兵单元上（剧 (-1,-1) / 电影 (0,0)），
     # 与 services/playback/marks.item_favorite_unit 同一份约定
     is_tv = MediaItem.kind == MediaKind.TV.value
@@ -699,71 +726,42 @@ async def build_library_index(
     倒过来排，档的先后与 offset 就一起倒过来（Z→A、低分档在前），不需要另算。
     """
     buckets: list[tuple[str, int, int]] = []
-    if sort == "rating":
+    if sort in ("rating", "release_date"):
         # 与墙读同一份有序名单：档位是在已排好的序列上就地分段，
-        # 因此点档名拿到的 offset 一定指向该档第一格
-        ids = await _wall_page_ids(
-            session,
-            library_id,
-            "rating",
-            None,
-            0,
-            filters=filters,
-            member_id=member_id,
-            content_limit=content_limit,
-            order=order,
-        )
-        scored = dict(
-            (
-                await session.execute(
-                    select(MediaMetadata.media_item_id, MediaMetadata.vote_average).where(
-                        MediaMetadata.media_item_id.in_(ids)  # type: ignore[attr-defined]
-                    )
+        # 因此点档名拿到的 offset 一定指向该档第一格。
+        # 度量（评分 / 上映日）与有序 id 一趟查询同时取回（见 ``_sorted_ids_query``
+        # 的 ``with_measure``）：这一档的口径与 ``_wall_page_ids`` 逐字相同，只是
+        # 不切页、多带一列——按评分/按上映时间的索引条一次请求就是整库的规模，
+        # 再拿几千个 id 回查一遍度量，是这条路径上最贵的一步
+        rows = (
+            await session.execute(
+                _sorted_ids_query(
+                    (
+                        *_wall_scope(library_id),
+                        *_narrow(
+                            filters, member_id, library_id=library_id, content_limit=content_limit
+                        ),
+                    ),
+                    sort,
+                    order,
+                    member_id,
+                    with_measure=True,
                 )
-            ).all()
-        )
-        for index, item_id in enumerate(ids):
-            score = scored.get(item_id)
-            if score is None:
+            )
+        ).all()
+        for index, (_, measure) in enumerate(r for r in rows if r[0] is not None):
+            if sort == "release_date":
+                label = measure.strftime("%Y-%m") if measure else "未知"
+            elif measure is None:
                 label = "未评分"
-            elif score >= 9:
+            elif measure >= 9:
                 label = "9+"
-            elif score >= 8:
+            elif measure >= 8:
                 label = "8+"
-            elif score >= 7:
+            elif measure >= 7:
                 label = "7+"
             else:
                 label = "更低"
-            if buckets and buckets[-1][0] == label:
-                head, count, start = buckets[-1]
-                buckets[-1] = (head, count + 1, start)
-            else:
-                buckets.append((label, 1, index))
-        return buckets
-    if sort == "release_date":
-        ids = await _wall_page_ids(
-            session,
-            library_id,
-            "release_date",
-            None,
-            0,
-            filters=filters,
-            member_id=member_id,
-            content_limit=content_limit,
-            order=order,
-        )
-        dated = dict(
-            (
-                await session.execute(
-                    select(MediaMetadata.media_item_id, MediaMetadata.release_date).where(
-                        MediaMetadata.media_item_id.in_(ids)  # type: ignore[attr-defined]
-                    )
-                )
-            ).all()
-        )
-        for index, item_id in enumerate(ids):
-            released = dated.get(item_id)
-            label = released.strftime("%Y-%m") if released else "未知"
             if buckets and buckets[-1][0] == label:
                 head, count, start = buckets[-1]
                 buckets[-1] = (head, count + 1, start)
@@ -1259,6 +1257,210 @@ async def build_library_relax(
     )
 
 
+def _sorted_ids_query(
+    scope: tuple,
+    sort: WallSort,
+    order: WallOrder | None,
+    member_id: int | None,
+    *,
+    with_measure: bool = False,
+):
+    """给定成员口径（WHERE 片段）与档位，返回「按该档排好的 media_item_id」查询。
+
+    标题档不在这里：拼音序在 Python 里排（见 ``_titles_sorted`` / ``sort_item_ids``），
+    SQLite 对中文按码点排出来的顺序对用户没有意义。
+
+    **排序键、方向语义、平局收尾只写在这一处。** 海报墙翻页（``_wall_page_ids``，
+    口径是"某个库里符合条件的"）与收藏页 / 名单驱动合集（``sort_item_ids``，
+    口径是"这一批 id"）换的只是 ``scope``：同一档在三面墙上必须指同一个数、
+    同一条平局规则，否则用户在收藏页看到的「按评分」与库页对不上。
+
+    每个排序都以 media_item_id 收尾——排序键相等时顺序必须稳定，否则翻页会出现
+    某条目重复出现、另一条目永远刷不到的漏项。``order`` 反转方向时收尾的 id 跟着
+    一起反：反向后的序列恰好是自然序列倒过来，翻页、索引、「回到上次位置」的
+    offset 口径都不必另算。度量为空（没评分、没看过）的条目两个方向都沉底——
+    它们不是"最小值"，是"没数据"。
+
+    ``with_measure=True`` 时每行多带一列**排序所依据的那个度量**（评分 / 上映日 /
+    片长 / 体积 / 入账时间 / 最近观看），仍按同一条 ORDER BY 排——索引条分档
+    （``build_library_index``）靠它一趟查询就拿到「按序排好的 (id, 度量)」。此前
+    是先取整库有序 id、再拿这几千个 id 做一次 ``IN (...)`` 回查度量：一个万级
+    条目的库要绑几千个变量，实测这一趟回查比排序本身还贵（9500 条目 45~150 ms），
+    而它取的恰恰是排序时已经算出来的那一列。
+    """
+    ascending = _ascending(sort, order)
+    query = select(LibraryFile.media_item_id).where(*scope).group_by(LibraryFile.media_item_id)  # type: ignore[arg-type]
+
+    if sort == "added_at":
+        # 「最近添加」：条目的入账时间取它名下最新的一次文件入账
+        added = func.max(LibraryFile.created_at)
+        if with_measure:
+            query = query.add_columns(added)
+        return query.order_by(
+            added.asc() if ascending else added.desc(),
+            LibraryFile.media_item_id.asc() if ascending else LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
+        )
+
+    query = query.join(MediaItem, MediaItem.id == LibraryFile.media_item_id).outerjoin(  # type: ignore[arg-type]
+        MediaMetadata,
+        MediaMetadata.media_item_id == MediaItem.id,  # type: ignore[arg-type]
+    )
+    if sort in ("release_date", "release_date_asc"):
+        # 「按内容时间」：其他库的家庭录像按拍摄日期倒序最自然（release_date 由
+        # 扫描从 sidecar NFO / 容器日期标签 / 文件 mtime 回落而来，见
+        # local_identity）；影视库则是上映/首播日期。缺日期的退到年份、再到 id
+        if with_measure:
+            query = query.add_columns(func.max(MediaMetadata.release_date))
+        if ascending:
+            # 正序：系列合集的 release_date_asc 档、或用户把「按上映时间」切成旧→新。
+            # 三个键一起翻向，只翻主键会让同年的片仍按倒序，读起来更乱。
+            # 缺日期的沉底（SQLite 升序默认把 NULL 排最前）：与倒序一致，
+            # 索引条的「未知」档因此两个方向都在最后
+            return query.order_by(
+                nullslast(func.max(MediaMetadata.release_date).asc()),
+                func.max(MediaItem.year).asc(),
+                func.max(MediaItem.title).asc(),
+                LibraryFile.media_item_id.asc(),  # type: ignore[union-attr]
+            )
+        return query.order_by(
+            func.max(MediaMetadata.release_date).desc(),
+            func.max(MediaItem.year).desc(),
+            # release_date 只有日期没有时分：同一天的照片/录像按标题（文件名
+            # 主干，相机序号单调）排，比按入账 id 稳定得多
+            func.max(MediaItem.title).desc(),
+            LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
+        )
+
+    # —— 以下四档共用同一个形状：按某个度量聚合后倒/正序，末尾一律以
+    #    media_item_id 收尾保证稳定分页；度量为空的条目靠 NULLS LAST 沉底，
+    #    而不是随排序方向在头尾之间跳
+    if sort == "rating":
+        measure = func.max(MediaMetadata.vote_average)
+    elif sort == "runtime":
+        measure = func.max(MediaMetadata.runtime_minutes)
+    elif sort == "size":
+        # 体积按口径内的在架文件求和：单库墙上是它在**这个库**占多少地方，
+        # 跨库的一面墙（收藏、跨库合集）问的才是它总共占多少
+        measure = func.sum(LibraryFile.size_bytes)
+    elif sort == "random":
+        # 每条目一个当日固定的伪随机数；GROUP BY 之后取 max 只是为了满足聚合形状。
+        # 随机档没有方向可言：order 参数对它忽略，永远按哈希升序
+        multiplier = (_RANDOM_MULTIPLIER * (2 * _random_seed() + 1)) % _RANDOM_MODULUS
+        measure = func.max(
+            (func.cast(LibraryFile.media_item_id, BigInteger) * multiplier) % _RANDOM_MODULUS
+        )
+        ascending = True
+    else:
+        measure = func.max(_last_played_at(member_id or 0))
+    if with_measure:
+        query = query.add_columns(measure)
+    # 自然方向下收尾一律是 id 倒序（加方向之前的行为）；反向时整条序列倒过来，
+    # 收尾也跟着变 id 正序——否则同分的片在两个方向里是同一个先后，不是"倒过来"
+    flipped = ascending != _NATURAL_ASC[sort]
+    return query.order_by(
+        nullslast(measure.asc() if ascending else measure.desc()),
+        LibraryFile.media_item_id.asc() if flipped else LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
+    )
+
+
+async def sort_item_ids(
+    session: AsyncSession,
+    ids: Sequence[int],
+    sort: WallSort,
+    order: WallOrder | None = None,
+    *,
+    member_id: int | None = None,
+    library_ids: set[int] | None = None,
+) -> list[int]:
+    """把一批**给定的**条目 id 按海报墙的档位排好——收藏页与名单驱动合集的排序入口。
+
+    这两面墙的成员不是"某个库里符合条件的"（那是 ``_wall_page_ids`` 的口径），
+    而是一份现成的名单：收藏行、``collection_item``。名单从哪来与按什么排是两件
+    事，但**排序键只能有一份**——「按评分」在库页、收藏页、合集页里必须指同一个
+    数、同一条平局规则、同一种方向语义。所以标题档走 ``title_sort_key``（与
+    ``_titles_sorted`` 同一把尺），其余档走 ``_sorted_ids_query``（与海报墙同一条
+    ORDER BY），只把口径换成"这批 id 在这些库里的在架文件"。
+
+    ``library_ids`` 是观看者可见库（None=不受限）：体积、入账时间这类按文件聚合
+    的度量只算可见库里的文件，与跨库合集的墙聚合同一口径。
+
+    排序查询里查不到的条目（名单里还挂着、文件已经全清掉的）按原顺序补在末尾：
+    排序不该让条目消失，出不出现由调用方的可见性过滤决定，这里只管先后。
+    """
+    if not ids:
+        return []
+    if sort in ("title", "probing"):
+        rows = (
+            await session.execute(
+                select(MediaItem.id, MediaItem.title).where(MediaItem.id.in_(list(ids)))  # type: ignore[attr-defined]
+            )
+        ).all()
+        ordered = [
+            i
+            for i, _ in sorted(
+                ((i, t) for i, t in rows if i is not None),
+                key=lambda r: (title_sort_key(r[1]), r[0]),
+            )
+        ]
+        if not _ascending("title", order):
+            ordered.reverse()
+    else:
+        scope: list = [
+            LibraryFile.media_item_id.in_(list(ids)),  # type: ignore[union-attr]
+            LibraryFile.on_shelf(),
+        ]
+        if library_ids is not None:
+            scope.append(LibraryFile.library_id.in_(library_ids))  # type: ignore[attr-defined]
+        ordered = [
+            i
+            for i in (
+                await session.execute(_sorted_ids_query(tuple(scope), sort, order, member_id))
+            )
+            .scalars()
+            .all()
+            if i is not None
+        ]
+    placed = set(ordered)
+    return ordered + [i for i in ids if i not in placed]
+
+
+async def landing_library_of(
+    session: AsyncSession,
+    item_ids: Sequence[int],
+    *,
+    library_ids: set[int] | None = None,
+    files=None,
+) -> dict[int, int]:
+    """跨库的一面墙上每个条目的**详情落点库**：有文件的可见库里、按媒体库首页
+    顺序取第一个。
+
+    收藏页与跨库合集共用：落点决定卡片点进去落在哪个库的条目页，以及图廊取
+    哪个库的章节图与分集剧照。同一作品跨库存在时按首页库顺序选，落点才稳定、
+    可访问。``files`` 是"什么样的文件算数"的判别（默认在架 ``on_shelf``，收藏页
+    传 ``in_place``——那里"没有在位文件的收藏不计入总数"是刻意的口径）。
+    没有任何合格文件的条目不在返回的字典里。
+    """
+    if not item_ids:
+        return {}
+    query = (
+        select(LibraryFile.media_item_id, Library.id)
+        .join(Library, Library.id == LibraryFile.library_id)  # type: ignore[arg-type]
+        .where(
+            LibraryFile.media_item_id.in_(list(item_ids)),  # type: ignore[union-attr]
+            LibraryFile.on_shelf() if files is None else files,
+        )
+        .order_by(Library.sort_order.asc(), Library.id.asc())  # type: ignore[union-attr]
+        .distinct()
+    )
+    if library_ids is not None:
+        query = query.where(Library.id.in_(library_ids))  # type: ignore[attr-defined]
+    landing: dict[int, int] = {}
+    for item_id, library_id in (await session.execute(query)).all():
+        if item_id is not None and library_id is not None:
+            landing.setdefault(item_id, library_id)
+    return landing
+
+
 async def _wall_page_ids(
     session: AsyncSession,
     library_id: int,
@@ -1299,95 +1501,12 @@ async def _wall_page_ids(
             ids.reverse()
         return ids if limit is None else ids[offset : offset + limit]
 
-    if sort == "added_at":
-        # 「最近添加」：条目的入账时间取它名下最新的一次文件入账
-        ascending = _ascending(sort, order)
-        added = func.max(LibraryFile.created_at)
-        query = (
-            select(LibraryFile.media_item_id)
-            .where(
-                *_wall_scope(library_id, identity, only_item_id),
-                *narrow,
-            )
-            .group_by(LibraryFile.media_item_id)  # type: ignore[arg-type]
-            .order_by(
-                added.asc() if ascending else added.desc(),
-                LibraryFile.media_item_id.asc() if ascending else LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
-            )
-        )
-        if limit is not None:
-            query = query.limit(limit).offset(offset)
-        return [i for i in (await session.execute(query)).scalars().all() if i is not None]
-
-    if sort in ("release_date", "release_date_asc"):
-        # 「按内容时间」：其他库的家庭录像按拍摄日期倒序最自然（release_date 由
-        # 扫描从 sidecar NFO / 容器日期标签 / 文件 mtime 回落而来，见
-        # local_identity）；影视库则是上映/首播日期。缺日期的退到年份、再到 id
-        query = (
-            select(LibraryFile.media_item_id)
-            .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
-            .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
-            .where(
-                *_wall_scope(library_id, identity, only_item_id),
-                *narrow,
-            )
-            .group_by(LibraryFile.media_item_id)  # type: ignore[arg-type]
-        )
-        if _ascending(sort, order):
-            # 正序：系列合集的 release_date_asc 档、或用户把「按上映时间」切成旧→新。
-            # 三个键一起翻向，只翻主键会让同年的片仍按倒序，读起来更乱。
-            # 缺日期的沉底（SQLite 升序默认把 NULL 排最前）：与倒序一致，
-            # 索引条的「未知」档因此两个方向都在最后
-            query = query.order_by(
-                nullslast(func.max(MediaMetadata.release_date).asc()),
-                func.max(MediaItem.year).asc(),
-                func.max(MediaItem.title).asc(),
-                LibraryFile.media_item_id.asc(),  # type: ignore[union-attr]
-            )
-        else:
-            query = query.order_by(
-                func.max(MediaMetadata.release_date).desc(),
-                func.max(MediaItem.year).desc(),
-                # release_date 只有日期没有时分：同一天的照片/录像按标题（文件名
-                # 主干，相机序号单调）排，比按入账 id 稳定得多
-                func.max(MediaItem.title).desc(),
-                LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
-            )
-        if limit is not None:
-            query = query.limit(limit).offset(offset)
-        return [i for i in (await session.execute(query)).scalars().all() if i is not None]
-
-    # —— 以下四档共用同一个形状：按某个度量聚合后倒/正序，末尾一律以
-    #    media_item_id 收尾保证稳定分页；度量为空的条目靠 NULLS LAST 沉底，
-    #    而不是随排序方向在头尾之间跳
-    if sort in ("rating", "runtime", "size", "last_played"):
-        query = (
-            select(LibraryFile.media_item_id)
-            .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
-            .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
-            .where(
-                *_wall_scope(library_id, identity, only_item_id),
-                *narrow,
-            )
-            .group_by(LibraryFile.media_item_id)  # type: ignore[arg-type]
-        )
-        if sort == "rating":
-            measure = func.max(MediaMetadata.vote_average)
-        elif sort == "runtime":
-            measure = func.max(MediaMetadata.runtime_minutes)
-        elif sort == "size":
-            # 体积按本库内的在位文件求和：同一部片散在两个库时，
-            # 这面墙上显示的应该是它在**这个库**占多少地方
-            measure = func.sum(LibraryFile.size_bytes)
-        else:
-            measure = func.max(_last_played_at(member_id or 0))
-        ascending = _ascending(sort, order)
-        # 自然方向下收尾一律是 id 倒序（加方向之前的行为）；反向时整条序列倒过来，
-        # 收尾也跟着变 id 正序——否则同分的片在两个方向里是同一个先后，不是"倒过来"
-        flipped = ascending != _NATURAL_ASC[sort]
-        query = query.order_by(
-            nullslast(measure.asc() if ascending else measure.desc()),
-            LibraryFile.media_item_id.asc() if flipped else LibraryFile.media_item_id.desc(),  # type: ignore[union-attr]
+    if sort != "probing":
+        # 走 SQL 的几档：口径（本库、在架、身份档、筛选收窄）在这里给定，
+        # ORDER BY 由 _sorted_ids_query 统一生成——收藏页与名单驱动的合集
+        # 给一批 id 排序时走的也是它，「按评分」在三处指同一个数、同一条平局规则
+        query = _sorted_ids_query(
+            (*_wall_scope(library_id, identity, only_item_id), *narrow), sort, order, member_id
         )
         if limit is not None:
             query = query.limit(limit).offset(offset)
@@ -1397,9 +1516,7 @@ async def _wall_page_ids(
     # 用户能看见"在处理哪几部"；两段各自保持拼音序（sorted 稳定排序）。
     # strm 占位文件不算"没读出"——它永远探不出规格，算进来会让网盘库
     # 每轮扫描都全墙置顶、永不落位
-    ordered = await _titles_sorted(
-        session, library_id, identity, filters, member_id, content_limit
-    )
+    ordered = await _titles_sorted(session, library_id, identity, filters, member_id, content_limit)
     unprobed = {
         i
         for i in (
@@ -1815,6 +1932,7 @@ async def build_library_gallery(
     limit: int | None = None,
     offset: int = 0,
     sort: WallSort = "title",
+    order: WallOrder | None = None,
     filters: LibraryFilter | None = None,
     content_limit: ContentLimit | None = None,
 ) -> list[LibraryGalleryGroupView]:
@@ -1822,12 +1940,21 @@ async def build_library_gallery(
 
     与海报墙共用同一份条目名单、同一套排序与分页口径（``offset`` / ``limit``
     都按**条目**数），本页条目定下来之后交给 :func:`build_gallery_groups` 组图。
-    默认按标题排（图廊的常驻序），``sort=added_at`` 是用户在 ⋯ 菜单里选的
-    「最近添加」——两面墙同一个 ``offset`` 口径，切了排序「回到上次位置」
-    仍然跳得准（前端把排序写进位置记录的形态里，见 lib/library-wall-recall.ts）。
+    ``sort`` / ``order`` 与海报墙同一套档位与方向语义——两面墙同一个 ``offset``
+    口径，切了排序「回到上次位置」仍然跳得准（前端把排序与方向写进位置记录的
+    形态里，见 lib/library-wall-recall.ts）。
     """
     page_ids = await _wall_page_ids(
-        session, library_id, sort, limit, offset, "confirmed", filters, member_id, content_limit
+        session,
+        library_id,
+        sort,
+        limit,
+        offset,
+        "confirmed",
+        filters,
+        member_id,
+        content_limit,
+        order,
     )
     return await build_gallery_groups(
         session, [(item_id, library_id) for item_id in page_ids], member_id=member_id
@@ -2718,6 +2845,104 @@ class DeleteResult:
     rows_deleted: int = 0  # 删掉的台账行数
     freed_bytes: int = 0  # 释放的空间（按台账 size 估算）
     errors: list[str] = field(default_factory=list)
+    # 已移出媒体库、等后台真删的暂存目录；路由挂到 BackgroundTasks 上，
+    # 响应发出后才做真正的磁盘回收（见 _TrashStaging / purge_staged_deletions）
+    pending_purge: list[str] = field(default_factory=list)
+
+
+# 附属文件（NFO/字幕/图片）的扩展名集合。判定口径见 _is_delete_sidecar
+_SIDECAR_DELETE_EXTS = _SUBTITLE_EXTS | {".nfo"} | set(_ART_EXTS)
+
+
+class _TrashStaging:
+    """删除的「先移开、后台再真删」两段式暂存区。
+
+    为什么要有它：大文件的磁盘回收是**慢 IO**——几十 GB 的单文件在机械盘
+    或网络挂载（NFS/SMB）上 unlink 要好几秒，原盘 BDMV 目录 rmtree 更是
+    成千上万次 unlink，每次一个 RTT。同步删完再回响应，前端就得对着转圈
+    干等。这里改成：先把要删的目录/文件 **改名**移进库根回收站下的一次性
+    暂存目录——同一文件系统内 rename 是常数时间，再大的片子也只是毫秒——
+    请求随即返回；真正的磁盘回收交给 ``purge_staged_deletions``。
+
+    暂存目录落在 ``.movieclaw-trash`` 之内是有意的，它同时满足三件事：
+    与库文件同一文件系统（rename 才可能成功，跨盘搬几十 GB 就没意义了）、
+    库扫描跳过点开头目录（文件不会被当新文件重新收编）、进程在后台清理
+    跑完前重启时有兜底（``recycle.sweep_orphan_trash`` 每天清扫回收站里
+    没有台账行的遗留条目）。
+
+    rename 失败（跨文件系统的 EXDEV、只读挂载、权限）时 ``stage`` 返回
+    False，调用方**退回原地同步删除**——慢，但语义与结果和以前完全一致，
+    绝不因为快不了就把文件留在库里。
+    """
+
+    def __init__(self, roots: list[Path]) -> None:
+        self._roots = roots
+        self._dirs: dict[Path, Path] = {}  # 库根 -> 该根下的暂存目录（按需创建）
+
+    def _dir_for(self, path: Path) -> Path | None:
+        """按前缀选 path 所属的库根，返回（必要时创建）该根下的暂存目录。
+
+        按库根分组而不是全局一个：多根库的各个根可能在不同盘上，只有同根
+        的暂存目录才保证 rename 落在同一文件系统里。
+        """
+        root = next((r for r in self._roots if r in path.parents), None)
+        if root is None:
+            return None
+        existing = self._dirs.get(root)
+        if existing is not None:
+            return existing
+        staging = root / TRASH_DIR_NAME / f"deleted-{uuid.uuid4().hex[:12]}"
+        try:
+            staging.mkdir(parents=True)
+        except OSError:
+            logger.warning("创建删除暂存目录失败，本次退回同步删除：%s", staging, exc_info=True)
+            return None
+        self._dirs[root] = staging
+        return staging
+
+    def stage(self, path: Path) -> bool:
+        """把 path 移进暂存目录；移不动返回 False（调用方退回原地删除）。"""
+        staging = self._dir_for(path)
+        if staging is None:
+            return False
+        target = staging / path.name
+        if target.exists():
+            # 同一次删除里撞名（多根同名条目目录）：加随机前缀，不覆盖
+            target = staging / f"{uuid.uuid4().hex[:8]}-{path.name}"
+        try:
+            # 必须是 os.rename 而不是 shutil.move：后者跨设备时会退化成
+            # **复制**几十 GB 再删，比原地删还慢，正好背离本机制的目的
+            os.rename(path, target)
+        except OSError:
+            logger.info(
+                "移入删除暂存目录失败（可能跨文件系统），退回同步删除：%s", path, exc_info=True
+            )
+            return False
+        return True
+
+    @property
+    def dirs(self) -> list[str]:
+        """本次删除实际用到的暂存目录（交给后台清理）。"""
+        return [str(path) for path in self._dirs.values()]
+
+
+async def purge_staged_deletions(paths: Sequence[str]) -> None:
+    """真正回收暂存目录里的内容（路由挂在 BackgroundTasks 上，响应发出后才跑）。
+
+    失败只记日志、不重试也不告诉用户：文件早已移出媒体库、台账也已清干净，
+    从用户视角删除就是完成了；万一残留（进程在这一步之前重启也一样），
+    回收站孤儿清扫会在保留期后兜底删掉。
+    """
+    for raw in paths:
+        path = Path(raw)
+        try:
+            await asyncio.to_thread(shutil.rmtree, path)
+        except OSError:
+            logger.warning(
+                "后台回收删除暂存目录失败，留给回收站孤儿清扫兜底：%s", path, exc_info=True
+            )
+        else:
+            logger.info("已完成后台磁盘回收：%s", path)
 
 
 async def delete_item_files(
@@ -2725,7 +2950,6 @@ async def delete_item_files(
     library: Library,
     media_item_id: int,
     files: list[LibraryFile],
-    all_library_files: list[LibraryFile],
 ) -> DeleteResult:
     """把条目从库中**彻底删除**：磁盘上的条目目录（视频+NFO+海报+字幕）
     整个清掉，台账行随之删除。
@@ -2736,18 +2960,23 @@ async def delete_item_files(
       及其同名附属文件（NFO/字幕/图片）；
     - 磁盘删除失败的文件保留台账行（并报错给用户），不制造"账没了文件还在"
       的幽灵——下次扫描会把它当新文件重新入账反而更乱。
+
+    磁盘回收是两段式的（见 ``_TrashStaging``）：本函数只把目标 rename 进
+    回收站暂存目录（常数时间，大文件也不卡），真删由调用方拿
+    ``result.pending_purge`` 交给 ``purge_staged_deletions`` 在响应之后做。
+    "移进暂存目录"即视为删除成功——文件已不在库内、扫描也不会再收编，
+    不存在幽灵账；只有连 rename 都失败、退回原地删除又失败时才保留台账行。
     """
     result = DeleteResult()
     roots = [Path(p) for p in library.root_paths]
-
-    # 其他条目占用的路径：判定条目目录是否可整删
-    foreign_paths = [
-        Path(row.file_path) for row in all_library_files if row.media_item_id != media_item_id
-    ]
+    staging = _TrashStaging(roots)
+    assert library.id is not None
 
     dirs_to_remove: list[Path] = []
     files_to_remove: dict[int, Path] = {}  # row.id -> 主文件路径（附属文件删除时一并找）
     covered_rows: dict[Path, list[LibraryFile]] = {}  # 整删目录覆盖的行
+    # 同一个条目目录往往对应几十行（整季剧集），存在性查询按目录缓存一次
+    foreign: dict[Path, bool] = {}
 
     for row in files:
         path = Path(row.file_path)
@@ -2763,7 +2992,11 @@ async def delete_item_files(
         if entry is None and row.container in ("bluray", "dvd"):
             entry = path  # 直接躺在根下的原盘目录：目录本身就是条目
         if entry is not None and _safe_inside_roots(entry, roots):
-            if any(entry in fp.parents or entry == fp for fp in foreign_paths):
+            if entry not in foreign:
+                foreign[entry] = await _dir_holds_other_item(
+                    session, library.id, entry, media_item_id
+                )
+            if foreign[entry]:
                 # 目录里混着其他条目：退化为逐文件删除
                 assert row.id is not None
                 files_to_remove[row.id] = path
@@ -2780,7 +3013,7 @@ async def delete_item_files(
     deleted_row_ids: set[int] = set()
 
     for directory in dirs_to_remove:
-        ok = await asyncio.to_thread(_remove_tree, directory, result)
+        ok = await asyncio.to_thread(_discard_tree, directory, staging, result)
         if ok:
             for row in covered_rows.get(directory, []):
                 assert row.id is not None
@@ -2790,7 +3023,7 @@ async def delete_item_files(
     by_id = {row.id: row for row in files}
     for row_id, path in files_to_remove.items():
         row = by_id[row_id]
-        ok = await asyncio.to_thread(_remove_file_with_sidecars, path, result)
+        ok = await asyncio.to_thread(_discard_file_with_sidecars, path, staging, result)
         if ok:
             deleted_row_ids.add(row_id)
             result.freed_bytes += row.size_bytes
@@ -2806,13 +3039,14 @@ async def delete_item_files(
         if row.id in deleted_row_ids:
             await session.delete(row)
     result.rows_deleted = len(deleted_row_ids)
+    result.pending_purge = staging.dirs
     await session.commit()
-    if result.rows_deleted and library.id is not None:
+    if result.rows_deleted:
         await LibraryRepository(session).refresh_stats([library.id])
 
     if result.removed_paths:
         logger.info(
-            "已从磁盘删除条目 #%s 的 %d 个路径（库「%s」，释放约 %.1f GB）：%s",
+            "已从库中移除条目 #%s 的 %d 个路径（库「%s」，释放约 %.1f GB）：%s",
             media_item_id,
             len(result.removed_paths),
             library.name,
@@ -2827,7 +3061,6 @@ async def delete_single_file(
     library: Library,
     row: LibraryFile,
     item_rows: list[LibraryFile],
-    all_library_files: list[LibraryFile],
 ) -> DeleteResult:
     """从磁盘删除条目的**单个文件**（多版本洗版 / 删某一集重下的出口）。
 
@@ -2839,20 +3072,20 @@ async def delete_single_file(
       的原则（调用方须在确认界面明确告知这一升级）；
     - missing 行没有磁盘实体，直接清台账；
     - 磁盘删除失败保留台账行（与整条目删除同规则，不制造幽灵账）。
+
+    磁盘回收同样是两段式的，见 ``delete_item_files`` 与 ``_TrashStaging``。
     """
     assert row.media_item_id is not None
     if len(item_rows) == 1:
-        return await delete_item_files(
-            session, library, row.media_item_id, item_rows, all_library_files
-        )
+        return await delete_item_files(session, library, row.media_item_id, item_rows)
 
     result = DeleteResult()
+    assert library.id is not None
     if row.state == FileState.MISSING:
         await session.delete(row)
         result.rows_deleted = 1
         await session.commit()
-        if library.id is not None:
-            await LibraryRepository(session).refresh_stats([library.id])
+        await LibraryRepository(session).refresh_stats([library.id])
         return result
 
     path = Path(row.file_path)
@@ -2862,27 +3095,26 @@ async def delete_single_file(
         return result
 
     # 原盘目录形态整树删除前查台账：监听导入按站点原始目录结构落盘，
-    # 新版本文件可能就在旧原盘目录里面——rmtree 会把它一起炸掉
+    # 新版本文件可能就在旧原盘目录里面——整目录处理会把它一起带走
     if path.is_dir():
-        prefix = str(path).rstrip("/") + "/"
-        if any(
-            other.id != row.id and other.file_path.startswith(prefix) for other in all_library_files
-        ):
+        assert row.id is not None
+        if await _dir_holds_other_rows(session, library.id, path, row.id):
             result.errors.append(
                 f"「{path}」目录内还有其他在案文件（可能是新入库的版本），已跳过整目录删除"
             )
             return result
 
-    ok = await asyncio.to_thread(_remove_file_with_sidecars, path, result)
+    staging = _TrashStaging(roots)
+    ok = await asyncio.to_thread(_discard_file_with_sidecars, path, staging, result)
     if ok:
         result.rows_deleted = 1
         result.freed_bytes = row.size_bytes
+        result.pending_purge = staging.dirs
         await session.delete(row)
         await session.commit()
-        if library.id is not None:
-            await LibraryRepository(session).refresh_stats([library.id])
+        await LibraryRepository(session).refresh_stats([library.id])
         logger.info(
-            "已从磁盘删除条目 #%s 的单个文件（库「%s」，释放约 %.1f GB）：%s",
+            "已从库中移除条目 #%s 的单个文件（库「%s」，释放约 %.1f GB）：%s",
             row.media_item_id,
             library.name,
             result.freed_bytes / 1024**3,
@@ -2891,58 +3123,140 @@ async def delete_single_file(
     return result
 
 
+def _like_prefix(prefix: str) -> str:
+    """LIKE 前缀里的通配符按字面转义——路径里出现 % 和 _ 一点也不罕见。"""
+    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _dir_holds_other_item(
+    session: AsyncSession, library_id: int, directory: Path, media_item_id: int
+) -> bool:
+    """目录之下（或目录本身）是否住着**别的条目**的台账行——住着就不能整删。
+
+    以前的写法是把整库台账 ``list_by_library`` 读进内存再遍历，删一部小片
+    也要为几万行的库付一次全表 hydrate，耗时随库存规模增长；这里换成一条
+    带 LIMIT 1 的存在性查询，成本与库存脱钩。
+
+    未识别行（``media_item_id`` 为空）同样算"别人的"，绝不能被卷走——SQL
+    的 ``!=`` 碰上 NULL 返回 NULL 会把这些行漏掉，所以显式并上 IS NULL。
+    """
+    prefix = _like_prefix(str(directory).rstrip("/") + "/")
+    found = (
+        await session.execute(
+            select(LibraryFile.id)
+            .where(
+                LibraryFile.library_id == library_id,
+                or_(
+                    LibraryFile.media_item_id.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.media_item_id != media_item_id,
+                ),
+                or_(
+                    LibraryFile.file_path == str(directory),
+                    LibraryFile.file_path.like(prefix + "%", escape="\\"),  # type: ignore[union-attr]
+                ),
+            )
+            .limit(1)
+        )
+    ).first()
+    return found is not None
+
+
+async def _dir_holds_other_rows(
+    session: AsyncSession, library_id: int, directory: Path, row_id: int
+) -> bool:
+    """目录之下是否还有除本行以外的台账行（原盘目录整删的爆炸半径保护）。"""
+    prefix = _like_prefix(str(directory).rstrip("/") + "/")
+    found = (
+        await session.execute(
+            select(LibraryFile.id)
+            .where(
+                LibraryFile.library_id == library_id,
+                LibraryFile.id != row_id,
+                LibraryFile.file_path.like(prefix + "%", escape="\\"),  # type: ignore[union-attr]
+            )
+            .limit(1)
+        )
+    ).first()
+    return found is not None
+
+
 def _safe_inside_roots(path: Path, roots: list[Path]) -> bool:
     """路径必须严格位于某个库根之内（不等于根本身）——删除的硬边界。"""
     return any(root in path.parents for root in roots)
 
 
-def _remove_tree(directory: Path, result: DeleteResult) -> bool:
-    """整删条目目录（同步，放线程池）。目录已不存在视为成功（幂等）。"""
-    if not directory.exists():
-        result.removed_paths.append(str(directory))
-        return True
-    try:
-        shutil.rmtree(directory)
-    except OSError as exc:
-        result.errors.append(f"删除目录失败：{directory}（{exc}）")
-        return False
-    result.removed_paths.append(str(directory))
-    return True
+def _discard_one(path: Path, staging: _TrashStaging) -> str | None:
+    """移开（或原地删除）单个路径；成功返回 None，失败返回可读的错误原因。
 
-
-def _remove_file_with_sidecars(path: Path, result: DeleteResult) -> bool:
-    """删单个视频文件及其同名附属文件（NFO/字幕/图片）。
-
-    主文件删除失败返回 False（台账保留）；附属文件失败只记错误不影响结论。
-    原盘目录（path 是目录）整目录删除。
+    先试暂存区 rename（常数时间），移不动才原地删。路径已不存在视为成功
+    （幂等）——删除是"确保它不在了"，不是"确保是我删的"。
     """
+    if staging.stage(path):
+        return None
     try:
         if path.is_dir():
             shutil.rmtree(path)
         elif path.exists():
             os.remove(path)
     except OSError as exc:
-        result.errors.append(f"删除文件失败：{path}（{exc}）")
+        return str(exc)
+    return None
+
+
+def _discard_tree(directory: Path, staging: _TrashStaging, result: DeleteResult) -> bool:
+    """整删条目目录（同步，放线程池）。"""
+    error = _discard_one(directory, staging)
+    if error is not None:
+        result.errors.append(f"删除目录失败：{directory}（{error}）")
+        return False
+    result.removed_paths.append(str(directory))
+    return True
+
+
+def _is_delete_sidecar(entry_name: str, stem: str) -> bool:
+    """``entry_name`` 是否是主文件名 ``stem``（小写）的同名附属文件。
+
+    口径与 ``library.sidecar`` 的整理/转移链路略有出入（这里还认
+    ``主文件名-`` 开头的任意图片，如 ``foo-fanart.jpg``），删除宁可多清一点
+    刮削残渣，改口径是另一件事，不在本次改动范围内。
+    """
+    entry = PurePath(entry_name)
+    if entry.suffix.lower() not in _SIDECAR_DELETE_EXTS:
+        return False
+    name = entry.stem.lower()
+    return name == stem or name.startswith(stem + ".") or name.startswith(stem + "-")
+
+
+def _discard_file_with_sidecars(path: Path, staging: _TrashStaging, result: DeleteResult) -> bool:
+    """删单个视频文件及其同名附属文件（NFO/字幕/图片）。
+
+    主文件删除失败返回 False（台账保留）；附属文件失败只记错误不影响结论。
+    原盘目录（path 是目录）整目录删除。
+    """
+    error = _discard_one(path, staging)
+    if error is not None:
+        result.errors.append(f"删除文件失败：{path}（{error}）")
         return False
     result.removed_paths.append(str(path))
 
-    if path.suffix:
-        stem = path.stem.lower()
-        try:
-            entries = list(path.parent.iterdir())
-        except OSError:
-            return True
-        for entry in entries:
-            if not entry.is_file():
-                continue
-            name = entry.stem.lower()
-            is_sidecar = entry.suffix.lower() in _SUBTITLE_EXTS | {".nfo"} | set(_ART_EXTS)
-            if is_sidecar and (
-                name == stem or name.startswith(stem + ".") or name.startswith(stem + "-")
-            ):
-                try:
-                    os.remove(entry)
-                    result.removed_paths.append(str(entry))
-                except OSError as exc:
-                    result.errors.append(f"删除附属文件失败：{entry}（{exc}）")
+    if not path.suffix:
+        return True
+    stem = path.stem.lower()
+    try:
+        # scandir 用 getdents 已带回的类型位判断，省掉逐条目一次 stat：
+        # 扁平大目录（上千个文件）里这就是上千次系统调用的差别
+        with os.scandir(path.parent) as entries:
+            sidecars = [
+                Path(entry.path)
+                for entry in entries
+                if entry.is_file() and _is_delete_sidecar(entry.name, stem)
+            ]
+    except OSError:
+        return True
+    for sidecar in sidecars:
+        error = _discard_one(sidecar, staging)
+        if error is not None:
+            result.errors.append(f"删除附属文件失败：{sidecar}（{error}）")
+        else:
+            result.removed_paths.append(str(sidecar))
     return True

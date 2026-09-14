@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>媒体库首页透视</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700&family=Noto+Sans+SC:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* ──────────────────────────────────────────────────────────────
+   单主题（暗）——与 library-filtering-demo.html 同一套样稿外壳：
+     --quill  评审者在说话（批注轨、当前页签、章节记号）
+     --chrome 产品自己的银灰（框内界面，取自 movieclaw web 现有皮肤）
+   ────────────────────────────────────────────────────────────── */
+:root{
+  --ink:#0b0c11;
+  --surface:#111320;
+  --line:rgba(238,242,251,.09);
+  --line-2:rgba(238,242,251,.16);
+  --text:#eef2fb;
+  --muted:rgba(238,242,251,.60);
+  --faint:rgba(238,242,251,.34);
+  --quill:#d9a441;
+  --chrome:#cdd6e6;
+  --chrome-soft:rgba(205,214,230,.13);
+  --ok:#4ade80; --info:#7fb0ff; --warn:#f5c451; --danger:#ff6b6b;
+  --f-display:"Noto Serif SC",Songti SC,serif;
+  --f-sans:"Noto Sans SC",-apple-system,"PingFang SC",sans-serif;
+  --f-mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+  --f-ui:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--f-sans);font-size:15px;line-height:1.65;-webkit-font-smoothing:antialiased}
+:focus-visible{outline:2px solid var(--quill);outline-offset:2px;border-radius:4px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.page{max-width:1200px;margin:0 auto;padding:0 24px 80px}
+
+.mast{padding:56px 0 30px;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:var(--f-mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--quill);margin:0 0 14px}
+.mast h1{font-family:var(--f-display);font-weight:700;font-size:clamp(30px,4.6vw,50px);line-height:1.14;letter-spacing:-.01em;margin:0 0 16px;text-wrap:balance}
+.lede{max-width:62ch;margin:0;color:var(--muted);font-size:16px}
+.lede b{color:var(--text);font-weight:600}
+.facts{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+.fact{display:inline-flex;align-items:baseline;gap:7px;border:1px solid var(--line-2);border-radius:999px;padding:4px 13px;font-size:12.5px;color:var(--muted)}
+.fact b{font-family:var(--f-mono);font-weight:600;color:var(--text);font-size:12px;font-variant-numeric:tabular-nums}
+
+.thesis{padding:40px 0 44px;border-bottom:1px solid var(--line)}
+.sec-h{display:flex;align-items:baseline;gap:14px;margin:0 0 6px}
+.sec-h h2{font-family:var(--f-display);font-weight:600;font-size:21px;margin:0;letter-spacing:-.01em}
+.sec-h .mark{font-family:var(--f-mono);font-size:11px;color:var(--quill);letter-spacing:.1em;padding-top:4px}
+.sec-p{max-width:64ch;color:var(--muted);font-size:14px;margin:0 0 26px}
+.sec-p b{color:var(--text);font-weight:600}
+.tenses{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.tense{border-top:2px solid var(--line-2);padding:14px 2px 0}
+.tense.now{border-top-color:var(--chrome)}
+.tense h3{font-size:15px;margin:0 0 3px;font-weight:600}
+.tense .when{font-family:var(--f-mono);font-size:11px;color:var(--faint);letter-spacing:.05em;margin:0 0 8px}
+.tense p{margin:0;font-size:13px;color:var(--muted);line-height:1.6}
+.tense p b{color:var(--text);font-weight:600}
+.dsl{margin-top:22px;width:100%;border:1px solid var(--line-2);border-radius:12px;background:var(--surface);padding:16px 18px;text-align:center}
+.dsl code{font-family:var(--f-mono);font-size:13.5px;color:var(--chrome);display:block;margin-bottom:6px;overflow-x:auto;white-space:nowrap}
+.dsl span{font-size:12.5px;color:var(--faint)}
+.dsl span b{color:var(--muted);font-weight:600}
+
+.tabs{display:flex;gap:2px;overflow-x:auto;margin:38px 0 0;border-bottom:1px solid var(--line);scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:none;appearance:none;background:none;border:0;border-bottom:2px solid transparent;color:var(--faint);font-family:var(--f-sans);font-size:13.5px;padding:11px 15px;cursor:pointer;white-space:nowrap;margin-bottom:-1px}
+.tab:hover{color:var(--muted)}
+.tab .no{font-family:var(--f-mono);font-size:11px;margin-right:7px;color:var(--faint)}
+.tab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--quill);font-weight:600}
+.tab[aria-selected="true"] .no{color:var(--quill)}
+
+.stage-wrap{display:grid;grid-template-columns:minmax(0,1fr) 268px;gap:26px;align-items:start;padding-top:22px}
+.panel[hidden]{display:none}
+.rail{position:sticky;top:22px;border-left:2px solid var(--quill);padding:2px 0 2px 16px}
+.rail h4{font-family:var(--f-display);font-size:15px;margin:0 0 12px;font-weight:600;text-wrap:balance}
+.rail ul{margin:0;padding:0}
+.rail li{list-style:none;margin:0 0 13px;font-size:13px;color:var(--muted);line-height:1.62}
+.rail b{color:var(--text);font-weight:600}
+.rail code{font-family:var(--f-mono);font-size:11.5px;color:var(--info);background:rgba(127,176,255,.08);border-radius:4px;padding:1px 5px}
+.rail .try{margin-top:16px;border:1px dashed var(--line-2);border-radius:9px;padding:10px 12px;font-size:12.5px;color:var(--faint);line-height:1.6}
+.rail .try b{color:var(--quill);font-weight:600;display:block;margin-bottom:3px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;font-family:var(--f-mono)}
+
+/* ══════════════ .ui = 产品界面本身 ══════════════ */
+.ui{font-family:var(--f-ui);font-size:14px;line-height:1.5}
+[hidden]{display:none!important}
+.ui .frame{position:relative;display:grid;grid-template-columns:154px 1fr;background:#0a0b10;border:1px solid var(--line-2);border-radius:16px;overflow:hidden;min-height:640px}
+.ui .side{border-right:1px solid var(--line);padding:15px 9px;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.01))}
+.ui .brand{font-weight:700;letter-spacing:.02em;padding:3px 9px 15px;font-size:13px}
+.ui .side a{display:block;padding:6px 9px;border-radius:8px;color:var(--muted);font-size:12.5px;text-decoration:none}
+.ui .side a.on{background:rgba(255,255,255,.1);color:var(--text)}
+.ui .subnav{margin:2px 0 0 9px;border-left:1px solid var(--line);padding-left:6px}
+.ui .subnav a{padding:4px 8px;font-size:11.5px}
+.ui .main{padding:20px 20px 26px;min-width:0}
+.ui .head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:6px}
+.ui h2{font-size:21px;letter-spacing:-.02em;margin:0 0 2px;font-weight:600;font-family:var(--f-ui)}
+.ui .sub{color:var(--muted);font-size:12px;margin:0}
+.ui .btn{appearance:none;display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line-2);background:rgba(255,255,255,.04);color:var(--text);border-radius:999px;padding:5px 12px;font:inherit;font-size:12.5px;white-space:nowrap;cursor:pointer}
+.ui .btn:hover{background:rgba(255,255,255,.09)}
+.ui .btn.primary{background:var(--chrome);color:#0a0b10;border-color:var(--chrome);font-weight:600}
+.ui .btn.sm{font-size:11.5px;padding:3px 10px}
+.ui .btn.ghost{border-color:transparent;color:var(--muted)}
+.ui .btn.ghost:hover{color:var(--text)}
+.ui .btn.danger{color:var(--danger);border-color:transparent}
+.ui .btn svg{width:14px;height:14px}
+.ui .spacer{flex:1}
+.ui .ikon{appearance:none;background:none;border:0;padding:4px;border-radius:7px;color:var(--faint);cursor:pointer;display:inline-flex;line-height:0;font:inherit;font-size:13px}
+.ui .ikon:hover{background:rgba(255,255,255,.09);color:var(--text)}
+.ui .ikon svg{width:15px;height:15px;display:block}
+
+/* ────────── 首页的行 ──────────
+   行是首页的原子：一个来源 + 一个排序 + 一个名字。首页上只有名字和「查看全部」，
+   没有任何排序细节、没有行菜单——首页是看的，调整全部收进「自定义首页」。 */
+.ui .hrow{position:relative;margin-top:20px}
+.ui .hh{display:flex;align-items:center;gap:8px;padding:0 0 9px;min-height:26px}
+.ui .hh h3{font-size:14.5px;font-weight:600;margin:0;font-family:var(--f-ui);white-space:nowrap}
+.ui .hh .more{margin-left:auto;font-size:11.5px;color:var(--faint);white-space:nowrap;cursor:pointer}
+.ui .hh .more:hover{color:var(--text)}
+.ui .strip{display:flex;gap:10px;overflow-x:auto;scrollbar-width:none;padding:2px 0 4px}
+.ui .strip::-webkit-scrollbar{display:none}
+.ui .pc{flex:none;width:94px;cursor:pointer}
+.ui .pc .p{position:relative;aspect-ratio:2/3;border-radius:8px;overflow:hidden;border:1px solid var(--line);display:block}
+.ui .pc .p::after{content:"";position:absolute;inset:0;background:linear-gradient(to top,rgba(6,7,11,.9) 4%,rgba(6,7,11,.18) 44%,transparent 70%)}
+.ui .pc .pt{position:absolute;left:7px;right:7px;bottom:6px;z-index:2;font-size:11px;font-weight:700;line-height:1.25;text-shadow:0 1px 6px rgba(0,0,0,.8)}
+.ui .pc .m{font-size:10px;color:var(--faint);margin-top:4px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ui .pc .heart{position:absolute;top:5px;right:6px;z-index:2;font-size:10px;color:#ff7d99;text-shadow:0 1px 4px rgba(0,0,0,.9)}
+.ui .pc .rt{position:absolute;top:5px;left:6px;z-index:2;font-family:var(--f-mono);font-size:9.5px;font-weight:600;padding:0 5px;border-radius:4px;background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.18);color:var(--warn)}
+.ui .prog{position:absolute;left:0;right:0;bottom:0;z-index:3;height:3px;background:rgba(255,255,255,.22)}
+.ui .prog i{display:block;height:100%;background:var(--danger)}
+.ui .lc{flex:none;width:158px;cursor:pointer}
+.ui .lc .p{position:relative;aspect-ratio:16/9;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+.ui .lc .p::after{content:"";position:absolute;inset:0;background:linear-gradient(to top,rgba(6,7,11,.55),transparent 55%)}
+.ui .lc .ep{position:absolute;top:5px;left:6px;z-index:2;font-family:var(--f-mono);font-size:9.5px;font-weight:600;padding:0 5px;border-radius:4px;background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.18)}
+.ui .lc .left{position:absolute;top:5px;right:6px;z-index:2;font-size:9.5px;padding:0 6px;border-radius:999px;background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.18);color:rgba(238,242,251,.85)}
+.ui .lc .play{position:absolute;left:50%;top:50%;z-index:2;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;background:rgba(255,255,255,.9);color:#0a0b10;display:grid;place-items:center;font-size:10px}
+.ui .lc .t{font-size:11.5px;font-weight:600;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ui .lc .m{font-size:10px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ui .libc{flex:none;width:188px;cursor:pointer}
+.ui .libc .shelf{position:relative;height:104px;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:linear-gradient(180deg,#1a1e2c,#0d0f16);display:flex;align-items:flex-end;justify-content:center;gap:6px;padding:0 0 10px}
+.ui .libc .shelf i{width:40px;height:60px;border-radius:4px;box-shadow:0 6px 12px rgba(0,0,0,.6);display:block}
+.ui .libc .shelf i:nth-child(2){height:66px}
+.ui .libc .shelf::after{content:"";position:absolute;left:0;right:0;bottom:0;height:10px;background:linear-gradient(to top,rgba(255,255,255,.06),transparent)}
+.ui .libc .nm{font-size:12.5px;font-weight:600;margin-top:6px}
+.ui .libc .st{font-size:10.5px;color:var(--faint)}
+.ui .homeempty{border:1px dashed var(--line-2);border-radius:13px;padding:26px;margin-top:40px;text-align:center;color:var(--muted);font-size:12.5px}
+.ui .homeempty b{display:block;color:var(--text);font-size:14px;margin-bottom:4px}
+
+/* ────────── 自定义首页：独立页面 ──────────
+   不是抽屉、不是弹层。桌面与移动端同一个页面（/library/customize）。
+   纯列表，不放海报：这里是配置，效果回首页看。 */
+.ui .cpage{max-width:640px}
+.ui .back{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--faint);text-decoration:none;margin-bottom:6px}
+.ui .back:hover{color:var(--text)}
+.ui .clist{margin-top:14px;display:flex;flex-direction:column;gap:6px}
+.ui .ritem{border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.02)}
+.ui .ritem.open{border-color:var(--line-2);background:rgba(255,255,255,.035)}
+.ui .rhead{display:flex;align-items:center;gap:9px;padding:9px 10px 9px 8px;cursor:pointer}
+.ui .ritem.nox .rhead{cursor:default}
+.ui .ritem.off .nm,.ui .ritem.off .mt,.ui .ritem.off .ico{opacity:.38}
+.ui .ritem .grip{color:var(--faint);cursor:grab;font-size:13px;letter-spacing:-2px;flex:none;width:12px}
+.ui .ritem .ico{width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font-size:11px;flex:none;background:rgba(255,255,255,.06);color:var(--muted)}
+.ui .ritem .ico.sys{background:var(--chrome-soft);color:var(--chrome)}
+.ui .ritem .ico.col{background:rgba(127,176,255,.14);color:var(--info)}
+.ui .ritem .tx{min-width:0;flex:1}
+.ui .ritem .nm{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ui .ritem .mt{font-size:10.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ui .ritem .acts{display:flex;gap:1px;flex:none;opacity:.6}
+.ui .ritem:hover .acts{opacity:1}
+.ui .ritem .acts .ikon{padding:3px}
+.ui .ritem .acts .ikon svg{width:14px;height:14px}
+.ui .ritem .acts .ikon.dis{opacity:.25;pointer-events:none}
+.ui .updown{display:contents}
+.ui .ritem .car{color:var(--faint);font-size:10px;transition:transform .15s;flex:none;width:12px;text-align:center}
+.ui .ritem.open .car{transform:rotate(180deg)}
+/* 就地展开的编辑区：排序单选 + 一个开关 + 名字，没有别的 */
+.ui .redit{border-top:1px solid var(--line);padding:11px 12px 12px 45px}
+.ui .redit .fl{font-size:11px;color:var(--faint);margin:0 0 6px}
+.ui .radios{display:grid;grid-template-columns:1fr 1fr;gap:2px 10px;margin-bottom:12px}
+.ui .radio{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;font-size:12.5px}
+.ui .radio:hover{background:rgba(255,255,255,.045)}
+.ui .radio .r{width:14px;height:14px;border-radius:50%;border:1px solid var(--line-2);flex:none;display:grid;place-items:center}
+.ui .radio.on .r{border-color:var(--info)}
+.ui .radio.on .r::after{content:"";width:7px;height:7px;border-radius:50%;background:var(--info)}
+.ui .radio .d{font-size:10.5px;color:var(--faint);margin-left:auto;white-space:nowrap}
+.ui .radio.on{color:var(--text)}
+.ui .swrow{display:flex;align-items:center;gap:10px;font-size:12.5px;margin-bottom:12px}
+.ui .swrow .d{font-size:10.5px;color:var(--faint);margin-left:auto}
+.ui .sw{appearance:none;flex:none;width:30px;height:18px;border-radius:999px;border:0;background:rgba(255,255,255,.16);position:relative;cursor:pointer;padding:0}
+.ui .sw::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .15s}
+.ui .sw.on{background:var(--info)}
+.ui .sw.on::after{transform:translateX(12px)}
+.ui .inp{width:100%;background:rgba(255,255,255,.05);border:1px solid var(--line-2);border-radius:8px;padding:7px 10px;color:var(--text);font:inherit;font-size:12.5px}
+.ui .inp::placeholder{color:var(--faint)}
+.ui .hint{font-size:11px;color:var(--faint);margin:6px 0 0;line-height:1.55}
+.ui .hint b{color:var(--muted);font-weight:500}
+.ui .redit .rft{display:flex;align-items:center;gap:8px;margin-top:10px}
+.ui .btn.danger{color:var(--danger);border-color:transparent}
+.ui .adder{margin-top:10px;border:1px dashed var(--line-2);border-radius:12px;padding:11px 12px 6px}
+.ui .adder .lb{font-size:11px;color:var(--faint);margin-bottom:6px}
+.ui .pills{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.ui .pill{appearance:none;border:1px solid var(--line-2);background:none;border-radius:999px;padding:3px 10px;font:inherit;font-size:11.5px;color:var(--muted);cursor:pointer;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
+.ui .pill:hover{background:rgba(255,255,255,.07);color:var(--text)}
+.ui .pill.dis{opacity:.35;pointer-events:none}
+.ui .pill .n{color:var(--faint);font-size:10.5px;font-family:var(--f-mono)}
+.ui .stk{position:relative;width:10px;height:12px;flex:none}
+.ui .stk i{position:absolute;inset:0;border-radius:2px;border:1px solid currentColor}
+.ui .stk i:nth-child(1){transform:translateX(3px) scaleY(.84);opacity:.3}
+.ui .stk i:nth-child(2){opacity:.7}
+.ui .cfoot{margin-top:14px;font-size:11px;color:var(--faint)}
+/* 放大看一个展开的行 */
+.ui .zoomwrap{display:grid;place-items:center;min-height:640px;border:1px solid var(--line-2);border-radius:16px;background:#0a0b10 radial-gradient(900px 320px at 50% 0%,rgba(127,176,255,.08),transparent);padding:26px}
+.ui .zoomwrap .clist{width:min(100%,520px);margin:0}
+
+/* ────────── 移动端 ────────── */
+.ui .phones{display:flex;gap:28px;justify-content:center;flex-wrap:wrap;padding:22px 0}
+.ui .phone{position:relative;width:296px;height:720px;border:1px solid var(--line-2);border-radius:34px;background:#0a0b10;padding:16px 12px 0;overflow:hidden;flex:none}
+.ui .phone .notch{width:86px;height:6px;border-radius:999px;background:rgba(255,255,255,.14);margin:0 auto 12px}
+.ui .phone .cap{position:absolute;left:0;right:0;bottom:-30px;text-align:center;font-size:11.5px;color:var(--faint)}
+.ui .phone h2{font-size:18px}
+.ui .phone .hrow{margin-top:14px}
+.ui .phone .hh h3{font-size:13.5px}
+.ui .phone .pc{width:82px}
+.ui .phone .lc{width:150px}
+.ui .phone .libc{width:160px}
+.ui .phone .libc .shelf{height:90px}
+.ui .phone .fab{position:absolute;right:14px;top:16px}
+.ui .phone .cpage{max-width:none}
+.ui .phone .clist{gap:5px;margin-top:10px}
+.ui .phone .ritem .grip{display:none}
+.ui .phone .ritem .car{display:none}
+.ui .phone .rhead{padding:7px 8px 7px 10px;gap:8px}
+.ui .phone .ritem .ico{width:20px;height:20px;font-size:10px}
+.ui .phone .ritem .nm{font-size:12.5px}
+.ui .phone .ritem .mt{font-size:10px}
+.ui .phone .ritem .acts{opacity:1;gap:4px;align-items:center}
+/* 手机上上下箭头叠成一列：宽度只占一个按钮，副标题不再被挤断 */
+.ui .phone .updown{display:flex;flex-direction:column;gap:0}
+.ui .phone .updown .ikon{padding:1px 3px}
+.ui .phone .updown .ikon svg{width:12px;height:12px}
+.ui .phone .redit{padding:9px 10px 11px}
+.ui .phone .radios{grid-template-columns:1fr;gap:0;margin-bottom:8px}
+.ui .phone .radio{padding:5px 6px;font-size:12px}
+.ui .phone .radio .d{display:none}
+.ui .phone .swrow{font-size:12px;margin-bottom:9px}
+.ui .phone .swrow .d{display:none}
+.ui .phone .adder{display:none}
+.ui .phone .cscroll{height:640px;overflow:hidden;mask-image:linear-gradient(to bottom,#000 90%,transparent)}
+
+/* ────────── 数据 ────────── */
+.ui .datawrap{border:1px solid var(--line-2);border-radius:16px;background:#0a0b10;padding:22px 24px;display:grid;grid-template-columns:1fr 1fr;gap:22px}
+.ui .datawrap h4{margin:0 0 10px;font-size:13.5px;font-weight:600}
+.ui pre{margin:0;font-family:var(--f-mono);font-size:11.5px;line-height:1.55;color:var(--chrome);background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:14px 16px;overflow-x:auto}
+.ui pre .c{color:var(--faint)}
+.ui pre .k{color:var(--info)}
+.ui table{width:100%;border-collapse:collapse;font-size:12px}
+.ui th,.ui td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.ui th{font-weight:500;color:var(--faint);font-size:11px}
+.ui td b{font-weight:600}
+.ui td .y{color:var(--ok)}
+.ui td .n{color:var(--faint)}
+.ui .rules{margin:12px 0 0;padding:0 0 0 18px;font-size:12.5px;color:var(--muted);line-height:1.65}
+.ui .rules li{margin-bottom:6px}
+.ui .rules b{color:var(--text);font-weight:600}
+
+@media (max-width:1080px){.stage-wrap{grid-template-columns:1fr}.rail{position:static;border-left:0;border-top:2px solid var(--quill);padding:16px 0 0}.tenses{grid-template-columns:1fr}.ui .datawrap{grid-template-columns:1fr}}
+@media (max-width:760px){.page{padding:0 16px 60px}.mast{padding:36px 0 24px}.ui .frame{grid-template-columns:1fr}.ui .side{display:none}.ui .drawer{width:100%}.ui .phone{width:100%;max-width:296px}}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="mast">
+    <p class="eyebrow">movieclaw · 产品设计 · 2026-09</p>
+    <h1>媒体库首页：像透视一样自定义</h1>
+    <p class="lede">首页现在是一份写死的清单：接下来继续、我的收藏、我的媒体库、每个库一行「最近添加」。它对第一天的用户是对的，对第一百天的用户就开始碍事——六个库六行「最近添加」，而他想看的是<b>「评分最高、我还没看的动漫」</b>。OmniFocus 的透视解决的正是这件事：<b>视图由用户定义，侧栏由用户排列</b>。首页也该如此。</p>
+    <div class="facts">
+      <span class="fact">首页原子 <b>行</b> = 来源 × 排序 × 名字</span>
+      <span class="fact">新增数据表 <b>0</b> 张</span>
+      <span class="fact">新条件语言 <b>0</b> 套</span>
+      <span class="fact">样稿里的排序与命名推荐 <b>真跑</b></span>
+    </div>
+  </header>
+
+  <section class="thesis">
+    <div class="sec-h"><span class="mark">论点</span><h2>透视 = 规则 + 呈现 + 位置</h2></div>
+    <p class="sec-p">OmniFocus 一个透视由三部分组成：<b>规则</b>决定筛哪些任务，<b>呈现</b>决定怎么排、叫什么，<b>位置</b>决定它在侧栏第几个、要不要显示。搬到首页上，三部分各有归宿——其中两部分项目里已经有了，只缺最后一部分。</p>
+    <div class="tenses">
+      <div class="tense"><h3>来源</h3><p class="when">规则 · 已有</p>
+        <p>一行滚的是哪一批作品：<b>一个库</b>，或<b>一个合集</b>。想要「8 分以上的日漫」，先筛、存成合集、再上首页。首页不新造第二套条件语言。</p></div>
+      <div class="tense"><h3>呈现</h3><p class="when">排序 · 名字</p>
+        <p>同一个库，按<b>入库 / 上映 / 最近观看 / 评分 / 随机</b>排，就是五行不同的东西。名字由用户定，系统按排序给推荐：「最近上映的电影」「评分最高的动漫」。</p></div>
+      <div class="tense now"><h3>位置</h3><p class="when">顺序 · 显隐 · 本期要做的</p>
+        <p>每个成员一份<b>有序的行清单</b>。能藏、能挪、能加、能恢复默认。数据形状照抄侧栏导航的 <b>NavUiPrefs</b>：存的是提示，不是契约。</p></div>
+    </div>
+    <div class="dsl">
+      <code>{ id:"row:8f2c", library_id:3, sort:"rating", unwatched:true, name:"评分最高的动漫" }</code>
+      <span>一行就是这么一条记录 · 内置行只有 <b>id</b> 和排序 · 合集行把 <b>library_id</b> 换成 <b>collection_id</b> · 名字留空即跟随系统推荐</span>
+    </div>
+  </section>
+
+  <div class="tabs" role="tablist" aria-label="样稿屏幕">
+    <button class="tab" role="tab" aria-selected="true" data-p="p1"><span class="no">01</span>新首页</button>
+    <button class="tab" role="tab" aria-selected="false" data-p="p2"><span class="no">02</span>自定义首页（页面）</button>
+    <button class="tab" role="tab" aria-selected="false" data-p="p3"><span class="no">03</span>编辑一行（就地展开）</button>
+    <button class="tab" role="tab" aria-selected="false" data-p="p4"><span class="no">04</span>移动端</button>
+    <button class="tab" role="tab" aria-selected="false" data-p="p5"><span class="no">05</span>数据与合并规则</button>
+  </div>
+
+  <div class="stage-wrap">
+    <div class="ui">
+
+      <!-- ① 新首页 -->
+      <div class="panel" id="p1">
+        <div class="frame">
+          <div class="side">
+            <div class="brand">movieclaw</div>
+            <a href="#p1">新会话</a><a href="#p1" class="on">媒体库</a>
+            <div class="subnav"><a href="#p1">电影库</a><a href="#p1">剧集库</a><a href="#p1">动漫库</a><a href="#p1">全部收藏</a></div>
+            <a href="#p1">我的订阅</a><a href="#p1">活动</a><a href="#p1">设置</a>
+          </div>
+          <div class="main">
+            <div class="head">
+              <div><h2>媒体库</h2><p class="sub">3 个媒体库 · 1,284 部电影 · 212 部剧集 · 共占用 9.6 TB</p></div>
+              <div style="display:flex;gap:6px;align-items:center;margin-top:2px">
+                <button class="btn sm ghost" data-goto="p2" title="自定义首页">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h12"/><circle cx="6" cy="4" r="1.6" fill="#0a0b10"/><circle cx="11" cy="8" r="1.6" fill="#0a0b10"/><circle cx="5" cy="12" r="1.6" fill="#0a0b10"/></svg>自定义首页</button>
+                <button class="btn sm">⚙ 管理媒体库</button>
+              </div>
+            </div>
+            <div id="home1"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ② 自定义首页（独立页面） -->
+      <div class="panel" id="p2" hidden>
+        <div class="frame">
+          <div class="side">
+            <div class="brand">movieclaw</div>
+            <a href="#p2">新会话</a><a href="#p2" class="on">媒体库</a>
+            <div class="subnav"><a href="#p2">电影库</a><a href="#p2">剧集库</a><a href="#p2">动漫库</a><a href="#p2">全部收藏</a></div>
+            <a href="#p2">我的订阅</a><a href="#p2">活动</a><a href="#p2">设置</a>
+          </div>
+          <div class="main">
+            <div class="cpage">
+              <a class="back" href="#p1" data-goto="p1">‹ 媒体库</a>
+              <div class="head">
+                <div><h2>自定义首页</h2><p class="sub" id="dcount"></p></div>
+                <button class="btn sm ghost" data-reset style="margin-top:2px">恢复默认</button>
+              </div>
+              <div id="clist1"></div>
+              <p class="cfoot">改动即时生效，只影响你自己的首页。点一行展开它的排序和名字，效果回首页看。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ③ 编辑一行：放大看一个展开的行 -->
+      <div class="panel" id="p3" hidden>
+        <div class="zoomwrap"><div class="clist" id="zoom"></div></div>
+      </div>
+
+      <!-- ④ 移动端 -->
+      <div class="panel" id="p4" hidden>
+        <div class="phones">
+          <div class="phone">
+            <div class="notch"></div>
+            <div class="head" style="margin-bottom:0"><div><h2>媒体库</h2><p class="sub">3 个库 · 1,496 部</p></div>
+              <button class="ikon fab" title="自定义首页"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h12"/><circle cx="6" cy="4" r="1.6" fill="#0a0b10"/><circle cx="11" cy="8" r="1.6" fill="#0a0b10"/><circle cx="5" cy="12" r="1.6" fill="#0a0b10"/></svg></button></div>
+            <div id="home3"></div>
+            <div class="cap">首页：只看，一个入口</div>
+          </div>
+          <div class="phone">
+            <div class="notch"></div>
+            <div class="cpage cscroll">
+              <a class="back" href="#p4">‹ 媒体库</a>
+              <div class="head" style="margin-bottom:0"><div><h2>自定义首页</h2></div><button class="btn sm ghost">恢复默认</button></div>
+              <div id="clist2"></div>
+            </div>
+            <div class="cap">独立页面 /library/customize · 「＋ 添加一行」在列表底部</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ⑤ 数据 -->
+      <div class="panel" id="p5" hidden>
+        <div class="datawrap">
+          <div>
+            <h4>member.ui_prefs → home.rows</h4>
+<pre>{
+  <span class="k">"home"</span>: { <span class="k">"rows"</span>: [
+    { <span class="k">"id"</span>: "up-next" },                       <span class="c">// 内置：排序固定</span>
+    { <span class="k">"id"</span>: "favorites", <span class="k">"sort"</span>: "unwatched_first" },
+    { <span class="k">"id"</span>: "libraries" },
+    { <span class="k">"id"</span>: "lib:1", <span class="k">"sort"</span>: "release_date" },   <span class="c">// 每库一条默认行，改了排序、名字留空</span>
+    { <span class="k">"id"</span>: "row:8f2c", <span class="k">"library_id"</span>: 3,
+      <span class="k">"sort"</span>: "rating", <span class="k">"unwatched"</span>: true,
+      <span class="k">"name"</span>: "评分最高的动漫" },                <span class="c">// 用户自己加的；sort 直接是 WallSort 取值</span>
+    { <span class="k">"id"</span>: "lib:2" },
+    { <span class="k">"id"</span>: "row:a91e", <span class="k">"collection_id"</span>: 7,
+      <span class="k">"sort"</span>: "release_date_asc" },             <span class="c">// 合集行，名字跟合集走，排序与库行同一组</span>
+    { <span class="k">"id"</span>: "lib:3", <span class="k">"hidden"</span>: true }
+  ] }
+}</pre>
+            <ol class="rules">
+              <li><b>存的是提示，不是契约。</b>读取时按「存过的按存的顺序，没存过的内置行与每个库的默认行追加在后」合并。新库、新版本加的内置行，老用户一定看得到。</li>
+              <li><b>认不出的 id 直接忽略。</b>库被删、合集被删或被别人改成私有，那一行静默消失。不需要迁移，不需要清孤儿。</li>
+              <li><b>隐藏保留位置。</b>再打开时它回到原来那个位置，而不是队尾。</li>
+              <li><b>名字留空 = 跟随推荐。</b>推荐由排序与来源实时生成；用户一旦手输，就不再跟着排序变。</li>
+              <li><b>没有 asc 字段。</b>方向合并进排序取值：「最早上映」就是现有的 <code style="font-family:var(--f-mono);font-size:11px;color:var(--info)">release_date_asc</code>，与系列合集用的同一档。</li>
+              <li><b>隐藏的行不发请求。</b>藏掉三个库的「最近添加」，首页少三次请求。</li>
+            </ol>
+          </div>
+          <div>
+            <h4>行类型 × 能力</h4>
+            <table>
+              <tr><th>行</th><th>排序</th><th>名字</th><th>隐藏</th><th>删除</th></tr>
+              <tr><td><b>接下来继续</b></td><td><span class="n">固定：最近播放</span></td><td><span class="n">固定</span></td><td class="y">✓</td><td><span class="n">—</span></td></tr>
+              <tr><td><b>我的媒体库</b></td><td><span class="n">固定：管理页库顺序</span></td><td><span class="n">固定</span></td><td class="y">✓</td><td><span class="n">—</span></td></tr>
+              <tr><td><b>我的收藏</b></td><td class="y">未看优先 / 最近收藏 / 评分最高 / 片名 A–Z</td><td><span class="n">固定</span></td><td class="y">✓</td><td><span class="n">—</span></td></tr>
+              <tr><td><b>库行（默认）</b><br><span class="n">lib:&lt;id&gt;，每库一条</span></td><td class="y">七个预设，见下表</td><td class="y">可改，留空跟推荐</td><td class="y">✓</td><td><span class="n">—</span></td></tr>
+              <tr><td><b>库行（自加）</b><br><span class="n">row:&lt;uuid&gt;，同库可多条</span></td><td class="y">同上</td><td class="y">同上</td><td class="y">✓</td><td class="y">✓</td></tr>
+              <tr><td><b>合集行</b></td><td class="y">与库行同一组预设，默认取合集自己的 sort</td><td><span class="n">跟合集名</span></td><td class="y">✓</td><td class="y">✓</td></tr>
+            </table>
+            <h4 style="margin-top:18px">库行的排序 = 一列预设，每个预设自带推荐名</h4>
+            <table>
+              <tr><th>WallSort</th><th>推荐名</th><th>规则</th></tr>
+              <tr><td>added_at</td><td>最近添加的{库}</td><td>入库时间，新的在前（每库默认行）</td></tr>
+              <tr><td>release_date</td><td>最近上映的{库}</td><td>上映时间，新的在前</td></tr>
+              <tr><td>release_date_asc</td><td>最早上映的{库}</td><td>上映时间，老的在前</td></tr>
+              <tr><td>last_played</td><td>最近观看的{库}</td><td>我最近播放过的</td></tr>
+              <tr><td>rating</td><td>评分最高的{库}</td><td>评分，高的在前</td></tr>
+              <tr><td>random</td><td>随便看看 · {库}</td><td>每天换一批</td></tr>
+              <tr><td>title</td><td>{库} A–Z</td><td>片名</td></tr>
+            </table>
+            <p class="hint" style="margin-top:10px">「只显示我没看过的」开着时推荐名不变，自定义页里这一行的小字多一个「只看没看过的」；首页上什么都不显示。随机的种子按天固定：轮询刷新不换一批，明天再换。</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+    <aside class="rail" id="rail"></aside>
+  </div>
+</div>
+
+<script>
+/* ══════ 批注（随页签切换）══════ */
+const RAIL={
+p1:{h:"首页只有一件事：看",li:[
+ "行的骨架没变：横滚、海报、「查看全部」。变的是<b>每一行都是用户的</b>——「最近上映的电影」是把默认的「最近添加」换了排序，「评分最高的动漫」是他自己加的一行，「宫崎骏」是一个合集。",
+ "首页上<b>没有任何排序细节</b>：没有「按评分」的标签，没有行菜单，没有悬停才出现的东西。名字就是这一行的全部说明——所以名字才值得让用户自己起。",
+ "唯一的配置入口在页头：「自定义首页」。它跳到一个独立页面，不是弹层。",
+ "空行照旧整段隐藏，偏好决定「想不想看」，数据决定「有没有」。全部藏光时不出白页，给一个指回「自定义首页」的空态。"],
+ try:"点右上角「自定义首页」。"},
+p2:{h:"一个独立页面，桌面和手机同一个",li:[
+ "<b>不是抽屉、不是弹层，也不放海报</b>。这里是配置页：一行一条，名字、来源与排序、上下移、眼睛，仅此而已。效果回首页看——「‹ 媒体库」一步就回去了。",
+ "列表每项：把手 · 类型 · 名字 · 小字「来源 · 排序」· 上移/下移 · 眼睛。<b>点一行就地展开</b>它的排序和名字，不再有第二个弹窗。内置的「接下来继续」「我的媒体库」没有可改的，点了不展开。",
+ "隐藏的行<b>留在原位、压暗</b>而不是挪到底部，再打开时回到原来的位置。",
+ "「＋ 添加一行」只问一个问题：<b>从哪来</b>。选一个库得到「最近添加的 X」，选一个合集得到它本身，排序和名字展开再改。已在首页的合集置灰标「已在首页」。",
+ "没有保存键，改动即时生效。「恢复默认」是页面里唯一带确认的动作。"],
+ try:"点「评分最高的动漫」展开；点眼睛、上下箭头；「＋ 添加一行」里选「诺兰」。再切回「01 新首页」看效果。"},
+p3:{h:"排序就是一列推荐名",li:[
+ "上一版的「分段控件选排序 + 方向开关 + 推荐名」三样东西，其实在说同一件事。现在合成一列<b>单选</b>：每个选项<b>就是推荐名</b>，右边小字才是规则。用户选的是「最近上映的动漫」，而不是「上映时间 + 倒序」。",
+ "方向没了：「最早上映」是它自己一个选项，对应现有的 <code>release_date_asc</code>，与系列合集用的同一档。七个选项，一个不多。",
+ "名字输入框<b>留空就用选中的那个推荐名</b>，占位文字实时显示。手输过就不再跟着动，清空即回到推荐。",
+ "「只显示我没看过的」留作唯一的开关：按评分排的行没有它会永远是同一批 20 部。后端已有 <code>w=unwatched</code>。",
+ "来源不在这里改：换库等于另一行，删了重加。"],
+ try:"切排序看占位名跟着变；手输一个名字再切排序，它就不动了。"},
+p4:{h:"移动端：同一个页面，窄一点",li:[
+ "首页与桌面一样干净：一个图标按钮进「自定义首页」。",
+ "「自定义首页」是<b>独立页面</b>，路由 <code>/library/customize</code>，返回键回首页。纯列表、不放海报，列表、展开、添加与桌面端同一份实现，只是排序单选变成一列。",
+ "拖拽换成上下箭头——拖拽在滚动容器里会抢手势，箭头笨一点但不会错。手机上两个箭头<b>叠成一列</b>，右侧只占两个按钮的宽度，名字与小字不再被挤断；展开箭头去掉，整个行头就是点击区。",
+ "密度：行头上下 7px、图标 20px、名字 12.5px；展开区排序单选一列、规则说明隐藏；「＋ 添加一行」沉到列表底部。一屏能看到 6 行左右。"],
+ try:null},
+p5:{h:"没有新表，没有第二套 DSL",li:[
+ "一行一条记录，存在成员自己的 <code>ui_prefs</code> 里，与侧栏导航排序同一个抽屉、同一套「提示而非契约」的合并规则。",
+ "库行的 <code>sort</code> 直接是现有 <code>WallSort</code> 的取值，加一档「随机」；方向不单独存。合集行走现有的合集条目接口。前端逐行取数，隐藏的行不取。",
+ "首页布局只影响 movieclaw 网页。Jellyfin 客户端的首页是它们自己的，唯一共享的是合集本身。",
+ "刻意不做的：多套具名首页（多成员已经是一层视角切换）、行的卡片样式、在首页上直接编辑合集规则（去合集页）。"],
+ try:null}};
+
+const tabs=[...document.querySelectorAll(".tab")];
+function goto(id){const t=tabs.find(x=>x.dataset.p===id);tabs.forEach(x=>x.setAttribute("aria-selected",String(x===t)));document.querySelectorAll(".panel").forEach(p=>p.hidden=p.id!==id);renderRail(id)}
+function renderRail(id){
+  const r=RAIL[id];
+  document.getElementById("rail").innerHTML='<h4>'+r.h+'</h4><ul>'+r.li.map(t=>'<li>'+t+'</li>').join("")+'</ul>'+(r.try?'<p class="try"><b>试试看</b>'+r.try+'</p>':"");
+}
+tabs.forEach(t=>t.addEventListener("click",()=>goto(t.dataset.p)));
+
+/* ══════ 演示数据 ══════
+   三个库、三个合集。d=入库距今天数，lp=最近播放距今天数（null 没播过），
+   rel=上映年月，r=评分，w=观看状态，fav=收藏距今天数。排序是真跑的。 */
+const LIBS={1:{name:"电影",kind:"movie"},2:{name:"剧集",kind:"tv"},3:{name:"动漫",kind:"anime"}};
+const COLS={7:{name:"宫崎骏",lib:3,n:9,sort:"release_date_asc"},8:{name:"诺兰",lib:1,n:11,sort:"release_date_asc"},9:{name:"90 年代港片",lib:1,n:23,sort:"title"}};
+const ITEMS=[
+ {lib:1,t:"沙丘 2",y:2024,rel:"2024-03",r:8.3,d:3,lp:null,w:"unwatched"},
+ {lib:1,t:"奥本海默",y:2023,rel:"2023-07",r:8.7,d:9,lp:12,w:"played",fav:40},
+ {lib:1,t:"周处除三害",y:2023,rel:"2023-10",r:8.1,d:5,lp:null,w:"unwatched"},
+ {lib:1,t:"星际穿越",y:2014,rel:"2014-11",r:9.4,d:400,lp:2,w:"watching",p:.62,fav:300},
+ {lib:1,t:"坠落的审判",y:2023,rel:"2023-08",r:8.6,d:14,lp:null,w:"unwatched",fav:10},
+ {lib:1,t:"疯狂的麦克斯",y:2015,rel:"2015-05",r:8.6,d:220,lp:60,w:"played"},
+ {lib:1,t:"利刃出鞘 2",y:2022,rel:"2022-12",r:7.3,d:31,lp:null,w:"unwatched"},
+ {lib:1,t:"寄生虫",y:2019,rel:"2019-05",r:8.8,d:150,lp:20,w:"played",fav:120},
+ {lib:1,t:"重庆森林",y:1994,rel:"1994-07",r:8.8,d:80,lp:null,w:"unwatched",fav:3},
+ {lib:1,t:"过往人生",y:2023,rel:"2023-06",r:7.9,d:2,lp:null,w:"unwatched"},
+ {lib:1,t:"银翼杀手 2049",y:2017,rel:"2017-10",r:8.4,d:500,lp:6,w:"played"},
+ {lib:1,t:"漫长的季节",y:2023,rel:"2023-04",r:9.4,d:60,lp:null,w:"unwatched"},
+ {lib:2,t:"繁花",y:2023,rel:"2023-12",r:8.5,d:4,lp:1,w:"watching",p:.31},
+ {lib:2,t:"人世间",y:2022,rel:"2022-01",r:8.1,d:40,lp:null,w:"unwatched"},
+ {lib:2,t:"最后生还者",y:2023,rel:"2023-01",r:8.9,d:7,lp:null,w:"unwatched",fav:6},
+ {lib:2,t:"黑暗荣耀",y:2022,rel:"2022-12",r:8.9,d:120,lp:30,w:"played"},
+ {lib:2,t:"沙丘：预言",y:2024,rel:"2024-11",r:7.4,d:1,lp:null,w:"unwatched"},
+ {lib:2,t:"老友记",y:1994,rel:"1994-09",r:9.8,d:600,lp:4,w:"watching",p:.08},
+ {lib:2,t:"幕府将军",y:2024,rel:"2024-02",r:8.8,d:20,lp:null,w:"unwatched"},
+ {lib:3,t:"千与千寻",y:2001,rel:"2001-07",r:9.4,d:90,lp:200,w:"played",fav:200,gh:1},
+ {lib:3,t:"龙猫",y:1988,rel:"1988-04",r:9.2,d:90,lp:null,w:"unwatched",gh:1},
+ {lib:3,t:"哈尔的移动城堡",y:2004,rel:"2004-11",r:9.1,d:90,lp:3,w:"watching",p:.44,gh:1},
+ {lib:3,t:"幽灵公主",y:1997,rel:"1997-07",r:8.9,d:90,lp:null,w:"unwatched",gh:1},
+ {lib:3,t:"你想活出怎样的人生",y:2023,rel:"2023-07",r:7.9,d:6,lp:null,w:"unwatched",gh:1},
+ {lib:3,t:"铃芽之旅",y:2022,rel:"2022-11",r:7.8,d:11,lp:null,w:"unwatched"},
+ {lib:3,t:"葬送的芙莉莲",y:2023,rel:"2023-09",r:9.3,d:2,lp:null,w:"unwatched"},
+ {lib:3,t:"进击的巨人",y:2013,rel:"2013-04",r:9.0,d:300,lp:9,w:"played"},
+ {lib:3,t:"蓝色巨星",y:2023,rel:"2023-10",r:8.6,d:16,lp:null,w:"unwatched"},
+ {lib:3,t:"红猪",y:1992,rel:"1992-07",r:8.6,d:90,lp:null,w:"unwatched",gh:1},
+];
+const UPNEXT=[
+ {t:"繁花",ep:"S01E13",m:"昨天看到 S01E12 · 31%",p:.31,left:17},
+ {t:"星际穿越",ep:"",m:"2 天前看到 62%",p:.62},
+ {t:"哈尔的移动城堡",ep:"",m:"3 天前看到 44%",p:.44},
+ {t:"老友记",ep:"S07E04",m:"4 天前看完 S07E03",p:0,left:134},
+];
+
+/* 排序预设：一个取值 = 一个推荐名 + 一句规则。方向合并在取值里，没有单独的开关。 */
+const SORTS={
+ added_at:        {nm:L=>"最近添加的"+L, d:"入库时间，新的在前"},
+ release_date:    {nm:L=>"最近上映的"+L, d:"上映时间，新的在前"},
+ release_date_asc:{nm:L=>"最早上映的"+L, d:"上映时间，老的在前"},
+ last_played:     {nm:L=>"最近观看的"+L, d:"我最近播放过的"},
+ rating:          {nm:L=>"评分最高的"+L, d:"评分，高的在前"},
+ random:          {nm:L=>"随便看看 · "+L, d:"每天换一批"},
+ title:           {nm:L=>L+" A–Z",       d:"片名"},
+};
+const FAV_SORTS={unwatched_first:{nm:"未看优先",d:"没看完的在前，再按收藏时间"},favorited_at:{nm:"最近收藏",d:"收藏时间"},rating:{nm:"评分最高",d:"评分"},title:{nm:"片名 A–Z",d:"片名"}};
+/* 合集行与库行同一组预设，只是标签不带库名；默认取合集自己的 sort */
+const COL_SORTS={added_at:{nm:"最近添加",d:"入库时间，新的在前"},release_date:{nm:"最近上映",d:"上映时间，新的在前"},release_date_asc:{nm:"最早上映",d:"上映时间，老的在前"},last_played:{nm:"最近观看",d:"我最近播放过的"},rating:{nm:"评分最高",d:"评分，高的在前"},random:{nm:"随便看看",d:"每天换一批"},title:{nm:"片名 A–Z",d:"片名"}};
+
+function seeded(n){let x=(20260913+n)|0;return()=>{x=(x*1103515245+12345)&0x7fffffff;return x/0x7fffffff}}
+function sortItems(list,sort){
+  const a=list.slice();
+  if(sort==="random"){const r=seeded(list.length);return a.map(i=>[r(),i]).sort((x,y)=>x[0]-y[0]).map(x=>x[1])}
+  if(sort==="last_played")return a.filter(i=>i.lp!=null).sort((x,y)=>x.lp-y.lp);
+  if(sort==="title")return a.sort((x,y)=>x.t<y.t?-1:1);
+  if(sort==="release_date_asc")return a.sort((x,y)=>x.rel<y.rel?-1:1);
+  const key={added_at:i=>-i.d,release_date:i=>i.rel,rating:i=>i.r}[sort];
+  return a.sort((x,y)=>{const kx=key(x),ky=key(y);return kx<ky?1:kx>ky?-1:0});
+}
+function hue(t){let h=0;for(const c of t)h=(h*31+c.charCodeAt(0))%360;return h}
+function art(t){const h=hue(t);return "radial-gradient(120% 78% at 24% 10%,hsl("+h+" 36% 31% / .95),transparent 60%),linear-gradient(168deg,hsl("+h+" 27% 20%),#0a0c12 78%)"}
+
+/* ══════ 首页状态（首页、自定义页、放大视图、手机共用一份）══════ */
+const DEFAULT_ROWS=()=>[
+ {id:"up-next"},{id:"favorites",sort:"unwatched_first"},{id:"libraries"},
+ {id:"lib:1",sort:"added_at",name:""},{id:"lib:2",sort:"added_at",name:""},{id:"lib:3",sort:"added_at",name:""},
+];
+let ROWS=[
+ {id:"up-next"},
+ {id:"favorites",sort:"unwatched_first"},
+ {id:"libraries"},
+ {id:"lib:1",sort:"release_date",name:""},
+ {id:"row:8f2c",library_id:3,sort:"rating",unwatched:true,name:"评分最高的动漫"},
+ {id:"lib:2",sort:"added_at",name:""},
+ {id:"row:a91e",collection_id:7,sort:"release_date_asc"},
+ {id:"lib:3",sort:"added_at",name:"",hidden:true},
+];
+let expanded="row:8f2c";
+let uid=0;
+
+function rowLib(r){return r.library_id??(r.id.startsWith("lib:")?+r.id.slice(4):null)}
+function rowKind(r){return r.id==="up-next"||r.id==="favorites"||r.id==="libraries"?"sys":r.collection_id?"col":"lib"}
+function editable(r){return rowKind(r)!=="sys"||r.id==="favorites"}
+function rowTitle(r){
+  if(r.id==="up-next")return"接下来继续";
+  if(r.id==="favorites")return"我的收藏";
+  if(r.id==="libraries")return"我的媒体库";
+  if(r.collection_id)return COLS[r.collection_id].name;
+  return r.name||SORTS[r.sort].nm(LIBS[rowLib(r)].name);
+}
+function rowMeta(r){
+  if(r.id==="up-next")return"内置 · 我正在看的";
+  if(r.id==="libraries")return"内置 · 管理页的库顺序";
+  if(r.id==="favorites")return"内置 · "+FAV_SORTS[r.sort].nm;
+  if(r.collection_id)return"合集 · "+COL_SORTS[r.sort].nm;
+  return LIBS[rowLib(r)].name+"库 · "+SORTS[r.sort].nm("")+(r.unwatched?" · 只看没看过的":"")+(r.id.startsWith("lib:")?"":" · 自加");
+}
+function rowItems(r){
+  if(r.id==="favorites"){
+    const f=ITEMS.filter(i=>i.fav!=null);
+    if(r.sort==="unwatched_first")return f.sort((a,b)=>((a.w==="played")-(b.w==="played"))||a.fav-b.fav);
+    if(r.sort==="favorited_at")return f.sort((a,b)=>a.fav-b.fav);
+    return sortItems(f,r.sort);
+  }
+  if(r.collection_id){
+    const c=COLS[r.collection_id];const list=ITEMS.filter(i=>c.lib===3?i.gh:i.lib===c.lib);
+    return sortItems(list,r.sort);
+  }
+  let list=ITEMS.filter(i=>i.lib===rowLib(r));
+  if(r.unwatched)list=list.filter(i=>i.w!=="played");
+  return sortItems(list,r.sort);
+}
+function posterHTML(i,r){
+  const meta=r?.sort==="rating"?i.r.toFixed(1)+" · "+i.y:r?.sort==="last_played"?i.lp+" 天前看过":r?.sort==="added_at"?i.d+" 天前入库":String(i.y);
+  return '<div class="pc"><div class="p" style="background:'+art(i.t)+'">'+
+    (r?.sort==="rating"?'<span class="rt">'+i.r.toFixed(1)+'</span>':'')+
+    (i.fav!=null&&r?.id==="favorites"?'<span class="heart">♥</span>':'')+
+    '<span class="pt">'+i.t+'</span>'+
+    (i.w==="watching"?'<span class="prog"><i style="width:'+Math.round(i.p*100)+'%"></i></span>':'')+
+    '</div><div class="m">'+meta+'</div></div>';
+}
+function rowBody(r){
+  if(r.id==="up-next")return UPNEXT.map(u=>'<div class="lc"><div class="p" style="background:'+art(u.t+"still")+'">'+(u.ep?'<span class="ep">'+u.ep+'</span>':'')+(u.left?'<span class="left">还有 '+u.left+' 集</span>':'')+'<span class="play">▶</span>'+(u.p?'<span class="prog"><i style="width:'+Math.round(u.p*100)+'%"></i></span>':'')+'</div><div class="t">'+u.t+'</div><div class="m">'+u.m+'</div></div>').join("");
+  if(r.id==="libraries")return Object.entries(LIBS).map(([id,l])=>{const ps=ITEMS.filter(i=>i.lib==id).slice(0,3);return'<div class="libc"><div class="shelf">'+ps.map(p=>'<i style="background:'+art(p.t)+'"></i>').join("")+'</div><div class="nm">'+l.name+'</div><div class="st">'+(id==1?"1,284 部 · 8.2 TB":id==2?"212 部 · 1.1 TB":"96 部 · 0.3 TB")+'</div></div>'}).join("");
+  return rowItems(r).slice(0,12).map(i=>posterHTML(i,r)).join("");
+}
+/* 首页：名字 + 查看全部，别的什么都没有 */
+function homeHTML(){
+  const vis=ROWS.filter(r=>!r.hidden);
+  if(!vis.length)return'<div class="homeempty"><b>首页空空如也</b>所有行都被隐藏了。打开「自定义首页」挑几行回来，或恢复默认。</div>';
+  return vis.map(r=>'<section class="hrow"><div class="hh"><h3>'+rowTitle(r)+'</h3>'+
+    '<span class="more">'+(r.id==="favorites"?"查看全部 7 部 ›":r.id==="libraries"?"全部合集 ›":r.id==="up-next"?"":"查看全部 ›")+'</span>'+
+    '</div><div class="strip">'+rowBody(r)+'</div></section>').join("");
+}
+/* 自定义页：每行一条小预览；可改的行点开就地编辑 */
+function editHTML(r){
+  const k=rowKind(r);
+  const radios=(opts,fmt)=>'<div class="radios">'+Object.entries(opts).map(([key,o])=>'<label class="radio'+(r.sort===key?" on":"")+'" data-sort="'+key+'"><span class="r"></span>'+fmt(o)+'<span class="d">'+o.d+'</span></label>').join("")+'</div>';
+  if(r.id==="favorites")return'<div class="redit"><div class="fl">排序</div>'+radios(FAV_SORTS,o=>o.nm)+'</div>';
+  if(k==="col")return'<div class="redit"><div class="fl">排序</div>'+radios(COL_SORTS,o=>o.nm)+'<div class="rft"><span class="hint" style="margin:0">名字跟合集走，规则在合集页改</span><span class="spacer"></span><button class="btn sm ghost">打开合集 ›</button><button class="btn sm danger" data-del>删除这一行</button></div></div>';
+  const L=LIBS[rowLib(r)].name,sug=SORTS[r.sort].nm(L);
+  return'<div class="redit"><div class="fl">排序</div>'+radios(SORTS,o=>o.nm(L))+
+    '<div class="swrow"><button class="sw'+(r.unwatched?" on":"")+'" role="switch" aria-checked="'+!!r.unwatched+'" data-unw></button>只显示我没看过的<span class="d">按评分排时，没有它这一行永远是同 20 部</span></div>'+
+    '<div class="fl">名字</div><input class="inp" id="nm-'+r.id+'" data-name value="'+(r.name||"").replace(/"/g,"&quot;")+'" placeholder="'+sug+'">'+
+    '<p class="hint" data-hint>'+(r.name?'已手动命名。清空则回到推荐：<b>'+sug+'</b>':'留空跟随排序：换一个排序，名字自动变')+'</p>'+
+    (r.id.startsWith("lib:")?'':'<div class="rft"><span class="spacer"></span><button class="btn sm danger" data-del>删除这一行</button></div>')+'</div>';
+}
+function itemHTML(r,i){
+  const eye=on=>'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">'+(on?'<path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>':'<path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z" opacity=".45"/><path d="M3 13L13 3"/>')+'</svg>';
+  const k=rowKind(r),open=expanded===r.id&&editable(r);
+  const ico='<span class="ico '+k+'">'+(k==="sys"?(r.id==="up-next"?"▶":r.id==="favorites"?"♥":"▦"):k==="col"?'<span class="stk"><i></i><i></i></span>':"≡")+'</span>';
+  return'<div class="ritem'+(r.hidden?" off":"")+(open?" open":"")+(editable(r)?"":" nox")+'" data-row="'+r.id+'">'+
+    '<div class="rhead"><span class="grip">⋮⋮</span>'+ico+'<div class="tx"><div class="nm">'+rowTitle(r)+'</div><div class="mt">'+rowMeta(r)+'</div></div>'+
+    '<div class="acts"><span class="updown"><button class="ikon'+(i===0?" dis":"")+'" data-move="-1" title="上移"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 10l4-4 4 4"/></svg></button><button class="ikon'+(i===ROWS.length-1?" dis":"")+'" data-move="1" title="下移"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg></button></span>'+
+    '<button class="ikon" data-hide title="'+(r.hidden?"显示":"隐藏")+'">'+eye(!r.hidden)+'</button></div>'+
+    '<span class="car">'+(editable(r)?"▾":"")+'</span></div>'+
+    (open?editHTML(r):'')+'</div>';
+}
+function listHTML(){
+  const onHome=new Set(ROWS.filter(r=>r.collection_id).map(r=>r.collection_id));
+  return'<div class="clist">'+ROWS.map(itemHTML).join("")+'</div>'+
+    '<div class="adder"><div class="lb">＋ 添加一行 · 从哪来？</div><div class="pills">'+
+    Object.entries(LIBS).map(([id,l])=>'<button class="pill" data-add-lib="'+id+'">'+l.name+'库</button>').join("")+'</div><div class="pills">'+
+    Object.entries(COLS).map(([id,c])=>'<button class="pill'+(onHome.has(+id)?" dis":"")+'" data-add-col="'+id+'"><span class="stk"><i></i><i></i></span>'+c.name+'<span class="n">'+(onHome.has(+id)?"已在首页":c.n+" 部")+'</span></button>').join("")+
+    '</div><p class="hint" style="margin:0 0 4px">选一个库得到「最近添加的 X」，选一个合集得到它本身；排序和名字点开那一行再改。</p></div>';
+}
+function render(){
+  for(const id of["home1","home3"]){document.getElementById(id).innerHTML=homeHTML()}
+  document.getElementById("clist1").innerHTML=listHTML();
+  document.getElementById("clist2").innerHTML=listHTML();
+  const z=ROWS.find(r=>r.id===expanded)||ROWS.find(r=>rowKind(r)==="lib");
+  document.getElementById("zoom").innerHTML=z?itemHTML(z,ROWS.indexOf(z)):"";
+  document.getElementById("dcount").textContent=ROWS.filter(r=>!r.hidden).length+" 行显示 · "+ROWS.filter(r=>r.hidden).length+" 行隐藏 · 改动即时生效";
+}
+function move(r,dir){const i=ROWS.indexOf(r),j=i+dir;if(j<0||j>=ROWS.length)return;ROWS.splice(i,1);ROWS.splice(j,0,r)}
+
+document.addEventListener("click",e=>{
+  const g=e.target.closest("[data-goto]");if(g){e.preventDefault();goto(g.dataset.goto);return}
+  const al=e.target.closest("[data-add-lib]");if(al){const id="row:"+(++uid);ROWS.push({id,library_id:+al.dataset.addLib,sort:"added_at",name:""});expanded=id;render();return}
+  const ac=e.target.closest("[data-add-col]");if(ac){const id="row:"+(++uid);ROWS.push({id,collection_id:+ac.dataset.addCol,sort:COLS[+ac.dataset.addCol].sort});expanded=id;render();return}
+  if(e.target.closest("[data-reset]")){if(confirm("恢复默认布局？你自己加的行会被移除。")){ROWS=DEFAULT_ROWS();expanded=null;render()}return}
+  const rowEl=e.target.closest("[data-row]");if(!rowEl)return;
+  const r=ROWS.find(x=>x.id===rowEl.dataset.row);if(!r)return;
+  if(e.target.closest("[data-name]"))return;
+  const b=e.target.closest("button,label");
+  if(b?.dataset.move){move(r,+b.dataset.move)}
+  else if(b&&"hide"in b.dataset){r.hidden=!r.hidden}
+  else if(b&&"del"in b.dataset){ROWS.splice(ROWS.indexOf(r),1);expanded=null}
+  else if(b&&"unw"in b.dataset){r.unwatched=!r.unwatched}
+  else if(b?.dataset.sort){r.sort=b.dataset.sort}
+  else if(e.target.closest(".rhead")&&editable(r)){expanded=expanded===r.id?null:r.id}
+  else return;
+  render();
+});
+/* 名字输入：不整页重绘（会丢焦点），只改这一行的标题、小字、提示，以及首页 */
+document.addEventListener("input",e=>{
+  const inp=e.target.closest("[data-name]");if(!inp)return;
+  const r=ROWS.find(x=>x.id===inp.closest("[data-row]").dataset.row);r.name=inp.value.trim();
+  const sug=SORTS[r.sort].nm(LIBS[rowLib(r)].name);
+  document.querySelectorAll('[data-row="'+r.id+'"]').forEach(el=>{
+    el.querySelector(".nm").textContent=rowTitle(r);
+    const h=el.querySelector("[data-hint]");if(h)h.innerHTML=r.name?'已手动命名。清空则回到推荐：<b>'+sug+'</b>':'留空跟随排序：换一个排序，名字自动变';
+    const o=el.querySelector("[data-name]");if(o!==inp)o&&(o.value=inp.value);
+  });
+  for(const id of["home1","home3"])document.getElementById(id).innerHTML=homeHTML();
+});
+
+renderRail("p1");
+render();
+</script>
+</body>
+</html>

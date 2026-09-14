@@ -18,6 +18,7 @@ import {
   type PlaybackDiagnostics,
   type PlaybackWatchState,
   pingPlaybackSession,
+  reportPlaybackClientLog,
   reportPlaybackProgress,
   reportPlaybackProgressOnUnload,
   resolveStreamUrl,
@@ -30,7 +31,14 @@ import {
   stopPlaybackSessionOnUnload,
 } from "@/lib/api/playback";
 import { type AutoplayOutcome, attemptAutoplay, shouldAttemptAutoplay } from "@/lib/player/autoplay";
-import { formatBandwidth } from "@/lib/player/bandwidth";
+import {
+  DIRECT_SHORTFALL_SAMPLES,
+  bandwidthDegradeWanted,
+  bandwidthRestartWanted,
+  directDownlinkShort,
+  downlinkHintBps,
+  formatBandwidth,
+} from "@/lib/player/bandwidth";
 import { getCapabilitySnapshot } from "@/lib/player/capability";
 import type { PlaybackEngine } from "@/lib/player/engine";
 import { createEngine, preloadHlsEngine } from "@/lib/player/engine";
@@ -523,6 +531,15 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 为了这个，见 player-feel.md §2.A1，别从这里把它加回来）。
    */
   const [speedLabel, setSpeedLabel] = useState<string | null>(null);
+  /** 最近一次可用的取流速度（bps），下一次开会话带给服务端压码率（§C） */
+  const lastDownlinkRef = useRef<number | null>(null);
+  /** 本会话是否已经按带宽重开过一次（每会话只试一次，防无限循环） */
+  const bandwidthRestartedRef = useRef(false);
+  /** 直通档「线路不够」的连续采样计数与是否已提示过 */
+  const directShortRef = useRef(0);
+  const directHintShownRef = useRef(false);
+  /** 源码率（台账真值），供 1Hz 循环判直通档线路够不够 */
+  const sourceBitrateRef = useRef<number | null>(null);
 
   /** 横滑拖进度时的落点读数。手势期间常显，松手/取消后淡出 */
   const [seekPreview, setSeekPreview] = useState<{
@@ -891,6 +908,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
             max_height: quality ?? undefined,
             audio_track: requestedAudio ?? undefined,
             subtitle_track: requestedSubtitle ?? undefined,
+            // 上一路引擎量到的线路速度：服务端据此压转码码率（§C）。首次
+            // 起播还没有读数，服务端按阶梯值；重开（seek 换会话 / 缺粮重开
+            // / 换轨）时才带得上——正是外网用户最需要它的时刻
+            downlink_bps: downlinkHintBps(lastDownlinkRef.current),
           },
           apiRef.current,
         );
@@ -992,6 +1013,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
     if (!session?.stream_url || !video || !mode) return;
 
     let disposed = false;
+    // 每路会话各自一次机会：按带宽重开的护栏、直通档提示的计数都按会话清
+    bandwidthRestartedRef.current = false;
+    directShortRef.current = 0;
+    directHintShownRef.current = false;
+    sourceBitrateRef.current = session.source?.bit_rate ?? null;
     const engine = createEngine({
       video,
       streamUrl: resolveStreamUrl(mode.streamUrl),
@@ -1005,8 +1031,65 @@ export function VideoPlayer(props: VideoPlayerProps) {
       // 全片列表下这是防止 hls.js 先去拉第 0 段的关键（engine.ts 有注释）
       startPositionS: Math.max(0, toSessionSeconds(pendingFileMsRef.current, mode.originMs)),
       telemetry: apiRef.current.telemetry,
-      onFailed: (reason) => {
-        if (!disposed) dispatch({ type: "failed", reason });
+      onFailed: (reason, cause) => {
+        if (disposed) return;
+        // 缺粮且线路装不下当前码率：按带宽同档重开（服务端用 downlink_bps
+        // 压码率），不走降档——降档降的是编码档，对带宽无能为力，只会白白
+        // 掉一级画质（docs/design/player-pipeline-optimization.md §C）。
+        // 每会话只试一次：重开后仍缺粮说明估错了，再来就是无限循环。
+        const stats = engine.stats();
+        if (
+          bandwidthRestartWanted({
+            cause,
+            videoAction: session.decision.video?.action,
+            downlinkBps: stats.downlinkBps,
+            bitrateBps: stats.bitrate,
+            alreadyRestarted: bandwidthRestartedRef.current,
+          })
+        ) {
+          bandwidthRestartedRef.current = true;
+          reportPlaybackClientLog("bandwidth-restart", {
+            reason,
+            downlink_bps: Math.round(stats.downlinkBps ?? 0),
+            bitrate_bps: Math.round(stats.bitrate ?? 0),
+          }, apiRef.current);
+          freezeFrame();
+          video.pause();
+          wantsPlayRef.current = true;
+          pendingFileMsRef.current = positionRef.current;
+          dispatch({ type: "restart", startMs: positionRef.current });
+          return;
+        }
+        // 视频直通且线路装不下源码率：逐级降到 remux / 音频单转码率一分不少，
+        // 照样缺粮，用户要转圈一分多钟外加三次黑屏重开才落到能压码率的转码档。
+        // 三个直通档一并标掉，直接带实测带宽去开转码会话（服务端按它压码率）。
+        // 直出档的引擎量不到分片码率，用台账里的源码率。
+        const sourceBitrate = stats.bitrate ?? sourceBitrateRef.current;
+        if (
+          bandwidthDegradeWanted({
+            cause,
+            videoAction: session.decision.video?.action,
+            downlinkBps: stats.downlinkBps,
+            bitrateBps: sourceBitrate,
+          })
+        ) {
+          // 重开请求要带的读数就是此刻这个：1Hz 循环下一拍未必来得及写
+          lastDownlinkRef.current = stats.downlinkBps;
+          reportPlaybackClientLog("bandwidth-degrade", {
+            reason,
+            tier: session.decision.tier,
+            downlink_bps: Math.round(stats.downlinkBps ?? 0),
+            bitrate_bps: Math.round(sourceBitrate ?? 0),
+          }, apiRef.current);
+          flashNotice("线路带宽装不下原片码率，改用转码降码率播放");
+          freezeFrame();
+          video.pause();
+          wantsPlayRef.current = true;
+          pendingFileMsRef.current = positionRef.current;
+          dispatch({ type: "bandwidth-degrade" });
+          return;
+        }
+        dispatch({ type: "failed", reason });
       },
       // 取流持续失败（token 过期 / 服务端中断）：与心跳自愈同一条路，同档位
       // 原地重开（新会话 = 新 token），不走降档——这一档没有失败。真断网时
@@ -1062,7 +1145,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
       engine.destroy();
       engineRef.current = null;
     };
-  }, [state.session, mode, video, tryAutoplay, freezeFrame]);
+  }, [state.session, mode, video, tryAutoplay, freezeFrame, flashNotice]);
 
   /**
    * 换了会话（降档 / seek 换流）就重新获得自动播放的机会。
@@ -1132,12 +1215,29 @@ export function VideoPlayer(props: VideoPlayerProps) {
     const timer = window.setInterval(() => {
       const engine = engineRef.current;
       if (!engine) return;
-      const label = formatBandwidth(engine.stats().downlinkBps);
+      const stats = engine.stats();
+      const label = formatBandwidth(stats.downlinkBps);
       // 新引擎刚挂上、样本还没攒够时同样保留上一个读数（理由同上）
       if (label !== null) setSpeedLabel(label);
+      // 最近一次可用读数留给下一次开会话（§C）：换会话的空档没有引擎可问，
+      // 而重开请求恰恰要在那个空档里发出
+      if (stats.downlinkBps !== null) lastDownlinkRef.current = stats.downlinkBps;
+      // 直通档线路不够：码率改不了，只能提醒用户换画质。连续十次采样都不够
+      // 才提示、每会话一次——一次抖动不该弹提示，反复弹更烦人
+      if (stats.engine === "direct" && !directHintShownRef.current) {
+        const short = directDownlinkShort({
+          downlinkBps: stats.downlinkBps,
+          sourceBitrateBps: sourceBitrateRef.current,
+        });
+        directShortRef.current = short ? directShortRef.current + 1 : 0;
+        if (directShortRef.current >= DIRECT_SHORTFALL_SAMPLES) {
+          directHintShownRef.current = true;
+          flashNotice("线路速度低于片源码率，可在设置里选更低画质");
+        }
+      }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [flashNotice]);
 
   /** 累计一条播放质量事件。归约是纯函数，这里只负责喂事件。 */
   const qoe = useCallback((event: QoeEvent) => {
@@ -1999,21 +2099,37 @@ export function VideoPlayer(props: VideoPlayerProps) {
   }, [unitKey, cancelPendingSeek, cancelScrubFollow]);
 
   /**
-   * 这一跳贵不贵：落点已在缓冲里、或档 0 直出（整个文件随便跳）就是零成本，
-   * 否则转码会话要按分片请求把 ffmpeg 杀掉重启直奔目标。
+   * 这一跳贵不贵：落点已在缓冲里就是零成本，否则要么等浏览器拉数据、要么
+   * （转码会话）按分片请求把 ffmpeg 杀掉重启直奔目标。
    *
-   * 拖动实时跟随（只在便宜时跟）与连按合并（只在贵时等）共用同一条判据。
+   * 档 0 直出**不再特殊**：整个文件都能 seek 不等于不要钱——远程的进度 MP4
+   * 在手机上每一次 seek 都是一条新的 Range 请求外加播放器重新起解码，拖动中
+   * 一秒十次就是画面一路抽（2026-09-13 真机反馈）。直出档拖出缓冲之后只在
+   * 手指停住时跟一次，见 canScrubFollow 与 scrub-follow.ts 的 settleOnly。
+   *
+   * 拖动实时跟随（只在便宜时按 10Hz 跟）与连按合并（只在贵时等）共用这条判据。
    */
   const isCheapSeek = useCallback(
     (fileMs: number) => {
       if (!video) return false;
-      if (mode?.engine === "direct") return true;
       return isWithinRanges(video.buffered, toSessionSeconds(fileMs, startMsRef.current));
     },
-    [video, mode],
+    [video],
   );
   const isCheapSeekRef = useRef(isCheapSeek);
   isCheapSeekRef.current = isCheapSeek;
+
+  /**
+   * 拖动跟随能不能落到这个位置：便宜的跳转任何模式都行；直出档不在缓冲里的
+   * 位置也行（浏览器自己按 Range 取数据），只是节奏由 planScrubFollow 收成
+   * 「手指停住才跟」。转码会话拖出缓冲绝不跟——那是杀 ffmpeg 重启。
+   */
+  const canScrubFollow = useCallback(
+    (fileMs: number) => mode?.engine === "direct" || isCheapSeek(fileMs),
+    [mode, isCheapSeek],
+  );
+  const canScrubFollowRef = useRef(canScrubFollow);
+  canScrubFollowRef.current = canScrubFollow;
 
   /** 把画面真的挪到落点。延时落地会跨过一段时间，所以只读 ref。 */
   const applyScrubFollow = useCallback(
@@ -2027,7 +2143,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
       // 后沿落地要跨过几十毫秒，**判据得在落地的这一刻重算**：这段时间里
       // back buffer 可能已经把落点回收掉，那时写 currentTime 就不再是零成本
       // 的跳转，而是一次把 ffmpeg 拽回去重启——跟随这条路上最不该出现的事。
-      if (seconds < 0 || !isCheapSeekRef.current(fileMs)) return;
+      if (seconds < 0 || !canScrubFollowRef.current(fileMs)) return;
       scrubRef.current = afterScrubFollow(performance.now());
       // **只动 currentTime，不走 engine.seek**：后者会 stopLoad + startLoad
       // 把在途的分片请求全掐掉重来——那是给「跳到没缓冲的地方」准备的重手段。
@@ -2051,10 +2167,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 松手才提交是转码会话逼出来的规矩：拖动中每次 move 都跳会让服务端一路杀
    * ffmpeg 重启，画面永远追不上手指。但**跳转不要钱的时候没有理由不跟随**：
    *
-   * - 档 0 直出：整个文件都能跳，浏览器自己按 range 取数据；
-   * - 任何模式落在已缓冲区间内：数据就在手上，跳过去是零成本。
+   * - 任何模式落在已缓冲区间内：数据就在手上，跳过去是零成本，10Hz 跟着走；
+   * - 档 0 直出拖出缓冲：浏览器自己按 range 取数据，能跳但不便宜（远程 MP4
+   *   在手机上一次就是几百毫秒到两秒），只在手指停住时跟一次。
    *
-   * 其余情况（拖到没缓冲的地方、旧会话相对制）原样按下不表，等松手那一次。
+   * 其余情况（转码会话拖到没缓冲的地方）原样按下不表，等松手那一次。
    *
    * 跟随的**节奏**由 lib/player/scrub-follow.ts 定：连续扫动时 10Hz（一秒
    * 跳六十次会让 hls.js 反复取消在途的分片请求，缓冲永远建立不起来），手指
@@ -2073,6 +2190,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
         state: scrubRef.current,
         cheap: isCheapSeek(fileMs),
         reachable: toSessionSeconds(fileMs, startMsRef.current) >= 0,
+        settleOnly: mode?.engine === "direct",
       });
       if (plan.kind === "skip") return;
       if (plan.kind === "follow") {
@@ -2092,7 +2210,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
         if (target !== null) applyScrubFollowRef.current(target);
       }, plan.delayMs);
     },
-    [video, isCheapSeek, bumpChromeActivity, cancelScrubFollow, applyScrubFollow],
+    [video, mode, isCheapSeek, bumpChromeActivity, cancelScrubFollow, applyScrubFollow],
   );
 
   /**
