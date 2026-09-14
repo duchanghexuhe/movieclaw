@@ -24,7 +24,7 @@ import { useAgentConversations } from "@/lib/agent-conversations";
 import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
 import { accessiblePathFor, usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
-import { taskActivityBadge, useTaskActivity } from "@/lib/task-activity";
+import { taskActivityBadge, useTaskActivity, type TaskActivityBadge } from "@/lib/task-activity";
 import { clearUiPrefsCache } from "@/lib/ui-prefs-cache";
 import { useTheme } from "@/lib/ui-prefs";
 
@@ -160,8 +160,8 @@ export function NetflixMyPage() {
   );
 }
 
-/** 活动入口行：useTaskActivity 是管理员的任务轮询，拆成独立组件让钩子
- *  只在管理员渲染本行时才挂载（成员不发起无谓的轮询）。 */
+/** 活动入口行：拆成独立组件，任务快照变化时只重渲染这一行、不牵动整页；
+ *  数据来自全站 Provider（本组件不发起请求）。 */
 function MyActivityRow() {
   const router = useRouter();
   const badge = taskActivityBadge(useTaskActivity());
@@ -190,26 +190,28 @@ function MyRow({
   danger?: boolean;
   running?: boolean;
   /** 右缘状态角标（活动行的任务计数：alert 红 / 否则提示蓝） */
-  badge?: { alert: boolean; count: number; hint?: string };
+  badge?: TaskActivityBadge;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       title={badge?.hint}
-      className={`glass-row w-full px-3 py-3 text-ui font-medium ${
+      className={`glass-row w-full px-3 py-2 max-md:py-2.5 text-ui font-medium ${
         danger ? "!text-[var(--danger)] hover:!bg-[rgba(255,107,107,0.12)]" : ""
       }`}
     >
       {running && (
-        <span aria-hidden="true" className="size-1.5 shrink-0 animate-pulse rounded-full bg-[#6aa7ff]" />
+        <span aria-hidden="true" className="size-1.5 shrink-0 animate-pulse rounded-full bg-[var(--info)]" />
       )}
-      {Icon && <Icon className="size-[20px] shrink-0" />}
+      {Icon && <Icon className="size-[18px] max-md:size-[22px] shrink-0" />}
       <span className="min-w-0 flex-1 truncate text-left">{label}</span>
       {badge && badge.count > 0 && (
         <span
-          className={`shrink-0 rounded-full px-1.5 py-0.5 text-micro font-semibold leading-none text-white ${
-            badge.alert ? "bg-[var(--danger-solid)]" : "bg-[var(--info)]"
+          className={`shrink-0 rounded-full px-1.5 py-0.5 text-micro font-semibold leading-none ${
+            badge.alert
+              ? "bg-[var(--danger-solid)] text-white"
+              : "bg-[var(--info)]/20 text-[var(--info)]"
           }`}
         >
           {badge.count}

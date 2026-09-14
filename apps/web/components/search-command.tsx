@@ -809,7 +809,9 @@ function HistorySingleRow({
       <DeleteHistoryButton
         label={`删除搜索历史：${item.keyword}`}
         onClick={onRemove}
-        className="touch-reveal absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover/single:opacity-100"
+        // !absolute 是必需的：.touch-target 在移动端的无层 position:relative
+        // 会顶掉普通 absolute（同 media-track-rows / sidebar 的既有处理）
+        className="touch-reveal !absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover/single:opacity-100"
       />
     </li>
   );

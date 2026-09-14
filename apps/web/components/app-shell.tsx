@@ -567,8 +567,11 @@ function MobileTopBar({
         {/* 页面级控件塞在字标与搜索之间——那段本来就空着，够放一个分段控件；
             min-w-0 让它在窄屏上自己收缩，而不是把搜索挤出屏幕。极窄视口
             （<350px，控件三件套 + 字标 + 搜索的宽度预算兜不住）退化为
-            横向可滑：最右的控件被裁一半能看到、能划出来，好过整颗消失 */}
-        <div className="ml-auto flex min-w-0 shrink items-center gap-2 overflow-x-auto scroll-none">
+            横向可滑：最右的控件被裁一半能看到、能划出来，好过整颗消失。
+            py + 等量负 my：overflow-x 容器的裁切口按 padding box 算，正
+            padding 把上下裁切口往外扩出角标（-top-1）需要的余量，负 margin
+            把布局占位原样收回——52px 顶栏的排版不变，角标不再被削顶。 */}
+        <div className="ml-auto flex min-w-0 shrink items-center gap-2 overflow-x-auto scroll-none py-1.5 -my-1.5">
           {actions}
           {canSearch && (
             <div className="shrink-0">

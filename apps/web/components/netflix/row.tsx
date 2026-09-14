@@ -44,7 +44,9 @@ export interface NetflixRowItem {
   media: MediaItem;
   /** 详情落点覆盖（库内条目跳库内详情页）；缺省走 useMediaDetail 的发现详情 */
   href?: Route;
-  /** 直接播放落点（继续观看行）；非空时整卡点击即起播（Netflix 同款） */
+  /** 直接播放落点（继续观看行）；非空时**触屏端**整卡点击即起播
+   *  （Netflix 同款）。桌面端仍 href 优先：hover 卡已同屏给出「播放 / 详情」
+   *  双入口，整卡直点进详情不损失一步起播（见下方 openItem） */
   playHref?: Route;
   /** 继续观看进度 0~100（有则卡片底部画 3px 红条） */
   progress?: number | null;

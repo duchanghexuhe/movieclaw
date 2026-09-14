@@ -3,7 +3,7 @@
 import Link from "next/link";
 import type { Route } from "next";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   ArrowLeftIcon,
@@ -13,6 +13,8 @@ import {
   LibraryIcon,
   UserIcon,
 } from "@/components/icons";
+import { PAGE_NAV_BUTTON_CLASS } from "@/components/page-nav";
+import { SearchCommand } from "@/components/search-command";
 import { settingsSectionGroupsFor } from "@/lib/mock-data";
 import { usePageChrome } from "@/lib/page-chrome";
 import { usePermissions } from "@/lib/permissions";
@@ -25,7 +27,7 @@ import { useSession } from "@/lib/session";
  * 订阅 / 我的（2026-09 修订：移除「首页」——内容首页 / 改由顶栏字标直达，
  * 底栏让位给高频的内容入口；「订阅」对齐桌面顶栏的「我的订阅」）。
  * 「订阅」按 canSubscribe 显隐，无权限时退化为 3 页签。
- * 栏高 49px + 底部安全区、激活白、未激活 #808080、图标 24px——这些数值
+ * 栏高 49px + 底部安全区、激活白、未激活 --text-faint、图标 24px——这些数值
  * 无官方出处，按 iOS 惯例取值（设计文档标注的自家设计决策）。
  */
 
@@ -73,7 +75,7 @@ export function NetflixTabBar() {
           href={href}
           aria-current={active === id ? "page" : undefined}
           className={`flex flex-1 flex-col items-center justify-center gap-0.5 ${
-            active === id ? "text-white" : "text-[#808080]"
+            active === id ? "text-white" : "text-[var(--text-faint)]"
           }`}
         >
           <Icon className="size-6" />
@@ -85,15 +87,17 @@ export function NetflixTabBar() {
 }
 
 /**
- * 移动端设置页的分区导航条：左侧返回键（回到「我的」/真实来路）+ 当前分区
- * 下拉。银玻璃主题下分区列表装在抽屉侧栏里，Netflix 主题抽屉退役后由这条
- * 下拉承接同样的导航能力（/settings/* 可达性不回退）。挂在页面内容顶部
- * （外壳在 settings 路由下渲染），数据与桌面分区菜单同源。
+ * 移动端设置页的分区导航条：左侧返回键（回到「我的」）+ 当前分区下拉 +
+ * 右侧搜索键。银玻璃主题下分区列表装在抽屉侧栏里，Netflix 主题抽屉退役后
+ * 由这条下拉承接同样的导航能力（/settings/* 可达性不回退）。挂在页面内容
+ * 顶部（外壳在 settings 路由下渲染），数据与桌面分区菜单同源。
  *
  * 顶栏认领：挂载即 registerPageNav，让外壳撤掉全局顶栏（MobileTopBar）——
  * 否则设置页顶上摞两条顶栏（全局 52px + 本条），违背「窄屏永远只有一条
- * 顶栏」的收口原则（lib/page-chrome.tsx）。认领后 safe-top/left/right 由
- * 本条自己让出（原由全局顶栏承担）。
+ * 顶栏」的收口原则（lib/page-chrome.tsx）。认领后 safe-top 由本条自己
+ * 让出；左右安全区仍由 main 的内边距承担（globals.css 的
+ * .app-shell[data-topbar="false"] 只清 padding-top），本条只补基础间距，
+ * 不重复让位——与 PageNav 的做法同型。
  */
 export function NetflixSettingsNav({
   active,
@@ -105,8 +109,11 @@ export function NetflixSettingsNav({
   const { session } = useSession();
   const router = useRouter();
   const chrome = usePageChrome();
-  // 认领移动端顶栏那一行（注销函数即 effect 清理）；桌面分支不渲染本组件，无副作用
-  useEffect(() => chrome?.registerPageNav(), [chrome]);
+  // 认领移动端顶栏那一行（注销函数即 effect 清理）；桌面分支不渲染本组件，
+  // 无副作用。必须用 useLayoutEffect 而不是 useEffect：登记要赶在浏览器
+  // 绘制之前生效，否则外壳的全局顶栏会先画出一帧再被撤掉（PageNav 对同一
+  // 机制记录过这个坑，见 components/page-nav.tsx）
+  useLayoutEffect(() => chrome?.registerPageNav(), [chrome]);
   // 设置是「我的」的二级页面，返回键语义是「回上级」而不是「历史后退」：
   // 用户可能在分区间连续切换（历史里堆着一串 /settings/*），按后退语义要
   // 逐级回退每个分区才能离开设置，与 iOS 设置页的返回心智不符。固定
@@ -139,7 +146,7 @@ export function NetflixSettingsNav({
   return (
     <div
       ref={rootRef}
-      className="relative z-30 shrink-0 border-b border-[var(--line)] bg-[var(--bg)] py-2 pl-[max(0.5rem,var(--safe-left))] pr-[max(0.5rem,var(--safe-right))] pt-[calc(var(--safe-top)+0.5rem)]"
+      className="relative z-30 shrink-0 border-b border-[var(--line)] bg-[var(--bg)] py-2 px-2 pt-[calc(var(--safe-top)+0.5rem)]"
     >
       <div className="flex items-center gap-1">
         <button
@@ -159,6 +166,16 @@ export function NetflixSettingsNav({
           <span className="truncate">{current.label}</span>
           <ChevronDownIcon className={`size-4 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
         </button>
+        {/* 本条认领顶栏后，全局顶栏（含搜索键）被撤掉——搜索是其中唯一
+            无处安放的入口，在这里补一颗（PageNav 对同一局面的既定做法）。
+            必须条件渲染而不是 CSS 隐藏：SearchCommand 自带全局 ⌘K 监听，
+            再挂一份会让一次快捷键把面板开了又关。 */}
+        {chrome && (
+          <SearchCommand
+            onSearch={chrome.onSearch}
+            triggerClassName={`${PAGE_NAV_BUTTON_CLASS} ml-auto`}
+          />
+        )}
       </div>
       {open && (
         <div

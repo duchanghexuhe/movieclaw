@@ -268,9 +268,11 @@ function NetflixBillboard({
         ) : libraryItem?.poster_url ? (
           <PosterFallbackFill url={libraryItem.poster_url} aspect={libraryItem.primary_aspect} />
         ) : null}
-        {/* 底部渐隐入画布色 + 左侧可读性渐变（§2.5 构图） */}
-        <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(20,20,20,0.45)_0%,rgba(20,20,20,0)_32%,rgba(20,20,20,0)_60%,#141414_100%)]" />
-        <div className="absolute inset-0 max-md:bg-[linear-gradient(180deg,rgba(0,0,0,0.5)_0%,transparent_40%,rgba(20,20,20,0.92)_100%)] md:bg-[linear-gradient(90deg,rgba(0,0,0,0.72)_0%,rgba(0,0,0,0.35)_42%,transparent_68%)]" />
+        {/* 底部渐隐入画布色 + 左侧可读性渐变（§2.5 构图）。渐变终点必须是
+            纯黑 #000（= 画布 --bg）：取卡片灰 #141414 会在图与下方内容的
+            交界处显出一道色差缝（globals.css 修 library hero 时的同一结论） */}
+        <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(20,20,20,0.45)_0%,rgba(20,20,20,0)_32%,rgba(20,20,20,0)_60%,#000_100%)]" />
+        <div className="absolute inset-0 max-md:bg-[linear-gradient(180deg,rgba(0,0,0,0.5)_0%,transparent_40%,rgba(0,0,0,0.92)_100%)] md:bg-[linear-gradient(90deg,rgba(0,0,0,0.72)_0%,rgba(0,0,0,0.35)_42%,transparent_68%)]" />
       </div>
 
       {/* 左下文案块 */}

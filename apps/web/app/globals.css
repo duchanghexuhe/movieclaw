@@ -2467,10 +2467,12 @@ html[data-theme="netflix"] .nf-nav-offset {
   );
 }
 
-/* 移动端底部标签栏（§5.2）：栏高 49px + 底部安全区，主区让位收口在这一条 */
+/* 移动端底部标签栏（§5.2）：栏高 49px + 底部安全区，主区让位收口在这一条。
+   实底不透明（同 NetflixTopNav 的取舍：Netflix 的栏是实底不是毛玻璃）——
+   0.95 不透明度下的模糊几乎不可见，却让滚动每帧多一层采样合成的开销，
+   索性提到全不透明并去掉 backdrop-filter。 */
 .nf-tabbar {
-  background: rgba(10, 10, 10, 0.95);
-  backdrop-filter: blur(12px);
+  background: #0a0a0a;
 }
 @media (max-width: 767px) {
   html[data-theme="netflix"] .app-shell > main {
