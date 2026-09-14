@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import configparser
 import logging
 from pathlib import Path
 
@@ -20,8 +21,20 @@ def _build_config() -> Config:
 
     用绝对路径覆盖 script_location，是为了让迁移无论从哪个工作目录启动
     （容器内 / IDE / 测试）都能找到迁移脚本。
+
+    ini 先用 UTF-8 显式预读再注入：alembic 内部读 ini 固定按系统区域编码
+    （Windows 中文系统 = GBK），而本仓库的 alembic.ini 带 UTF-8 中文注释，
+    把路径直接交给 Config 会在 Windows 上 UnicodeDecodeError、应用起不来。
+    预读用与 alembic 同款带插值的 ConfigParser，ini 里的其余配置
+    （file_template 的 %% 转义、日志段、prepend_sys_path）语义不变。
     """
-    cfg = Config(str(_ALEMBIC_INI))
+    file_config = configparser.ConfigParser({"here": _ALEMBIC_INI.parent.as_posix()})
+    file_config.read(_ALEMBIC_INI, encoding="utf-8")
+    cfg = Config()
+    # file_config 是 memoized_property：先触发一次默认构建，再用预读结果覆写
+    # 实例缓存（实例属性优先于类描述符），后续所有读取都命中 UTF-8 副本
+    cfg.file_config  # noqa: B018 —— 刻意解引用以触发 memoized 构建
+    cfg.__dict__["file_config"] = file_config
     cfg.set_main_option("script_location", str(_ALEMBIC_DIR))
     return cfg
 
