@@ -5,72 +5,66 @@ import type { Route } from "next";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
-import { AccountSwitcherDialog } from "@/components/account-switcher-dialog";
-import { AvatarBadge } from "@/components/avatar-badge";
-import { MovieclawMark } from "@/components/netflix/brand";
 import {
-  ActivityIcon,
+  ArrowLeftIcon,
   BookmarkIcon,
   ChevronDownIcon,
   CompassIcon,
-  GearIcon,
-  HouseIcon,
   LibraryIcon,
-  LogoutIcon,
-  PlusIcon,
   UserIcon,
 } from "@/components/icons";
-import { logout } from "@/lib/api/auth";
-import { clearBackdropCache } from "@/lib/backdrop-cache";
-import { useAgentConversations } from "@/lib/agent-conversations";
 import { settingsSectionGroupsFor } from "@/lib/mock-data";
-import { accessiblePathFor, usePermissions } from "@/lib/permissions";
+import { usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
-import { clearUiPrefsCache } from "@/lib/ui-prefs-cache";
 
 /**
  * Netflix 主题的移动端底部标签栏（<768px，docs/design/web-themes.md §5.2）。
  *
- * 参照基准：Netflix App 2026-04 改版前的三 tab 稳定期形态，按本站功能映射为
- * 4 个页签：首页 / 发现 / 媒体库 / 我的。「我的」承载原抽屉内容（原 mobile
- * 抽屉在 Netflix 主题下退役，openDrawer 由外壳改接到这个面板上），栏高
- * 49px + 底部安全区、激活白、未激活 #808080、图标 24px——这些数值无官方
- * 出处，按 iOS 惯例取值（设计文档标注的自家设计决策）。
+ * 参照 Netflix App 的内容消费动线映射为 4 个**路由**页签：发现 / 媒体库 /
+ * 订阅 / 我的（2026-09 修订：移除「首页」——内容首页 / 改由顶栏字标直达，
+ * 底栏让位给高频的内容入口；「订阅」对齐桌面顶栏的「我的订阅」）。
+ * 「订阅」按 canSubscribe 显隐，无权限时退化为 3 页签。
+ * 栏高 49px + 底部安全区、激活白、未激活 #808080、图标 24px——这些数值
+ * 无官方出处，按 iOS 惯例取值（设计文档标注的自家设计决策）。
  */
 
-const TABS = [
-  { id: "home", label: "首页", href: "/", Icon: HouseIcon },
+/** 页签基础清单（订阅由权限过滤补充，「我的」固定在末位）。 */
+const BASE_TABS = [
   { id: "discover", label: "发现", href: "/discover/movie", Icon: CompassIcon },
   { id: "library", label: "媒体库", href: "/library", Icon: LibraryIcon },
 ] as const;
 
+const SUBSCRIPTION_TAB = {
+  id: "subscriptions",
+  label: "订阅",
+  href: "/subscriptions",
+  Icon: BookmarkIcon,
+} as const;
+
+const MY_TAB = { id: "my", label: "我的", href: "/my", Icon: UserIcon } as const;
+
 /** pathname → 当前页签 id（详情等子页落在所属的顶层页签上）。 */
 function activeTabId(pathname: string): string {
-  if (pathname === "/" || pathname.startsWith("/new") || pathname.startsWith("/sessions/")) {
-    return "home";
-  }
-  if (pathname.startsWith("/discover")) return "discover";
-  if (pathname.startsWith("/library") || pathname.startsWith("/media")) return "library";
+  if (pathname.startsWith("/discover") || pathname.startsWith("/media")) return "discover";
+  if (pathname.startsWith("/library")) return "library";
+  if (pathname.startsWith("/subscriptions")) return "subscriptions";
+  if (pathname === "/my") return "my";
   return "";
 }
 
-export function NetflixTabBar({
-  onOpenMy,
-  myOpen = false,
-}: {
-  onOpenMy: () => void;
-  /** 「我的」面板当前开合：开着时页签保持高亮、aria-expanded 如实上报 */
-  myOpen?: boolean;
-}) {
+export function NetflixTabBar() {
   const pathname = usePathname();
-  const active = myOpen ? "my" : activeTabId(pathname);
+  const { canSubscribe } = usePermissions();
+  const active = activeTabId(pathname);
+  // 订阅页签按权限插在媒体库与我的之间；tab 数组重建的代价可忽略（4 个字面量）
+  const tabs = canSubscribe ? [...BASE_TABS, SUBSCRIPTION_TAB, MY_TAB] : [...BASE_TABS, MY_TAB];
 
   return (
     <nav
       aria-label="主导航"
       className="nf-tabbar fixed inset-x-0 bottom-0 z-40 flex h-[calc(49px+var(--safe-bottom))] items-stretch border-t border-white/[0.06] pb-[var(--safe-bottom)]"
     >
-      {TABS.map(({ id, label, href, Icon }) => (
+      {tabs.map(({ id, label, href, Icon }) => (
         <Link
           key={id}
           href={href}
@@ -83,194 +77,15 @@ export function NetflixTabBar({
           <span className="text-[10px] font-medium leading-none">{label}</span>
         </Link>
       ))}
-      {/* 「我的」不是路由而是面板：面板开着时保持高亮 */}
-      <button
-        type="button"
-        onClick={onOpenMy}
-        aria-expanded={myOpen}
-        className={`flex flex-1 flex-col items-center justify-center gap-0.5 ${
-          active === "my" ? "text-white" : "text-[#808080]"
-        }`}
-      >
-        <UserIcon className="size-6" />
-        <span className="text-[10px] font-medium leading-none">我的</span>
-      </button>
     </nav>
   );
 }
 
 /**
- * 「我的」面板：原移动抽屉的内容在 Netflix 主题下的新家——用户信息、新任务、
- * 我的订阅、活动、设置、AI 会话列表、切换账号、退出登录。
- *
- * 复用原抽屉的交互契约：路由切换自动收起由外壳负责；Esc 关闭；面板挂在
- * .app-shell 之外不会被外壳缩放裁掉（.nf-mysheet 是 fixed 定位）。
- */
-export function NetflixMySheet({
-  open,
-  onClose,
-  onOpenSettings,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onOpenSettings: (sectionId?: string) => void;
-}) {
-  const router = useRouter();
-  const { session } = useSession();
-  const { isAdmin, canSubscribe } = usePermissions();
-  const { conversations } = useAgentConversations();
-  const [switcherOpen, setSwitcherOpen] = useState(false);
-
-  // 面板打开时按 Esc 关闭（外接键盘 / 平板场景）
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
-
-  const go = (href: Route) => {
-    onClose();
-    router.push(href);
-  };
-
-  const handleLogout = async () => {
-    onClose();
-    let next: Awaited<ReturnType<typeof logout>> = null;
-    try {
-      next = await logout();
-    } catch {
-      // 即使请求失败，也照常跳登录页；会话在后端仍会自然过期
-    }
-    clearBackdropCache();
-    clearUiPrefsCache();
-    window.location.href = next ? accessiblePathFor(next, "/") : "/login";
-  };
-
-  return (
-    <>
-      <AccountSwitcherDialog open={switcherOpen} onClose={() => setSwitcherOpen(false)} />
-      {open && (
-        <button
-          type="button"
-          aria-label="关闭我的面板"
-          onClick={onClose}
-          className="mobile-drawer-scrim cursor-default"
-        />
-      )}
-      <div className="nf-mysheet" data-open={open} aria-hidden={!open} inert={!open}>
-        <div className="menu-surface flex h-full flex-col overflow-hidden border-0 p-1.5">
-          {/* 头部：品牌 + 用户信息 */}
-          <div className="flex items-center gap-3 px-2 pb-3 pt-1">
-            <MovieclawMark className="h-8 w-auto" />
-            <div className="ml-auto flex min-w-0 items-center gap-2">
-              <AvatarBadge
-                nickname={session.nickname}
-                avatarUrl={session.avatar_url}
-                className="size-8 text-ui"
-              />
-              <p className="min-w-0 truncate text-ui font-semibold text-[var(--text)]">
-                {session.nickname}
-              </p>
-            </div>
-          </div>
-          <div className="h-px bg-white/[0.08]" />
-
-          <div className="scroll-thin min-h-0 flex-1 overflow-y-auto pt-1.5">
-            <SheetRow
-              Icon={PlusIcon}
-              label="新任务"
-              onClick={() => go("/new" as Route)}
-            />
-            {canSubscribe && (
-              <SheetRow
-                Icon={BookmarkIcon}
-                label="我的订阅"
-                onClick={() => go("/subscriptions" as Route)}
-              />
-            )}
-            {isAdmin && <SheetRow Icon={ActivityIcon} label="活动" onClick={() => go("/activity" as Route)} />}
-            <SheetRow Icon={GearIcon} label="设置" onClick={() => { onClose(); onOpenSettings(); }} />
-
-            {isAdmin && (
-              <>
-                <p className="group-label px-3 pb-1 pt-4">AI 会话</p>
-                {conversations.length === 0 ? (
-                  <p className="px-3 py-1 text-caption leading-5 text-[var(--text-faint)]">
-                    还没有会话，从「新任务」开始。
-                  </p>
-                ) : (
-                  conversations.map((c) => (
-                    <SheetRow
-                      key={c.id}
-                      label={c.title}
-                      running={c.running}
-                      onClick={() => go(`/sessions/${c.id}` as Route)}
-                    />
-                  ))
-                )}
-              </>
-            )}
-          </div>
-
-          <div className="h-px bg-white/[0.08]" />
-          <SheetRow
-            Icon={UserIcon}
-            label="切换账号"
-            onClick={() => {
-              onClose();
-              setSwitcherOpen(true);
-            }}
-          />
-          <SheetRow
-            Icon={LogoutIcon}
-            label="退出登录"
-            danger
-            onClick={() => void handleLogout()}
-          />
-        </div>
-      </div>
-    </>
-  );
-}
-
-/** 面板里的一行（glass-row 皮肤，Netflix 主题下自动跟随 token 换肤）。 */
-function SheetRow({
-  Icon,
-  label,
-  onClick,
-  danger = false,
-  running = false,
-}: {
-  Icon?: React.ComponentType<React.SVGProps<SVGSVGElement>>;
-  label: string;
-  onClick: () => void;
-  danger?: boolean;
-  running?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`glass-row px-2.5 py-2.5 text-ui font-medium ${
-        danger ? "!text-[var(--danger)] hover:!bg-[rgba(255,107,107,0.12)]" : ""
-      }`}
-    >
-      {running && (
-        <span aria-hidden="true" className="size-1.5 shrink-0 animate-pulse rounded-full bg-[#6aa7ff]" />
-      )}
-      {Icon && <Icon className="size-[20px] shrink-0" />}
-      <span className="min-w-0 flex-1 truncate">{label}</span>
-    </button>
-  );
-}
-
-/**
- * 移动端设置页的分区下拉：银玻璃主题下分区列表装在抽屉侧栏里，Netflix
- * 主题抽屉退役后由这条下拉承接同样的导航能力（/settings/* 可达性不回退）。
- * 挂在页面内容顶部（外壳在 settings 路由下渲染），数据与桌面分区菜单同源。
+ * 移动端设置页的分区导航条：左侧返回键（回到「我的」/真实来路）+ 当前分区
+ * 下拉。银玻璃主题下分区列表装在抽屉侧栏里，Netflix 主题抽屉退役后由这条
+ * 下拉承接同样的导航能力（/settings/* 可达性不回退）。挂在页面内容顶部
+ * （外壳在 settings 路由下渲染），数据与桌面分区菜单同源。
  */
 export function NetflixSettingsNav({
   active,
@@ -280,6 +95,12 @@ export function NetflixSettingsNav({
   onSelect: (id: string) => void;
 }) {
   const { session } = useSession();
+  const router = useRouter();
+  // 设置是「我的」的二级页面，返回键语义是「回上级」而不是「历史后退」：
+  // 用户可能在分区间连续切换（历史里堆着一串 /settings/*），按后退语义要
+  // 逐级回退每个分区才能离开设置，与 iOS 设置页的返回心智不符。固定
+  // replace 回 /my，一次到位且不额外堆积历史。
+  const back = () => router.replace("/my" as Route);
   const groups = settingsSectionGroupsFor(session.role);
   const all = groups.flatMap((group) => group.items);
   const current = all.find((section) => section.id === active) ?? all[0];
@@ -305,16 +126,26 @@ export function NetflixSettingsNav({
   if (!current) return null;
 
   return (
-    <div ref={rootRef} className="relative shrink-0 border-b border-[var(--line)] bg-[var(--bg)] px-4 py-2.5">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-        className="flex items-center gap-1.5 text-title font-semibold text-[var(--text)]"
-      >
-        {current.label}
-        <ChevronDownIcon className={`size-4 transition-transform ${open ? "rotate-180" : ""}`} />
-      </button>
+    <div ref={rootRef} className="relative z-30 shrink-0 border-b border-[var(--line)] bg-[var(--bg)] px-2 py-2">
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={back}
+          aria-label="返回"
+          className="nf-icon-btn !size-9"
+        >
+          <ArrowLeftIcon className="size-[22px]" />
+        </button>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex min-w-0 items-center gap-1.5 px-2 text-title font-semibold text-[var(--text)]"
+        >
+          <span className="truncate">{current.label}</span>
+          <ChevronDownIcon className={`size-4 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
+        </button>
+      </div>
       {open && (
         <div
           className="menu-surface absolute inset-x-4 top-full z-50 p-1.5"

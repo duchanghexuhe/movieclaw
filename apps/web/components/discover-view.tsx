@@ -216,14 +216,6 @@ export function DiscoverView({
     return () => controller.abort();
   }, [cacheKey, filtering, mediaType, reloadKey, source]);
 
-  const switchSource = useCallback(
-    (nextSource: MediaSource) => {
-      if (nextSource === source) return;
-      router.push(`/discover/${mediaType}?source=${nextSource}` as Route);
-    },
-    [mediaType, router, source],
-  );
-
   const applyFilters = useCallback(
     (nextFilters: DiscoveryFilters) => {
       const query = discoveryFiltersQuery(nextFilters);
@@ -232,9 +224,33 @@ export function DiscoverView({
     [mediaType, router],
   );
 
+  const switchSource = useCallback(
+    (nextSource: MediaSource) => {
+      if (nextSource === source) return;
+      router.push(`/discover/${mediaType}?source=${nextSource}` as Route);
+    },
+    [mediaType, router, source],
+  );
+
+  // 电影/剧集切换（移动端挂顶栏右上角，与订阅页的类型切换同一位置同一形态；
+  // 桌面端顶栏导航已有「电影 / 剧集」两个链接，不再重复放）。切换保留当前
+  // 数据源视角。
+  const chrome = usePageChrome();
+  const isMobile = useIsMobile();
+  // Netflix 主题：工具栏悬浮在 Hero 上（不自占一条）、Hero 全出血（§5.3 构图）
+  const isNf = useTheme().id === "netflix";
+  const switchMediaType = useCallback(
+    (next: MediaType) => {
+      if (next === mediaType) return;
+      router.push(`/discover/${next}?source=${source}` as Route);
+    },
+    [mediaType, router, source],
+  );
+
   const controls = useMemo(
     () => (
       <div className="flex items-center gap-2">
+        {isMobile && <MediaTypeSwitcher value={mediaType} onChange={switchMediaType} />}
         {source === "tmdb" && (
           <DiscoveryFilterControl
             mediaType={mediaType}
@@ -243,19 +259,15 @@ export function DiscoverView({
             onApply={applyFilters}
           />
         )}
-        <SourceSwitcher value={source} onChange={switchSource} />
+        <SourceSwitcher value={source} onChange={switchSource} compact={isMobile} />
       </div>
     ),
-    [applyFilters, currentYear, filters, mediaType, source, switchSource],
+    [applyFilters, currentYear, filters, isMobile, mediaType, source, switchMediaType, switchSource],
   );
 
   // 发现页是侧栏一级入口，没有 PageNav，数据源切换若自己吸一条顶栏，窄屏上
   // 就会摞在全局顶栏底下变成两排 header。移动端改为挂进全局顶栏那一行
   // （字标与搜索之间本来就空着），桌面端维持原来的吸顶工具栏不变。
-  const chrome = usePageChrome();
-  const isMobile = useIsMobile();
-  // Netflix 主题：工具栏悬浮在 Hero 上（不自占一条）、Hero 全出血（§5.3 构图）
-  const isNf = useTheme().id === "netflix";
   const setTopBarActions = chrome?.setTopBarActions;
   useEffect(() => {
     if (!isMobile || !setTopBarActions) return;
@@ -360,31 +372,68 @@ export function DiscoverView({
   );
 }
 
-/** 数据源视角切换：两个视角分别缓存，来回切换不会重复请求。 */
+/** 数据源视角切换：两个视角分别缓存，来回切换不会重复请求。compact 档给
+    移动端顶栏用（内边距收窄，给同排的电影/剧集切换让宽度）。 */
 function SourceSwitcher({
   value,
   onChange,
+  compact = false,
 }: {
   value: MediaSource;
   onChange: (source: MediaSource) => void;
+  compact?: boolean;
 }) {
   return (
-      <div className="flex shrink-0 rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl">
-        {(["tmdb", "douban"] as const).map((source) => (
-          <button
-            key={source}
-            type="button"
-            onClick={() => onChange(source)}
-            className={`rounded-full px-4 py-1.5 text-sub font-semibold transition ${
-              value === source
-                ? "bg-white/15 text-white shadow-sm"
-                : "text-[var(--text-muted)] hover:text-white"
-            }`}
-          >
-            {source === "tmdb" ? "TMDB" : "豆瓣"}
-          </button>
-        ))}
-      </div>
+    <div className="flex shrink-0 rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl">
+      {(["tmdb", "douban"] as const).map((source) => (
+        <button
+          key={source}
+          type="button"
+          onClick={() => onChange(source)}
+          className={`rounded-full py-1.5 text-sub font-semibold transition ${compact ? "px-2.5" : "px-4"} ${
+            value === source
+              ? "bg-white/15 text-white shadow-sm"
+              : "text-[var(--text-muted)] hover:text-white"
+          }`}
+        >
+          {source === "tmdb" ? "TMDB" : "豆瓣"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** 电影/剧集切换（移动端顶栏右上角）：与订阅页的类型切换同一形态，
+    走路由切换（/discover/movie ↔ /discover/tv），各视角独立缓存。 */
+function MediaTypeSwitcher({
+  value,
+  onChange,
+}: {
+  value: MediaType;
+  onChange: (type: MediaType) => void;
+}) {
+  const labels: Record<MediaType, string> = { movie: "电影", tv: "剧集" };
+  return (
+    <div
+      className="flex shrink-0 rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl"
+      aria-label="内容类型"
+    >
+      {(["movie", "tv"] as const).map((type) => (
+        <button
+          key={type}
+          type="button"
+          aria-pressed={value === type}
+          onClick={() => onChange(type)}
+          className={`rounded-full px-2.5 py-1.5 text-sub font-semibold transition ${
+            value === type
+              ? "bg-white/15 text-white shadow-sm"
+              : "text-[var(--text-muted)] hover:text-white"
+          }`}
+        >
+          {labels[type]}
+        </button>
+      ))}
+    </div>
   );
 }
 

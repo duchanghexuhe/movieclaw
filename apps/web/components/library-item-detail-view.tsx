@@ -83,6 +83,7 @@ import { invalidateLibraryDetailSnapshot } from "@/lib/library-detail-snapshot";
 import { refreshItemConfirm, rereadItemNfoConfirm } from "@/lib/library-confirm";
 import { usePermissions } from "@/lib/permissions";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
+import { useTheme } from "@/lib/ui-prefs";
 import { usePageTitle } from "@/lib/use-page-title";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
 
@@ -322,6 +323,41 @@ export function LibraryItemDetailView({
   // 的 setOverrideBackdrop。没有横幅剧照时退回海报，覆盖层自己会铺满作氛围色。
   const { setOverrideBackdrop } = useBackdrop();
   const isMobile = useIsMobile();
+  const isNfDesktop = useTheme().id === "netflix" && !isMobile;
+  // Netflix 桌面的滚动退场（与发现详情页同一套）：挂 html.nf-hero-live 标记类，
+  // 把滚动进度写进 --nf-hero-recede，globals.css 据此给沉浸覆盖层加渐暗 + 模糊、
+  // 左侧纯黑遮罩护住上移后的标题。仅桌面启用——手机的剧照是页内 Hero
+  // （showMobileHero），滚动容器铺黑已把全站背景层整个挡住，标记类无处生效。
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const hasDetail = detail !== null;
+  useEffect(() => {
+    if (!isNfDesktop) return;
+    const root = document.documentElement;
+    root.classList.add("nf-hero-live");
+    const el = scrollRef.current;
+    if (!el) return () => {
+      root.classList.remove("nf-hero-live");
+      root.style.removeProperty("--nf-hero-recede");
+    };
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      const range = Math.max(320, el.clientHeight * 0.75);
+      const progress = Math.min(1, Math.max(0, el.scrollTop / range));
+      root.style.setProperty("--nf-hero-recede", progress.toFixed(3));
+    };
+    const onScroll = () => {
+      if (!frame) frame = window.requestAnimationFrame(sync);
+    };
+    sync();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (frame) window.cancelAnimationFrame(frame);
+      root.classList.remove("nf-hero-live");
+      root.style.removeProperty("--nf-hero-recede");
+    };
+  }, [isNfDesktop, hasDetail]);
   const immersiveUrl = detail ? imageUrl(detail.backdrop_url ?? detail.poster_url) : "";
   // 手机也换全站背景，但页面本身不靠它显示：横版剧照铺满又高又窄的整屏只能按高度放大、
   // 从正中裁一条竖条，所以手机上看到的剧照是页内 Hero（mobileHeroSrc），滚动容器铺黑把
@@ -555,6 +591,7 @@ export function LibraryItemDetailView({
     // overflow 一裁，就成了贴在屏幕顶上的一块圆角色块（手机上肉眼可见的
     // 两个缺角），底边同理被 Home 指示条切掉。手机上一律方角、真通栏。
     <div
+      ref={scrollRef}
       className={`detail-ambient scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl max-md:rounded-none ${
         showMobileHero ? "detail-ambient--hero" : ""
       }`}
@@ -676,7 +713,7 @@ export function LibraryItemDetailView({
           顶栏的占位（52px + 安全区）与片名压进图里的那一截（150px），片名与信息落在剧照
           底部的渐变上；视口很矮时减到负数就不留白 */}
       <div
-        className={showMobileHero ? undefined : "h-[30vh] min-h-[180px] max-md:h-[22vh] max-md:min-h-[120px]"}
+        className={showMobileHero ? undefined : "h-[var(--detail-hero-h)] min-h-[var(--detail-hero-min-h)]"}
         style={
           showMobileHero
             ? { height: `max(0px, calc(${mobileHeroHeight} - 52px - var(--safe-top) - 150px))` }
@@ -685,8 +722,10 @@ export function LibraryItemDetailView({
       />
 
       {/* 内容层：-mt-28/pt-28 与 .detail-ambient 的渐变起点对齐——渐变从标题
-          上方开始压暗，音轨附近已接近纯黑，下面保持全黑。 */}
-      <div className="relative z-10 -mt-28 pb-12 pt-28">
+          上方开始压暗，音轨附近已接近纯黑，下面保持全黑。detail-content 是
+          Netflix 主题的标题上移钩子（globals.css 把它的 pt 收小、标题借左侧
+          遮罩直接落在剧照上，与发现详情页同一构图）。 */}
+      <div className="detail-content relative z-10 -mt-28 pb-12 pt-28">
       {/* —— 头部信息区 —— */}
       <div className="relative z-10 px-12 pt-6 max-md:px-4 max-md:pt-3">
         <div className="min-w-0 max-w-5xl pb-1">

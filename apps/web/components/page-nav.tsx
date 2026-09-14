@@ -99,7 +99,7 @@ export function PageNav({
   const back = useBackNavigation(fallback.href);
   const rootRef = useRef<HTMLDivElement>(null);
   const chrome = usePageChrome();
-  // ☰ 键的落点随主题分叉：银玻璃开抽屉、Netflix 开「我的」面板——aria 如实上报
+  // ☰ 键只在银玻璃渲染（开抽屉）；Netflix 的导航在底部页签，详见下方控件组注释
   const isNetflix = useTheme().id === "netflix";
   const isMobile = useIsMobile();
 
@@ -159,15 +159,17 @@ export function PageNav({
         }}
       />
       <div className="relative flex h-[52px] items-center gap-3">
-        {/* 左侧控件组：移动端补一颗 ☰ 排在返回键左边。本页顶栏顶掉了外壳那条
-            全局顶栏，抽屉入口不在这儿补回来，详情页就只能先返回才能换区。
-            组内 gap-2 与右侧控件组一致，组与标题之间才是外层的 gap-3。 */}
+        {/* 左侧控件组：银玻璃移动端补一颗 ☰ 排在返回键左边（本页顶栏顶掉了
+            外壳那条全局顶栏，抽屉入口不在这儿补回来，详情页就只能先返回才能
+            换区）。Netflix 主题不放 ☰：导航全在底部页签，「我的」是 /my 路由，
+            这颗键只会在 390px 宽的一行里白占一格。组内 gap-2 与右侧控件组
+            一致，组与标题之间才是外层的 gap-3。 */}
         <div className="flex shrink-0 items-center gap-2">
-          {isMobile && chrome && (
+          {isMobile && chrome && !isNetflix && (
             <button
               type="button"
               onClick={chrome.openDrawer}
-              aria-label={isNetflix ? "打开我的面板" : "打开侧边栏"}
+              aria-label="打开侧边栏"
               className={backClass}
             >
               <MenuIcon className="size-[18px] max-md:size-[22px]" />

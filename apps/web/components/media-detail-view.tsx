@@ -210,19 +210,21 @@ export function MediaDetailView({
   // 这些 hook 必须无条件调用（短路写法会触发 rules-of-hooks）。
   const themeId = useTheme().id;
   const isMobile = useIsMobile();
-  const isNfDesktop = themeId === "netflix" && !isMobile;
+  const isNf = themeId === "netflix";
+  const isNfDesktop = isNf && !isMobile;
   const hidePageNav = isNfDesktop;
 
   // 滚动退场：详情页下滚时剧照不是被机械地推出屏幕，而是随滚动进度渐暗 +
   // 模糊（Netflix 海报墙的观感）。进度写到根节点 CSS 变量 --nf-hero-recede
   // （0→1），沉浸覆盖层（globals.css 的 html.nf-hero-live .backdrop-override）
   // 用它驱动 filter——滚动过程零 React 重渲染。rAF 合帧：一次滚动会派发多次
-  // scroll 事件，只保留最后一帧的写入。只在 Netflix 桌面启用；卸载 / 换片
+  // scroll 事件，只保留最后一帧的写入。Netflix 主题桌面与移动都启用（移动端
+  // 的纵向渐隐同样挂在这个标记类上，见 globals.css 的移动端档）；卸载 / 换片
   // 重建时把变量与标记类清干净，别污染其他页面。
   const scrollRef = useRef<HTMLDivElement>(null);
   const hasItem = Boolean(item);
   useEffect(() => {
-    if (!isNfDesktop) return;
+    if (!isNf) return;
     const root = document.documentElement;
     root.classList.add("nf-hero-live");
     const el = scrollRef.current;
@@ -253,7 +255,7 @@ export function MediaDetailView({
       root.classList.remove("nf-hero-live");
       root.style.removeProperty("--nf-hero-recede");
     };
-  }, [isNfDesktop, hasItem]);
+  }, [isNf, hasItem]);
 
   // 兜底态也必须渲染 PageNav——它向外壳登记「本页自带顶栏」，否则移动端的
   // 全局顶栏（☰ + logo）会在数据到达前先显示、随后又消失，顶部闪一下；

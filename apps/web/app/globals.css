@@ -2210,10 +2210,12 @@ html[data-theme="netflix"] .detail-ambient::-webkit-scrollbar-track {
   background-size: cover;
   background-position: center top;
 }
-/* Netflix 详情页的「左黑右图」构图：黑色块只占窗口左 1/4，覆盖层从窗口
-   25% 起铺（图片保持 cover 原始比例**不放大**）；25%~50% 区间从纯黑渐显，
-   窗口右半完全正常显示图片。渐变用多段缓动曲线（两端平缓、中段过渡），
-   线性 ramp 在照片上会读出一道明显的「带」。 */
+/* Netflix 详情页的「左黑右图」构图（仅桌面）：黑色块只占窗口左 1/4，覆盖层
+   从窗口 25% 起铺（图片保持 cover 原始比例**不放大**）；25%~50% 区间从纯黑
+   渐显，窗口右半完全正常显示图片。渐变用多段缓动曲线（两端平缓、中段过渡），
+   线性 ramp 在照片上会读出一道明显的「带」。
+   移动端不做左移/mask（竖屏没有「左文右图」的横向分区），改为全幅 + 纵向
+   渐隐（见下方 ::after 的移动端档）。 */
 /* 渐变曲线定义在 html.nf-hero-live 上：覆盖层与轮换层（body 的子节点、
    不是覆盖层的后代）都要继承它——定义在覆盖层上轮换层只能拿到 undefined，
    mask 整个失效成硬边（实测踩过）。 */
@@ -2228,10 +2230,12 @@ html.nf-hero-live {
     #000 40%
   );
 }
-html.nf-hero-live .backdrop-override {
-  left: 25%;
-  mask-image: var(--nf-blend);
-  -webkit-mask-image: var(--nf-blend);
+@media (min-width: 768px) {
+  html.nf-hero-live .backdrop-override {
+    left: 25%;
+    mask-image: var(--nf-blend);
+    -webkit-mask-image: var(--nf-blend);
+  }
 }
 /* 轮换层挂载时隐藏沉浸覆盖层：覆盖层永远停在主 backdrop（第一张图），
    轮换开始后它会从半透明渐变区透出、成为「上一张的残影」。覆盖层的 opacity
@@ -2269,6 +2273,23 @@ html.nf-hero-live .detail-slideshow::after {
   position: absolute;
   inset: 0;
   background: linear-gradient(180deg, rgba(0, 0, 0, 0) 58%, #000 88%);
+}
+/* 移动端竖屏档（2026-09 修订）：hero 约 40vh、标题压进图下段，渐变整体
+   上移收口到 ~60vh；顶部另压一抹暗，保证状态栏/PageNav 返回键在亮图上
+   可读。此前移动端完全没有渐变（净效果 = 亮图直压白字），桌面专属的
+   「左黑右图」又与竖屏无关——这是移动端详情页观感「不成体系」的主因。 */
+@media (max-width: 767px) {
+  html.nf-hero-live .backdrop-override::after {
+    background:
+      linear-gradient(180deg, rgba(0, 0, 0, 0.32) 0%, rgba(0, 0, 0, 0) 15%),
+      linear-gradient(
+        180deg,
+        rgba(0, 0, 0, 0) 20%,
+        rgba(0, 0, 0, 0.5) 36%,
+        rgba(0, 0, 0, 0.85) 50%,
+        #000 62%
+      );
+  }
 }
 /* 滚动退场的另一半：整层随进度淡出（此前纵向渐变随内容滚上来兜底，
    移除后改由这里接手）——深层滚动时图片只剩微光，正文完全主导。 */
@@ -2338,9 +2359,20 @@ html.nf-hero-live .detail-slideshow {
  * 品牌加载动画（components/brand-loader.tsx）：M 字标缓慢呼吸——
  * 轻微放大 + 透明度起伏，比旋转圆环安静、有品牌辨识度。
  * 系统开启「减弱动态效果」时退化为静止 logo。
+ * 品牌资产随主题分叉（组件里双渲染）：银玻璃 = rotor 图片；
+ * Netflix = 红色 SVG M 字标——加载中的一抹品牌红。
  */
 .brand-loader {
   animation: brand-loader-breath 1.4s ease-in-out infinite;
+}
+.brand-loader--netflix {
+  display: none;
+}
+html[data-theme="netflix"] .brand-loader--silver {
+  display: none;
+}
+html[data-theme="netflix"] .brand-loader--netflix {
+  display: block;
 }
 @keyframes brand-loader-breath {
   0%,
@@ -2360,7 +2392,10 @@ html.nf-hero-live .detail-slideshow {
   }
 }
 html[data-theme="netflix"] .detail-ambient.detail-ambient--hero {
-  background: #141414;
+  /* 纯黑而非 #141414：手机页内 Hero 的底部渐变（library-item-detail-view）
+     落点是 to-black（#000），容器底色取卡片灰会在图与内容的交界处显出一道
+     色差缝；Netflix 画布本就是 #000，与渐变终点同色无缝衔接 */
+  background: #000;
 }
 html[data-theme="netflix"] .ambient-fallback {
   background: rgb(20 20 20 / 0.8);
@@ -2457,29 +2492,15 @@ html[data-theme="netflix"] .nf-nav-offset {
   }
 }
 
-/* 移动端「我的」页签的抽屉式面板：覆盖式浮层，自右侧滑入 */
-.nf-mysheet {
-  position: fixed;
-  z-index: 60;
-  top: 0;
-  bottom: calc(-1 * var(--vp-overshoot));
-  right: 0;
-  width: 86vw;
-  max-width: 320px;
-  padding: calc(var(--safe-top) + 10px) 0
-    calc(var(--safe-bottom) + var(--vp-overshoot) + 10px) 0;
-  transition: transform 280ms cubic-bezier(0.2, 0.8, 0.2, 1);
-  will-change: transform;
-}
-.nf-mysheet[data-open="false"] {
-  transform: translateX(104%);
-  pointer-events: none;
-}
-.nf-mysheet[data-open="true"] {
-  transform: translateX(0);
-}
-
 /* —— 移动端收口（docs/design/web-themes-mobile/）—— */
+
+/* 设置页大图标头（settings-view 的分区头）：Netflix 移动端由页顶的
+   NetflixSettingsNav（返回键 + 分区下拉）承担定位，窄屏不再重复占位 */
+@media (max-width: 767px) {
+  html[data-theme="netflix"] .settings-panel-head {
+    display: none;
+  }
+}
 
 /* 移动全局顶栏雾层换纯黑系：Netflix 画布是纯黑，银玻璃蓝黑雾在其上会读出色偏。
    blur 与 mask 保留——雾下滚过的海报墙仍要被压糊，这是雾的职责。 */

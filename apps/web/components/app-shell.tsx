@@ -17,7 +17,7 @@ import { SearchCommand, type SearchSubmitOptions } from "@/components/search-com
 import { SettingsSidebar } from "@/components/settings-view";
 import { Sidebar } from "@/components/sidebar";
 import { SubscribeEntryProvider } from "@/components/subscribe-entry";
-import { NetflixMySheet, NetflixSettingsNav, NetflixTabBar } from "@/components/netflix/tab-bar";
+import { NetflixSettingsNav, NetflixTabBar } from "@/components/netflix/tab-bar";
 import { NetflixTopNav } from "@/components/netflix/top-nav";
 import { MovieclawMark, MovieclawWordmark } from "@/components/netflix/brand";
 import { AgentConversationsProvider } from "@/lib/agent-conversations";
@@ -94,9 +94,9 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
   // 结构层主题：netflix 主题换外壳（顶栏 / 底部标签栏 / 内容首页）
   const theme = useTheme();
   const isNetflix = theme.id === "netflix";
-  // 抽屉开合（银玻璃移动端）/「我的」面板开合（Netflix 移动端）
+  // 抽屉开合（银玻璃移动端）。「我的」在 Netflix 主题下是独立路由页（/my），
+  // 不再是外壳管理的开合面板（原 NetflixMySheet 已退役）。
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [mySheetOpen, setMySheetOpen] = useState(false);
   // 本页是否自带顶栏（详情类页面的 PageNav 会自登记，见 lib/page-chrome.tsx）。
   // 计数而非布尔：路由切换时新旧页面短暂共存，先卸载的那个不能把状态清零。
   const [pageNavCount, setPageNavCount] = useState(0);
@@ -227,15 +227,14 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
   // 移动端顶栏归属：详情类页面自带 PageNav（返回 + 标题 + 页面操作），
   // 全局顶栏再叠一条就成了两层顶栏，于是把这一行让给页面自己（见 lib/page-chrome.tsx）。
   const showMobileTopBar = isMobile && pageNavCount === 0;
-  // 导航浮层的唤起：银玻璃移动端开抽屉；Netflix 移动端开「我的」面板
-  // （原抽屉体系在该主题下退役，chrome 契约不变，页面无感）。
+  // 导航浮层的唤起：银玻璃移动端开抽屉；Netflix 主题下「我的」已是路由页
+  // （/my），任何残留的唤起点（如旧书签脚本）统一改为跳转，chrome 契约不变。
   const openDrawer = useCallback(() => {
-    if (isNetflix) setMySheetOpen(true);
+    if (isNetflix) router.push("/my");
     else setDrawerOpen(true);
-  }, [isNetflix]);
+  }, [isNetflix, router]);
   const closeDrawer = useCallback(() => {
     setDrawerOpen(false);
-    setMySheetOpen(false);
   }, []);
   const pageChrome = useMemo(
     () => ({
@@ -249,25 +248,21 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
     [registerPageNav, handleSearch, openDrawer, closeDrawer, setTopBarActions, setTopBarTitle],
   );
 
-  // 移动端抽屉 /「我的」面板：切换路由即自动收起（点导航项跳走后浮层不该还
-  // 盖着新页面），回到桌面版式时也一并复位，避免再切回窄屏时莫名其妙已经开着。
+  // 移动端抽屉：切换路由即自动收起（点导航项跳走后浮层不该还盖着新页面），
+  // 回到桌面版式时也一并复位，避免再切回窄屏时莫名其妙已经开着。
   useEffect(() => {
     setDrawerOpen(false);
-    setMySheetOpen(false);
   }, [pathname, isMobile]);
 
-  // 抽屉 / 面板打开时按 Esc 关闭（外接键盘 / 平板场景）
+  // 抽屉打开时按 Esc 关闭（外接键盘 / 平板场景）
   useEffect(() => {
-    if (!drawerOpen && !mySheetOpen) return;
+    if (!drawerOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setDrawerOpen(false);
-        setMySheetOpen(false);
-      }
+      if (e.key === "Escape") setDrawerOpen(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [drawerOpen, mySheetOpen]);
+  }, [drawerOpen]);
 
   // 侧栏本体：桌面常驻左栏、移动端装进抽屉，两处共用同一份实例。
   // 必须只渲染一份——面板是真实 WebGL 液态玻璃，多一份就多吃一个 WebGL 上下文。
@@ -296,9 +291,10 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
     return (
       <PageChromeProvider value={pageChrome}>
         {isMobile ? (
-          /* —— Netflix 移动端：底部标签栏 +「我的」面板 ——
+          /* —— Netflix 移动端：底部标签栏（发现/媒体库/订阅/我的，全是路由）——
              详情页 PageNav（返回键 + 吸顶雾）保留（App 详情页同样有返回）；
-             无 PageNav 的页面继续用原雾层顶栏承载页面级控件与搜索。 */
+             无 PageNav 的页面继续用原雾层顶栏承载字标、页面级控件与搜索；
+             首页 / 与「我的」/my 都由字标/页签直达，顶栏不再需要 ☰。 */
           <div
             className="app-shell viewport-app-height relative z-10 w-full"
             data-topbar={showMobileTopBar}
@@ -326,12 +322,7 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
                 children
               )}
             </main>
-            <NetflixTabBar onOpenMy={() => setMySheetOpen(true)} myOpen={mySheetOpen} />
-            <NetflixMySheet
-              open={mySheetOpen}
-              onClose={() => setMySheetOpen(false)}
-              onOpenSettings={openSettings}
-            />
+            <NetflixTabBar />
           </div>
         ) : (
           /* —— Netflix 桌面：顶栏 + 全宽内容 ——
@@ -482,7 +473,7 @@ function pathOfNavId(id: string): Route {
 }
 
 /**
- * 移动端顶栏：汉堡（唤起抽屉/我的面板）+ 品牌字标（回首页）+ 搜索。
+ * 移动端顶栏：品牌字标（回首页）+ 搜索。
  *
  * 为什么是「浮在内容之上」而不是「占一行把内容推下去」：全站有一半页面是
  * 大图氛围页与 Hero 大剧照，顶栏若占位会在画面顶端切出一条硬边。这里做成
@@ -490,8 +481,9 @@ function pathOfNavId(id: string): Route {
  * 一条 `.app-shell > main` 规则里（安全区 + --mobile-topbar-h），
  * 各页面不必各写各的 padding，新增路由自动继承。
  *
- * 只放三个入口是有意为之：手机上顶栏的每一个图标都在跟内容抢宽度，
- * 导航（抽屉里全都有）、设置（抽屉底部用户菜单里）都不该在这里再占一格。
+ * ☰ 只在银玻璃主题渲染（开侧栏抽屉）：Netflix 主题的导航全在底部页签与
+ * 「我的」页里，顶栏每一格宽度都要留给页面级控件（发现页的电影/剧集 +
+ * 数据源切换）——对齐 Netflix App 顶栏「左字标、右搜索」的极简形态。
  */
 function MobileTopBar({
   onMenu,
@@ -508,8 +500,8 @@ function MobileTopBar({
 }) {
   const router = useRouter();
   const { canSearch } = usePermissions();
-  // 品牌与 ☰ 落点随主题分叉：Netflix 用红色 SVG 字标、☰ 开「我的」面板
-  // （银玻璃 = rotor 图片 logo + 侧栏抽屉）。雾层色由 globals.css 的
+  // 品牌与 ☰ 落点随主题分叉：Netflix 用红色 SVG 字标、不放 ☰（导航在底栏）；
+  // 银玻璃 = rotor 图片 logo + ☰ 开侧栏抽屉。雾层色由 globals.css 的
   // html[data-theme="netflix"] .mobile-topbar 覆盖，组件里不用管。
   const isNetflix = useTheme().id === "netflix";
   return (
@@ -521,14 +513,16 @@ function MobileTopBar({
             WebGL 上下文（移动 Safari 上限个位数，超限静默丢弃最老的上下文），且它
             只会折射静态背景大图——顶栏浮在滚动的海报墙上，CSS backdrop-blur 对真实
             内容实时取样反而更接近真玻璃（2026-07 实测对比后的结论）。 */}
-        <button
-          type="button"
-          onClick={onMenu}
-          aria-label={isNetflix ? "打开我的面板" : "打开侧边栏"}
-          className={PAGE_NAV_BUTTON_CLASS}
-        >
-          <MenuIcon className="size-[22px]" />
-        </button>
+        {!isNetflix && (
+          <button
+            type="button"
+            onClick={onMenu}
+            aria-label="打开侧边栏"
+            className={PAGE_NAV_BUTTON_CLASS}
+          >
+            <MenuIcon className="size-[22px]" />
+          </button>
+        )}
         {title ? (
           // 页面标题顶替字标：min-w-0 + truncate 让超长标题在汉堡与右侧控件
           // 之间安全截断成省略号，绝不把搜索键挤出屏幕或撑破顶栏
