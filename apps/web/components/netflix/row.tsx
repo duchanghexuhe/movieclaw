@@ -18,6 +18,7 @@ import { MediaRow } from "@/components/media-row";
 import { PosterImage } from "@/components/poster-image";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { useMediaDetail } from "@/lib/media-detail";
+import { useTapGuard } from "@/lib/use-tap-guard";
 import type { PosterCardAction } from "@/components/poster-card";
 import type { MediaItem } from "@/lib/media-types";
 import { imageUrl } from "@/lib/image-proxy";
@@ -125,14 +126,20 @@ export function NetflixRow({
         </section>
       );
     }
-    // 常规行：复用既有 2:3 海报行（PosterCard 的触屏首点展开等约定全部保留）
+    // 常规行：复用既有 2:3 海报行（PosterCard 的触屏首点展开等约定全部保留）。
+    // cardHref：NetflixRowItem.href（库内条目 → 库内详情页）必须映射回
+    // MediaRow——否则移动端回落 useMediaDetail 的发现详情，无 tmdb_id 的
+    // 本地条目（id 形如 local:123）会跳进解析必败的无效路由
+    const hrefByMediaId = new Map(
+      items.flatMap((item) => (item.href ? [[item.media.id, item.href] as const] : [])),
+    );
     return (
       <MediaRow
         row={{ id, title, items: items.map((item) => item.media) }}
         moreHref={moreHref}
         moreLabel={moreLabel}
         cardAction={cardAction}
-        cardHref={undefined}
+        cardHref={(m) => hrefByMediaId.get(m.id)}
         cardRevealInfoOnTouch={cardRevealInfoOnTouch}
         insetClassName="px-[var(--nf-inset)]"
       />
@@ -428,6 +435,8 @@ function HoverSubscribeButton({ item }: { item: NetflixRowItem }) {
  * 行内横版卡：16:9 剧照 + 底部 3px 红色进度条。无横版图的条目复用
  * PosterImage 的「主图模糊铺底 + 居中完整显示」机制兜底。
  * 落点：playHref（继续观看，整卡即播）→ href → 全站详情入口。
+ * 触屏误触保护：卡在横滚行里，滑动/刹车手势会派发 click（use-tap-guard
+ * 三重判定），Link 分支只拦截不传动作——放行的点击走默认跳转。
  */
 function NetflixLandscapeCard({
   item,
@@ -441,7 +450,13 @@ function NetflixLandscapeCard({
   onHoverLeave?: () => void;
 }) {
   const { open: openDetail } = useMediaDetail();
-  const target = item.href ?? item.playHref;
+  // playHref 优先（接口注释与「继续观看」行的设计一致：整卡点击即起播，
+  // 不该先进详情再找播放键）；仅有 href 时落详情页
+  const playFirst = Boolean(item.playHref);
+  const target = item.playHref ?? item.href;
+  // Link 分支不传动作：guard 只负责拦下误触（preventDefault 掉跳转），
+  // 放行的点击走 Link 默认导航；button 分支把 openDetail 交给 onTap
+  const tapGuard = useTapGuard(target ? undefined : () => openDetail(item.media));
   const artwork = (
     <>
       <div className="relative aspect-video overflow-hidden rounded-[4px] bg-[#181818] ring-1 ring-white/[0.06] transition-all duration-150 group-hover/nfcard:ring-white/30">
@@ -472,15 +487,16 @@ function NetflixLandscapeCard({
       {target ? (
         <Link
           href={target}
+          {...tapGuard}
           className={shared}
-          aria-label={`查看《${item.media.title}》详情${item.context ? `，${item.context}` : ""}`}
+          aria-label={`${playFirst ? "播放" : "查看"}《${item.media.title}》${playFirst ? "" : "详情"}${item.context ? `，${item.context}` : ""}`}
         >
           {artwork}
         </Link>
       ) : (
         <button
           type="button"
-          onClick={() => openDetail(item.media)}
+          {...tapGuard}
           className={shared}
           aria-label={`查看《${item.media.title}》详情${item.context ? `，${item.context}` : ""}`}
         >

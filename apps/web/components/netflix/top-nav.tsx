@@ -9,14 +9,16 @@ import { AccountSwitcherDialog } from "@/components/account-switcher-dialog";
 import { AvatarBadge } from "@/components/avatar-badge";
 import { MovieclawWordmark } from "@/components/netflix/brand";
 import { ChevronDownIcon, LogoutIcon, UserIcon } from "@/components/icons";
+import { AppUpdateEntry } from "@/components/app-update-entry";
 import { NoticeCenter } from "@/components/notice-center";
 import { SearchCommand, type SearchSubmitOptions } from "@/components/search-command";
 import { logout } from "@/lib/api/auth";
 import { clearBackdropCache } from "@/lib/backdrop-cache";
-import type { SearchScope } from "@/lib/categories";
+import { type SearchScope } from "@/lib/categories";
 import { useAgentConversations } from "@/lib/agent-conversations";
 import { accessiblePathFor, usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
+import { taskActivityBadge, useTaskActivity } from "@/lib/task-activity";
 import { clearUiPrefsCache } from "@/lib/ui-prefs-cache";
 
 /**
@@ -315,13 +317,21 @@ function NetflixAvatarMenu({
             </div>
           </div>
           <div className="my-1 h-px bg-white/[0.08]" />
+          {/* 更新入口：侧栏在 Netflix 主题下退役，常驻更新徽标由头像菜单承接
+              （组件自轮询自鉴权，无更新时整行不渲染），一跳直达更新分区 */}
+          <AppUpdateEntry
+            collapsed={false}
+            onOpen={() => {
+              setOpen(false);
+              onOpenSettings("app");
+            }}
+          />
           <MenuRow label="设置" onClick={() => { setOpen(false); onOpenSettings(); }} />
           {isAdmin && (
-            <MenuRow
-              label="活动"
-              onClick={() => {
+            <AvatarActivityRow
+              onGo={(href) => {
                 setOpen(false);
-                router.push("/activity");
+                router.push(href as Route);
               }}
             />
           )}
@@ -380,6 +390,20 @@ function NetflixAvatarMenu({
   );
 }
 
+/** 头像菜单里的活动行：带任务角标（alert 红 / 进行中蓝）与动态落点——
+ *  侧栏 JobCenter 的同一套徽标逻辑（taskActivityBadge）。拆成独立组件让
+ *  任务轮询只在管理员展开时挂载。 */
+function AvatarActivityRow({ onGo }: { onGo: (href: string) => void }) {
+  const badge = taskActivityBadge(useTaskActivity());
+  return (
+    <MenuRow
+      label="活动"
+      badge={badge.count > 0 ? badge : undefined}
+      onClick={() => onGo(badge.href)}
+    />
+  );
+}
+
 /** 头像下拉里的一行（glass-row 皮肤在 Netflix 主题下自动跟随 token）。 */
 function MenuRow({
   label,
@@ -387,18 +411,21 @@ function MenuRow({
   icon,
   danger = false,
   running = false,
+  badge,
 }: {
   label: string;
   onClick: () => void;
   icon?: React.ReactNode;
   danger?: boolean;
   running?: boolean;
+  /** 右缘状态角标（活动行的任务计数：alert 红 / 否则提示蓝） */
+  badge?: { alert: boolean; count: number; hint?: string };
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      title={label}
+      title={badge?.hint ?? label}
       className={`glass-row px-2.5 py-2 text-ui font-medium max-md:py-2.5 ${
         danger ? "!text-[var(--danger)] hover:!bg-[rgba(255,107,107,0.12)]" : ""
       }`}
@@ -408,6 +435,15 @@ function MenuRow({
       )}
       {icon && <span className="shrink-0 opacity-80">{icon}</span>}
       <span className="min-w-0 flex-1 truncate">{label}</span>
+      {badge && badge.count > 0 && (
+        <span
+          className={`shrink-0 rounded-full px-1.5 py-0.5 text-micro font-semibold leading-none text-white ${
+            badge.alert ? "bg-[var(--danger-solid)]" : "bg-[var(--info)]"
+          }`}
+        >
+          {badge.count}
+        </span>
+      )}
     </button>
   );
 }

@@ -257,6 +257,7 @@ export function DiscoverView({
             filters={filters}
             currentYear={currentYear}
             onApply={applyFilters}
+            compact={isMobile}
           />
         )}
         <SourceSwitcher value={source} onChange={switchSource} compact={isMobile} />
@@ -373,7 +374,10 @@ export function DiscoverView({
 }
 
 /** 数据源视角切换：两个视角分别缓存，来回切换不会重复请求。compact 档给
-    移动端顶栏用（内边距收窄，给同排的电影/剧集切换让宽度）。 */
+ *  移动端顶栏用：字号降到 micro、内边距收窄（给同排的电影/剧集切换与筛选
+ *  键让宽度——三组控件全塞顶栏时按 px 计的宽度预算非常紧，375px 视口里
+ *  字标 + 三控件 + 搜索键必须都放得下），纵向用 py-2 把整颗胶囊撑到
+ *  ≈44px 触控高度。 */
 function SourceSwitcher({
   value,
   onChange,
@@ -390,7 +394,9 @@ function SourceSwitcher({
           key={source}
           type="button"
           onClick={() => onChange(source)}
-          className={`rounded-full py-1.5 text-sub font-semibold transition ${compact ? "px-2.5" : "px-4"} ${
+          className={`rounded-full font-semibold transition ${
+            compact ? "px-1.5 py-2 text-micro" : "py-1.5 px-4 text-sub"
+          } ${
             value === source
               ? "bg-white/15 text-white shadow-sm"
               : "text-[var(--text-muted)] hover:text-white"
@@ -404,7 +410,8 @@ function SourceSwitcher({
 }
 
 /** 电影/剧集切换（移动端顶栏右上角）：与订阅页的类型切换同一形态，
-    走路由切换（/discover/movie ↔ /discover/tv），各视角独立缓存。 */
+    走路由切换（/discover/movie ↔ /discover/tv），各视角独立缓存。
+    只在移动端渲染，尺寸即 compact 档（与 SourceSwitcher 同一套宽度预算）。 */
 function MediaTypeSwitcher({
   value,
   onChange,
@@ -424,7 +431,7 @@ function MediaTypeSwitcher({
           type="button"
           aria-pressed={value === type}
           onClick={() => onChange(type)}
-          className={`rounded-full px-2.5 py-1.5 text-sub font-semibold transition ${
+          className={`rounded-full px-1.5 py-2 text-micro font-semibold transition ${
             value === type
               ? "bg-white/15 text-white shadow-sm"
               : "text-[var(--text-muted)] hover:text-white"
@@ -497,7 +504,9 @@ function RowItemsSkeleton() {
       {Array.from({ length: 8 }, (_, i) => (
         <div
           key={i}
-          className="aspect-[2/3] w-[152px] shrink-0 animate-pulse rounded-2xl bg-white/[0.05] max-md:w-[126px] xl:w-[164px]"
+          // m-row-skel：Netflix 主题下真实行卡宽走 .m-row 的 clamp(100px,30vw,156px)
+          // 公式（globals.css），骨架卡挂同一钩子避免数据到达时整行跳宽
+          className="m-row-skel aspect-[2/3] w-[152px] shrink-0 animate-pulse rounded-2xl bg-white/[0.05] max-md:w-[126px] xl:w-[164px]"
         />
       ))}
     </>

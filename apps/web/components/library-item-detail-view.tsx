@@ -2012,7 +2012,7 @@ function FileRow({
           <button
             type="button"
             onClick={onRestore}
-            className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+            className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
           >
             恢复
           </button>
@@ -2021,7 +2021,7 @@ function FileRow({
           <button
             type="button"
             onClick={onPurge}
-            className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-faint)] transition hover:bg-white/[0.06] hover:text-[#ff9f9f]"
+            className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-faint)] transition hover:bg-white/[0.06] hover:text-[#ff9f9f]"
           >
             立即清理
           </button>
@@ -2032,7 +2032,7 @@ function FileRow({
             aria-label="删除此文件"
             title="删除此文件"
             onClick={onDelete}
-            className="touch-reveal shrink-0 rounded-md p-1.5 text-[var(--text-faint)] opacity-0 transition group-hover/filerow:opacity-100 hover:bg-white/[0.05] hover:text-[#ff9f9f]"
+            className="touch-reveal touch-target shrink-0 rounded-md p-1.5 text-[var(--text-faint)] opacity-0 transition group-hover/filerow:opacity-100 hover:bg-white/[0.05] hover:text-[#ff9f9f]"
           >
             <TrashIcon className="size-4" />
           </button>

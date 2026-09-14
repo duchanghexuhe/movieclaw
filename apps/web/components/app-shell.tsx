@@ -565,8 +565,10 @@ function MobileTopBar({
           </button>
         )}
         {/* 页面级控件塞在字标与搜索之间——那段本来就空着，够放一个分段控件；
-            min-w-0 让它在窄屏上自己收缩，而不是把搜索挤出屏幕 */}
-        <div className="ml-auto flex min-w-0 shrink items-center gap-2">
+            min-w-0 让它在窄屏上自己收缩，而不是把搜索挤出屏幕。极窄视口
+            （<350px，控件三件套 + 字标 + 搜索的宽度预算兜不住）退化为
+            横向可滑：最右的控件被裁一半能看到、能划出来，好过整颗消失 */}
+        <div className="ml-auto flex min-w-0 shrink items-center gap-2 overflow-x-auto scroll-none">
           {actions}
           {canSearch && (
             <div className="shrink-0">

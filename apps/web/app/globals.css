@@ -231,12 +231,15 @@ html {
 
 /* iOS 对每次点按都要等一拍判断「是不是双击缩放」，快速连点（翻页、
    步进按钮）会被误判成缩放手势把页面放大。声明 manipulation 告诉系统
-   这些元素只做点按/平移，判定取消、响应也更跟手。捏合缩放不受影响。 */
+   这些元素只做点按/平移，判定取消、响应也更跟手。捏合缩放不受影响。
+   video 同理入列：播放器在 video 上自实现双击快进，不声明的话
+   Android Chrome 里双击会和浏览器的双击缩放判定竞争（§播放器触控）。 */
 button,
 a,
 input,
 select,
 textarea,
+video,
 [role="button"] {
   touch-action: manipulation;
 }
@@ -2423,6 +2426,15 @@ html[data-theme="netflix"] .ambient-fallback {
 .nf-icon-btn:hover {
   background: var(--glass-fill-hover);
 }
+/* 触屏设备（含 ≥768px 的平板 / 横屏手机）放大到 44px 触控目标——与播放器
+   控件、PageNav 的 pointer-coarse 分档同一原则：触控尺寸看指针能力而不是
+   视口宽度，视口分档会让 iPad 与横屏手机回落到鼠标档的 36px。 */
+@media (pointer: coarse) {
+  .nf-icon-btn {
+    width: 44px;
+    height: 44px;
+  }
+}
 
 /* 桌面外壳：主区为绝对定位画布，非氛围页为顶栏让位（氛围页全出血、
    内容从顶栏底下穿过，观感即 Netflix 的 billboard / 详情 hero） */
@@ -2463,6 +2475,12 @@ html[data-theme="netflix"] .nf-nav-offset {
 @media (max-width: 767px) {
   html[data-theme="netflix"] .app-shell > main {
     padding-bottom: calc(49px + var(--safe-bottom));
+  }
+  /* 不透明 tab 栏下，main 已整层让位 49px+safe-bottom，各页滚动容器里的
+     .scroll-safe（为「内容从指示条下方穿过」的半透明设计）再垫一次
+     safe-bottom 就是双倍空白——Netflix 主题作用域下关掉内层占位。 */
+  html[data-theme="netflix"] .app-shell > main .scroll-safe::after {
+    height: 0;
   }
 }
 
@@ -2545,6 +2563,11 @@ html[data-theme="netflix"] .search-palette-panel {
      320px ≈ 2~3 张，一条规则覆盖首页 / 发现 / 库的全部行（都走 MediaRow 的
      .m-row），银玻璃不受作用域影响。 */
   html[data-theme="netflix"] .m-row > div {
+    width: clamp(100px, 30vw, 156px);
+  }
+  /* 发现页加载骨架卡挂同一宽度公式（discover-view 的 .m-row-skel）：
+     骨架与真实行卡同宽，数据到达时整行不跳宽。 */
+  html[data-theme="netflix"] .m-row-skel {
     width: clamp(100px, 30vw, 156px);
   }
 }

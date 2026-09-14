@@ -287,13 +287,15 @@ function NetflixBillboard({
         {addedLabel && (
           <p className="text-on-image mt-1 text-caption text-[var(--text-muted)]">{addedLabel}</p>
         )}
-        {/* 按钮组：▶ 播放（白底黑字）· ⓘ 详情（灰底）· ✦ 问 AI（ghost） */}
-        <div className="mt-4 flex items-center gap-2.5 max-md:mt-3.5">
+        {/* 按钮组：▶ 播放（白底黑字）· ⓘ 详情（灰底）· ✦ 问 AI（ghost）。
+            移动端可换行（320px 视口三颗排不下）且保持 44px 触控高度——
+            billboard 按钮组是首页最高频的操作区，max-md:h-9 的 36px 偏小 */}
+        <div className="mt-4 flex items-center gap-2.5 max-md:mt-3.5 max-md:flex-wrap">
           {playHref && (
             <button
               type="button"
               onClick={() => router.push(playHref)}
-              className="flex h-10 items-center gap-2 rounded-[4px] bg-white px-5 text-[15px] font-bold text-black transition-colors hover:bg-white/75 max-md:h-9 max-md:px-4"
+              className="flex h-10 items-center gap-2 rounded-[4px] bg-white px-5 text-[15px] font-bold text-black transition-colors hover:bg-white/75 max-md:h-11 max-md:px-4"
             >
               <PlayIcon className="size-5" fill="currentColor" />
               播放
@@ -303,7 +305,7 @@ function NetflixBillboard({
             <button
               type="button"
               onClick={() => router.push(detailHref)}
-              className="flex h-10 items-center gap-2 rounded-[4px] bg-[rgba(109,109,110,0.7)] px-5 text-[15px] font-semibold text-white transition-colors hover:bg-[rgba(109,109,110,0.4)] max-md:h-9 max-md:px-4"
+              className="flex h-10 items-center gap-2 rounded-[4px] bg-[rgba(109,109,110,0.7)] px-5 text-[15px] font-semibold text-white transition-colors hover:bg-[rgba(109,109,110,0.4)] max-md:h-11 max-md:px-4"
             >
               <InfoIcon className="size-5" />
               更多信息
@@ -313,7 +315,7 @@ function NetflixBillboard({
           <button
             type="button"
             onClick={() => router.push("/new")}
-            className="text-on-image flex h-10 items-center gap-1.5 rounded-[4px] px-3 text-[15px] font-medium text-[var(--text-muted)] transition-colors hover:text-white max-md:h-9"
+            className="text-on-image flex h-10 items-center gap-1.5 rounded-[4px] px-3 text-[15px] font-medium text-[var(--text-muted)] transition-colors hover:text-white max-md:h-11"
           >
             <SparkIcon className="size-4" />
             问 AI
@@ -387,8 +389,16 @@ function libraryItemToMediaItem(item: LibraryItem) {
     genres: [],
     extent: "",
     badges: [],
-    overview: "",
     libraryStatus: { mediaItemId: item.media_item_id, libraryCount: 1, fileCount: item.file_count },
+    // 信息层的元信息：库行的 cardRevealInfoOnTouch 依赖信息层可渲染（无内容
+    // 时不渲染、「首点展开看入库时间」的承诺落空）。走 overview 字段——
+    // overlayMeta 在 PosterVisualItem 上、MediaItem 不带，悬层两者都渲染。
+    overview: [
+      item.added_at ? `${formatRelativeTime(item.added_at)}入库` : null,
+      item.file_count > 0 ? `${item.file_count} 个文件` : null,
+    ]
+      .filter(Boolean)
+      .join(" · "),
     posterUrl: item.poster_url ? imageUrl(item.poster_url, cardVariantFor(item.primary_aspect)) : "",
     imageAspect: item.primary_aspect,
     // 行内卡是 16:9 框：封面即 16:9 抓帧时直接铺满，竖海报模糊铺底

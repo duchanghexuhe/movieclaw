@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-import { XIcon } from "@/components/icons";
+import { FilterIcon, XIcon } from "@/components/icons";
 import { Modal } from "@/components/modal";
 import { fetchDiscoveryGenres, type DiscoveryGenre } from "@/lib/api/discover";
 import {
@@ -22,11 +22,14 @@ export function DiscoveryFilterControl({
   filters,
   currentYear,
   onApply,
+  compact = false,
 }: {
   mediaType: MediaType;
   filters: DiscoveryFilters;
   currentYear: number;
   onApply: (filters: DiscoveryFilters) => void;
+  /** 移动端顶栏的图标形态（44px 圆钮 + 角标），与文字形态同开一个弹窗 */
+  compact?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(filters);
@@ -71,19 +74,38 @@ export function DiscoveryFilterControl({
 
   return (
     <>
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="relative flex h-9 shrink-0 items-center rounded-full border border-white/10 bg-black/35 px-4 text-sub font-semibold text-[var(--text-muted)] backdrop-blur-xl transition hover:border-white/20 hover:text-white"
-        aria-label={activeCount > 0 ? `筛选，已启用 ${activeCount} 项` : "筛选影片"}
-      >
-        筛选
-        {activeCount > 0 && (
-          <span className="tnum ml-2 flex size-5 items-center justify-center rounded-full bg-[var(--accent)] text-micro font-bold text-black">
-            {activeCount}
-          </span>
-        )}
-      </button>
+      {compact ? (
+        /* 移动端顶栏的紧凑档：去掉「筛选」文字换成图标 + 角标计数——顶栏要
+           同时装下电影/剧集切换、筛选、数据源切换与搜索键，文字按钮放不下；
+           size-11 圆钮与搜索键同一触控规格（44px） */
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="relative flex size-11 shrink-0 items-center justify-center rounded-full border border-white/10 bg-black/35 text-sub font-semibold text-[var(--text-muted)] backdrop-blur-xl transition hover:border-white/20 hover:text-white"
+          aria-label={activeCount > 0 ? `筛选，已启用 ${activeCount} 项` : "筛选影片"}
+        >
+          <FilterIcon className="size-[18px]" />
+          {activeCount > 0 && (
+            <span className="tnum absolute -right-1 -top-1 flex size-[18px] items-center justify-center rounded-full bg-[var(--accent)] text-micro font-bold text-black">
+              {activeCount}
+            </span>
+          )}
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="relative flex h-9 shrink-0 items-center rounded-full border border-white/10 bg-black/35 px-4 text-sub font-semibold text-[var(--text-muted)] backdrop-blur-xl transition hover:border-white/20 hover:text-white"
+          aria-label={activeCount > 0 ? `筛选，已启用 ${activeCount} 项` : "筛选影片"}
+        >
+          筛选
+          {activeCount > 0 && (
+            <span className="tnum ml-2 flex size-5 items-center justify-center rounded-full bg-[var(--accent)] text-micro font-bold text-black">
+              {activeCount}
+            </span>
+          )}
+        </button>
+      )}
       <Modal
         open={open}
         onClose={() => setOpen(false)}

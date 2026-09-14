@@ -41,6 +41,7 @@ import { buildDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
 import { upgradedTmdbOriginalUrl } from "@/lib/image-proxy";
 import { getMediaSeed } from "@/lib/media-detail";
+import { useTapGuard } from "@/lib/use-tap-guard";
 import { usePageTitle } from "@/lib/use-page-title";
 import { useTheme } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
@@ -666,32 +667,7 @@ function TrailerRow({ title, videos }: { title: string; videos: MediaVideo[] }) 
 
       <HScroller className="-mx-1 gap-3 px-1 pb-1 pt-1">
         {videos.map((video) => (
-          <button
-            key={video.key}
-            type="button"
-            onClick={() => setPlaying(video)}
-            className="group/trailer w-[264px] shrink-0 text-left max-md:w-[208px]"
-          >
-            <div className="relative aspect-video overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/trailer:-translate-y-1 group-hover/trailer:shadow-[0_16px_40px_rgba(0,0,0,0.55)] group-hover/trailer:ring-white/30">
-              {/* YouTube 封面是 4:3（上下带黑边），object-cover 裁进 16:9 恰好只剩画面 */}
-              <PosterImage
-                src={video.thumbnailUrl}
-                alt={`${title} ${video.kind}`}
-                className="size-full object-cover transition-transform duration-500 ease-out group-hover/trailer:scale-[1.05]"
-              />
-              <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25 transition-colors group-hover/trailer:bg-black/10">
-                <span className="flex size-11 items-center justify-center rounded-full bg-black/55 text-white ring-1 ring-white/25 backdrop-blur-sm transition-transform duration-300 group-hover/trailer:scale-110">
-                  <PlayIcon className="ml-0.5 size-5" />
-                </span>
-              </span>
-              <span className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-caption font-medium text-white/85 backdrop-blur-sm">
-                {video.kind}
-              </span>
-            </div>
-            <p className="mt-2 truncate text-sub text-[var(--text-muted)] transition-colors group-hover/trailer:text-[var(--text)]">
-              {video.name}
-            </p>
-          </button>
+          <TrailerCard key={video.key} video={video} title={title} onPlay={() => setPlaying(video)} />
         ))}
       </HScroller>
 
@@ -699,6 +675,47 @@ function TrailerRow({ title, videos }: { title: string; videos: MediaVideo[] }) 
         <TrailerPlayer video={playing} title={title} onClose={() => setPlaying(null)} />
       )}
     </section>
+  );
+}
+
+/** 预告片卡：横滚行内的可点卡，套 useTapGuard——滑动/刹车手势派发的
+ *  click 会被拦下，避免滑一下就弹出播放层（同 PosterCard 约定）。 */
+function TrailerCard({
+  video,
+  title,
+  onPlay,
+}: {
+  video: MediaVideo;
+  title: string;
+  onPlay: () => void;
+}) {
+  const tapGuard = useTapGuard(onPlay);
+  return (
+    <button
+      type="button"
+      {...tapGuard}
+      className="group/trailer w-[264px] shrink-0 text-left max-md:w-[208px]"
+    >
+      <div className="relative aspect-video overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/trailer:-translate-y-1 group-hover/trailer:shadow-[0_16px_40px_rgba(0,0,0,0.55)] group-hover/trailer:ring-white/30">
+        {/* YouTube 封面是 4:3（上下带黑边），object-cover 裁进 16:9 恰好只剩画面 */}
+        <PosterImage
+          src={video.thumbnailUrl}
+          alt={`${title} ${video.kind}`}
+          className="size-full object-cover transition-transform duration-500 ease-out group-hover/trailer:scale-[1.05]"
+        />
+        <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25 transition-colors group-hover/trailer:bg-black/10">
+          <span className="flex size-11 items-center justify-center rounded-full bg-black/55 text-white ring-1 ring-white/25 backdrop-blur-sm transition-transform duration-300 group-hover/trailer:scale-110">
+            <PlayIcon className="ml-0.5 size-5" />
+          </span>
+        </span>
+        <span className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-caption font-medium text-white/85 backdrop-blur-sm">
+          {video.kind}
+        </span>
+      </div>
+      <p className="mt-2 truncate text-sub text-[var(--text-muted)] transition-colors group-hover/trailer:text-[var(--text)]">
+        {video.name}
+      </p>
+    </button>
   );
 }
 
@@ -927,24 +944,20 @@ function PhotoWall({
         <div
           ref={scrollerRef}
           onScroll={updateEdges}
-          className="scroll-none -mx-1 flex gap-3 overflow-x-auto px-1 pb-1 pt-1"
+          // overscroll-x-contain：滑到行的尽头后不把剩余动量甩给外层纵向滚动
+          // （同 HScroller 的处理，触屏上「滑到头带动整页跳一下」即由此而来）
+          className="scroll-none -mx-1 flex gap-3 overflow-x-auto overscroll-x-contain px-1 pb-1 pt-1"
         >
           {active.images.map((img, i) => (
-            <button
+            <PhotoCard
               key={img.previewUrl}
-              type="button"
-              aria-label={`查看${active.label}第 ${i + 1} 张`}
-              onClick={() => setLightboxIndex(i)}
-              className={`shrink-0 overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out hover:-translate-y-1 hover:shadow-[0_16px_40px_rgba(0,0,0,0.55)] hover:ring-white/30 ${
-                active.id === "backdrops" ? "aspect-video h-[148px] max-md:h-[104px]" : "aspect-[2/3] h-[148px] max-md:h-[126px]"
-              }`}
-            >
-              <PosterImage
-                src={img.previewUrl}
-                alt={`${title} ${active.label}`}
-                className="size-full object-cover transition-transform duration-500 ease-out hover:scale-[1.05]"
-              />
-            </button>
+              img={img}
+              index={i}
+              label={active.label}
+              landscape={active.id === "backdrops"}
+              title={title}
+              onOpen={() => setLightboxIndex(i)}
+            />
           ))}
         </div>
 
@@ -982,7 +995,9 @@ function PhotoArrow({
       type="button"
       aria-label={dir === -1 ? "向左滚动" : "向右滚动"}
       onClick={onClick}
-      className={`surface-raised !absolute top-1/2 z-10 flex size-9 -translate-y-1/2 items-center justify-center !rounded-full text-[var(--text)] transition-all duration-200 hover:scale-110 ${
+      // 触屏隐藏箭头（同 HScroller）：本就只靠 hover 显形，触屏没有 hover
+      // 会变成「看不见但能点」的隐形命中区，吃掉图片边缘的点击
+      className={`surface-raised !absolute top-1/2 z-10 flex size-9 -translate-y-1/2 items-center justify-center !rounded-full text-[var(--text)] transition-all duration-200 hover:scale-110 [@media(hover:none)]:hidden ${
         dir === -1 ? "left-2" : "right-2"
       } ${
         visible
@@ -991,6 +1006,41 @@ function PhotoArrow({
       }`}
     >
       <Icon className="size-4" />
+    </button>
+  );
+}
+
+/** 剧照墙的单张卡：横滚行内可点（开灯箱），套 useTapGuard 防滑动误触。 */
+function PhotoCard({
+  img,
+  index,
+  label,
+  landscape,
+  title,
+  onOpen,
+}: {
+  img: { previewUrl: string };
+  index: number;
+  label: string;
+  landscape: boolean;
+  title: string;
+  onOpen: () => void;
+}) {
+  const tapGuard = useTapGuard(onOpen);
+  return (
+    <button
+      type="button"
+      {...tapGuard}
+      aria-label={`查看${label}第 ${index + 1} 张`}
+      className={`shrink-0 overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out hover:-translate-y-1 hover:shadow-[0_16px_40px_rgba(0,0,0,0.55)] hover:ring-white/30 ${
+        landscape ? "aspect-video h-[148px] max-md:h-[104px]" : "aspect-[2/3] h-[148px] max-md:h-[126px]"
+      }`}
+    >
+      <PosterImage
+        src={img.previewUrl}
+        alt={`${title} ${label}`}
+        className="size-full object-cover transition-transform duration-500 ease-out hover:scale-[1.05]"
+      />
     </button>
   );
 }

@@ -491,7 +491,7 @@ function SearchPalette({
               <button
                 type="button"
                 onClick={removeAll}
-                className="rounded-md px-1.5 py-0.5 text-caption text-[var(--text-faint)] transition-colors hover:bg-white/[0.08] hover:text-[var(--text-muted)]"
+                className="touch-target rounded-md px-1.5 py-0.5 text-caption text-[var(--text-faint)] transition-colors hover:bg-white/[0.08] hover:text-[var(--text-muted)]"
               >
                 清空
               </button>
@@ -725,7 +725,7 @@ function HistoryGroupRow({
           aria-expanded={expanded}
           onMouseDown={(event) => event.preventDefault()}
           onClick={onToggle}
-          className="mx-0.5 rounded-md p-1.5 text-[var(--text-faint)] transition-colors hover:bg-white/[0.08] hover:text-[var(--text-muted)]"
+          className="touch-target mx-0.5 rounded-md p-1.5 text-[var(--text-faint)] transition-colors hover:bg-white/[0.08] hover:text-[var(--text-muted)]"
         >
           <svg
             viewBox="0 0 20 20"
@@ -892,7 +892,9 @@ function DeleteHistoryButton({
       aria-label={label}
       onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
-      className={`rounded-md p-1 text-[var(--text-faint)] transition-opacity hover:bg-white/[0.1] hover:text-[var(--text-muted)] ${className ?? ""}`}
+      // touch-target：21px 的裸 X 键是移动端删除历史的唯一入口，命中区
+      // 撑到 44px（伪元素方案，外观不变）——紧贴相邻可点行，太小必误触
+      className={`touch-target rounded-md p-1 text-[var(--text-faint)] transition-opacity hover:bg-white/[0.1] hover:text-[var(--text-muted)] ${className ?? ""}`}
     >
       <svg
         viewBox="0 0 24 24"

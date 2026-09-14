@@ -16,12 +16,15 @@ import {
   BookmarkIcon,
   UserIcon,
 } from "@/components/icons";
+import { AppUpdateEntry } from "@/components/app-update-entry";
+import { NoticeCenter } from "@/components/notice-center";
 import { logout } from "@/lib/api/auth";
 import { clearBackdropCache } from "@/lib/backdrop-cache";
 import { useAgentConversations } from "@/lib/agent-conversations";
 import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
 import { accessiblePathFor, usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
+import { taskActivityBadge, useTaskActivity } from "@/lib/task-activity";
 import { clearUiPrefsCache } from "@/lib/ui-prefs-cache";
 import { useTheme } from "@/lib/ui-prefs";
 
@@ -97,6 +100,9 @@ export function NetflixMyPage() {
 
         {/* 快捷入口 */}
         <nav aria-label="我的入口" className="mt-6 space-y-0.5">
+          {/* 待处理事项：Netflix 主题没有侧栏，银玻璃侧栏里的告警入口由本行
+              承接（组件自轮询自鉴权，无事时整行不渲染） */}
+          <NoticeCenter collapsed={false} />
           <MyRow Icon={PlusIcon} label="新任务" onClick={() => router.push("/new" as Route)} />
           {canSubscribe && (
             <MyRow
@@ -105,13 +111,19 @@ export function NetflixMyPage() {
               onClick={() => router.push("/subscriptions" as Route)}
             />
           )}
-          {isAdmin && (
-            <MyRow Icon={ActivityIcon} label="活动" onClick={() => router.push("/activity" as Route)} />
-          )}
+          {/* 活动：带任务角标（下载失败红 / 进行中蓝）与动态落点——侧栏
+              JobCenter 的同一套徽标逻辑，Netflix 入口不再是无声的裸链接 */}
+          {isAdmin && <MyActivityRow />}
           <MyRow
             Icon={GearIcon}
             label="设置"
             onClick={() => router.push(`/settings/${defaultSettingsSection}` as Route)}
+          />
+          {/* 应用内更新的常驻入口（组件自轮询，无更新时整行不渲染）：
+              Netflix 主题不再渲染侧栏，侧栏里的更新徽标改由本行承接 */}
+          <AppUpdateEntry
+            collapsed={false}
+            onOpen={() => router.push("/settings/app" as Route)}
           />
         </nav>
 
@@ -148,6 +160,21 @@ export function NetflixMyPage() {
   );
 }
 
+/** 活动入口行：useTaskActivity 是管理员的任务轮询，拆成独立组件让钩子
+ *  只在管理员渲染本行时才挂载（成员不发起无谓的轮询）。 */
+function MyActivityRow() {
+  const router = useRouter();
+  const badge = taskActivityBadge(useTaskActivity());
+  return (
+    <MyRow
+      Icon={ActivityIcon}
+      label="活动"
+      badge={badge.count > 0 ? badge : undefined}
+      onClick={() => router.push(badge.href as Route)}
+    />
+  );
+}
+
 /** 页面行：glass-row 皮肤 + 右缘 chevron 表达「点进去」的可点性。 */
 function MyRow({
   Icon,
@@ -155,17 +182,21 @@ function MyRow({
   onClick,
   danger = false,
   running = false,
+  badge,
 }: {
   Icon?: React.ComponentType<React.SVGProps<SVGSVGElement>>;
   label: string;
   onClick: () => void;
   danger?: boolean;
   running?: boolean;
+  /** 右缘状态角标（活动行的任务计数：alert 红 / 否则提示蓝） */
+  badge?: { alert: boolean; count: number; hint?: string };
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      title={badge?.hint}
       className={`glass-row w-full px-3 py-3 text-ui font-medium ${
         danger ? "!text-[var(--danger)] hover:!bg-[rgba(255,107,107,0.12)]" : ""
       }`}
@@ -175,6 +206,15 @@ function MyRow({
       )}
       {Icon && <Icon className="size-[20px] shrink-0" />}
       <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+      {badge && badge.count > 0 && (
+        <span
+          className={`shrink-0 rounded-full px-1.5 py-0.5 text-micro font-semibold leading-none text-white ${
+            badge.alert ? "bg-[var(--danger-solid)]" : "bg-[var(--info)]"
+          }`}
+        >
+          {badge.count}
+        </span>
+      )}
       <ChevronRightIcon className="size-4 shrink-0 text-[var(--text-faint)]" />
     </button>
   );
