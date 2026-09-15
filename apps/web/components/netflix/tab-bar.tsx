@@ -3,29 +3,26 @@
 import Link from "next/link";
 import type { Route } from "next";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect } from "react";
 
 import {
   ArrowLeftIcon,
   BookmarkIcon,
-  ChevronDownIcon,
   CompassIcon,
   LibraryIcon,
   UserIcon,
 } from "@/components/icons";
 import { PAGE_NAV_BUTTON_CLASS } from "@/components/page-nav";
 import { SearchCommand } from "@/components/search-command";
-import { settingsSectionGroupsFor } from "@/lib/mock-data";
 import { usePageChrome } from "@/lib/page-chrome";
 import { usePermissions } from "@/lib/permissions";
-import { useSession } from "@/lib/session";
 
 /**
  * Netflix 主题的移动端底部标签栏（<768px，docs/design/web-themes.md §5.2）。
  *
  * 参照 Netflix App 的内容消费动线映射为 4 个**路由**页签：发现 / 媒体库 /
- * 订阅 / 我的（2026-09 修订：移除「首页」——内容首页 / 改由顶栏字标直达，
- * 底栏让位给高频的内容入口；「订阅」对齐桌面顶栏的「我的订阅」）。
+ * 订阅 / 我的（2026-09 修订：移除「首页」——内容首页与媒体库合并，/ 改由
+ * 顶栏字标直达，底栏让位给高频的内容入口；「订阅」对齐桌面顶栏的「我的订阅」）。
  * 「订阅」按 canSubscribe 显隐，无权限时退化为 3 页签。
  * 栏高 49px + 底部安全区、激活白、未激活 --text-faint、图标 24px——这些数值
  * 无官方出处，按 iOS 惯例取值（设计文档标注的自家设计决策）。
@@ -49,10 +46,12 @@ const MY_TAB = { id: "my", label: "我的", href: "/my", Icon: UserIcon } as con
 /** pathname → 当前页签 id（详情等子页落在所属的顶层页签上）。 */
 function activeTabId(pathname: string): string {
   if (pathname.startsWith("/discover") || pathname.startsWith("/media")) return "discover";
-  if (pathname.startsWith("/library")) return "library";
+  // / 是 /library 的别名（Netflix 主题下 replace 过去），高亮随媒体库
+  if (pathname === "/" || pathname.startsWith("/library")) return "library";
   if (pathname.startsWith("/subscriptions")) return "subscriptions";
-  // 设置是「我的」的二级页面（返回键固定回 /my）：iOS 惯例是二级页保持
-  // 父页签高亮，进设置后四个页签全部熄灭会让用户失去「我在哪」的位置感
+  // 设置是「我的」的二级页面（返回链固定 /settings/[x] → /settings → /my）：
+  // iOS 惯例是二级页保持父页签高亮，进设置后四个页签全部熄灭会让用户失去
+  // 「我在哪」的位置感
   if (pathname.startsWith("/settings") || pathname === "/my") return "my";
   return "";
 }
@@ -87,10 +86,16 @@ export function NetflixTabBar() {
 }
 
 /**
- * 移动端设置页的分区导航条：左侧返回键（回到「我的」）+ 当前分区下拉 +
- * 右侧搜索键。银玻璃主题下分区列表装在抽屉侧栏里，Netflix 主题抽屉退役后
- * 由这条下拉承接同样的导航能力（/settings/* 可达性不回退）。挂在页面内容
- * 顶部（外壳在 settings 路由下渲染），数据与桌面分区菜单同源。
+ * 移动端设置页的导航条：左侧返回键 + 页面标题 + 右侧搜索键。银玻璃主题下
+ * 分区列表装在抽屉侧栏里，Netflix 主题抽屉退役后由本条承接页顶导航。
+ * 挂在页面内容顶部（外壳在 settings 路由下渲染）。
+ *
+ * **2026-09 修订**：原实现把分区选择做成标题旁的下拉浮层——分区一多
+ * （管理员 19 个）浮层高过视口又不能滚，长列表在触屏上滑不动；且换分区的
+ * 入口藏在二级交互里。分区选择改为独立路由页：/settings 列出全部分区
+ * （components/netflix/settings-index.tsx），点行进 /settings/[section]。
+ * 本条退化为纯导航：列表页显示「设置」、返回「我的」；分区页显示分区名、
+ * 返回列表页（两级返回链由外壳按 pathname 计算）。
  *
  * 顶栏认领：挂载即 registerPageNav，让外壳撤掉全局顶栏（MobileTopBar）——
  * 否则设置页顶上摞两条顶栏（全局 52px + 本条），违背「窄屏永远只有一条
@@ -99,55 +104,21 @@ export function NetflixTabBar() {
  * .app-shell[data-topbar="false"] 只清 padding-top），本条只补基础间距，
  * 不重复让位——与 PageNav 的做法同型。
  */
-export function NetflixSettingsNav({
-  active,
-  onSelect,
-}: {
-  active: string;
-  onSelect: (id: string) => void;
-}) {
-  const { session } = useSession();
+export function NetflixSettingsNav({ title, backHref }: { title: string; backHref: Route }) {
   const router = useRouter();
   const chrome = usePageChrome();
-  // 认领移动端顶栏那一行（注销函数即 effect 清理）；桌面分支不渲染本组件，
-  // 无副作用。必须用 useLayoutEffect 而不是 useEffect：登记要赶在浏览器
-  // 绘制之前生效，否则外壳的全局顶栏会先画出一帧再被撤掉（PageNav 对同一
-  // 机制记录过这个坑，见 components/page-nav.tsx）
+  // 认领移动端顶栏那一行（注销函数即 effect 清理）。必须用 useLayoutEffect
+  // 而不是 useEffect：登记要赶在浏览器绘制之前生效，否则外壳的全局顶栏会
+  // 先画出一帧再被撤掉（PageNav 对同一机制记录过这个坑，见 components/page-nav.tsx）
   useLayoutEffect(() => chrome?.registerPageNav(), [chrome]);
-  // 设置是「我的」的二级页面，返回键语义是「回上级」而不是「历史后退」：
-  // 用户可能在分区间连续切换（历史里堆着一串 /settings/*），按后退语义要
-  // 逐级回退每个分区才能离开设置，与 iOS 设置页的返回心智不符。固定
-  // replace 回 /my，一次到位且不额外堆积历史。
-  const back = () => router.replace("/my" as Route);
-  const groups = settingsSectionGroupsFor(session.role);
-  const all = groups.flatMap((group) => group.items);
-  const current = all.find((section) => section.id === active) ?? all[0];
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointer = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onPointer);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onPointer);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  if (!current) return null;
+  // 返回键语义是「回上级页」而不是「历史后退」：用户可能在分区间连续切换
+  // （历史里堆着一串 /settings/*），按后退语义要逐级回退每个分区才能离开
+  // 设置，与 iOS 设置页的返回心智不符。固定 replace 到上级，一次到位且不
+  // 额外堆积历史。
+  const back = () => router.replace(backHref);
 
   return (
-    <div
-      ref={rootRef}
-      className="relative z-30 shrink-0 border-b border-[var(--line)] bg-[var(--bg)] py-2 px-2 pt-[calc(var(--safe-top)+0.5rem)]"
-    >
+    <div className="relative z-30 shrink-0 border-b border-[var(--line)] bg-[var(--bg)] py-2 px-2 pt-[calc(var(--safe-top)+0.5rem)]">
       <div className="flex items-center gap-1">
         <button
           type="button"
@@ -157,15 +128,9 @@ export function NetflixSettingsNav({
         >
           <ArrowLeftIcon className="size-[22px]" />
         </button>
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          aria-expanded={open}
-          className="flex min-w-0 items-center gap-1.5 px-2 text-title font-semibold text-[var(--text)]"
-        >
-          <span className="truncate">{current.label}</span>
-          <ChevronDownIcon className={`size-4 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
-        </button>
+        <h1 className="min-w-0 flex-1 truncate px-1 text-title font-semibold text-[var(--text)]">
+          {title}
+        </h1>
         {/* 本条认领顶栏后，全局顶栏（含搜索键）被撤掉——搜索是其中唯一
             无处安放的入口，在这里补一颗（PageNav 对同一局面的既定做法）。
             必须条件渲染而不是 CSS 隐藏：SearchCommand 自带全局 ⌘K 监听，
@@ -177,35 +142,6 @@ export function NetflixSettingsNav({
           />
         )}
       </div>
-      {open && (
-        <div
-          className="menu-surface absolute inset-x-4 top-full z-50 p-1.5"
-          // .menu-surface 的无层 CSS position:relative 会压过 absolute 工具类
-          // （同 top-nav.tsx 两处下拉），内联覆盖才能锚在当前行下方
-          style={{ position: "absolute" }}
-        >
-          {groups.map((group) => (
-            <div key={group.label || group.items[0]?.id}>
-              {group.label && <p className="group-label px-2.5 pb-1 pt-2.5">{group.label}</p>}
-              {group.items.map((section) => (
-                <button
-                  key={section.id}
-                  type="button"
-                  onClick={() => {
-                    setOpen(false);
-                    onSelect(section.id);
-                  }}
-                  className={`glass-row px-2.5 py-2 text-ui font-medium ${
-                    section.id === active ? "text-white" : ""
-                  }`}
-                >
-                  <span className="flex-1 truncate">{section.label}</span>
-                </button>
-              ))}
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

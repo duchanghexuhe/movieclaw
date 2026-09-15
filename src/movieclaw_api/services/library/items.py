@@ -1726,6 +1726,45 @@ async def poster_facts_many(
     return out
 
 
+async def backdrop_facts_many(
+    session: AsyncSession, item_ids: Sequence[int]
+) -> dict[int, str | None]:
+    """一批条目的横版剧照 URL——与 ``poster_facts_many`` 同一套规则的 backdrop 版。
+
+    「本地刮削资产优先（断网可用），没有资产才回落 TMDB 图床」保持与海报同源
+    的唯一实现；消费方是首页 billboard 这类横幅位（正常取宽幅剧照直出，海报
+    模糊铺底只是前端在 URL 为空时的最后兜底）。剧照没有模糊占位/尺寸的展示
+    需求，返回纯 URL 映射即可。
+    """
+    from movieclaw_api.core.config import get_settings
+
+    ids = [i for i in item_ids if i is not None]
+    if not ids:
+        return {}
+    base = get_settings().tmdb_image_base_url.rstrip("/")
+    rows = (
+        await session.execute(
+            select(
+                MediaItem.id,
+                MediaItem.backdrop_path,
+                MediaMetadata.backdrop_file,
+            )
+            .outerjoin(MediaMetadata, MediaMetadata.media_item_id == MediaItem.id)  # type: ignore[arg-type]
+            .where(MediaItem.id.in_(ids))  # type: ignore[attr-defined]
+        )
+    ).all()
+    return {
+        item_id: (
+            f"/images/assets/{backdrop_file}?v={asset_version(backdrop_file)}"
+            if backdrop_file
+            else f"{base}/w1280{backdrop_path}"
+            if backdrop_path
+            else None
+        )
+        for item_id, backdrop_path, backdrop_file in rows
+    }
+
+
 async def _aggregate_wall_views(
     session: AsyncSession,
     library_id: int | None,
@@ -1822,6 +1861,8 @@ async def _aggregate_wall_views(
     # 海报优先本地刮削资产（断网可用），没有资产的回落 TMDB 图床——
     # 这条规则的唯一实现在 poster_facts_many，合集封面走的是同一处
     posters = await poster_facts_many(session, list(grouped.keys()))
+    # 横版剧照与海报同批装配（同一条规则），billboard 横幅位消费
+    backdrops = await backdrop_facts_many(session, list(grouped.keys()))
     by_id: dict[int, LibraryItemView] = {}
     for item, files in grouped.values():
         season_episode_counts = season_episode_counts_by_item.get(item.id, {})  # type: ignore[arg-type]
@@ -1886,6 +1927,7 @@ async def _aggregate_wall_views(
             title=item.title,
             year=item.year,
             poster_url=poster.url,
+            backdrop_url=backdrops.get(item.id),
             # 缩略图还没生成时用扫描入账记下的原图尺寸定比例：墙一开始就是最终
             # 布局，缩略图到达不会引起重排（渐进式加载的第 0 级）
             primary_aspect=primary_aspect(item, *(poster.asset_size or _pixel_size_of(files))),

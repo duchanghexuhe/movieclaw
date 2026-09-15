@@ -27,7 +27,7 @@ import { clearUiPrefsCache } from "@/lib/ui-prefs-cache";
  * - 高 68px、fixed，页面顶端透明（压一层向下渐隐的黑雾保证字标可读），
  *   任一滚动容器滚过阈值后过渡为 #141414 实底——Netflix 顶栏是实底不是毛玻璃，
  *   不引入 backdrop-filter。
- * - 左：品牌字标（回首页）+ 导航链接（激活 = 白 700，未激活 = #e5e5e5）；
+ * - 左：品牌字标（回媒体库）+ 导航链接（激活 = 白 700，未激活 = #e5e5e5）；
  *   <1100px 收敛为「浏览 ▾」下拉（Netflix 同款断点）。
  * - 右：「＋ 新任务」（白底黑字，AI 是本站差异能力，给一个 Netflix 没有但
  *   不破坏画面的入口）· 搜索（复用 SearchCommand 命令面板）· 通知铃 · 头像下拉。
@@ -35,9 +35,9 @@ import { clearUiPrefsCache } from "@/lib/ui-prefs-cache";
  *   全局固定五项，权限过滤对齐侧栏的可见性判定（useVisibleNavItems 同口径）。
  */
 
-/** 顶栏导航链接的全局固定清单（权限过滤对齐侧栏可见性判定）。 */
+/** 顶栏导航链接的全局固定清单（权限过滤对齐侧栏可见性判定）。
+ *  无「首页」——内容首页已与媒体库合并（2026-09 修订），字标直达 /library。 */
 const NAV_LINKS: { id: string; label: string; href: Route }[] = [
-  { id: "home", label: "首页", href: "/" as Route },
   { id: "movies", label: "电影", href: "/discover/movie" as Route },
   { id: "tv", label: "剧集", href: "/discover/tv" as Route },
   { id: "library", label: "媒体库", href: "/library" as Route },
@@ -46,10 +46,10 @@ const NAV_LINKS: { id: string; label: string; href: Route }[] = [
 
 /** pathname → 顶栏激活项 id（与 NAV_LINKS 对齐；未命中返回空串，无高亮）。 */
 function activeNavId(pathname: string): string {
-  if (pathname === "/") return "home";
   if (pathname.startsWith("/discover/movie")) return "movies";
   if (pathname.startsWith("/discover/tv")) return "tv";
-  if (pathname.startsWith("/library")) return "library";
+  // / 是 /library 的别名（Netflix 主题下 replace 过去），高亮随媒体库
+  if (pathname === "/" || pathname.startsWith("/library")) return "library";
   if (pathname.startsWith("/subscriptions")) return "subscriptions";
   return "";
 }
@@ -112,10 +112,11 @@ export function NetflixTopNav({
       />
       <div aria-hidden="true" className="absolute inset-0 bg-black" style={{ opacity: "var(--nf-nav-dim, 0)" }} />
       <div className="relative flex h-[68px] items-center gap-6 px-[4vw]">
-        {/* 品牌字标：回首页（内容可点区拉满高度，与导航链接同标准） */}
+        {/* 品牌字标：回媒体库（Netflix 主题没有首页——内容首页与媒体库合并；
+            内容可点区拉满高度，与导航链接同标准） */}
         <Link
-          href="/"
-          aria-label="回到首页"
+          href="/library"
+          aria-label="回到媒体库"
           className="flex shrink-0 items-center transition-opacity hover:opacity-80"
         >
           <MovieclawWordmark className="h-7 w-auto" />

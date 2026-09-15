@@ -1,14 +1,13 @@
 import type { Metadata } from "next";
 
-import { LibraryView } from "@/components/library-view";
+import { LibraryPageBody } from "@/components/library-page";
 
 export const metadata: Metadata = { title: "媒体库" };
 
-/** 媒体库（/library）：全部库的 Emby 风格卡片墙，内容的一等入口。 */
+/**
+ * 媒体库（/library）：内容的一等入口。Netflix 主题把原「内容首页」的
+ * Billboard 并入本页顶部（2026-09 修订，/ 在该主题下重定向到这里）。
+ */
 export default function LibraryPage() {
-  return (
-    <div className="flex h-full flex-col">
-      <LibraryView />
-    </div>
-  );
+  return <LibraryPageBody />;
 }

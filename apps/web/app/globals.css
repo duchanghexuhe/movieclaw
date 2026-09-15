@@ -2515,7 +2515,7 @@ html[data-theme="netflix"] .nf-nav-offset {
 /* —— 移动端收口（docs/design/web-themes-mobile/）—— */
 
 /* 设置页大图标头（settings-view 的分区头）：Netflix 移动端由页顶的
-   NetflixSettingsNav（返回键 + 分区下拉）承担定位，窄屏不再重复占位 */
+   NetflixSettingsNav（返回键 + 分区名）承担定位，窄屏不再重复占位 */
 @media (max-width: 767px) {
   html[data-theme="netflix"] .settings-panel-head {
     display: none;

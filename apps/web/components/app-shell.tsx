@@ -37,7 +37,9 @@ import { useSession } from "@/lib/session";
  * 应用外壳：全站骨架布局，所有导航态由 URL 驱动。
  *
  * 每个页面都是真实路由——刷新保留、可分享、前进后退可用：
- *   /                    内容首页（银玻璃=新任务氛围页；Netflix=billboard + 行）
+ *   /                    银玻璃=新任务氛围页；Netflix 无首页（replace 到 /library，
+ *                        原内容首页 Billboard 已并入媒体库页，2026-09 修订）
+ *   /library             媒体库（内容的一等入口；Netflix 主题顶部带 Billboard）
  *   /new                 AI 新任务（Netflix 主题的顶栏「＋ 新任务」落点）
  *   /discover/movie|tv   发现电影 / 剧集
  *   /subscriptions       我的订阅
@@ -123,6 +125,8 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
   }, []);
 
   const isSettings = pathname.startsWith("/settings");
+  // 设置分区选择是独立路由页（Netflix 移动端）：/settings 列表 → /settings/[section]
+  const isSettingsIndex = pathname === "/settings";
   const activeNav = navIdFromPath(pathname);
   // 设置分区从路径推导：/settings/appearance → appearance；/settings 兜底到首个分区
   const activeSettings = isSettings
@@ -209,8 +213,12 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
   // 详情页（媒体库条目 /library/x/item/y 与发现页条目 /media/...）。两类详情都用
   // 页面内部的有限高度剧照，并由自身渐变保证内容可读。新增路由无需登记，
   // 自动继承蒙版。Netflix 主题是纯色平铺设计，蒙版整体不渲染（§3.5）。
+  // Netflix 主题的 /library 顶部是原内容首页并入的全出血 Billboard
+  // （components/netflix/library-hero.tsx），同为大图直出的氛围页：
+  // 不加顶栏让位，让画面从透明顶栏底下穿过（银玻璃的 /library 不在此列）。
   const isHome =
     pathname === "/" ||
+    (isNetflix && pathname === "/library") ||
     /^\/library\/\d+\/item\/\d+/.test(pathname) ||
     pathname.startsWith("/media/");
   // Agent 对话页走沉浸模式：蒙版换成完全不透明的 .page-solid，整页盖掉
@@ -294,7 +302,7 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
           /* —— Netflix 移动端：底部标签栏（发现/媒体库/订阅/我的，全是路由）——
              详情页 PageNav（返回键 + 吸顶雾）保留（App 详情页同样有返回）；
              无 PageNav 的页面继续用原雾层顶栏承载字标、页面级控件与搜索；
-             首页 / 与「我的」/my 都由字标/页签直达，顶栏不再需要 ☰。 */
+             字标与「我的」/my 页签直达内容入口，顶栏不再需要 ☰。 */
           <div
             className="app-shell viewport-app-height relative z-10 w-full"
             data-topbar={showMobileTopBar}
@@ -309,12 +317,17 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
             )}
             <main className="absolute inset-0">
               {isSettings ? (
-                /* 设置页在银玻璃移动端靠抽屉侧栏切分区；该主题抽屉退役，
-                   分区导航改由页顶下拉承接（可达性不回退）。 */
+                /* 设置：/settings 是分区列表页，/settings/[x] 是分区内容页，
+                   本条只承担「返回键 + 标题」（分区下拉浮层已退役——长清单
+                   在触屏上滑不动，见 components/netflix/settings-index.tsx）。 */
                 <div className="flex h-full flex-col">
                   <NetflixSettingsNav
-                    active={activeSettings}
-                    onSelect={(id) => router.push(`/settings/${id}` as Route)}
+                    title={
+                      isSettingsIndex
+                        ? "设置"
+                        : (settingsSections.find((s) => s.id === activeSettings)?.label ?? "设置")
+                    }
+                    backHref={(isSettingsIndex ? "/my" : "/settings") as Route}
                   />
                   <div className="min-h-0 flex-1">{children}</div>
                 </div>
@@ -473,7 +486,7 @@ function pathOfNavId(id: string): Route {
 }
 
 /**
- * 移动端顶栏：品牌字标（回首页）+ 搜索。
+ * 移动端顶栏：品牌字标（Netflix 主题回媒体库、银玻璃回新任务首页）+ 搜索。
  *
  * 为什么是「浮在内容之上」而不是「占一行把内容推下去」：全站有一半页面是
  * 大图氛围页与 Hero 大剧照，顶栏若占位会在画面顶端切出一条硬边。这里做成
@@ -532,11 +545,12 @@ function MobileTopBar({
         ) : isNetflix ? (
           /* 字标可点区拉到 44px 高（与图标键同标准）——红色内联 SVG 本身保持
              h-7 的视觉大小（无 actions 时整词 ≈175px 宽、窄屏仍放得下），
-             命中区靠按钮撑起，否则 28px 高的字标在触屏上很难点中 */
+             命中区靠按钮撑起，否则 28px 高的字标在触屏上很难点中。
+             Netflix 主题没有首页：字标回媒体库（原内容首页已并入）。 */
           <button
             type="button"
-            onClick={() => router.push("/")}
-            aria-label="回到首页"
+            onClick={() => router.push("/library")}
+            aria-label="回到媒体库"
             className="flex h-11 shrink-0 items-center transition-opacity active:opacity-60"
           >
             {actions ? (

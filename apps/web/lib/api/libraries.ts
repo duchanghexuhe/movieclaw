@@ -266,6 +266,8 @@ export interface LibraryItem {
   title: string;
   year: number | null;
   poster_url: string | null;
+  /** 横版剧照（宽幅 backdrop）：横幅位（billboard）优先用它，没有时回落海报模糊铺底 */
+  backdrop_url: string | null;
   /** 主图宽高比（真实像素尺寸或来源惯例：TMDB 海报 2:3、本地抓帧 16:9），卡片按它排版 */
   primary_aspect: number;
   /** 内容日期（ISO 日期）：影视为上映/首播日，本地条目为拍摄/录制日 */

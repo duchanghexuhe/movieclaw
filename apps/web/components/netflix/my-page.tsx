@@ -21,7 +21,6 @@ import { NoticeCenter } from "@/components/notice-center";
 import { logout } from "@/lib/api/auth";
 import { clearBackdropCache } from "@/lib/backdrop-cache";
 import { useAgentConversations } from "@/lib/agent-conversations";
-import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
 import { accessiblePathFor, usePermissions } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
 import { taskActivityBadge, useTaskActivity, type TaskActivityBadge } from "@/lib/task-activity";
@@ -35,7 +34,8 @@ import { useTheme } from "@/lib/ui-prefs";
  * 账号/设置动线（面板里点设置又要跳路由），且与「每个入口都是真实路由、
  * 可刷新可分享」的全站导航原则相悖。改为独立页面后：
  *   - 底栏「我的」页签直接路由到 /my（不再开关面板）；
- *   - 设置成为本页的二级页面（顶栏返回键回来，见 NetflixSettingsNav）；
+ *   - 设置成为本页的二级页面（/settings 分区列表 → /settings/[section]，
+ *     页顶返回键逐级回来，见 NetflixSettingsNav 与 settings-index.tsx）；
  *   - 银玻璃主题不使用本页（它的同等入口在抽屉侧栏），直达时跳回首页。
  *
  * 内容分区对齐 Netflix App 的 My Netflix：用户头 + 快捷入口 + AI 会话 +
@@ -71,11 +71,6 @@ export function NetflixMyPage() {
   };
 
   if (theme.id !== "netflix") return null;
-
-  // 进设置的默认分区按角色取可见清单第一项：管理员落「概览」，成员落
-  // 「个人信息」——避免把成员送进一个 403 分区（与外壳 openSettings 同口径）
-  const defaultSettingsSection =
-    settingsSectionGroupsFor(session.role)[0]?.items[0]?.id ?? settingsSections[0].id;
 
   return (
     <div className="scroll-thin scroll-safe h-full overflow-y-auto">
@@ -117,7 +112,7 @@ export function NetflixMyPage() {
           <MyRow
             Icon={GearIcon}
             label="设置"
-            onClick={() => router.push(`/settings/${defaultSettingsSection}` as Route)}
+            onClick={() => router.push("/settings" as Route)}
           />
           {/* 应用内更新的常驻入口（组件自轮询，无更新时整行不渲染）：
               Netflix 主题不再渲染侧栏，侧栏里的更新徽标改由本行承接 */}

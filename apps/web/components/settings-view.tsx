@@ -177,7 +177,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
         }`}
       >
         {/* Netflix 移动端：分区名已由页顶的 NetflixSettingsNav（返回键 + 分区
-            下拉）呈现，这里的大图标头在窄屏上重复占位（globals.css 按主题隐藏） */}
+            名）呈现，这里的大图标头在窄屏上重复占位（globals.css 按主题隐藏） */}
         <header className="settings-panel-head flex items-center gap-4">
           <span className="icon-chip size-12 !rounded-2xl">
             <Icon className="size-[22px]" />

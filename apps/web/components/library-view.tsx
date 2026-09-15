@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { Route } from "next";
 import Link from "next/link";
@@ -110,7 +110,7 @@ export function libraryStatsSummary(libraries: MediaLibrary[] | null): string {
  * 数据源是 library_file 台账的**真实库存**（L3 起）：入库管线与存量扫描
  * 落账的文件聚合，不再用订阅占位。
  */
-export function LibraryView() {
+export function LibraryView({ hero }: { hero?: ReactNode }) {
   const { canManageLibraries } = usePermissions();
   // 首页的行清单存在界面偏好里（成员各存各的），应用启动时已随全站偏好拉过一次
   const { prefs } = useUiPrefs();
@@ -377,6 +377,9 @@ export function LibraryView() {
 
   return (
     <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+      {/* Netflix 主题的全出血 Billboard（原内容首页并入，见 library-hero.tsx）：
+          挂在滚动容器内、跟随页面一起滚走，页头与行清单依次排在其后 */}
+      {hero}
       {/* 页头：标题 + 统计，右侧是页面级操作「自定义首页」「管理媒体库」（SaaS 惯例：
           页面动作放标题行右端；分区标题行只留分区自己的东西）。首页上没有任何
           排序细节与行菜单——调整全部收进自定义页，首页只负责看 */}
