@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { ArrowLeftIcon } from "@/components/icons";
 import { PageNav } from "@/components/page-nav";
 import { PosterCardVisual } from "@/components/poster-card";
@@ -72,7 +73,7 @@ export function DiscoveredPersonDetailView({
       <div className="flex h-full flex-col">
         <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在读取 TMDB 影人作品…
         </div>
       </div>

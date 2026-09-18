@@ -35,8 +35,10 @@ import {
   EMPTY_DISCOVERY_FILTERS,
   type DiscoveryFilters,
 } from "@/lib/discovery-filters";
+import { upgradedTmdbOriginalUrl } from "@/lib/image-proxy";
 import { useMediaDetail } from "@/lib/media-detail";
 import { usePageChrome } from "@/lib/page-chrome";
+import { useTheme } from "@/lib/ui-prefs";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 import { useIsMobile } from "@/lib/use-media-query";
 import { useTapGuard } from "@/lib/use-tap-guard";
@@ -214,14 +216,6 @@ export function DiscoverView({
     return () => controller.abort();
   }, [cacheKey, filtering, mediaType, reloadKey, source]);
 
-  const switchSource = useCallback(
-    (nextSource: MediaSource) => {
-      if (nextSource === source) return;
-      router.push(`/discover/${mediaType}?source=${nextSource}` as Route);
-    },
-    [mediaType, router, source],
-  );
-
   const applyFilters = useCallback(
     (nextFilters: DiscoveryFilters) => {
       const query = discoveryFiltersQuery(nextFilters);
@@ -230,35 +224,67 @@ export function DiscoverView({
     [mediaType, router],
   );
 
+  const switchSource = useCallback(
+    (nextSource: MediaSource) => {
+      if (nextSource === source) return;
+      router.push(`/discover/${mediaType}?source=${nextSource}` as Route);
+    },
+    [mediaType, router, source],
+  );
+
+  // 电影/剧集切换（移动端挂顶栏右上角，与订阅页的类型切换同一位置同一形态；
+  // 桌面端顶栏导航已有「电影 / 剧集」两个链接，不再重复放）。切换保留当前
+  // 数据源视角。
+  const chrome = usePageChrome();
+  const isMobile = useIsMobile();
+  // Netflix 主题：工具栏悬浮在 Hero 上（不自占一条）、Hero 全出血（§5.3 构图）
+  const isNf = useTheme().id === "netflix";
+  const switchMediaType = useCallback(
+    (next: MediaType) => {
+      if (next === mediaType) return;
+      router.push(`/discover/${next}?source=${source}` as Route);
+    },
+    [mediaType, router, source],
+  );
+
   const controls = useMemo(
     () => (
       <div className="flex items-center gap-2">
+        {isMobile && <MediaTypeSwitcher value={mediaType} onChange={switchMediaType} />}
         {source === "tmdb" && (
           <DiscoveryFilterControl
             mediaType={mediaType}
             filters={filters}
             currentYear={currentYear}
             onApply={applyFilters}
+            compact={isMobile}
           />
         )}
-        <SourceSwitcher value={source} onChange={switchSource} />
+        <SourceSwitcher value={source} onChange={switchSource} compact={isMobile} />
       </div>
     ),
-    [applyFilters, currentYear, filters, mediaType, source, switchSource],
+    [applyFilters, currentYear, filters, isMobile, mediaType, source, switchMediaType, switchSource],
   );
 
   // 发现页是侧栏一级入口，没有 PageNav，数据源切换若自己吸一条顶栏，窄屏上
   // 就会摞在全局顶栏底下变成两排 header。移动端改为挂进全局顶栏那一行
   // （字标与搜索之间本来就空着），桌面端维持原来的吸顶工具栏不变。
-  const chrome = usePageChrome();
-  const isMobile = useIsMobile();
   const setTopBarActions = chrome?.setTopBarActions;
   useEffect(() => {
     if (!isMobile || !setTopBarActions) return;
     return setTopBarActions(controls);
   }, [controls, isMobile, setTopBarActions]);
 
-  const toolbar = isMobile ? null : (
+  const toolbar = isMobile ? null : isNf ? (
+    // Netflix：fixed 悬浮在视口右上（顶栏下方），不随页面滚动移位——发现页
+    // 一滚数屏，筛选/数据源入口跟着内容滚走后想换源就得滚回顶部；银玻璃维持
+    // 原吸顶工具栏不变。right 对齐行内边距 4vw，top 让出顶栏高度。
+    // calc 任意值里 +/- 两侧必须空白（用下划线转义），无空格是无效 CSS、
+    // top 整条被丢掉，控件会落回静态位置钻进顶栏底下点不到。
+    <div className="fixed right-[4vw] top-[calc(var(--nf-nav-h)_+_12px)] z-20 flex items-center gap-2">
+      {controls}
+    </div>
+  ) : (
     <div className="sticky top-0 z-20 flex items-center justify-end px-6 pb-3 pt-7">
       {controls}
     </div>
@@ -284,7 +310,7 @@ export function DiscoverView({
 
   if (error) {
     return (
-      <div className="flex flex-1 flex-col max-md:pt-4">
+      <div className={`flex flex-1 flex-col max-md:pt-4 ${isNf ? "relative" : ""}`}>
         {toolbar}
         <DiscoverError error={error} onRetry={() => setReloadKey((k) => k + 1)} />
       </div>
@@ -292,27 +318,30 @@ export function DiscoverView({
   }
   if (!page) {
     return (
-      <div className="flex flex-1 flex-col max-md:pt-4">
+      <div className={`flex flex-1 flex-col max-md:pt-4 ${isNf ? "relative" : ""}`}>
         {toolbar}
-        <DiscoverSkeleton />
+        <DiscoverSkeleton fullBleed={isNf} />
       </div>
     );
   }
   return (
     <div
       ref={scrollRef}
-      className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4"
+      className={`scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4 ${
+        isNf ? "relative" : ""
+      }`}
     >
       {toolbar}
-      {/* Hero 区：展示清单声明 Hero 时先占位，数据到达后换成轮播。 */}
+      {/* Hero 区：展示清单声明 Hero 时先占位，数据到达后换成轮播。
+          Netflix 主题全出血（无左右留白、无圆角描边），银玻璃维持圆角卡片。 */}
       {page.sections.some((section) => section.presentation === "hero") && hero === undefined && (
-        <div className="px-6 max-md:px-4">
-          <HeroSkeleton />
+        <div className={isNf ? undefined : "px-6 max-md:px-4"}>
+          <HeroSkeleton fullBleed={isNf} />
         </div>
       )}
       {hero && hero.length > 0 && (
-        <div className="px-6 max-md:px-4">
-          <HeroBanner items={hero} />
+        <div className={isNf ? undefined : "px-6 max-md:px-4"}>
+          <HeroBanner items={hero} fullBleed={isNf} />
         </div>
       )}
       <div className="mt-8 space-y-8">
@@ -321,7 +350,7 @@ export function DiscoverView({
           // 失败或条目太少（空 items）的行整行收起
           if (row === "error") return null;
           if (row && row.items.length === 0) return null;
-          if (!row) return <RowSkeleton key={section.collectionRef} stub={section} />;
+          if (!row) return <RowSkeleton key={section.collectionRef} stub={section} fullBleed={isNf} />;
           const href = section.supportsFullListing
             ? collectionHref(section.collectionRef)
             : undefined;
@@ -331,6 +360,7 @@ export function DiscoverView({
               key={row.id}
               row={moreHref ? { ...row, items: row.items.slice(0, 10) } : row}
               moreHref={moreHref}
+              insetClassName={isNf ? "px-[4vw]" : undefined}
             />
           );
         })}
@@ -343,39 +373,86 @@ export function DiscoverView({
   );
 }
 
-/** 数据源视角切换：两个视角分别缓存，来回切换不会重复请求。 */
+/** 数据源视角切换：两个视角分别缓存，来回切换不会重复请求。compact 档给
+ *  移动端顶栏用：字号降到 micro、内边距收窄（给同排的电影/剧集切换与筛选
+ *  键让宽度——三组控件全塞顶栏时按 px 计的宽度预算非常紧，375px 视口里
+ *  字标 + 三控件 + 搜索键必须都放得下），纵向用 py-2 把整颗胶囊撑到
+ *  ≈44px 触控高度。 */
 function SourceSwitcher({
   value,
   onChange,
+  compact = false,
 }: {
   value: MediaSource;
   onChange: (source: MediaSource) => void;
+  compact?: boolean;
 }) {
   return (
-      <div className="flex shrink-0 rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl">
-        {(["tmdb", "douban"] as const).map((source) => (
-          <button
-            key={source}
-            type="button"
-            onClick={() => onChange(source)}
-            className={`rounded-full px-4 py-1.5 text-sub font-semibold transition ${
-              value === source
-                ? "bg-white/15 text-white shadow-sm"
-                : "text-[var(--text-muted)] hover:text-white"
-            }`}
-          >
-            {source === "tmdb" ? "TMDB" : "豆瓣"}
-          </button>
-        ))}
-      </div>
+    <div className="flex shrink-0 rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl">
+      {(["tmdb", "douban"] as const).map((source) => (
+        <button
+          key={source}
+          type="button"
+          onClick={() => onChange(source)}
+          className={`rounded-full font-semibold transition ${
+            compact ? "px-1.5 py-2 text-micro" : "py-1.5 px-4 text-sub"
+          } ${
+            value === source
+              ? "bg-white/15 text-white shadow-sm"
+              : "text-[var(--text-muted)] hover:text-white"
+          }`}
+        >
+          {source === "tmdb" ? "TMDB" : "豆瓣"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** 电影/剧集切换（移动端顶栏右上角）：与订阅页的类型切换同一形态，
+    走路由切换（/discover/movie ↔ /discover/tv），各视角独立缓存。
+    只在移动端渲染，尺寸即 compact 档（与 SourceSwitcher 同一套宽度预算）。 */
+function MediaTypeSwitcher({
+  value,
+  onChange,
+}: {
+  value: MediaType;
+  onChange: (type: MediaType) => void;
+}) {
+  const labels: Record<MediaType, string> = { movie: "电影", tv: "剧集" };
+  return (
+    <div
+      className="flex shrink-0 rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl"
+      aria-label="内容类型"
+    >
+      {(["movie", "tv"] as const).map((type) => (
+        <button
+          key={type}
+          type="button"
+          aria-pressed={value === type}
+          onClick={() => onChange(type)}
+          className={`rounded-full px-1.5 py-2 text-micro font-semibold transition ${
+            value === type
+              ? "bg-white/15 text-white shadow-sm"
+              : "text-[var(--text-muted)] hover:text-white"
+          }`}
+        >
+          {labels[type]}
+        </button>
+      ))}
+    </div>
   );
 }
 
 /** 布局到达前的整页骨架（Hero 大块 + 两行海报）；布局是毫秒级的，一闪而过。 */
-function DiscoverSkeleton() {
+function DiscoverSkeleton({ fullBleed = false }: { fullBleed?: boolean }) {
   return (
-    <div className="flex-1 overflow-hidden px-6 pb-10 max-md:px-4" aria-busy="true" aria-label="发现页加载中">
-      <HeroSkeleton />
+    <div
+      className={`flex-1 overflow-hidden pb-10 ${fullBleed ? "" : "px-6 max-md:px-4"}`}
+      aria-busy="true"
+      aria-label="发现页加载中"
+    >
+      <HeroSkeleton fullBleed={fullBleed} />
       {[0, 1].map((row) => (
         <div key={row} className="mt-10">
           <div className="h-4 w-28 animate-pulse rounded bg-white/[0.08]" />
@@ -389,9 +466,13 @@ function DiscoverSkeleton() {
 }
 
 /** Hero 大横幅的占位块（与真实 Hero 同尺寸，数据到达后原位替换不跳版）。 */
-function HeroSkeleton() {
+function HeroSkeleton({ fullBleed = false }: { fullBleed?: boolean }) {
   return (
-    <div className="h-[46vh] min-h-[320px] animate-pulse rounded-2xl bg-white/[0.05] ring-1 ring-white/10 max-md:h-[38vh] max-md:min-h-[230px]" />
+    <div
+      className={`h-[46vh] min-h-[320px] animate-pulse bg-white/[0.05] max-md:h-[38vh] max-md:min-h-[230px] ${
+        fullBleed ? "" : "rounded-2xl ring-1 ring-white/10"
+      }`}
+    />
   );
 }
 
@@ -400,15 +481,16 @@ function HeroSkeleton() {
  * 标题栏与横滚区的留白复刻 MediaRow 的布局，数据到达后原位替换不跳版；
  * 这一行行「亮着名字等数据」的骨架就是页面的分区加载进度。
  */
-function RowSkeleton({ stub }: { stub: { title: string } }) {
+function RowSkeleton({ stub, fullBleed = false }: { stub: { title: string }; fullBleed?: boolean }) {
+  const inset = fullBleed ? "px-[4vw]" : "px-6 max-md:px-4";
   return (
     <section aria-busy="true" aria-label={`「${stub.title}」加载中`}>
-      <div className="mb-3 px-6 max-md:mb-2 max-md:px-4">
+      <div className={`mb-3 max-md:mb-2 ${inset}`}>
         <h3 className="text-on-image text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
           {stub.title}
         </h3>
       </div>
-      <div className="flex gap-4 overflow-hidden px-6 pb-1 pt-1 max-md:gap-3 max-md:px-4">
+      <div className={`flex gap-4 overflow-hidden pb-1 pt-1 max-md:gap-3 ${inset}`}>
         <RowItemsSkeleton />
       </div>
     </section>
@@ -422,7 +504,9 @@ function RowItemsSkeleton() {
       {Array.from({ length: 8 }, (_, i) => (
         <div
           key={i}
-          className="aspect-[2/3] w-[152px] shrink-0 animate-pulse rounded-2xl bg-white/[0.05] max-md:w-[126px] xl:w-[164px]"
+          // m-row-skel：Netflix 主题下真实行卡宽走 .m-row 的 clamp(100px,30vw,156px)
+          // 公式（globals.css），骨架卡挂同一钩子避免数据到达时整行跳宽
+          className="m-row-skel aspect-[2/3] w-[152px] shrink-0 animate-pulse rounded-2xl bg-white/[0.05] max-md:w-[126px] xl:w-[164px]"
         />
       ))}
     </>
@@ -484,7 +568,7 @@ const HERO_INTERVAL = 8000;
  * 图片按需装载：帧壳常驻，但 w1280 大图只有轮到（当前帧/下一帧）才写入 src，
  * 首屏不必一次下载解码全部 6 张；已展示过的帧保持已加载，交叉淡出不闪白。
  */
-function HeroBanner({ items }: { items: MediaItem[] }) {
+function HeroBanner({ items, fullBleed = false }: { items: MediaItem[]; fullBleed?: boolean }) {
   const [index, setIndex] = useState(0);
   // 触屏滑动切换的起点（无悬停设备不显示箭头，滑动是唯一的大面积切换手势）
   const touchStart = useRef<{ x: number; y: number } | null>(null);
@@ -507,7 +591,11 @@ function HeroBanner({ items }: { items: MediaItem[] }) {
   const next = (index + 1) % items.length;
   return (
     <div
-      className="group relative h-[46vh] min-h-[320px] w-full overflow-hidden rounded-2xl shadow-[0_24px_70px_-18px_rgba(0,0,0,0.62)] ring-1 ring-white/10 max-md:h-[38vh] max-md:min-h-[230px]"
+      className={`group relative h-[46vh] min-h-[320px] w-full overflow-hidden max-md:h-[38vh] max-md:min-h-[230px] ${
+        fullBleed
+          ? ""
+          : "rounded-2xl shadow-[0_24px_70px_-18px_rgba(0,0,0,0.62)] ring-1 ring-white/10"
+      }`}
       onTouchStart={(e) => {
         const t = e.touches[0];
         touchStart.current = { x: t.clientX, y: t.clientY };
@@ -574,6 +662,39 @@ function HeroBanner({ items }: { items: MediaItem[] }) {
   );
 }
 
+/**
+ * Hero 大图的「同图升清」：列表数据只有 w1280（首屏快），这里在图 reveal 后
+ * 预加载 original 原图（大屏整幅拉伸发虚），加载**并解码**完成才替换 src——
+ * 与详情页沉浸背景同一策略；非 TMDB 图（无 w 档位）原样返回、不预加载。
+ */
+function useHeroBackdrop(revealed: boolean, w1280: string | undefined): string | undefined {
+  const original = w1280 ? upgradedTmdbOriginalUrl(w1280) : undefined;
+  const upgradable = Boolean(original && original !== w1280);
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    if (!revealed || !upgradable || !original) {
+      setReady(false);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    const settle = () => {
+      img
+        .decode()
+        .catch(() => {})
+        .then(() => {
+          if (!cancelled) setReady(true);
+        });
+    };
+    img.onload = settle;
+    img.src = original;
+    return () => {
+      cancelled = true;
+    };
+  }, [revealed, upgradable, original]);
+  return revealed ? (ready ? original : w1280) : undefined;
+}
+
 function HeroSlide({
   item,
   active,
@@ -593,6 +714,8 @@ function HeroSlide({
   useEffect(() => {
     if (preload) setRevealed(true);
   }, [preload]);
+  // reveal 后升清：w1280 先显示，original 解码就位后无感替换（不闪）
+  const backdropSrc = useHeroBackdrop(revealed, item.backdropUrl);
   // 整块 Hero 就是进详情的入口（与海报卡片「点海报进详情」一致，不再另设「更多信息」键）。
   // Hero 占满首屏，手机上「向下滑看海报墙」几乎必然从这块起手，所以点击要过一遍误触判定。
   const tapGuard = useTapGuard(() => open(item));
@@ -620,7 +743,7 @@ function HeroSlide({
     >
       {/* 宽幅剧照 + 双层渐变蒙版：左侧压暗保文字可读，底部渐隐融入页面 */}
       <PosterImage
-        src={revealed ? item.backdropUrl : undefined}
+        src={backdropSrc}
         alt={`${item.title} 剧照`}
         className={`absolute inset-0 size-full object-cover object-top transition-transform duration-[9000ms] ease-linear ${
           active ? "scale-[1.06]" : "scale-100"

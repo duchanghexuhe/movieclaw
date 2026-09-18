@@ -7,6 +7,7 @@ import { ChevronLeftIcon, MenuIcon } from "@/components/icons";
 import { SearchCommand } from "@/components/search-command";
 import { useBackNavigation } from "@/lib/back-navigation";
 import { usePageChrome } from "@/lib/page-chrome";
+import { useTheme } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
 
 /** 没有可用站内历史时的结构父级；只作兜底，不覆盖真实来路。 */
@@ -29,12 +30,15 @@ const REVEAL_END = 82;
  * 必须是同一副长相，否则一边圆一边胶囊会像两套控件凑在一起。
  * 页面侧的操作按钮（见 library-detail-view 的 ⋯ 菜单）复用这个类名。
  *
- * 尺寸分两档：移动端 44px（iOS HIG 的最小可点目标，导航栏图标键的原生比例，
- * 触屏上 36px 的键会显得局促难点）；桌面端保持 36px（鼠标精度高，44px 反而笨重）。
+ * 尺寸分两档：触屏 44px（iOS HIG 的最小可点目标，导航栏图标键的原生比例，
+ * 36px 的键在触屏上会显得局促难点）；鼠标 36px（精度高，44px 反而笨重）。
+ * 分档按指针能力（pointer-coarse）而不是视口宽度——iPad 竖屏 / 手机横屏
+ * 都会越过 md 断点，按视口分档会让触屏设备吃到鼠标档（与播放器控件、
+ * .nf-icon-btn 的同一结论，2026-09 移动端审查统一）。
  * 图标同比例缩放（约为键径的一半），改动时两档要一起看。
  */
 export const PAGE_NAV_BUTTON_CLASS =
-  "grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] max-md:size-11";
+  "grid size-9 shrink-0 place-items-center rounded-full border border-white/[0.09] bg-black/30 text-white/85 backdrop-blur-md transition hover:bg-black/50 hover:text-white active:scale-[0.94] pointer-coarse:size-11";
 
 /**
  * 找到本组件所在的滚动容器（全站页面都是「外壳固定 + 内层 overflow-y-auto」，
@@ -98,6 +102,8 @@ export function PageNav({
   const back = useBackNavigation(fallback.href);
   const rootRef = useRef<HTMLDivElement>(null);
   const chrome = usePageChrome();
+  // ☰ 键只在银玻璃渲染（开抽屉）；Netflix 的导航在底部页签，详见下方控件组注释
+  const isNetflix = useTheme().id === "netflix";
   const isMobile = useIsMobile();
 
   // 向外壳登记「本页自带顶栏」：移动端据此撤掉全局顶栏，两条顶栏不再摞在一起
@@ -148,18 +154,21 @@ export function PageNav({
         className="pointer-events-none absolute inset-x-0 -bottom-5 top-0 backdrop-blur-md"
         style={{
           opacity: "var(--nav-reveal, 0)",
-          background:
-            "linear-gradient(180deg, rgba(9,11,16,0.72) 0%, rgba(9,11,16,0.46) 46%, rgba(9,11,16,0) 100%)",
+          /* 雾层色相走 --page-fog（:root 银玻璃 / netflix 覆盖组纯黑）：
+             内联 style 无法被 CSS 选择器压过，主题换肤必须经变量 */
+          background: "var(--page-fog)",
           maskImage: "linear-gradient(180deg, #000 0%, #000 38%, transparent 92%)",
           WebkitMaskImage: "linear-gradient(180deg, #000 0%, #000 38%, transparent 92%)",
         }}
       />
       <div className="relative flex h-[52px] items-center gap-3">
-        {/* 左侧控件组：移动端补一颗 ☰ 排在返回键左边。本页顶栏顶掉了外壳那条
-            全局顶栏，抽屉入口不在这儿补回来，详情页就只能先返回才能换区。
-            组内 gap-2 与右侧控件组一致，组与标题之间才是外层的 gap-3。 */}
+        {/* 左侧控件组：银玻璃移动端补一颗 ☰ 排在返回键左边（本页顶栏顶掉了
+            外壳那条全局顶栏，抽屉入口不在这儿补回来，详情页就只能先返回才能
+            换区）。Netflix 主题不放 ☰：导航全在底部页签，「我的」是 /my 路由，
+            这颗键只会在 390px 宽的一行里白占一格。组内 gap-2 与右侧控件组
+            一致，组与标题之间才是外层的 gap-3。 */}
         <div className="flex shrink-0 items-center gap-2">
-          {isMobile && chrome && (
+          {isMobile && chrome && !isNetflix && (
             <button
               type="button"
               onClick={chrome.openDrawer}

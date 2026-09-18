@@ -8,6 +8,7 @@ import {
   type LiquidGlassVariant,
 } from "@/vendor/liquid-glass";
 import { LiquidGlassRenderer } from "@/vendor/liquid-glass/core/LiquidGlassRenderer";
+import { useTheme } from "@/lib/ui-prefs";
 
 /**
  * GlassPanel —— 边到边大面板专用的「真实 WebGL 液态玻璃」承载层。
@@ -79,6 +80,11 @@ export function GlassPanel({
   const rendererRef = useRef<LiquidGlassRenderer | null>(null);
   const sizeRef = useRef({ width: 0, height: 0 });
 
+  // Netflix 主题（纯色平铺设计）整体停用 WebGL：不挂 canvas、按 flat 预设渲染
+  // （实色卡面 + 实线描边，见 globals.css 的 .glass-panel--flat）。调用方零改动，
+  // 顺带省下 GPU 与移动端的 WebGL 上下文配额（docs/design/web-themes.md §3.5）。
+  const theme = useTheme();
+
   // 最新配置的引用：apply 从这里取值而非闭包捕获，保证参数热更新时
   // （如设置页拖动侧栏透明度滑杆）不必销毁重建 WebGL 渲染器。
   const propsRef = useRef({ variant, settings, radius, sampleBackground });
@@ -107,7 +113,10 @@ export function GlassPanel({
   }, []);
 
   // 渲染器只随背景图重建（要换折射纹理）；参数变化走下面的轻量热更新。
+  // 主题参与依赖：netflix 主题不创建渲染器，从银玻璃切过来时也会把旧渲染器
+  // 一并 dispose（live 切换主题不能泄漏 WebGL 上下文）。
   useEffect(() => {
+    if (theme.id === "netflix") return;
     const root = rootRef.current;
     const canvas = canvasRef.current;
     if (!root || !canvas) return;
@@ -142,13 +151,27 @@ export function GlassPanel({
       renderer.dispose();
       rendererRef.current = null;
     };
-  }, [backgroundImage, apply]);
+  }, [backgroundImage, apply, theme.id]);
 
   // 参数（variant/settings/radius/sampleBackground）内容变化时热更新，不重建渲染器。
   useEffect(() => {
     apply();
     // settingsKey 覆盖了上述参数的内容变化
   }, [settingsKey, apply]);
+
+  // —— flat 分支（Netflix 主题）：实色卡面，不挂 canvas、不初始化 WebGL ——
+  if (theme.id === "netflix") {
+    return (
+      <div
+        className={`glass-panel glass-panel--flat ${className}`}
+        // Netflix 全站圆角压到 2/4/8 档（globals.css 的 --radius-* 覆盖只作用于
+        // 工具类，radius 是内联样式够不到），16px 的银玻璃默认值在此钳到 8px 档
+        style={{ borderRadius: Math.min(radius, 8) }}
+      >
+        <div className={`glass-panel__content ${contentClassName}`}>{children}</div>
+      </div>
+    );
+  }
 
   return (
     // borderRadius 与 WebGL 的 radius 同步：CSS 负责裁切 canvas 四角 + 投影，

@@ -32,6 +32,7 @@ import {
   ClaimSearchPanel,
   type ClaimSeed,
 } from "@/components/claim-panels";
+import { BrandLoader } from "@/components/brand-loader";
 import { useConfirm } from "@/components/feedback";
 import { Modal } from "@/components/modal";
 import {
@@ -123,7 +124,7 @@ export function ReidentifyDialog({
 
         {!preview && !error && (
           <div className="flex items-center justify-center gap-2.5 py-10 text-ui text-[var(--text-muted)]">
-            <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+            <BrandLoader className="size-5" />
             正在重新识别…
           </div>
         )}

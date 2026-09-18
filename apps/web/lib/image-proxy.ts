@@ -50,3 +50,20 @@ export function imageUrl(url: string | null, variant?: ImageVariant): string {
     variant && /^\/?images\/assets\//.test(url) ? appendVariant(url, variant) : url;
   return resolveRequestUrl(resolved);
 }
+
+/**
+ * 把经代理的 TMDB 图 URL 升级到 original 尺寸档（同一张图换分辨率）。
+ * 用于大屏全幅场景（发现页 Hero、详情页沉浸背景）：w1280 拉伸到整屏会发虚。
+ * 非 TMDB 图（豆瓣等没有 /t/p/ 尺寸段的）原样返回——没有更高清的档位可升。
+ */
+export function upgradedTmdbOriginalUrl(proxiedUrl: string): string {
+  if (typeof window === "undefined") return proxiedUrl;
+  try {
+    const u = new URL(proxiedUrl, window.location.origin);
+    const remote = u.searchParams.get("url");
+    if (!remote || !/\/t\/p\/w\d+\//.test(remote)) return proxiedUrl;
+    return cachedImageUrl(remote.replace(/\/t\/p\/w\d+\//, "/t/p/original/"));
+  } catch {
+    return proxiedUrl;
+  }
+}

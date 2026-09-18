@@ -15,6 +15,7 @@ import {
   updateUiPreferences,
   type UiPreferences,
 } from "@/lib/api/ui";
+import { DEFAULT_THEME_ID, normalizeThemeId, themeMeta, type ThemeMeta } from "@/lib/themes";
 import { readUiPrefsCache, writeUiPrefsCache } from "@/lib/ui-prefs-cache";
 
 /**
@@ -49,6 +50,16 @@ interface UiPrefsContextValue {
 }
 
 const UiPrefsContext = createContext<UiPrefsContextValue | null>(null);
+
+/**
+ * 浏览器 UI 框（移动端地址栏 / PWA 状态栏）随主题取的画布色：与 <meta
+ * name="theme-color"> 同步写入。manifest 的静态 theme_color 保持银玻璃
+ * （只影响安装过渡帧，动态化需 cookie 路由，不值得）。
+ */
+const THEME_BROWSER_CHROME: Record<string, string> = {
+  netflix: "#000000",
+  [DEFAULT_THEME_ID]: "#0a0b10",
+};
 
 export function UiPrefsProvider({ children }: { children: React.ReactNode }) {
   // 惰性初始化读缓存：本 Provider 只在 AuthGate 确认登录后于客户端渲染
@@ -90,6 +101,35 @@ export function UiPrefsProvider({ children }: { children: React.ReactNode }) {
     root.style.setProperty("--scrim-dark", `${effectiveScrim.dark}`);
   }, [effectiveScrim.blur, effectiveScrim.dark]);
 
+  // 主题同步：把生效主题（含设置页的预览草稿——点主题卡实时预览就靠它）写到
+  // <html> 的 data-theme 属性上。token 层与圆角换档都挂在这个作用域，属性一改
+  // 全站换肤；结构层（外壳分支）由 useTheme() 的消费方跟随同一份值渲染。
+  // 默认主题移除属性而不是写 data-theme="silver"，与防闪烁脚本（只认 netflix）
+  // 的落点保持一致，SSR 首屏也无需任何属性。
+  const effectiveTheme = normalizeThemeId((preview ?? prefs).theme);
+  useEffect(() => {
+    const root = document.documentElement;
+    if (effectiveTheme === DEFAULT_THEME_ID) root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", effectiveTheme);
+    // 浏览器 UI 框颜色与画布同源跟随（含设置页实时预览切主题的瞬间）。
+    // Next 的路由元数据机制可能在客户端导航时把 viewport 导出的静态
+    // themeColor（银玻璃值）写回 meta——用观察器持续断言当前主题的画布色，
+    // 无论被谁改写都拉回，避免主题与浏览器框颜色脱节。
+    const desired =
+      THEME_BROWSER_CHROME[effectiveTheme] ?? THEME_BROWSER_CHROME[DEFAULT_THEME_ID];
+    const apply = () => {
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta && meta.getAttribute("content") !== desired) {
+        meta.setAttribute("content", desired);
+      }
+      return meta;
+    };
+    const meta = apply();
+    const observer = new MutationObserver(apply);
+    if (meta) observer.observe(meta, { attributes: true, attributeFilter: ["content"] });
+    return () => observer.disconnect();
+  }, [effectiveTheme]);
+
   const savePrefs = useCallback(
     async (next: UiPreferences) => {
       const previous = prefs;
@@ -122,4 +162,17 @@ export function useUiPrefs(): UiPrefsContextValue {
   const ctx = useContext(UiPrefsContext);
   if (!ctx) throw new Error("useUiPrefs 必须在 <UiPrefsProvider> 内使用");
   return ctx;
+}
+
+/**
+ * 读取当前主题（含设置页未保存的预览草稿）。
+ *
+ * 在 UiPrefsProvider 外调用（登录 / 初始化页的 GlassPanel 等前置页面）不抛错、
+ * 按默认主题渲染：那些页面还没有账号上下文，主题本就未知；token 层不受影响
+ * ——layout.tsx 的内联脚本已按 localStorage 缓存把 data-theme 写上 <html>，
+ * 纯 CSS 换肤在任意页面都生效，这里兜底的只是结构层的分支选择。
+ */
+export function useTheme(): ThemeMeta {
+  const ctx = useContext(UiPrefsContext);
+  return themeMeta(ctx ? ctx.prefs.theme : DEFAULT_THEME_ID);
 }

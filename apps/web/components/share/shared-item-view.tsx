@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Route } from "next";
 import { useRouter } from "next/navigation";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { CastRow } from "@/components/cast-row";
 import { ChapterStrip } from "@/components/chapter-strip";
 import {
@@ -141,7 +142,7 @@ export function SharedItemView({
   if (!item) {
     return (
       <div className="flex min-h-dvh items-center justify-center gap-2.5 text-ui text-white/60">
-        <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+        <BrandLoader className="size-5" />
         正在读取影片信息…
       </div>
     );

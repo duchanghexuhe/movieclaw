@@ -5,6 +5,7 @@ import type { Route } from "next";
 
 import { HScroller } from "@/components/h-scroller";
 import { PosterImage } from "@/components/poster-image";
+import { useTapGuard } from "@/lib/use-tap-guard";
 
 /**
  * 演职员横滚条 —— 媒体库条目详情页与发现页条目详情页共用。
@@ -92,6 +93,10 @@ function CastCard({
   personHrefPrefix: PersonHrefPrefix;
 }) {
   const subtitle = person.credit ?? (person.role ? `饰 ${person.role}` : null);
+  // tapGuard：演员卡在横滚行里，滑动/刹车手势派发的 click 拦下不跳人物页
+  // （Link 分支不传动作，放行的点击走默认导航——同 PosterCard 的接法）。
+  // 无 tmdbPersonId 的静态块用不到，但 hook 必须无条件先调
+  const tapGuard = useTapGuard();
   const body = (
     <>
       <div className="aspect-[2/3] overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/cast:-translate-y-1 group-hover/cast:shadow-[0_16px_38px_rgba(0,0,0,0.5)] group-hover/cast:ring-white/25">
@@ -122,6 +127,7 @@ function CastCard({
   return (
     <Link
       href={`${personHrefPrefix}/${person.tmdbPersonId}` as Route}
+      {...tapGuard}
       aria-label={`查看 ${person.name} 的影人页`}
       className="group/cast w-[104px] shrink-0 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]"
     >

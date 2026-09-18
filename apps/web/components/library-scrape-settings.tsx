@@ -39,6 +39,7 @@ import {
   useScrapeChipOptions,
 } from "@/components/scrape-settings-section";
 import { type ScrapeConfigView, type ScrapeSetting, getScrapeConfig } from "@/lib/api/scrape";
+import { BrandLoader } from "@/components/brand-loader";
 
 const NAMING_FIELDS = [
   { key: "naming_entry_dir", label: "条目目录", fallback: "{title} ({year})" },
@@ -167,7 +168,7 @@ export function LibraryScrapeSettings({
   if (!merged || !base) {
     return (
       <p className="flex items-center gap-2.5 text-sub text-[var(--text-muted)]">
-        <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+        <BrandLoader className="size-5" />
         正在加载全局刮削设置…
       </p>
     );

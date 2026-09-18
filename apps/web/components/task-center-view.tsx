@@ -12,6 +12,7 @@ import {
   TaskActionsMenu,
   TaskStatusDot,
 } from "@/components/job-center";
+import { BrandLoader } from "@/components/brand-loader";
 import { useToast } from "@/components/feedback";
 import { HandoffButton } from "@/components/handoff-button";
 import {
@@ -349,7 +350,7 @@ export function TaskCenterView({
 
         {loading && visibleCount === 0 && (
           <div className="flex items-center justify-center gap-2.5 py-20 text-ui text-[var(--text-muted)]">
-            <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+            <BrandLoader className="size-5" />
             正在汇总任务…
           </div>
         )}

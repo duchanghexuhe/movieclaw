@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { AuthError, AuthField, AuthScreen } from "@/components/auth-screen";
+import { BrandLoader } from "@/components/brand-loader";
 import { SharedCollectionView } from "@/components/share/shared-collection-view";
 import { SharedItemView } from "@/components/share/shared-item-view";
 import { probeShare, unlockShare } from "@/lib/api/shares";
@@ -92,7 +93,7 @@ export function SharePage({ slug }: { slug: string }) {
   if (phase.kind === "unavailable") return <ShareUnavailable message={phase.message} />;
   return (
     <div className="flex min-h-dvh items-center justify-center gap-2.5 text-ui text-white/60">
-      <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+      <BrandLoader className="size-5" />
       正在打开分享…
     </div>
   );

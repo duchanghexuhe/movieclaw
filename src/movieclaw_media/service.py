@@ -683,12 +683,18 @@ class MediaDiscoverService:
         ][:_RELATED_LIMIT]
         collection = await self._movie_collection(data, kind, genre_map)
         backdrops, posters = self._images(data)
+        backdrop_path = data.get("backdrop_path")
         return MediaDetail(
             card=card,
             facts=self._facts(data, kind),
             videos=self._videos(data),
             backdrops=backdrops,
             posters=posters,
+            # 沉浸背景要铺满整屏，列表用的 w1280 在大屏上拉伸发虚；这里给
+            # 同一张主 backdrop 的 original 原图，前端详情页到达后无缝升级
+            backdrop_url=(
+                f"{self._image_base}/original{backdrop_path}" if backdrop_path else None
+            ),
             collection=collection,
             related=related,
         )

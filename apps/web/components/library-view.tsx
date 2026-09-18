@@ -1,14 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { Route } from "next";
 import Link from "next/link";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { ContentEmptyState } from "@/components/content-empty-state";
 import { HScroller } from "@/components/h-scroller";
 import { LIBRARY_KIND_META } from "@/components/library-kind-meta";
-import { LibrarySectionSwitch } from "@/components/library-section-switch";
 import {
   FilmIcon,
   GearIcon,
@@ -49,13 +49,11 @@ import { formatBytes } from "@/lib/format";
 import { cardVariantFor, imageUrl } from "@/lib/image-proxy";
 import { libraryInventoryAction } from "@/lib/library-inventory-summary";
 import type { MediaItem } from "@/lib/media-types";
-import { usePageChrome } from "@/lib/page-chrome";
 import { usePermissions } from "@/lib/permissions";
 import { buildRecentAdditionOverlay } from "@/lib/recent-addition";
 import { formatRelativeTime } from "@/lib/time";
 import { useUiPrefs } from "@/lib/ui-prefs";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
-import { useIsMobile } from "@/lib/use-media-query";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /** 每个库行 / 合集行的格数（也是本页向服务端要的条目数上限）。 */
@@ -123,21 +121,48 @@ export function libraryStatsSummary(libraries: MediaLibrary[] | null): string {
 //: 首帧等合集列表的预算（毫秒）。见 reload 里的说明
 const COLLECTIONS_FIRST_PAINT_BUDGET_MS = 1500;
 
-export function LibraryView() {
+/**
+ * 上一次成功加载的首页数据（模块级，进程内存，跨路由驻留）。
+ *
+ * 顶栏「媒体库」等入口回到本页时组件会重挂载：没有这份快照，首帧只能画
+ * 「正在加载…」的矮内容，滚动恢复（use-scroll-restoration）要等行数据到齐、
+ * 内容撑到旧位置的高度才能写入 scrollTop——页面先在最上端闪一拍、再跳回
+ * 离开处。快照让首帧直接以全量内容渲染，恢复就能在首次绘制前落位。
+ * 数据仍照常重新拉取刷新，快照只是绘制起点，不承担缓存有效期职责。
+ */
+let lastLoadedHome: {
+  libraries: MediaLibrary[];
+  collections: Collection[];
+  upNext: UpNextItem[];
+  favorites: FavoritesPage;
+  itemsByKey: Map<string, LibraryItem[]>;
+} | null = null;
+
+export function LibraryView({ hero }: { hero?: ReactNode }) {
   const { canManageLibraries } = usePermissions();
   // 首页的行清单存在界面偏好里（成员各存各的），应用启动时已随全站偏好拉过一次
   const { prefs } = useUiPrefs();
   const homePrefs = prefs.home;
   const scrollRef = useScrollRestoration("library");
-  const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
-  // 当前身份可见的合集：合并行清单要靠它认出合集行（空合集后端已经滤掉了）
-  const [collections, setCollections] = useState<Collection[]>([]);
+  // 各状态初值取上次会话留存的快照（没有则走加载态），见 lastLoadedHome
+  const [libraries, setLibraries] = useState<MediaLibrary[] | null>(
+    () => lastLoadedHome?.libraries ?? null,
+  );
+  // 当前身份可见的合集：合并行清单要靠它认出合集行；数字大于零也决定
+  // 「全部合集」入口露不露（空合集后端已经滤掉了）
+  const [collections, setCollections] = useState<Collection[]>(
+    () => lastLoadedHome?.collections ?? [],
+  );
   // 库行 / 合集行 / 库卡片封面的条目按「取数键」缓存：同一个库同一种排序只请求
   // 一次（库卡片封面与默认的「最近添加」行共用 added_at 那一份）
-  const [itemsByKey, setItemsByKey] = useState<Map<string, LibraryItem[]>>(new Map());
-  const [upNext, setUpNext] = useState<UpNextItem[] | null>(null);
+  const [itemsByKey, setItemsByKey] = useState<Map<string, LibraryItem[]>>(
+    () => lastLoadedHome?.itemsByKey ?? new Map(),
+  );
+  const [upNext, setUpNext] = useState<UpNextItem[] | null>(() => lastLoadedHome?.upNext ?? null);
   // 我的收藏：与接下来继续同一轮拉取、同一套失败策略（拉不到保留旧数据）
-  const [favorites, setFavorites] = useState<FavoritesPage | null>(null);
+  const [favorites, setFavorites] = useState<FavoritesPage | null>(
+    () => lastLoadedHome?.favorites ?? null,
+  );
   const [failed, setFailed] = useState(false);
 
   // 轮询乱序守卫：扫描期间后端响应时间抖动大，上一轮的慢响应可能晚于
@@ -241,6 +266,19 @@ export function LibraryView() {
     reload();
   }, [reload]);
 
+  // 成功到手的数据随手更新模块级快照，供下次重挂载首帧直出（见 lastLoadedHome）。
+  // 只在 libraries 已加载时写：加载态/失败态不该顶掉上一份好数据。
+  useEffect(() => {
+    if (libraries === null) return;
+    lastLoadedHome = {
+      libraries,
+      collections,
+      upNext: upNext ?? [],
+      favorites: favorites ?? { items: [], total: 0 },
+      itemsByKey,
+    };
+  }, [libraries, collections, upNext, favorites, itemsByKey]);
+
   // 有库在扫描/整理时轮询刷新，任务完成即看到最新库存与文件名
   const busyAny = (libraries ?? []).some((l) => l.scanning || l.organizing);
   // 元数据刷新单独一档：它以分钟计，而本页每轮 reload 还要把每个库的条目
@@ -287,22 +325,8 @@ export function LibraryView() {
     [homePrefs, libraries, collections],
   );
   const visibleRows = useMemo(() => rows.filter((row) => !row.hidden), [rows]);
-
-  // 首页 ⇄ 合集 的视角切换，位置规则与发现页的 TMDB / 豆瓣 完全一致：
-  // 本页是侧栏一级入口、没有 PageNav，切换器若在窄屏自己占一行就会和全局顶栏
-  // 摞成两排 header，所以移动端挂进全局顶栏那一行，桌面端留在页头右上角。
-  // 节点必须是稳定的 useMemo，否则每渲染一次就重挂一次。
-  const chrome = usePageChrome();
-  const isMobile = useIsMobile();
-  const sectionSwitch = useMemo(
-    () => <LibrarySectionSwitch current="home" className="mt-1 max-md:mt-0" />,
-    [],
-  );
-  const setTopBarActions = chrome?.setTopBarActions;
-  useEffect(() => {
-    if (!isMobile || !setTopBarActions) return;
-    return setTopBarActions(sectionSwitch);
-  }, [isMobile, sectionSwitch, setTopBarActions]);
+  const librariesRowHidden = rows.some((row) => row.kind === "libraries" && row.hidden);
+  const collectionCount = collections.length;
 
   // 「我的收藏」横滚行：与库行同一张海报卡、同一个行组件，只把 hover
   // 层换成收藏的层级说明；落点是服务端解析好的可见库里的条目详情
@@ -381,13 +405,23 @@ export function LibraryView() {
         if (visibleLibraries.length === 0) return null;
         return (
           <section key={row.id} className="mt-8 max-md:mt-6" aria-labelledby="my-libraries-title">
-            <div className="px-6 max-md:px-4">
+            <div className="flex items-center justify-between gap-4 px-6 max-md:px-4">
               <h3
                 id="my-libraries-title"
                 className="text-on-image text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]"
               >
                 {rowTitle(row)}
               </h3>
+              {/* 「全部合集」的入口等到真有合集了才露出：一开始就摆在这儿，
+                  用户点进去只有一片空白，那个位置就白占了（IA 那条决策） */}
+              {collectionCount > 0 && (
+                <Link
+                  href={"/library/collections" as Route}
+                  className="shrink-0 text-ui text-[var(--text-faint)] transition hover:text-[var(--text)]"
+                >
+                  全部合集 ›
+                </Link>
+              )}
             </div>
             <HScroller className="mt-3 gap-5 px-6 pb-1 pt-1 max-md:gap-3.5 max-md:px-4">
               {visibleLibraries.map((library) => (
@@ -419,6 +453,9 @@ export function LibraryView() {
 
   return (
     <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+      {/* Netflix 主题的全出血 Billboard（原内容首页并入，见 library-hero.tsx）：
+          挂在滚动容器内、跟随页面一起滚走，页头与行清单依次排在其后 */}
+      {hero}
       {/* 页头：标题 + 统计，右侧是页面级操作「自定义首页」「管理媒体库」（SaaS 惯例：
           页面动作放标题行右端；分区标题行只留分区自己的东西）。首页上没有任何
           排序细节与行菜单——调整全部收进自定义页，首页只负责看 */}
@@ -433,10 +470,8 @@ export function LibraryView() {
               : libraryStatsSummary(libraries === null ? null : visibleLibraries)}
           </p>
         </div>
-        {/* 右上角：视角切换（桌面端；移动端在全局顶栏）+ 两个图标钮——
-            自定义首页（所有人）、管理媒体库（有权限的人） */}
+        {/* 两个页面级动作都是图标钮：自定义首页（所有人）、管理媒体库（有权限的人） */}
         <div className="flex shrink-0 items-center gap-2">
-          {!isMobile && sectionSwitch}
           <Link
             href={"/library/customize" as Route}
             aria-label="自定义首页"
@@ -460,7 +495,7 @@ export function LibraryView() {
 
       {libraries === null && !failed && (
         <div className="mt-16 flex items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在加载媒体库…
         </div>
       )}

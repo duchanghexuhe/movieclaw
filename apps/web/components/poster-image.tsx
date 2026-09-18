@@ -101,10 +101,13 @@ export function PosterImage({
   const [loaded, setLoaded] = useState(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [eager, setEager] = useState(false);
-  // 换图时复位「已就位」：缓存直出的图 load 事件可能早于本组件挂载，
-  // 那种情况下 img.complete 已经是 true，不补这一下占位就撤不掉
+  // 换图时保持已显示状态：同一个 <img> 换 src 后旧位图会继续显示到新图就位
+  // （浏览器原生行为），主动复位反而把旧图藏掉、露一下底色——发现页 Hero 的
+  // 「同图升清」（w1280 → original，discover-view.tsx）就踩在这条路径上。
+  // 只有挂载首图才需要 complete 检测：缓存直出的图 load 事件可能早于本组件
+  // 挂载，不补这一下占位就撤不掉。
   useEffect(() => {
-    setLoaded(imgRef.current?.complete ?? false);
+    setLoaded((prev) => prev || (imgRef.current?.complete ?? false));
   }, [src]);
   useEffect(() => {
     // 调用方接管了取图时机：不必再探测（见 preload 的说明）
@@ -138,7 +141,11 @@ export function PosterImage({
         referrerPolicy="no-referrer"
         onError={() => setBroken(true)}
         onLoad={() => setLoaded(true)}
-        className={`bg-[#141824] object-cover ${className}`}
+        // 加载完成前先透明、就位后 500ms 淡入：避免大图解码完成那一帧「突然出现」。
+        // 就位后不再带任何 opacity 类——不干扰调用方自己的 hover 透明度效果。
+        className={`bg-[#141824] object-cover transition-opacity duration-500 ease-out ${
+          loaded ? "" : "opacity-0"
+        } ${className}`}
       />
       {/* 脉冲占位盖在图片**之上**：<img> 自带不透明深色底，垫在下面看不见 */}
       {pulseWhileLoading && !loaded && (

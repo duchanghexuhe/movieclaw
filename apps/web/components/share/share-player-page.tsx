@@ -10,6 +10,7 @@ import { unavailableMessage } from "@/components/share/share-page";
 import { sharePlaybackScope } from "@/lib/api/playback";
 import { probeShare } from "@/lib/api/shares";
 import { sharePath } from "@/lib/share";
+import { BrandLoader } from "@/components/brand-loader";
 
 /**
  * 分享页的播放器（docs/design/media-share.md §5.3）：先探针拿到条目 id，
@@ -61,7 +62,7 @@ export function SharePlayerPage({
         </div>
       ) : mediaItemId === null ? (
         <div className="flex size-full items-center justify-center text-ui text-white/60">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
         </div>
       ) : (
         <PlayerPage

@@ -512,6 +512,15 @@ class HomeUiPrefs(BaseModel):
 class UiPreferencesSetting(SettingSchema):
     """全站界面样式偏好，按页面分组。新页面的设定加嵌套模型字段即可。"""
 
+    theme: str = Field(
+        default="silver",
+        max_length=32,
+        description=(
+            "主题 id，取值见前端 lib/themes.ts 的注册表（silver / netflix）。"
+            "存纯字符串并放宽校验：未知值由前端 normalizeThemeId 兜底为默认主题，"
+            "老后端读到新主题 id 也不会整体拒绝（前向兼容）。"
+        ),
+    )
     sidebar: SidebarUiPrefs = Field(default_factory=SidebarUiPrefs, description="侧边栏玻璃面板")
     scrim: ScrimUiPrefs = Field(default_factory=ScrimUiPrefs, description="全站背景蒙版")
     nav: NavUiPrefs = Field(default_factory=NavUiPrefs, description="侧边栏主导航排序")

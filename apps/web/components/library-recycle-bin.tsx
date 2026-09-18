@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { ContentEmptyState } from "@/components/content-empty-state";
 import { useConfirm, useToast } from "@/components/feedback";
 import { ChevronDownIcon, SearchIcon, XIcon } from "@/components/icons";
@@ -275,7 +276,7 @@ export function LibraryRecycleBin({ onCountChange }: { onCountChange?: (total: n
   if (data === null && !failed) {
     return (
       <div className="mt-16 flex items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
-        <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+        <BrandLoader className="size-5" />
         正在加载回收站…
       </div>
     );

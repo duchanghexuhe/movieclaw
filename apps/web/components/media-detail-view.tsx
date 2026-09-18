@@ -17,9 +17,12 @@ import {
   StarIcon,
   XIcon,
 } from "@/components/icons";
+import { BrandLoader } from "@/components/brand-loader";
 import { CastRow } from "@/components/cast-row";
+import { DetailBackdropSlideshow } from "@/components/detail-backdrop-slideshow";
 import { HScroller } from "@/components/h-scroller";
 import { Modal } from "@/components/modal";
+import { NetflixBackButton } from "@/components/netflix/back-button";
 import { PageNav } from "@/components/page-nav";
 import { ImageLightbox, type LightboxAction } from "@/components/image-lightbox";
 import { MediaRow } from "@/components/media-row";
@@ -37,8 +40,11 @@ import { useBackNavigation } from "@/lib/back-navigation";
 import { useBackdrop } from "@/lib/backdrop";
 import { buildDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
+import { upgradedTmdbOriginalUrl } from "@/lib/image-proxy";
 import { getMediaSeed } from "@/lib/media-detail";
+import { useTapGuard } from "@/lib/use-tap-guard";
 import { usePageTitle } from "@/lib/use-page-title";
+import { useTheme } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
 import { usePermissions } from "@/lib/permissions";
 import type { MediaSource, MediaType } from "@/lib/media-types";
@@ -58,9 +64,8 @@ import {
  *
  * 页面纵向结构：
  *   1. 沉浸背景 —— 进入本页把全站背景临时换成该片剧照（setOverrideBackdrop），
- *      桌面上页面本身不画 Hero 图层：大图直出、零边界，侧栏与外壳留白一起透出；
- *      手机上竖屏放不下横版剧照，改由页内 Hero 呈现（与媒体库条目详情页同一套，
- *      见下方 mobileHeroSrc）。没有横幅剧照时退回海报作氛围图。
+ *      页面本身不画 Hero 图层：大图直出、零边界，侧栏与外壳留白一起透出。
+ *      顶栏首屏只有一颗返回键浮在剧照上，没有横幅剧照时退回海报作氛围图。
  *   2. 氛围留白 + 渐变内容层 —— 渐变从标题上方开始压暗，并在基础信息之后落成纯黑。
  *   3. 头部信息区 —— 标题 / 核心元信息 / 地区、语言与类型 / 上映日期 / 订阅操作，
  *      已订阅的影片额外显示订阅状态与追更进度。
@@ -137,34 +142,120 @@ export function MediaDetailView({
   // 沉浸背景：进入本页把全站背景临时换成该片剧照（侧栏、外壳留白一起透出，
   // 不再只铺详情卡片的局部），离开即恢复用户配置的背景——与媒体库条目详情页
   // 同一条链路（见 lib/backdrop.tsx 的 setOverrideBackdrop）。没有横幅剧照时
-  // 退回海报，覆盖层自己会铺满作氛围色。豆瓣条目同样换：它的图确实比 TMDB 小，
-  // 但手机上页面看到的是下面的页内 Hero、全站背景被黑底整个挡住，桌面上一张
-  // 偏软的剧照也好过「这部片的页面配着另一部片的壁纸」的断裂感。
+  // 退回海报，覆盖层自己会铺满作氛围色。豆瓣来源不换背景：只有小尺寸海报、
+  // 没有高清横幅剧照，铺成全屏背景是一片糊图——宁可保持原背景，也不为沉浸降质
+  // （页内手机 Hero 与背景分开取源，豆瓣在手机上仍有 Hero，见下）。
   const { setOverrideBackdrop } = useBackdrop();
-  const isMobile = useIsMobile();
-  const immersiveUrl = item?.backdropUrl || item?.posterUrl || "";
-  // 手机也换全站背景，但页面本身不靠它显示：横版剧照铺满又高又窄的整屏只能按高度放大、
-  // 从正中裁一条竖条，所以手机上看到的剧照是页内 Hero（mobileHeroSrc），滚动容器铺黑把
-  // 全站背景整个挡住。仍然要换，是因为侧栏的液态玻璃折射的就是全站背景
-  // （useBackdrop().backdrop）：不换的话展开侧栏透出的是用户自己的壁纸，与页面上的剧照
-  // 断成两截。两处是同一个 URL，浏览器只下载一次
+  // 沉浸背景只走高清：TMDB 的 original 地址是确定性的（w1280 同图换尺寸段，
+  // 见 upgradedTmdbOriginalUrl），进入页面即刻推导并预加载，加载**并解码**完成
+  // 才显示——不存在「先低清后高清」的换图过程，也就没有换图带来的突兀/闪烁。
+  // 低清 w1280 只作兜底：非 TMDB 图（无更高档位，地址原样返回）或高清加载
+  // 失败时才显示。没有横幅剧照时退回海报。
+  const fallbackBackdrop = item?.backdropUrl || item?.posterUrl || "";
+  const hdUrl =
+    source === "douban"
+      ? undefined
+      : (detail?.backdropOriginalUrl ??
+        (fallbackBackdrop ? upgradedTmdbOriginalUrl(fallbackBackdrop) : undefined));
+  const [hdState, setHdState] = useState<"pending" | "ok" | "failed">("pending");
+  useEffect(() => {
+    if (!hdUrl) {
+      setHdState("failed"); // 没有高清档：直接用兜底图
+      return;
+    }
+    setHdState("pending");
+    let cancelled = false;
+    const img = new Image();
+    const settle = () => {
+      img
+        .decode()
+        .catch(() => {})
+        .then(() => {
+          if (!cancelled) setHdState("ok");
+        });
+    };
+    img.onload = settle;
+    img.onerror = () => {
+      if (!cancelled) setHdState("failed");
+    };
+    img.src = hdUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [hdUrl]);
+  // 等待高清期间保持黑场（宁黑勿糊）：只有确认无高清档或高清加载失败，
+  // 才把低清图作为兜底显示出来。豆瓣不换背景（没有高清横幅，铺满全屏是糊图）。
+  const immersiveUrl =
+    source === "douban"
+      ? ""
+      : hdState === "ok"
+        ? hdUrl
+        : hdState === "failed"
+          ? fallbackBackdrop
+          : "";
   useEffect(() => {
     if (!immersiveUrl) return;
     setOverrideBackdrop(immersiveUrl);
     return () => setOverrideBackdrop(null);
   }, [immersiveUrl, setOverrideBackdrop]);
-  // 手机 Hero 用剧照，与桌面同一张：海报在外面的海报墙上已经看过了，进详情页要的是另一张
-  // 画面。没有剧照时才退回海报（豆瓣榜单条目、极少数没有横幅图的 TMDB 条目）
-  const mobileHeroSrc = immersiveUrl;
-  // Hero 的框比剧照高：宽度撑满、高约 1.15 倍宽（封顶 62svh，390px 宽的屏上约 448px）。
-  // 横版剧照按高度铺满、上下不裁，左右裁掉两边、居中留下人物主体——比按宽度塞下整张
-  // （只有 219px 高）多一倍画面，又不像铺满整屏那样只剩中间一条
-  const mobileHeroHeight = "min(115vw, 62svh)";
-  const showMobileHero = isMobile && mobileHeroSrc !== "";
-
   // 豆瓣外链的移动端 App 直跳：无悬停设备把「豆瓣」外链换成官方分发地址，
   // 装了豆瓣 App 直接拉起进词条页（桌面/未命中时为 null，回落网页地址）
   const doubanAppHref = useDoubanAppHref(source === "douban" ? id : null);
+
+  // Netflix 桌面主题的详情页定制层。银玻璃的 PageNav（圆角玻璃返回键 + 吸顶
+  // 雾）在这里退役——它是银玻璃的控件语言，浮在仿 Netflix 顶栏左端既突兀、
+  // 又被 z-40 的固定顶栏整个盖住点不到；Netflix 的返回语言是一颗裸的白色
+  // chevron（见 NetflixBackButton）。移动端仍保留 PageNav：它要向外壳登记
+  // 「本页自带顶栏」并充当返回入口（见 app-shell）。
+  // 这些 hook 必须无条件调用（短路写法会触发 rules-of-hooks）。
+  const themeId = useTheme().id;
+  const isMobile = useIsMobile();
+  const isNf = themeId === "netflix";
+  const isNfDesktop = isNf && !isMobile;
+  const hidePageNav = isNfDesktop;
+
+  // 滚动退场：详情页下滚时剧照不是被机械地推出屏幕，而是随滚动进度渐暗 +
+  // 模糊（Netflix 海报墙的观感）。进度写到根节点 CSS 变量 --nf-hero-recede
+  // （0→1），沉浸覆盖层（globals.css 的 html.nf-hero-live .backdrop-override）
+  // 用它驱动 filter——滚动过程零 React 重渲染。rAF 合帧：一次滚动会派发多次
+  // scroll 事件，只保留最后一帧的写入。Netflix 主题桌面与移动都启用（移动端
+  // 的纵向渐隐同样挂在这个标记类上，见 globals.css 的移动端档）；卸载 / 换片
+  // 重建时把变量与标记类清干净，别污染其他页面。
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const hasItem = Boolean(item);
+  useEffect(() => {
+    if (!isNf) return;
+    const root = document.documentElement;
+    root.classList.add("nf-hero-live");
+    const el = scrollRef.current;
+    if (!el) {
+      // 兜底态（数据未到）没有滚动容器：只挂标记类，清理时照常摘除
+      return () => {
+        root.classList.remove("nf-hero-live");
+        root.style.removeProperty("--nf-hero-recede");
+      };
+    }
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      // 归一化尺度取首屏的 75%：缓出的区间更长，渐暗/模糊的「过程感」更足；
+      // 变量注册了 <number> 类型并挂了过渡，滚轮大幅甩动时也是缓动跟随
+      const range = Math.max(320, el.clientHeight * 0.75);
+      const progress = Math.min(1, Math.max(0, el.scrollTop / range));
+      root.style.setProperty("--nf-hero-recede", progress.toFixed(3));
+    };
+    const onScroll = () => {
+      if (!frame) frame = window.requestAnimationFrame(sync);
+    };
+    sync();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (frame) window.cancelAnimationFrame(frame);
+      root.classList.remove("nf-hero-live");
+      root.style.removeProperty("--nf-hero-recede");
+    };
+  }, [isNf, hasItem]);
 
   // 兜底态也必须渲染 PageNav——它向外壳登记「本页自带顶栏」，否则移动端的
   // 全局顶栏（☰ + logo）会在数据到达前先显示、随后又消失，顶部闪一下；
@@ -174,7 +265,8 @@ export function MediaDetailView({
     return (
       <div className="flex h-full flex-col">
         {/* 当前页标题未知，留空——只为立起返回键并认领顶栏 */}
-        <PageNav title="" fallback={navFallback} />
+        {!hidePageNav && <PageNav title="" fallback={navFallback} />}
+        {isNfDesktop && <NetflixBackButton onBack={back} />}
         <DetailFallback failed={loadFailed} onBack={back} />
       </div>
     );
@@ -225,46 +317,38 @@ export function MediaDetailView({
     // 窄屏通栏满屏，圆角会直接压在屏幕边上，把吸顶顶栏裁成一块贴在屏幕顶上的
     // 圆角色块——与 library-item-detail-view 同一处理。
     <div
-      className={`detail-ambient scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl max-md:rounded-none ${
-        showMobileHero ? "detail-ambient--hero" : ""
-      }`}
+      ref={scrollRef}
+      className="detail-ambient scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl max-md:rounded-none"
     >
-      {/* 桌面没有任何 Hero 图层：全站背景此刻就是本片剧照（沉浸覆盖 + 本页豁免
+      {/* 没有任何 Hero 图层：全站背景此刻就是本片剧照（沉浸覆盖 + 本页豁免
           全局蒙版，见 app-shell 的 isHome），大图直出、零边界；.detail-ambient
-          在滚动容器上铺「透明 → 纯黑」的渐变板托住下方内容（见 globals.css）。
-          顶栏首屏只有一颗返回键浮在剧照上。 */}
-      <PageNav title={item.title} fallback={navFallback} />
-
-      {/* 手机 Hero（剧照）：宽度撑满，从状态栏底下起铺（绝对定位在滚动内容顶端，PageNav
-          的返回键与吸顶雾层浮在它上面），随内容一起滚走，不固定在背景上。顶部一抹暗让状态栏
-          与返回键落在亮图上也读得清；底部从中段开始压暗，到底边落成纯黑，与下方黑底无缝接上 */}
-      {showMobileHero && (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-x-0 top-0 z-0 overflow-hidden"
-          style={{ height: mobileHeroHeight }}
-        >
-          <img src={mobileHeroSrc} alt="" decoding="async" className="size-full object-cover object-center" />
-          <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-black/45 to-transparent" />
-          <div className="absolute inset-x-0 bottom-0 h-[55%] bg-gradient-to-b from-transparent via-black/55 to-black" />
-        </div>
+          在滚动容器上铺「透明 → 纯黑」的渐变板托住下方内容（见 globals.css，
+          Netflix 主题另有左侧渐变遮罩护住标题区）。 */}
+      {!hidePageNav && <PageNav title={item.title} fallback={navFallback} />}
+      {isNfDesktop && <NetflixBackButton onBack={back} />}
+      {/* 背景轮换：Netflix 桌面且剧照多于一张时，按序叠变（见组件说明）。
+          首帧传主 backdrop 原图——与覆盖层当前显示的是同一张照片，轮换层
+          淡入接管时没有构图/内容跳变。 */}
+      {isNfDesktop && detail && detail.backdrops.length > 1 && (
+        <DetailBackdropSlideshow
+          images={detail.backdrops}
+          initialUrl={detail.backdropOriginalUrl ?? detail.backdrops[0]?.fullUrl}
+        />
       )}
 
-      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。手机有 Hero 时 = Hero 高度减去吸顶
-          顶栏的占位（52px + 安全区）与片名压进图里的那一截（150px），片名与信息落在剧照
-          底部的渐变上；视口很矮时减到负数就不留白 */}
-      <div
-        className={showMobileHero ? undefined : "h-[30vh] min-h-[180px] max-md:h-[22vh] max-md:min-h-[120px]"}
-        style={
-          showMobileHero
-            ? { height: `max(0px, calc(${mobileHeroHeight} - 52px - var(--safe-top) - 150px))` }
-            : undefined
-        }
-      />
+      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。高度由 --detail-hero-h
+          驱动（与 globals.css 的渐变起点同源，各主题自行取值）。 */}
+      <div className="h-[var(--detail-hero-h)] min-h-[var(--detail-hero-min-h)]" />
 
       {/* 内容层：-mt-28/pt-28 与 .detail-ambient 的渐变起点对齐——渐变从标题
-          上方开始压暗，基础信息附近已接近纯黑，下面保持全黑。 */}
-      <div className="relative z-10 -mt-28 pb-12 pt-28">
+          上方开始压暗，基础信息附近已接近纯黑，下面保持全黑。detail-content
+          是 Netflix 主题的标题上移钩子（globals.css 把它的 pt 收小，标题
+          借左侧遮罩直接落在剧照上）。 */}
+      <div className="detail-content relative z-10 -mt-28 pb-12 pt-28">
+      {/* 前导簇（标题 → 元信息 → 操作 → 简介）：Netflix 主题下高度固定
+          （globals.css 的 .detail-lead min-height），演职员表从横幅正下方一条
+          固定线开始，不随简介长短上下漂移——简介短时下方留黑色空档。 */}
+      <div className="detail-lead">
       {/* —— 3. 头部信息区 —— */}
       <div className="relative z-10 px-12 pt-6 max-md:px-4 max-md:pt-3">
         <div className="min-w-0 max-w-5xl pb-1">
@@ -412,6 +496,7 @@ export function MediaDetailView({
           <ExpandablePlot text={item.overview} />
         </div>
       )}
+      </div>
 
       {/* —— 5. 演职员 —— */}
       {people.length > 0 && (
@@ -581,32 +666,7 @@ function TrailerRow({ title, videos }: { title: string; videos: MediaVideo[] }) 
 
       <HScroller className="-mx-1 gap-3 px-1 pb-1 pt-1">
         {videos.map((video) => (
-          <button
-            key={video.key}
-            type="button"
-            onClick={() => setPlaying(video)}
-            className="group/trailer w-[264px] shrink-0 text-left max-md:w-[208px]"
-          >
-            <div className="relative aspect-video overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/trailer:-translate-y-1 group-hover/trailer:shadow-[0_16px_40px_rgba(0,0,0,0.55)] group-hover/trailer:ring-white/30">
-              {/* YouTube 封面是 4:3（上下带黑边），object-cover 裁进 16:9 恰好只剩画面 */}
-              <PosterImage
-                src={video.thumbnailUrl}
-                alt={`${title} ${video.kind}`}
-                className="size-full object-cover transition-transform duration-500 ease-out group-hover/trailer:scale-[1.05]"
-              />
-              <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25 transition-colors group-hover/trailer:bg-black/10">
-                <span className="flex size-11 items-center justify-center rounded-full bg-black/55 text-white ring-1 ring-white/25 backdrop-blur-sm transition-transform duration-300 group-hover/trailer:scale-110">
-                  <PlayIcon className="ml-0.5 size-5" />
-                </span>
-              </span>
-              <span className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-caption font-medium text-white/85 backdrop-blur-sm">
-                {video.kind}
-              </span>
-            </div>
-            <p className="mt-2 truncate text-sub text-[var(--text-muted)] transition-colors group-hover/trailer:text-[var(--text)]">
-              {video.name}
-            </p>
-          </button>
+          <TrailerCard key={video.key} video={video} title={title} onPlay={() => setPlaying(video)} />
         ))}
       </HScroller>
 
@@ -614,6 +674,47 @@ function TrailerRow({ title, videos }: { title: string; videos: MediaVideo[] }) 
         <TrailerPlayer video={playing} title={title} onClose={() => setPlaying(null)} />
       )}
     </section>
+  );
+}
+
+/** 预告片卡：横滚行内的可点卡，套 useTapGuard——滑动/刹车手势派发的
+ *  click 会被拦下，避免滑一下就弹出播放层（同 PosterCard 约定）。 */
+function TrailerCard({
+  video,
+  title,
+  onPlay,
+}: {
+  video: MediaVideo;
+  title: string;
+  onPlay: () => void;
+}) {
+  const tapGuard = useTapGuard(onPlay);
+  return (
+    <button
+      type="button"
+      {...tapGuard}
+      className="group/trailer w-[264px] shrink-0 text-left max-md:w-[208px]"
+    >
+      <div className="relative aspect-video overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/trailer:-translate-y-1 group-hover/trailer:shadow-[0_16px_40px_rgba(0,0,0,0.55)] group-hover/trailer:ring-white/30">
+        {/* YouTube 封面是 4:3（上下带黑边），object-cover 裁进 16:9 恰好只剩画面 */}
+        <PosterImage
+          src={video.thumbnailUrl}
+          alt={`${title} ${video.kind}`}
+          className="size-full object-cover transition-transform duration-500 ease-out group-hover/trailer:scale-[1.05]"
+        />
+        <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25 transition-colors group-hover/trailer:bg-black/10">
+          <span className="flex size-11 items-center justify-center rounded-full bg-black/55 text-white ring-1 ring-white/25 backdrop-blur-sm transition-transform duration-300 group-hover/trailer:scale-110">
+            <PlayIcon className="ml-0.5 size-5" />
+          </span>
+        </span>
+        <span className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-caption font-medium text-white/85 backdrop-blur-sm">
+          {video.kind}
+        </span>
+      </div>
+      <p className="mt-2 truncate text-sub text-[var(--text-muted)] transition-colors group-hover/trailer:text-[var(--text)]">
+        {video.name}
+      </p>
+    </button>
   );
 }
 
@@ -842,24 +943,20 @@ function PhotoWall({
         <div
           ref={scrollerRef}
           onScroll={updateEdges}
-          className="scroll-none -mx-1 flex gap-3 overflow-x-auto px-1 pb-1 pt-1"
+          // overscroll-x-contain：滑到行的尽头后不把剩余动量甩给外层纵向滚动
+          // （同 HScroller 的处理，触屏上「滑到头带动整页跳一下」即由此而来）
+          className="scroll-none -mx-1 flex gap-3 overflow-x-auto overscroll-x-contain px-1 pb-1 pt-1"
         >
           {active.images.map((img, i) => (
-            <button
+            <PhotoCard
               key={img.previewUrl}
-              type="button"
-              aria-label={`查看${active.label}第 ${i + 1} 张`}
-              onClick={() => setLightboxIndex(i)}
-              className={`shrink-0 overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out hover:-translate-y-1 hover:shadow-[0_16px_40px_rgba(0,0,0,0.55)] hover:ring-white/30 ${
-                active.id === "backdrops" ? "aspect-video h-[148px] max-md:h-[104px]" : "aspect-[2/3] h-[148px] max-md:h-[126px]"
-              }`}
-            >
-              <PosterImage
-                src={img.previewUrl}
-                alt={`${title} ${active.label}`}
-                className="size-full object-cover transition-transform duration-500 ease-out hover:scale-[1.05]"
-              />
-            </button>
+              img={img}
+              index={i}
+              label={active.label}
+              landscape={active.id === "backdrops"}
+              title={title}
+              onOpen={() => setLightboxIndex(i)}
+            />
           ))}
         </div>
 
@@ -897,7 +994,9 @@ function PhotoArrow({
       type="button"
       aria-label={dir === -1 ? "向左滚动" : "向右滚动"}
       onClick={onClick}
-      className={`surface-raised !absolute top-1/2 z-10 flex size-9 -translate-y-1/2 items-center justify-center !rounded-full text-[var(--text)] transition-all duration-200 hover:scale-110 ${
+      // 触屏隐藏箭头（同 HScroller）：本就只靠 hover 显形，触屏没有 hover
+      // 会变成「看不见但能点」的隐形命中区，吃掉图片边缘的点击
+      className={`surface-raised !absolute top-1/2 z-10 flex size-9 -translate-y-1/2 items-center justify-center !rounded-full text-[var(--text)] transition-all duration-200 hover:scale-110 [@media(hover:none)]:hidden ${
         dir === -1 ? "left-2" : "right-2"
       } ${
         visible
@@ -906,6 +1005,41 @@ function PhotoArrow({
       }`}
     >
       <Icon className="size-4" />
+    </button>
+  );
+}
+
+/** 剧照墙的单张卡：横滚行内可点（开灯箱），套 useTapGuard 防滑动误触。 */
+function PhotoCard({
+  img,
+  index,
+  label,
+  landscape,
+  title,
+  onOpen,
+}: {
+  img: { previewUrl: string };
+  index: number;
+  label: string;
+  landscape: boolean;
+  title: string;
+  onOpen: () => void;
+}) {
+  const tapGuard = useTapGuard(onOpen);
+  return (
+    <button
+      type="button"
+      {...tapGuard}
+      aria-label={`查看${label}第 ${index + 1} 张`}
+      className={`shrink-0 overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out hover:-translate-y-1 hover:shadow-[0_16px_40px_rgba(0,0,0,0.55)] hover:ring-white/30 ${
+        landscape ? "aspect-video h-[148px] max-md:h-[104px]" : "aspect-[2/3] h-[148px] max-md:h-[126px]"
+      }`}
+    >
+      <PosterImage
+        src={img.previewUrl}
+        alt={`${title} ${label}`}
+        className="size-full object-cover transition-transform duration-500 ease-out hover:scale-[1.05]"
+      />
     </button>
   );
 }
@@ -937,7 +1071,7 @@ function DetailFallback({ failed, onBack }: { failed: boolean; onBack: () => voi
         </>
       ) : (
         <div className="flex items-center gap-2.5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在加载详情…
         </div>
       )}

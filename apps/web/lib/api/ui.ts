@@ -1,5 +1,6 @@
 import { request } from "@/lib/http";
 import type { HomeUiPrefs } from "@/lib/home-rows";
+import { normalizeThemeId } from "@/lib/themes";
 
 /** 后端统一响应信封（见 movieclaw_api.schemas.response.ApiResponse） */
 interface ApiEnvelope<T> {
@@ -45,6 +46,8 @@ export interface NavUiPrefs {
 }
 
 export interface UiPreferences {
+  /** 主题 id，取值来自 lib/themes.ts 的注册表；未知值由 normalizeThemeId 兜底为 silver */
+  theme: string;
   sidebar: SidebarUiPrefs;
   scrim: ScrimUiPrefs;
   nav: NavUiPrefs;
@@ -56,6 +59,8 @@ export interface UiPreferences {
  *  设置页「恢复默认」也回到这一组值。改动时须同步后端
  *  SidebarUiPrefs / ScrimUiPrefs 与 globals.css 里 .page-scrim 的变量兜底值。 */
 export const DEFAULT_UI_PREFS: UiPreferences = {
+  // 默认主题 = 银玻璃（现有观感）。主题列表见 lib/themes.ts 的 THEMES。
+  theme: "silver",
   sidebar: { transparency: 0.49, brightness: -0.36, depth: 28 },
   scrim: { blur: 13, dark: 0.69 },
   // 空顺序 = 内置默认顺序（导航项在 components/sidebar.tsx 的 SIDEBAR_NAV_ITEMS）
@@ -71,6 +76,8 @@ export function normalizeUiPreferences(
   data: Partial<UiPreferences> | null | undefined,
 ): UiPreferences {
   return {
+    // 老后端不认识 theme 字段时返回 undefined，兜底为默认主题（天然向前兼容）
+    theme: normalizeThemeId(data?.theme),
     sidebar: { ...DEFAULT_UI_PREFS.sidebar, ...data?.sidebar },
     scrim: { ...DEFAULT_UI_PREFS.scrim, ...data?.scrim },
     // order 必须兜住非数组：老后端不认识这个分组时返回的是 undefined，

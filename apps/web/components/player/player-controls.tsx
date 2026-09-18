@@ -1367,7 +1367,10 @@ function MenuPanel({
       // - 行是**通宽命中**（YouTube/Netflix 菜单都不给行画圆角胶囊），
       //   面板自己 overflow-hidden 让首尾行贴住 14px 圆角。
       // - 进场与调节胶囊同一个 0.16s 动画，origin 指向锚点按钮那一角。
-      className="player-flash-in absolute bottom-full left-0 mb-8 w-[300px] origin-bottom-left overflow-hidden rounded-[14px] bg-black/85 py-2 text-[13px] shadow-[0_18px_44px_rgba(0,0,0,0.5)]"
+      // 移动端窄档：240px 对齐诊断面板的 max-md 档（300px 在 375px 视口会从
+      // 锚点按钮溢出右缘）；left 再左移 2rem——三个菜单锚点在左簇（音轨/
+      // 字幕/设置），设置键最靠右，不左移的话 360px 视口起面板右缘就出屏。
+      className="player-flash-in absolute bottom-full left-0 mb-8 w-[300px] origin-bottom-left overflow-hidden rounded-[14px] bg-black/85 py-2 text-[13px] shadow-[0_18px_44px_rgba(0,0,0,0.5)] max-md:left-[-2rem] max-md:w-[240px]"
     >
       <p className="px-4 pb-1.5 pt-0.5 text-[12px] font-semibold text-white/55">{title}</p>
       {children}
@@ -1460,7 +1463,9 @@ function StepButton({ onClick, children }: { onClick: () => void; children: Reac
     <button
       type="button"
       onClick={onClick}
-      className="size-6 rounded-[7px] border border-white/10 bg-white/[0.06] leading-none text-white/85 transition-colors hover:bg-white/[0.14] hover:text-white"
+      // pointer-coarse 档放大到 32px：24px 的「+ / −」在触屏上很难点中，
+      // 与控制条按钮的 pointer-coarse 分档同一原则
+      className="size-6 rounded-[7px] border border-white/10 bg-white/[0.06] leading-none text-white/85 transition-colors hover:bg-white/[0.14] hover:text-white pointer-coarse:size-8 pointer-coarse:text-[13px]"
     >
       {children}
     </button>
@@ -1480,8 +1485,9 @@ function Toggle({
     <button
       type="button"
       onClick={onClick}
-      // 两态都带 border 占位，否则开关瞬间会差 1px 抖一下
-      className={`rounded-full border px-3 py-1 text-[12px] font-medium transition-colors ${
+      // 两态都带 border 占位，否则开关瞬间会差 1px 抖一下；
+      // pointer-coarse 档加高触控高度（字幕描边/背景开关在触屏上也要好点）
+      className={`rounded-full border px-3 py-1 text-[12px] font-medium transition-colors pointer-coarse:py-2 ${
         on
           ? "border-transparent bg-[var(--player-accent)] text-black"
           : "border-white/10 bg-white/[0.06] text-white/65 hover:bg-white/[0.14] hover:text-white"

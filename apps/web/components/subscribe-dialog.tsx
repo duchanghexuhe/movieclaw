@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Route } from "next";
 import { useRouter } from "next/navigation";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { CheckIcon } from "@/components/icons";
 import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
@@ -367,7 +368,7 @@ export function SubscribeDialog({
           {/* —— 加载 / 错误 —— */}
           {!prepared && !error && (
             <div className="mt-8 flex items-center justify-center gap-2.5 pb-4 text-ui text-[var(--text-muted)]">
-              <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+              <BrandLoader className="size-5" />
               正在获取条目信息…
             </div>
           )}

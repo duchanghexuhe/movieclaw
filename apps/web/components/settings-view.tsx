@@ -46,10 +46,11 @@ import { changePassword, updateProfile, uploadAvatar } from "@/lib/api/auth";
 import { clearPlaybackHistory } from "@/lib/api/playback";
 import { DEFAULT_UI_PREFS } from "@/lib/api/ui";
 import { HttpError } from "@/lib/http";
+import { normalizeThemeId, THEMES } from "@/lib/themes";
 import { useSession } from "@/lib/session";
 import { applyNavOrder, mergeNavOrder, sameNavOrder } from "@/lib/sidebar-nav";
 import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
-import { useUiPrefs } from "@/lib/ui-prefs";
+import { useTheme, useUiPrefs } from "@/lib/ui-prefs";
 import { useTabParam } from "@/lib/use-tab-param";
 
 /**
@@ -176,7 +177,9 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
               : "max-w-2xl"
         }`}
       >
-        <header className="flex items-center gap-4">
+        {/* Netflix 移动端：分区名已由页顶的 NetflixSettingsNav（返回键 + 分区
+            名）呈现，这里的大图标头在窄屏上重复占位（globals.css 按主题隐藏） */}
+        <header className="settings-panel-head flex items-center gap-4">
           <span className="icon-chip size-12 !rounded-2xl">
             <Icon className="size-[22px]" />
           </span>
@@ -198,7 +201,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
         </header>
 
         {/* 发丝分隔线：左亮右隐的渐变，呼应玻璃边缘的受光 */}
-        <div className="mb-8 mt-7 h-px bg-gradient-to-r from-white/[0.14] via-white/[0.06] to-transparent" />
+        <div className="settings-panel-head mb-8 mt-7 h-px bg-gradient-to-r from-white/[0.14] via-white/[0.06] to-transparent" />
 
         {section.id === "overview" ? (
           <SettingsOverviewSection />
@@ -587,6 +590,8 @@ function AppSection() {
   const [tab, setTab] = useTabParam(["update", "storage", "tasks"] as const, "update");
   // 本分区只对管理员渲染（成员的分区清单里没有 app），无需再按角色关轮询
   const pendingUpdate = usePendingUpdate();
+  // Netflix：激活胶囊是白底黑字（与外观分区同一语言，见 AppearanceSection）
+  const activePillCls = useTheme().id === "netflix" ? "bg-white text-black" : "bg-white/[0.14] text-white";
   const tabs = [
     { id: "update" as const, label: "版本与更新" },
     { id: "storage" as const, label: "缓存管理" },
@@ -604,7 +609,7 @@ function AppSection() {
             onClick={() => setTab(t.id)}
             className={`flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-sub font-medium transition-colors ${
               t.id === tab
-                ? "bg-white/[0.14] text-white"
+                ? activePillCls
                 : "text-[var(--text-muted)] hover:bg-white/[0.07] hover:text-[var(--text)]"
             }`}
           >
@@ -642,8 +647,9 @@ function PlaybackSection() {
 }
 
 /**
- * —— 外观分区：两类设置，胶囊标签切换 ——
+ * —— 外观分区：主题 + 两类设置，胶囊标签切换 ——
  *
+ *   - 主题：整档切换（银玻璃 / Netflix），置顶独立成组（见 ThemeGroup）；
  *   - 背景图：首页背景图库的管理（见 BackdropGroup）；
  *   - 界面质感：侧栏玻璃 + 背景蒙版的滑杆（见 InterfaceTextureGroup）。
  *
@@ -661,9 +667,16 @@ function AppearanceSection() {
     { id: "texture" as const, label: "界面质感" },
     { id: "nav" as const, label: "导航顺序" },
   ] as const;
+  // Netflix 主题是纯色平铺设计（docs/design/web-themes.md §3.5）：背景大图与
+  // 玻璃/蒙版整体停用，这两组设置置灰标注，prefs 字段保留不丢。
+  const theme = useTheme();
+  const glassDisabled = theme.id === "netflix";
+  // Netflix：激活胶囊是白底黑字（品牌语言：选中态 = 白底），不是灰底透明白
+  const activePillCls = glassDisabled ? "bg-white text-black" : "bg-white/[0.14] text-white";
 
   return (
     <div className="space-y-5">
+      <ThemeGroup />
       <div className="flex gap-1.5">
         {tabs.map((t) => (
           <button
@@ -673,7 +686,7 @@ function AppearanceSection() {
             onClick={() => setTab(t.id)}
             className={`rounded-full px-3.5 py-1.5 text-sub font-medium transition-colors ${
               t.id === tab
-                ? "bg-white/[0.14] text-white"
+                ? activePillCls
                 : "text-[var(--text-muted)] hover:bg-white/[0.07] hover:text-[var(--text)]"
             }`}
           >
@@ -682,13 +695,120 @@ function AppearanceSection() {
         ))}
       </div>
       {tab === "backdrop" ? (
-        <BackdropGroup />
+        glassDisabled ? (
+          <DisabledGlassGroup label="首页背景">
+            <BackdropGroup />
+          </DisabledGlassGroup>
+        ) : (
+          <BackdropGroup />
+        )
       ) : tab === "texture" ? (
-        <InterfaceTextureGroup />
+        glassDisabled ? (
+          <DisabledGlassGroup label="界面质感">
+            <InterfaceTextureGroup />
+          </DisabledGlassGroup>
+        ) : (
+          <InterfaceTextureGroup />
+        )
       ) : (
         <NavOrderGroup />
       )}
     </div>
+  );
+}
+
+/**
+ * 「仅银玻璃主题生效」的置灰壳：Netflix 主题下包住背景图 / 界面质感两组设置。
+ * 置灰 + 挡指针（不只是禁用单个控件——整组交互都无意义），对应偏好字段保留，
+ * 切回银玻璃后原样恢复可调。
+ */
+function DisabledGlassGroup({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div aria-disabled className="pointer-events-none select-none opacity-45">
+        {children}
+      </div>
+      <p className="mt-2.5 px-1 text-caption text-[var(--text-faint)]">
+        {label}仅「银玻璃」主题生效——Netflix 主题是纯色平铺设计，没有背景大图与玻璃质感。
+      </p>
+    </div>
+  );
+}
+
+/**
+ * —— 主题：整档切换卡（多主题框架的设置入口，docs/design/web-themes.md §3.6）——
+ *
+ * 两张可选卡（缩略预览 = 预览色块 + 主题名），点击即保存：savePrefs 乐观更新
+ * 让全站（token 层 + 外壳结构层）立即按新主题渲染，「保存中/失败回滚」复用
+ * 偏好通道的既有语义；主题跟随账号存储，全设备同步。
+ *
+ * 预览不再单独走 setPreview 草稿：主题切换是原子操作（没有连续微调的滑杆），
+ * 点击即所见即所得，无需「拖动预览 → 保存落库」的两段式。
+ */
+function ThemeGroup() {
+  const { savedPrefs, savePrefs, loading } = useUiPrefs();
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const current = normalizeThemeId(savedPrefs.theme);
+
+  const pick = async (id: string) => {
+    if (id === current || busyId) return;
+    setBusyId(id);
+    setError(null);
+    try {
+      await savePrefs({ ...savedPrefs, theme: id });
+    } catch (err) {
+      setError(err instanceof HttpError ? err.message : "保存失败，请稍后重试");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <SettingsGroup label="主题">
+      <div className="grid grid-cols-2 gap-3 max-[420px]:grid-cols-1">
+        {THEMES.map((theme) => {
+          const active = theme.id === current;
+          const busy = busyId === theme.id;
+          return (
+            <button
+              key={theme.id}
+              type="button"
+              onClick={() => void pick(theme.id)}
+              disabled={loading || busyId != null}
+              aria-pressed={active}
+              className={`group relative overflow-hidden rounded-xl border p-4 text-left outline-none transition focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] ${
+                active
+                  ? "border-transparent ring-2 ring-[var(--accent)]"
+                  : "border-white/[0.12] hover:border-white/[0.35]"
+              } ${busyId && !busy ? "opacity-50" : ""}`}
+            >
+              {/* 预览缩略：底色块 + 一条强调色，两个主色即可拼出主题观感 */}
+              <span
+                className="mb-3 flex h-14 items-end rounded-lg p-2"
+                style={{ background: theme.preview.bg }}
+              >
+                <span
+                  className="h-1.5 w-10 rounded-full"
+                  style={{ background: theme.preview.accent }}
+                />
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="text-body font-semibold text-[var(--text)]">{theme.label}</span>
+                {active && <CheckIcon className="size-4 text-[var(--accent)]" />}
+              </span>
+              <span className="mt-0.5 block text-caption leading-4 text-[var(--text-muted)]">
+                {theme.description}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      {error && <p className="mt-2 text-sub text-[var(--danger)]">{error}</p>}
+      <p className="mt-2.5 px-1 text-caption text-[var(--text-faint)]">
+        主题跟随账号保存，所有设备同步；切换立即生效。
+      </p>
+    </SettingsGroup>
   );
 }
 

@@ -680,6 +680,9 @@ class LibraryItemView(BaseModel):
     title: str
     year: int | None
     poster_url: str | None
+    #: 横版剧照（宽幅 backdrop）。与海报同一套「本地资产优先、回落 TMDB 图床」
+    #  规则；横幅位（首页 billboard）优先用它，没有时前端才回落海报模糊铺底
+    backdrop_url: str | None = None
     primary_aspect: float = Field(
         default=0.6667, description="主图宽高比（真实像素尺寸或来源惯例），卡片按它排版"
     )

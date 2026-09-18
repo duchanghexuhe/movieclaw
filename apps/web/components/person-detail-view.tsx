@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import type { Route } from "next";
 
+import { BrandLoader } from "@/components/brand-loader";
 import { ArrowLeftIcon } from "@/components/icons";
 import { PageNav } from "@/components/page-nav";
 import { PosterImage } from "@/components/poster-image";
@@ -65,7 +66,7 @@ export function PersonDetailView({ tmdbPersonId }: { tmdbPersonId: number | stri
       <div className="flex h-full flex-col">
         <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
-          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          <BrandLoader className="size-5" />
           正在读取影人档案…
         </div>
       </div>
