@@ -245,7 +245,9 @@ def dismiss_last_abnormal_exit() -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError:
-        logger.warning("清除异常退出记录失败（%s），将在展示窗口过期后自动消失", path, exc_info=True)
+        logger.warning(
+            "清除异常退出记录失败（%s），将在展示窗口过期后自动消失", path, exc_info=True
+        )
 
 
 def _overlay_state(vdir: Path) -> tuple[str, bool, str]:
