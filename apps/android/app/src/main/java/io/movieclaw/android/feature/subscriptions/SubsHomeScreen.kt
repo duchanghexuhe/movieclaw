@@ -692,6 +692,11 @@ fun SubsHomeScreen(
                     onPlay = onPlay,
                     onOpenSubscription = onOpenSubscription,
                 )
+            } else {
+                // 有订阅但没有英雄位（没有在播 / 刚入库的条目，比如只追新集的完结剧）：
+                // 顶部的「我的订阅」大标题是悬浮叠在内容上的，这里得让出它的位置，
+                // 否则剧集/电影那一排直接从屏幕顶端画起，压在状态栏和大标题下面
+                Spacer(Modifier.statusBarsPadding().height(McMetrics.topBarHeight))
             }
 
             Column(Modifier.padding(top = 22.dp)) {
@@ -787,9 +792,10 @@ private fun SubsHero(
     // 把进行中的翻页动画取消掉，轮播就卡在「左右各半张」（实机反馈）。
     // settledPage 只在滚动停稳后才更新——手动滑动也会因此自然重新计时（同 iOS）。
     val fill = remember { Animatable(0f) }
-    LaunchedEffect(pager.settledPage, slides.size) {
+    val tabActive = io.movieclaw.android.core.designsystem.LocalTabActive.current
+    LaunchedEffect(pager.settledPage, slides.size, tabActive) {
         fill.snapTo(0f)
-        if (slides.size <= 1) return@LaunchedEffect
+        if (slides.size <= 1 || !tabActive) return@LaunchedEffect
         fill.animateTo(1f, tween(8000, easing = LinearEasing))
         // 用户正在拖的时候让位；停稳后本次效果会重排，再重新计时
         if (pager.isScrollInProgress) return@LaunchedEffect
@@ -1417,8 +1423,7 @@ private fun SubCard(sub: SubscriptionView, dim: Boolean, origin: String?, onClic
         }
         Text(sub.media.title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = if (dim) TextMuted else TextPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 6.dp))
         val meta = if (sub.media.kind == "tv") {
-            val season = sub.selectedSeasons.firstOrNull()
-            "第 ${season ?: 1} 季 · ${sub.progress.imported} / ${sub.progress.total}"
+            tvShelfMeta(sub)
         } else {
             listOfNotNull(sub.media.year?.toString(), if (sub.progress.imported > 0) "已入库" else "未入库").joinToString(" · ")
         }
@@ -1528,4 +1533,15 @@ private fun SubscriptionEmptyState(onOpenDiscover: () -> Unit) {
             Text("去发现剧集", style = McType.subSemibold, color = Color(0xFF0A0E12))
         }
     }
+}
+
+/**
+ * 剧集海报下第二行：「第 N 季 · 已入库 / 总集数」。没勾季的订阅（只追新集）没有季可写——
+ * 以前兜底成「第 1 季 · 0 / 0」，看着像订阅坏了；按网页口径改写为「仅追新集」，
+ * 已收齐的就只写年份。
+ */
+internal fun tvShelfMeta(sub: io.movieclaw.android.core.model.SubscriptionView): String {
+    val season = sub.selectedSeasons.firstOrNull()
+        ?: return if (sub.followFuture && sub.status != "completed") "仅追新集" else (sub.media.year?.toString() ?: "剧集")
+    return "第 $season 季 · ${sub.progress.imported} / ${sub.progress.total}"
 }

@@ -1,7 +1,8 @@
 # =============================================================================
 # Release changelog 同步
 #
-# docs/changelog/vX.Y.Z.md 是各版本 changelog 的事实源（进版本管理、可评审）。
+# docs/changelog/vX.Y.Z.md 与 torrent-ner-vN.md 是应用和模型日志的事实源。
+# 每份文件包含英文正文与完整中文说明（进版本管理、可评审）。
 # 该目录有文件合入 main 时，本工作流把每份 changelog 同步为同名 tag 的
 # GitHub Release body——应用内更新界面会原文展示这段文字。
 #
@@ -12,6 +13,9 @@
 #
 # 对应 Release 尚不存在的文件（例如提前合入下个版本的 changelog）会被
 # 跳过，等 Release 创建后再次触碰该文件即可同步。
+#
+# 同步正文后重新生成该版本的 release.json（scripts/publish-release-info.sh），
+# 官网更新日志读的是这份按语言拆好的清单。
 # =============================================================================
 name: release-notes
 
@@ -28,17 +32,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # release.json 要和上一个 tag 比较运行时版本，需要完整历史与 tag
+          fetch-depth: 0
 
       - name: 同步 changelog 到对应 Release body
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          for file in docs/changelog/v*.md; do
+          for file in docs/changelog/v*.md docs/changelog/torrent-ner-v*.md; do
             tag="$(basename "$file" .md)"
             if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
               echo "同步 $file → Release $tag"
               gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$file"
+              case "$tag" in v*) bash scripts/publish-release-info.sh "$tag" ;; esac
             else
               echo "跳过 $file：Release $tag 尚不存在"
             fi

@@ -174,6 +174,12 @@ struct ReelsView: View {
                     .frame(width: size.width + insets.leading + insets.trailing,
                            height: size.height + insets.top + insets.bottom)
                 }
+                if store.exhausted {
+                    endPage(store)
+                        .frame(width: size.width + insets.leading + insets.trailing,
+                               height: size.height + insets.top + insets.bottom)
+                        .id(ReelsStore.endPageID)
+                }
             }
             .scrollTargetLayout()
         }
@@ -194,6 +200,27 @@ struct ReelsView: View {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) { router.play(request) }
+    }
+
+    // MARK: - 刷到底
+
+    /// 末尾一页：没有更多了；开了片段预切、还没切完时补一句其余的还在切
+    private func endPage(_ store: ReelsStore) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 36, weight: .light))
+                .foregroundStyle(.white.opacity(0.7))
+            Text("没有更多了")
+                .font(.headline)
+                .foregroundStyle(.white)
+            if let clips = store.clips, clips.state != "done", clips.ready < clips.total {
+                Text("其余 \(clips.total - clips.ready) 部的片段还在预切，晚点再来")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.textMuted)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black)
     }
 
     // MARK: - 空态
@@ -235,6 +262,12 @@ struct ReelsView: View {
                 Text(message)
                 Button("重试") { Task { await store.retry() } }
                     .buttonStyle(.glass)
+            } else if let clips = store.clips, clips.state != "done", clips.ready < clips.total {
+                // 开了片段预切、这些条件下一部都还没切好
+                Text("片段正在预切，已完成 \(clips.ready) / \(clips.total)")
+                Text(clips.state == "paused" ? "有人在观看，预切暂停中，稍后再来" : "稍后再来就能刷了")
+                    .font(.caption)
+                    .foregroundStyle(Theme.textFaint)
             } else if !store.filter.isEmpty || store.kind != nil {
                 Text("这些条件下还没有能刷的片子")
                 Button("清空条件") { store.applyFilter(LibraryFilter(), kind: nil) }
@@ -338,7 +371,8 @@ private struct ReelPage: View {
                 if !expanded {
                     // 横带下方一行：画质在左、全屏观看在右（2026-09-30 用户调整：原来画质压在横带右下角，看着怪）
                     HStack(spacing: 10) {
-                        qualityMenu
+                        // 预切片段本身就是 1080p 小文件，选画质不起作用：不显示这个胶囊
+                        if item.play.mode != "clip" { qualityMenu }
                         fullscreenButton
                     }
                     // 只改亮度不隐藏：按钮始终在原位、暗着也能点。调暗靠降文字与描边的颜色（`controlsAlpha`），

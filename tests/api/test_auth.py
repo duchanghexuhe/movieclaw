@@ -294,6 +294,8 @@ _PUBLIC_ALLOWLIST = {
     ("GET", "/api/v1/playback/files/{file_id}/disc"),
     ("GET", "/api/v1/playback/files/{file_id}/disc/{relative_path}"),
     ("GET", "/api/v1/playback/files/{file_id}/subtitles"),
+    # 预切片段（reels.md §8）：系统播放器按 Range 取，同原文件直出只凭签名 token
+    ("GET", "/api/v1/reels/clips/{file_id}/{start_ms}.mp4"),
     ("GET", "/api/v1/playback/files/{file_id}/fonts"),
     ("GET", "/api/v1/playback/files/{file_id}/fonts/{name}"),
     ("GET", "/api/v1/playback/files/{file_id}/trickplay"),
@@ -363,6 +365,8 @@ def fill_path_params(path: str) -> str:
         .replace("{douban_id}", "26266893")
         .replace("{collection_id}", "movie_top250")
         .replace("{subscription_id}", "1")
+        .replace("{wanted_id}", "1")
+        .replace("{kind}", "movie")
         .replace("{rule_set_id}", "1")
         .replace("{library_id}", "1")
         .replace("{media_item_id}", "1")
@@ -371,6 +375,8 @@ def fill_path_params(path: str) -> str:
         .replace("{file_id}", "1")
         .replace("{token_id}", "1")
         .replace("{notice_id}", "1")
+        .replace("{event_id}", "x")
+        .replace("{tip_id}", "x")
         .replace("{run_id}", "test-run")
         .replace("{session_id}", "test-session")
         .replace("{day}", "2026-01-01")
@@ -379,6 +385,8 @@ def fill_path_params(path: str) -> str:
         .replace("{challenge_id}", "test-challenge")
         .replace("{account_id}", "test-bot")
         .replace("{channel}", "weixin")
+        .replace("{channel_id}", "weixin")
+        .replace("{binding_id}", "test-binding")
         .replace("{endpoint_id}", "test-endpoint")
         .replace("{username}", "family")
         .replace("{member_id}", "1")
@@ -395,6 +403,9 @@ def fill_path_params(path: str) -> str:
         .replace("{relay_id}", "r_test")  # App 推送的自建中继
         .replace("{token}", "no-such-image")  # 推送配图的签名
         .replace("{item_id}", "1")  # 推送「这部剧不再提醒」的条目
+        .replace("{letter_id}", "1")  # 可靠事件死信
+        .replace("{start_ms}", "0")  # 预切片段的起点
+        .replace("{key_id}", "1")  # 插件回调地址
     )
 
 

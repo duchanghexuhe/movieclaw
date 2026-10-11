@@ -50,7 +50,11 @@ object TabBarMinimize {
 @Composable
 fun TrackTabBarMinimize(scroll: ScrollState) {
     val density = androidx.compose.ui.platform.LocalDensity.current.density
-    LaunchedEffect(scroll, density) {
+    val active = LocalTabActive.current
+    // 后台页签不喂：几个页签同时在组合里，各自的滚动位置混着喂会把收起判断搅乱；
+    // 切回前台时按本页当前位置重新起算
+    LaunchedEffect(scroll, density, active) {
+        if (!active) return@LaunchedEffect
         TabBarMinimize.reset(scroll.value)
         snapshotFlow { scroll.value }.collect { TabBarMinimize.onScroll(it, density) }
     }
@@ -64,7 +68,9 @@ fun TrackTabBarMinimize(scroll: ScrollState) {
 @Composable
 fun TrackTabBarMinimize(scroll: LazyListState) {
     val density = androidx.compose.ui.platform.LocalDensity.current.density
-    LaunchedEffect(scroll, density) {
+    val active = LocalTabActive.current
+    LaunchedEffect(scroll, density, active) {
+        if (!active) return@LaunchedEffect
         TabBarMinimize.reset(scroll.firstVisibleItemIndex * 100_000 + scroll.firstVisibleItemScrollOffset)
         snapshotFlow { scroll.firstVisibleItemIndex * 100_000 + scroll.firstVisibleItemScrollOffset }
             .collect { TabBarMinimize.onScroll(it, density) }

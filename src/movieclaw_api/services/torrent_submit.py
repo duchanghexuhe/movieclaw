@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api import hooks
 from movieclaw_api.exceptions import BadRequestException, UpstreamServiceException
 from movieclaw_api.services.site_access import SiteUnavailableError, get_site_access
 from movieclaw_db.models import DownloaderClient, DownloadHint, ManualDownloadIntent, utcnow
@@ -147,9 +149,7 @@ def _best_match(
     return best
 
 
-def translate_save_path(
-    path: str | None, mappings: list[dict[str, str]] | None
-) -> str | None:
+def translate_save_path(path: str | None, mappings: list[dict[str, str]] | None) -> str | None:
     """把 movieclaw 视角的保存目录翻译成下载器视角（最长前缀匹配）。
 
     映射形如 ``[{"local": "/data/downloads", "remote": "/downloads"}]``。
@@ -165,9 +165,7 @@ def translate_save_path(
     return remote + path[len(local) :]
 
 
-def translate_to_local(
-    path: str | None, mappings: list[dict[str, str]] | None
-) -> str | None:
+def translate_to_local(path: str | None, mappings: list[dict[str, str]] | None) -> str | None:
     """反向翻译：把下载器上报的路径翻译回 movieclaw 视角（最长前缀匹配）。
 
     救援巡检核验落点用。未命中原样返回（视角一致部署）。
@@ -198,6 +196,10 @@ async def submit_torrent(
     category: str = "movieclaw",
     select_units: set[tuple[int, int]] | None = None,
     known_seasons: Collection[int] | None = None,
+    before_submit=None,
+    selection_owner: str | None = None,
+    route_hint: hooks.DownloaderQuery | None = None,
+    before_resume=None,
 ) -> tuple[SubmitResult, DownloaderClient]:
     """从站点取回种子并提交到下载器，返回（提交结果, 所用下载器记录）。
 
@@ -231,14 +233,7 @@ async def submit_torrent(
                 "请在「设置 → 下载器」里检查后重试，或改用其他下载器"
             )
     else:
-        result = await session.execute(
-            select(DownloaderClient).where(
-                DownloaderClient.is_default.is_(True),  # type: ignore[attr-defined]
-                DownloaderClient.enabled.is_(True),  # type: ignore[attr-defined]
-                DownloaderClient.status == ConfigStatus.ACTIVE,
-            )
-        )
-        row = result.scalars().first()
+        row = await pick_downloader(session, route_hint)
     if row is None:
         raise BadRequestException("没有可用的默认下载器（请在「设置 → 下载器」里添加并设为默认）")
 
@@ -274,29 +269,46 @@ async def submit_torrent(
     # 4. 提交（幂等，重复种子不报错）
     repo = DownloaderRepository(session)
     config = DownloaderConfig(
-        type=row.client_type.value,
+        type=row.client_type,
         url=row.url,
         username=row.username,
         password=repo.decrypted_password(row),
     )
     downloader = create_downloader(config)
     try:
+        if before_submit is not None:
+            from movieclaw_downloader.torrent import compute_info_hash
+
+            await before_submit(compute_info_hash(torrent_bytes), row.id)
         submit_result = await downloader.submit(
             DownloadRequest(
                 torrent_bytes=torrent_bytes,
                 save_path=submit_save_path,
                 category=category,
-                tags=tags,
+                tags=tags + ([selection_owner] if selection_owner else []),
                 # 选择性下载必须以暂停态入库：先规划文件取舍再恢复下载，
                 # 否则下载器可能瞬间把整包拉完，选择失去意义
                 paused=select_units is not None,
             )
         )
+        # 下载器里多了一颗种子：入库用的下载器概览缓存作废，落盘后第一轮巡检就能认出它
+        from movieclaw_api.services.acquisition_ingest import invalidate_downloader_briefs
+
+        invalidate_downloader_briefs()
         # 「已存在」且是刷流引擎自己抢下的种子 → 接管：把数据迁到本次请求
         # 的目标目录（否则文件留在刷流目录，入库监听永远看不见），台账转出。
         # 迁移失败不连累提交——留给刷流的认领转出兜底，订阅按"非自有任务"
         # 的既有路径处理
-        if submit_result.already_exists and category != "movieclaw-boost":
+        if selection_owner and select_units and submit_result.info_hash:
+            submit_result = await apply_strict_file_selection(
+                downloader,
+                submit_result,
+                select_units,
+                known_seasons=known_seasons,
+                owner=selection_owner,
+                before_resume=before_resume,
+            )
+        elif submit_result.already_exists and category != "movieclaw-boost":
             submit_result = await _reclaim_boost_task(
                 session, downloader, submit_result, save_path=submit_save_path
             )
@@ -341,6 +353,65 @@ async def submit_torrent(
                 "下载线索写入失败（目录 %s），副标题识别信号将缺失", save_path, exc_info=True
             )
     return submit_result, row
+
+
+async def apply_strict_file_selection(
+    downloader,
+    submit_result: SubmitResult,
+    needed_units: set[tuple[int, int]],
+    *,
+    known_seasons: Collection[int] | None,
+    owner: str,
+    before_resume=None,
+) -> SubmitResult:
+    """暂停态选择并回读验证；任何异常都不恢复，重试仅操作原意图的任务。"""
+    from movieclaw_api.services.subscription.file_selection import plan_strict_file_selection
+
+    info_hash = submit_result.info_hash
+    status = await downloader.get_torrent(info_hash, include_files=True)
+    # 添加后下载器可能先校验恢复数据；等暂停状态可观察后才改文件。
+    for _ in range(10):
+        if status is None or status.state != "checking":
+            break
+        await asyncio.sleep(0.2)
+        status = await downloader.get_torrent(info_hash, include_files=True)
+    if status is None or owner not in status.tags:
+        raise ValueError("无法确认该任务属于本次智能投递，不修改已有任务，等待对账")
+    plan = plan_strict_file_selection(
+        [f.path for f in status.files],
+        needed_units,
+        known_seasons=known_seasons,
+    )
+    expected = set(plan.keep_indices)
+    actual = {i for i, f in enumerate(status.files) if f.selected}
+    if actual != expected:
+        if status.state != "paused":
+            raise ValueError("文件选择尚未核验且任务不是暂停状态，请在下载器暂停后重试")
+        indices = [
+            status.files[i].index if status.files[i].index is not None else i
+            for i in plan.keep_indices
+        ]
+        await downloader.set_file_selection(info_hash, indices)
+    verified = await downloader.get_torrent(info_hash, include_files=True)
+    if (
+        verified is None
+        or owner not in verified.tags
+        or [(f.index, f.path, f.size_bytes) for f in verified.files]
+        != [(f.index, f.path, f.size_bytes) for f in status.files]
+        or {i for i, f in enumerate(verified.files) if f.selected} != expected
+    ):
+        raise ValueError("下载器文件选择回读不一致，未恢复下载；稍后重试同一任务")
+    if not verified.completed:
+        if verified.state not in {"paused", "downloading", "queued", "stalled", "checking"}:
+            raise ValueError("下载器状态尚未确认，等待重试同一任务")
+        if before_resume is not None:
+            await before_resume()
+        # 校验恢复数据时也可能仍处于添加时的暂停态；恢复是幂等操作。
+        await downloader.resume(info_hash)
+    # 所有权标签证明这是超时后找回的同一投递，不是用户已有任务。
+    return submit_result.model_copy(
+        update={"already_exists": False, "skipped_file_count": len(plan.skip_indices)}
+    )
 
 
 async def _apply_file_selection(
@@ -446,6 +517,38 @@ async def _reclaim_boost_task(
     return submit_result.model_copy(update={"reclaimed_from_boost": True})
 
 
+async def pick_downloader(
+    session: AsyncSession, route_hint: hooks.DownloaderQuery | None = None
+) -> DownloaderClient | None:
+    """没有显式指定下载器时用哪台：先问插件（dl.downloader.select），再取默认。
+
+    插件选中的下载器必须启用且连接验证通过，否则当它没回答。投递与投递预览共用这一个函数，
+    预检结论与实际投递不会分家。
+    """
+    if route_hint is not None and hooks.active(hooks.DOWNLOADER_SELECT):
+        choice = await hooks.bail(hooks.DOWNLOADER_SELECT, route_hint)
+        if choice is not None:
+            row = await session.get(DownloaderClient, choice.downloader_id)
+            if row is not None and row.enabled and row.status == ConfigStatus.ACTIVE:
+                logger.info(
+                    "插件把投递分到下载器「%s」%s",
+                    row.name,
+                    f"：{choice.reason}" if choice.reason else "",
+                )
+                return row
+            logger.warning(
+                "插件选的下载器 #%d 不存在或不可用，改用默认下载器", choice.downloader_id
+            )
+    result = await session.execute(
+        select(DownloaderClient).where(
+            DownloaderClient.is_default.is_(True),  # type: ignore[attr-defined]
+            DownloaderClient.enabled.is_(True),  # type: ignore[attr-defined]
+            DownloaderClient.status == ConfigStatus.ACTIVE,
+        )
+    )
+    return result.scalars().first()
+
+
 async def anchor_manual_download(
     session: AsyncSession,
     *,
@@ -457,8 +560,11 @@ async def anchor_manual_download(
     downloader_id: int | None = None,
     download_name: str | None = None,
     save_path: str | None = None,
+    owner: str = "manual",
 ) -> None:
     """按 infohash 保存手动下载的已确认身份，供监听导入完成后直接认领。
+
+    ``owner``：谁发起的下载——``manual``（用户）或 ``plugin:<条目 id>``（插件经宿主操作投递）。
 
     下载器已存在同一任务时会返回同一个 hash。此时保留首次提交时确认的
     身份/库，不能让一次后来的重复点击覆盖原任务的入库归属。
@@ -490,6 +596,7 @@ async def anchor_manual_download(
                 save_path=save_path,
                 site_id=site_id,
                 torrent_id=torrent_id,
+                owner=owner,
             )
         )
         try:

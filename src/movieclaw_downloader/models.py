@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class DownloaderType(StrEnum):
-    """已适配的下载器类型。"""
+    """内置的两种下载器类型（类型值本身是开放的字符串：插件可以登记新的，见 registry.py）。"""
 
     QBITTORRENT = "qbittorrent"
     TRANSMISSION = "transmission"
@@ -21,7 +21,8 @@ class DownloaderConfig(BaseModel):
       （路径缺省时自动补全为 ``/transmission/rpc``）
     """
 
-    type: DownloaderType
+    type: str
+    """下载器类型值（如 ``qbittorrent``），对应一个已登记的适配器。"""
     url: str
     username: str | None = None
     password: str | None = None
@@ -84,7 +85,7 @@ class SubmitResult(BaseModel):
 class DownloaderInfo(BaseModel):
     """连接测试返回的下载器信息。"""
 
-    type: DownloaderType
+    type: str
     version: str
 
 
@@ -118,6 +119,7 @@ class DownloaderLimits(BaseModel):
 class TorrentFile(BaseModel):
     """下载任务内的单个文件（路径是种子内相对路径）。"""
 
+    index: int | None = None
     path: str
     size_bytes: int
     # 单文件完成字节数是分批入库的权威证据。None 表示旧适配器没有提供，
@@ -192,6 +194,7 @@ class TorrentStatus(BaseModel):
     completed: bool
     save_path: str
     files: list[TorrentFile] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     # 任务总体积（已选文件），未知为 None
     size_bytes: int | None = None
     # 当前下载速度（字节/秒），未知为 None

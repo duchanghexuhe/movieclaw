@@ -188,6 +188,23 @@ def download_started(
 
 
 @_never_raise
+def identity_skipped(*, subscription_id: int, item_id: int, title: str, message: str) -> None:
+    """同名资源已自动跳过：只知会订阅者，点通知查看订阅，不提供下载操作。"""
+    async def build(session: AsyncSession, member_id: int) -> AlertContent | None:
+        if not await _item_visible(session, member_id, item_id):
+            return None
+        return AlertContent(
+            title=title, body=message, open=f"/subscriptions/{subscription_id}",
+            thread=f"subscription:{subscription_id}",
+        )
+
+    notify(
+        "identity_skipped", subscribers(subscription_id), build,
+        collapse=("identity-skipped", str(subscription_id)),
+    )
+
+
+@_never_raise
 def upgraded(
     *,
     subscription_id: int,
@@ -313,6 +330,14 @@ def notice_path(source: str, payload: dict) -> str:
     if source == "subscription":
         subscription_id = payload.get("subscription_id")
         return f"/subscriptions/{subscription_id}" if subscription_id else "/subscriptions"
+    if source == "plugin":
+        # 插件可以带一个站内路径指向能修它的地方（插件包回滚 → 插件管理页）；没带就定位到
+        # 插件页里它那一行（docs/design/plugin-page-tiers.md §4.1）
+        href = payload.get("action_href")
+        if isinstance(href, str) and href.startswith("/") and not href.startswith("//"):
+            return href
+        entry_id = payload.get("entry_id")
+        return f"/settings/plugins?module={entry_id}" if entry_id else "/settings/plugins"
     return {
         "ingest": "/settings/import-watch",
         "downloader": "/settings/downloaders",
@@ -486,3 +511,25 @@ def new_version(*, version: str, compatible: bool) -> None:
         )
 
     notify("new_version", {0}, build, collapse=("update", "app"))
+
+
+# ----------------------------------------------------------------------
+# 使用建议（管理员）
+# ----------------------------------------------------------------------
+
+
+@_never_raise
+def reel_clips_suggested() -> None:
+    """开关关着时有人刷片、放了大图预告：建议管理员开启片段预切（调用方保证只调一次）。"""
+
+    async def build(_session: AsyncSession, _member_id: int) -> AlertContent:
+        return AlertContent(
+            title="开启片段预切，预告和刷片更流畅",
+            body="家里已经有人在刷片或看电视大图预告了。在「设置 → 播放」打开片段预切，"
+            "起播更快、不卡顿。",
+            open="/settings/playback",
+            thread="tips",
+            source="server",
+        )
+
+    notify("usage_tip", {0}, build, collapse=("tip", "reel-clips"))

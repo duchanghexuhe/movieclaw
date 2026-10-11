@@ -37,7 +37,7 @@ _DOMAIN_LINES = {
     "保存路径与路径映射，预演落点并提交种子；tasks 汇总所有下载器里正在跑的任务及其对应的"
     "影片/集与订阅——「我的剧下到哪了」看这里，torrent replace 给卡住的下载换源、"
     "torrent delete 删任务）",
-    "extension": "extension Chromium 浏览器插件 Cookie 同步（管理同步令牌/支持站点，把页面中的"
+    "extension": "extension Chromium 浏览器扩展 Cookie 同步（管理同步令牌/支持站点，把页面中的"
     " httpOnly 站点 Cookie 安全同步到服务端）",
     "health": "health   API 存活检查（通常优先用顶级 status 查看更完整的部署状态）",
     "jobs": "jobs     后台作业（按来源/状态/类型查询，查看事件与执行器健康，等待/取消/重试；"
@@ -91,6 +91,9 @@ _TOP_LEVEL_LINES = [
     "status   部署总览：服务健康、当前身份、客户端/服务端版本与命令目录同步状态",
     "activity 现在有什么事：需要处理与进行中的任务数、有几个人在看；"
     "口径与网页活动页一致（下载与它触发的入库算一件事）",
+    # 插件接口是运行期装上的，构建期的 spec 里没有：不写这一行，模型就不知道装好的插件能调
+    "plugins  已装插件提供的能力（如插件加的查天气、查外部服务）：装了带接口的插件才有，"
+    '有哪些先 --help 现查，如 args="plugins --help"',
 ]
 
 # 不进目录的域：

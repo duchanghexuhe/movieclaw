@@ -9,6 +9,7 @@ import type { Route } from "next";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
+import { DeleteFollowUps, DeleteOptions, useDeletePreview } from "@/components/library-delete-options";
 import { AddToCollectionDialog } from "@/components/add-to-collection-dialog";
 import { useHeroEdgeColor } from "@/lib/hero-edge-color";
 import { ArtworkPickerDialog } from "@/components/artwork-picker-dialog";
@@ -75,7 +76,7 @@ import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { LIBRARY_KIND_LABELS } from "@/lib/media-types";
 import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { scopeOfMediaKind } from "@/lib/categories";
-import { buildSearchPath } from "@/lib/search-url";
+import { buildSearchPath, titleSearchAlso } from "@/lib/search-url";
 import { formatBytes, formatRuntimeMinutes, formatVideoResolution } from "@/lib/format";
 import { formatClock } from "@/lib/player/timeline";
 import { USER_LOWEST_SOURCE, mediaSourceDisplayLabel } from "@/lib/media-source-annotation";
@@ -90,6 +91,14 @@ import { invalidateLibraryDetailSnapshot } from "@/lib/library-detail-snapshot";
 import { refreshItemConfirm, rereadItemNfoConfirm } from "@/lib/library-confirm";
 import { usePermissions } from "@/lib/permissions";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
+import {
+  type EpisodeRange,
+  episodeRangeLabel,
+  episodeRanges,
+  rangeContaining,
+  rangeEntry,
+  seasonAnchor,
+} from "@/lib/episode-ranges";
 import { useTheme } from "@/lib/ui-prefs";
 import { usePageTitle } from "@/lib/use-page-title";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
@@ -427,7 +436,7 @@ export function LibraryItemDetailView({
   const edgeColor = useHeroEdgeColor(silverHero ? mobileHeroSrc : undefined, heroEl);
 
   // 待回收行的恢复 / 立即清理（library-file-recycle.md §7）。
-  // 恢复是可逆动作直接执行；清理真删磁盘，做种保护形态额外讲清断种风险
+  // 恢复是可逆动作直接执行；清理真删磁盘，原地待回收的额外讲清断种风险
   const restoreTrashedFile = useCallback(
     async (file: LibraryItemFile) => {
       try {
@@ -446,7 +455,7 @@ export function LibraryItemDetailView({
       const ok = await confirm({
         title: `立即清理「${file.file_name}」？`,
         description: seeding
-          ? "该文件处于做种保护，可能仍被下载器做种。清理会从磁盘删除文件并可能中断做种任务（PT 站请留意保种要求），此操作不可恢复。"
+          ? "该文件留在原位置（原盘目录或没能移入回收站），清理会直接从磁盘删除，此操作不可恢复。若它仍被下载器做种，清理会中断做种任务（PT 站请留意保种要求）。"
           : "将立即从回收站删除该文件，不再等待保留期，此操作不可恢复。",
         confirmLabel: "立即清理",
         cancelLabel: "先不",
@@ -682,7 +691,11 @@ export function LibraryItemDetailView({
       scraped={detail.source === "tmdb"}
       readsNfo={detail.kind === "video"}
       scraping={scrapingNow}
-      searchHref={buildSearchPath({ keyword: detail.title, scope: scopeOfMediaKind(detail.kind) }) as Route}
+      searchHref={buildSearchPath({
+        keyword: detail.title,
+        also: titleSearchAlso(detail.english_title, detail.original_title),
+        scope: scopeOfMediaKind(detail.kind),
+      }) as Route}
       // 加入合集：任何能看到这部片的人都能把它扔进自己的单子
       onAddToCollection={() => setAddToCollectionOpen(true)}
       // 分享仅超管（media-share.md §2.1）；照片库条目不分享（分享页是影片页）
@@ -1737,8 +1750,13 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
   const [data, setData] = useState<SeasonEpisodes | null>(null);
   const [failed, setFailed] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
   const sectionRef = useRef<HTMLElement>(null);
   const initialEpisodeScrolled = useRef(false);
+  // 程序改选中集（进页、换段、面板点格子、锚点变了）后要把横排滚到它；
+  // 用户在横排里直接点卡不滚
+  const rowScrollTarget = useRef<number | null>(null);
+  const [rowScrollNonce, setRowScrollNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -1751,15 +1769,16 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
       .then((result) => {
         if (cancelled) return;
         setData(result);
-        // 最近观看入口优先选中目标集；目标已不在库时安全回退到第一集在库内容。
+        // 最近观看入口优先选中目标集；目标已不在库时落在接着看的那一集（锚点）。
         const requested =
           season === requestedSeason && initialEpisode != null
             ? result.episodes.find(
                 (episode) => episode.episode_number === initialEpisode && episode.owned,
               )
             : undefined;
-        const first = requested ?? result.episodes.find((e) => e.owned) ?? result.episodes[0];
-        setSelected(first?.episode_number ?? null);
+        const target = requested?.episode_number ?? seasonAnchor(result);
+        rowScrollTarget.current = target;
+        setSelected(target);
       })
       .catch(() => {
         if (!cancelled) setFailed(true);
@@ -1782,15 +1801,23 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
 
   // Hero 的对勾改了当前集的观看状态：只换分集数据（进度条 / 绿色对勾跟上），
   // 不走上面那条会重置选中集的加载路径。首次渲染（refreshKey=0）不拉。
+  // 锚点变了（看完 1050 → 1051）就选中新锚点、段跟过去；没变不动用户的浏览。
   useEffect(() => {
     if (!refreshKey) return;
     let cancelled = false;
+    const previousResume = data?.season_number === season ? data.resume_episode : undefined;
     (fetchEpisodes
       ? fetchEpisodes(detail.media_item_id, season)
       : getItemEpisodes(libraryId, detail.media_item_id, season)
     )
       .then((result) => {
-        if (!cancelled && result.season_number === season) setData(result);
+        if (cancelled || result.season_number !== season) return;
+        setData(result);
+        if (previousResume !== undefined && result.resume_episode !== previousResume) {
+          const anchor = seasonAnchor(result);
+          rowScrollTarget.current = anchor;
+          setSelected(anchor);
+        }
       })
       // 拉不到就保持旧数据，下次换季自然刷新
       .catch(() => undefined);
@@ -1838,6 +1865,49 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
   );
   const ownedCount = data ? data.episodes.filter((e) => e.owned).length : 0;
 
+  // 长季分段（超过 50 集）：横排只放选中集所在的那一段；≤50 集 ranges 为空，一切照旧
+  const ranges = useMemo(
+    () => (data ? episodeRanges(data.episodes.map((e) => e.episode_number)) : []),
+    [data],
+  );
+  const anchor = useMemo(() => (data ? seasonAnchor(data) : null), [data]);
+  // 「接着看」只标有观看记录的季：一集都没碰过的季，锚点只是退回规则落的第一集，标了是噪音
+  const watched = data?.episodes.some((e) => e.played || e.position_ms > 0) ?? false;
+  const currentRange =
+    ranges.length > 0
+      ? ((selected != null ? rangeContaining(ranges, selected) : undefined) ?? ranges[0])
+      : null;
+  const currentRangePos = currentRange ? ranges.indexOf(currentRange) : -1;
+  const rowEpisodes = useMemo(
+    () =>
+      data && currentRange
+        ? data.episodes.filter(
+            (e) => e.episode_number >= currentRange.first && e.episode_number <= currentRange.last,
+          )
+        : (data?.episodes ?? []),
+    [data, currentRange],
+  );
+  const selectEpisode = (episodeNumber: number) => {
+    rowScrollTarget.current = episodeNumber;
+    setSelected(episodeNumber);
+    // 选的就是当前集（面板里点回原来那一格）时 selected 不变，靠它触发滚动
+    setRowScrollNonce((n) => n + 1);
+  };
+  // 手动换段：段里有锚点选锚点，否则段首
+  const selectRange = (range: EpisodeRange) => selectEpisode(rangeEntry(range, anchor));
+
+  // 程序改了选中集：横排（只横向，不带动整页纵向滚动）把那张卡滚到中间
+  useEffect(() => {
+    const target = rowScrollTarget.current;
+    if (target == null || target !== selected) return;
+    const card = sectionRef.current?.querySelector<HTMLElement>(
+      `[data-episode-number="${target}"]`,
+    );
+    if (!card) return;
+    rowScrollTarget.current = null;
+    centerInScroller(card);
+  }, [selected, rowEpisodes, rowScrollNonce]);
+
   // Hero 的简介、文件、分辨率和轨道必须与分集区保持同一选择；数据加载或
   // 换季期间先清空，避免短暂显示上一季上一集的信息。
   useEffect(() => {
@@ -1875,12 +1945,33 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
             {seasonLabel(season, ownedSeasons.has(season))}
           </span>
         )}
-        {data && (
-          <span className="tnum text-sub text-[var(--text-faint)]">
-            在库 {ownedCount} / {data.episodes.length} 集
-          </span>
-        )}
+        {data &&
+          (ranges.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => setPanelOpen(true)}
+              className="tnum ml-auto flex shrink-0 items-center gap-0.5 text-sub text-[var(--text-muted)] transition hover:text-white"
+            >
+              全部 {data.episodes.length} 集
+              <ChevronRightIcon className="size-3.5" />
+            </button>
+          ) : (
+            <span className="tnum text-sub text-[var(--text-faint)]">
+              在库 {ownedCount} / {data.episodes.length} 集
+            </span>
+          ))}
       </div>
+
+      {/* 集段胶囊：选中段实心，锚点段右上角橙点 */}
+      {data && ranges.length > 0 && (
+        <EpisodeRangeChips
+          ranges={ranges}
+          active={currentRange}
+          anchor={anchor}
+          onSelect={selectRange}
+          className="mb-3"
+        />
+      )}
 
       {failed && (
         <p className="text-sub text-[var(--text-muted)]">分集信息加载失败，请稍后重试。</p>
@@ -1896,17 +1987,264 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
           走 HScroller 以复用发现页海报行的左右翻页钮，避免用户看不出这行可横滑。 */}
       {data && (
         <HScroller className="-mx-1 gap-3 px-1 pb-1 pt-1">
-          {data.episodes.map((episode) => (
+          {currentRangePos > 0 && (
+            <RangeEdgeCard
+              dir={-1}
+              range={ranges[currentRangePos - 1]}
+              onSelect={selectRange}
+            />
+          )}
+          {rowEpisodes.map((episode) => (
             <EpisodeCard
               key={episode.episode_number}
               episode={episode}
               selected={episode.episode_number === selected}
+              resume={watched && episode.episode_number === anchor}
               onSelect={() => setSelected(episode.episode_number)}
             />
           ))}
+          {currentRangePos >= 0 && currentRangePos < ranges.length - 1 && (
+            <RangeEdgeCard
+              dir={1}
+              range={ranges[currentRangePos + 1]}
+              onSelect={selectRange}
+            />
+          )}
         </HScroller>
       )}
+
+      {panelOpen && data && (
+        <AllEpisodesPanel
+          episodes={data.episodes}
+          ranges={ranges}
+          anchor={anchor}
+          selected={selected}
+          ownedCount={ownedCount}
+          onClose={() => setPanelOpen(false)}
+          onPick={(episodeNumber) => {
+            setPanelOpen(false);
+            selectEpisode(episodeNumber);
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+/** 把横滚容器里的某一项滚到容器中间；只动容器自己的 scrollLeft，不带动整页 */
+function centerInScroller(item: HTMLElement) {
+  const scroller = item.parentElement;
+  if (!scroller) return;
+  const box = scroller.getBoundingClientRect();
+  const rect = item.getBoundingClientRect();
+  scroller.scrollLeft += rect.left - box.left - (box.width - rect.width) / 2;
+}
+
+/** 集段胶囊横排：选中段实心，锚点所在段右上角橙点（只标这一种状态） */
+function EpisodeRangeChips({
+  ranges,
+  active,
+  anchor,
+  onSelect,
+  className = "",
+}: {
+  ranges: EpisodeRange[];
+  active: EpisodeRange | null;
+  anchor: number | null;
+  onSelect: (range: EpisodeRange) => void;
+  className?: string;
+}) {
+  const anchorRange = anchor != null ? rangeContaining(ranges, anchor) : undefined;
+  const rowRef = useRef<HTMLDivElement>(null);
+  // 选中段的胶囊滚到中间（打开、换段都跟上）
+  useEffect(() => {
+    const chip = rowRef.current?.querySelector<HTMLElement>(
+      `[data-range-index="${active?.index}"]`,
+    );
+    if (chip) centerInScroller(chip);
+  }, [active?.index]);
+  return (
+    <div ref={rowRef} className={className}>
+      <HScroller className="-mx-1 gap-2 px-1 py-0.5">
+        {ranges.map((range) => {
+          const on = range.index === active?.index;
+          return (
+            <button
+              key={range.index}
+              type="button"
+              data-range-index={range.index}
+              aria-pressed={on}
+              onClick={() => onSelect(range)}
+              className={`tnum relative shrink-0 whitespace-nowrap rounded-full px-3 py-1.5 text-sub transition ${
+                on
+                  ? "bg-white font-semibold text-black"
+                  : "bg-white/[0.06] text-[var(--text-muted)] hover:bg-white/[0.1] hover:text-white"
+              }`}
+            >
+              {episodeRangeLabel(range)}
+              {range.index === anchorRange?.index && (
+                <span
+                  aria-label="接着看在这一段"
+                  className="absolute right-1.5 top-1 size-1.5 rounded-full bg-[#ffb340]"
+                />
+              )}
+            </button>
+          );
+        })}
+      </HScroller>
+    </div>
+  );
+}
+
+/** 横排首尾的「← 上一段 / 下一段 →」小卡，高度与分集剧照对齐 */
+function RangeEdgeCard({
+  dir,
+  range,
+  onSelect,
+}: {
+  dir: -1 | 1;
+  range: EpisodeRange;
+  onSelect: (range: EpisodeRange) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(range)}
+      className="tnum flex h-[112.5px] w-[96px] shrink-0 flex-col items-center justify-center gap-0.5 self-start rounded-xl bg-white/[0.04] text-caption text-[var(--text-muted)] ring-1 ring-white/[0.08] transition hover:text-white hover:ring-white/35"
+    >
+      <span>{dir === -1 ? "← 上一段" : "下一段 →"}</span>
+      <span className="text-[var(--text-faint)]">{episodeRangeLabel(range)}</span>
+    </button>
+  );
+}
+
+/**
+ * 「全部分集」面板：一排段胶囊 + 数字宫格（网页 10 列、手机 5 列）。
+ * 打开时落在锚点所在的段，锚点格子描橙边并滚到可见；点格子由调用方关面板、选中那一集。
+ */
+function AllEpisodesPanel({
+  episodes,
+  ranges,
+  anchor,
+  selected,
+  ownedCount,
+  onClose,
+  onPick,
+}: {
+  episodes: LibraryEpisode[];
+  ranges: EpisodeRange[];
+  anchor: number | null;
+  selected: number | null;
+  ownedCount: number;
+  onClose: () => void;
+  onPick: (episodeNumber: number) => void;
+}) {
+  const [range, setRange] = useState(
+    () => (anchor != null ? rangeContaining(ranges, anchor) : undefined) ?? ranges[0],
+  );
+  const gridRef = useRef<HTMLDivElement>(null);
+  const cells = episodes.filter(
+    (e) => e.episode_number >= range.first && e.episode_number <= range.last,
+  );
+
+  // 锚点在这一段就把它滚到宫格中间（第 50 集在宫格最底下，不滚看不见）
+  useEffect(() => {
+    const grid = gridRef.current;
+    const hit = grid?.querySelector<HTMLElement>("[data-anchor]");
+    if (!grid) return;
+    if (!hit) {
+      grid.scrollTop = 0;
+      return;
+    }
+    const box = grid.getBoundingClientRect();
+    const rect = hit.getBoundingClientRect();
+    grid.scrollTop += rect.top - box.top - (box.height - rect.height) / 2;
+  }, [range]);
+
+  return (
+    <Modal open onClose={onClose} label="全部分集" width="2xl" panelClassName="flex max-h-[80vh] flex-col">
+      <div className="flex items-center gap-2 px-5 pb-1 pt-4">
+        <h2 className="text-body-lg font-semibold text-[var(--text)]">全部分集</h2>
+        <span className="tnum text-caption text-[var(--text-faint)]">
+          在库 {ownedCount} / {episodes.length}
+        </span>
+        <button
+          type="button"
+          onClick={onClose}
+          className="ml-auto text-sub text-[var(--text-muted)] transition hover:text-white"
+        >
+          完成
+        </button>
+      </div>
+      <EpisodeRangeChips
+        ranges={ranges}
+        active={range}
+        anchor={anchor}
+        onSelect={setRange}
+        className="px-5 pt-2"
+      />
+      <div
+        ref={gridRef}
+        className="grid min-h-0 flex-1 grid-cols-10 content-start gap-2 overflow-y-auto scroll-thin px-5 pb-5 pt-3 max-md:grid-cols-5"
+      >
+        {cells.map((episode) => (
+          <EpisodeCell
+            key={episode.episode_number}
+            episode={episode}
+            anchor={episode.episode_number === anchor}
+            selected={episode.episode_number === selected}
+            onPick={() => onPick(episode.episode_number)}
+          />
+        ))}
+      </div>
+    </Modal>
+  );
+}
+
+/** 宫格的一格：已看 ✓、看了一半底部进度条、缺集虚线、锚点橙边、选中实心 */
+function EpisodeCell({
+  episode,
+  anchor,
+  selected,
+  onPick,
+}: {
+  episode: LibraryEpisode;
+  anchor: boolean;
+  selected: boolean;
+  onPick: () => void;
+}) {
+  const progress = episode.position_ms > 0 ? (episode.progress_percent ?? null) : null;
+  return (
+    <button
+      type="button"
+      data-cell-episode={episode.episode_number}
+      data-anchor={anchor ? "" : undefined}
+      aria-pressed={selected}
+      aria-label={`第 ${episode.episode_number} 集${episode.owned ? "" : "（缺集）"}${
+        episode.played ? "（已看完）" : ""
+      }`}
+      onClick={onPick}
+      className={`tnum relative h-11 overflow-hidden rounded-[10px] text-ui transition ${
+        selected
+          ? "bg-white font-semibold text-black"
+          : !episode.owned
+            ? "border border-dashed border-white/[0.18] text-[var(--text-faint)] hover:border-white/35"
+            : episode.played
+              ? "bg-white/[0.03] text-[var(--text-muted)] hover:bg-white/[0.08]"
+              : "bg-white/[0.07] text-[var(--text)] hover:bg-white/[0.12]"
+      } ${anchor ? "shadow-[inset_0_0_0_2px_#ffb340]" : ""}`}
+    >
+      {episode.episode_number}
+      {episode.played && (
+        <CheckIcon className="pointer-events-none absolute right-1 top-1 size-2.5 stroke-[3] text-[var(--ok)]" />
+      )}
+      {progress != null && (
+        <span
+          className="pointer-events-none absolute bottom-0 left-0 h-[3px] bg-[var(--accent-2)]"
+          style={{ width: `${progress}%` }}
+        />
+      )}
+    </button>
   );
 }
 
@@ -1918,10 +2256,13 @@ export function SeasonEpisodesSection<F extends { id: number; season_number: num
 function EpisodeCard({
   episode,
   selected,
+  resume = false,
   onSelect,
 }: {
   episode: LibraryEpisode;
   selected: boolean;
+  /** 接着看的那一集（只在分段的长季标）：左上角「接着看」 */
+  resume?: boolean;
   onSelect: () => void;
 }) {
   // 看完 = 满条绿；看一半 = 百分比蓝；有记录但算不出百分比（无时长）给
@@ -1958,6 +2299,11 @@ function EpisodeCard({
             </span>
           }
         />
+        {resume && (
+          <span className="pointer-events-none absolute left-1.5 top-1.5 rounded bg-[#ffb340] px-1.5 py-px text-micro font-bold text-black">
+            接着看
+          </span>
+        )}
         {/* 右上角状态位：缺集与已看对勾同排（看过之后文件丢了两者会同时出现） */}
         {(!episode.owned || episode.played) && (
           <div className="pointer-events-none absolute right-1.5 top-1.5 flex items-center gap-1">
@@ -2070,7 +2416,7 @@ function FileSection({
 
 /** 待回收行的倒计时文案：直读 purge_after，展示精度与清理周期无关。 */
 function purgeCountdown(purgeAfter: string | null): string {
-  if (!purgeAfter) return "做种保护中，不自动清理";
+  if (!purgeAfter) return "不自动清理";
   const ms = new Date(purgeAfter).getTime() - Date.now();
   if (ms <= 0) return "即将自动清理";
   const days = Math.floor(ms / 86_400_000);
@@ -2651,12 +2997,15 @@ function DeleteDialog({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ItemDeleteResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const deletePreview = useDeletePreview(open, libraryId, detail.media_item_id);
 
   useEffect(() => {
     if (open) {
       setConfirmed(false);
       setResult(null);
       setError(null);
+      setSelected(new Set());
     }
   }, [open]);
 
@@ -2664,7 +3013,7 @@ function DeleteDialog({
     setBusy(true);
     setError(null);
     try {
-      setResult(await deleteLibraryItem(libraryId, detail.media_item_id));
+      setResult(await deleteLibraryItem(libraryId, detail.media_item_id, [...selected]));
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败，请稍后重试");
     } finally {
@@ -2700,6 +3049,7 @@ function DeleteDialog({
             <p className="mt-3 text-sub text-[var(--text-muted)]">
               已清理 {result.rows_deleted} 条台账，释放 {formatBytes(result.freed_bytes)}。
             </p>
+            <DeleteFollowUps items={result.follow_ups ?? []} />
             <div className="mt-5 flex justify-end">
               <button
                 type="button"
@@ -2735,6 +3085,13 @@ function DeleteDialog({
                 </p>
               ))}
             </div>
+            <DeleteOptions
+              preview={deletePreview.preview}
+              error={deletePreview.error}
+              selected={selected}
+              onToggle={(key) => setSelected((prev) => toggled(prev, key))}
+              disabled={busy}
+            />
             <label className="mt-4 flex cursor-pointer items-start gap-2.5 text-sub leading-6 text-white/80">
               <input
                 type="checkbox"
@@ -2797,6 +3154,8 @@ function DeleteFileDialog({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ItemDeleteResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const deletePreview = useDeletePreview(file != null, libraryId, detail.media_item_id, file?.id);
   // 条目在本库只剩这一行台账（含 missing 行）→ 后端会升级为整条目删除
   const isLast = detail.files.length === 1;
 
@@ -2805,6 +3164,7 @@ function DeleteFileDialog({
       setConfirmed(false);
       setResult(null);
       setError(null);
+      setSelected(new Set());
     }
   }, [file]);
 
@@ -2814,7 +3174,7 @@ function DeleteFileDialog({
     setBusy(true);
     setError(null);
     try {
-      setResult(await deleteLibraryFile(libraryId, detail.media_item_id, file.id));
+      setResult(await deleteLibraryFile(libraryId, detail.media_item_id, file.id, [...selected]));
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败，请稍后重试");
     } finally {
@@ -2852,6 +3212,7 @@ function DeleteFileDialog({
             <p className="mt-3 text-sub text-[var(--text-muted)]">
               已清理 {result.rows_deleted} 条台账，释放 {formatBytes(result.freed_bytes)}。
             </p>
+            <DeleteFollowUps items={result.follow_ups ?? []} />
             <div className="mt-5 flex justify-end">
               <button
                 type="button"
@@ -2906,6 +3267,15 @@ function DeleteFileDialog({
             <p className="mt-3 text-caption leading-5 text-[var(--text-faint)]">
               若该作品有订阅且删除后此单元不再有其他拷贝，订阅会将其视为缺失并自动重新下载。
             </p>
+            {!file.missing && (
+              <DeleteOptions
+                preview={deletePreview.preview}
+                error={deletePreview.error}
+                selected={selected}
+                onToggle={(key) => setSelected((prev) => toggled(prev, key))}
+                disabled={busy}
+              />
+            )}
             <label className="mt-4 flex cursor-pointer items-start gap-2.5 text-sub leading-6 text-white/80">
               <input
                 type="checkbox"
@@ -2943,6 +3313,13 @@ function DeleteFileDialog({
       </div>
     </Modal>
   );
+}
+
+function toggled(set: Set<string>, key: string): Set<string> {
+  const next = new Set(set);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
 }
 
 /** 「合集」那一行最多摆几个，再多的收进「还有 N 个」。 */

@@ -19,6 +19,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -189,10 +191,12 @@ fun MainTabScreen(
     val hazeState = dev.chrisbanes.haze.rememberHazeState()
 
     Box(Modifier.fillMaxSize().background(Bg)) {
-        androidx.compose.runtime.CompositionLocalProvider(
-            io.movieclaw.android.core.designsystem.LocalTabHazeState provides if (liquidTabBar) hazeState else null,
-        ) {
-            when (tabs[selected]) {
+        KeepAliveTabs(tabs, tabs[selected]) { tab, active ->
+                    androidx.compose.runtime.CompositionLocalProvider(
+                        // 模糊源只挂前台页签：后台页签也挂的话，同一个 HazeState 会收到几块不在屏上的内容
+                        io.movieclaw.android.core.designsystem.LocalTabHazeState provides if (liquidTabBar && active) hazeState else null,
+                    ) {
+            when (tab) {
             MainTab.DISCOVER -> DiscoverScreen(
                 onOpenLibrary = onOpenLibrary,
                 onOpenItem = onOpenItem,
@@ -239,6 +243,7 @@ fun MainTabScreen(
                 onOpenSettings = onOpenSettings,
             )
             }
+                    }
         }
 
         // 悬浮胶囊底栏：内容从它下面穿过（实测就是这样，底栏不占布局高度）。
@@ -279,3 +284,37 @@ fun MainTabScreen(
         }
     }
 }
+
+/**
+ * 主页签容器：去过的页签都留在组合里，切换只换「摆哪一页」（见 [LocalTabActive]）。
+ * 以前 `when (tab)` 每次切换都把整页拆掉重建，那一帧很重，底栏胶囊会顿一下。
+ */
+@androidx.compose.runtime.Composable
+internal fun <T : Any> KeepAliveTabs(
+    tabs: List<T>,
+    selected: T,
+    content: @androidx.compose.runtime.Composable (tab: T, active: Boolean) -> Unit,
+) {
+    // 普通集合即可：只在组合时追加，而切页签本身就会触发这次组合
+    val visited = androidx.compose.runtime.remember { mutableSetOf<T>() }
+    visited += selected
+    tabs.filter { it in visited }.forEach { tab ->
+        val active = tab == selected
+        androidx.compose.runtime.key(tab) {
+            Box(Modifier.fillMaxSize().then(if (active) Modifier else Modifier.hiddenTab())) {
+                androidx.compose.runtime.CompositionLocalProvider(
+                    io.movieclaw.android.core.designsystem.LocalTabActive provides active,
+                ) { content(tab, active) }
+            }
+        }
+    }
+}
+
+/**
+ * 后台页签：留在组合里（状态、已组装的列表项、已解码的图都在），但**不测量、不摆放**——
+ * 不画、不收触摸、不进布局。切回来只需测量摆放，不用从头组装整页。
+ */
+private fun Modifier.hiddenTab(): Modifier = this
+    .layout { _, constraints -> layout(constraints.maxWidth, constraints.maxHeight) {} }
+    // 不摆放的节点仍留在无障碍树里：读屏会读到、聚焦到看不见的后台页签，一并清掉
+    .clearAndSetSemantics {}

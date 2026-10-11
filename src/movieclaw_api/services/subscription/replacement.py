@@ -18,6 +18,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api import hooks
 from movieclaw_api.services.download_health import landing_brake, record_stalled
 from movieclaw_api.services.subscription.matching import (
     covered_units,
@@ -247,7 +248,7 @@ async def _torrent_exists_on_downloader(
     repo = DownloaderRepository(session)
     adapter = create_downloader(
         DownloaderConfig(
-            type=downloader.client_type.value,
+            type=downloader.client_type,
             url=downloader.url,
             username=downloader.username,
             password=repo.decrypted_password(downloader),
@@ -341,7 +342,12 @@ async def run_replacement_search(attempt_id: int, *, force: bool = False) -> boo
             # 给的是「악인전」，中文 PT 站根本不用它命名，于是死种换不出来
             from movieclaw_api.services.subscription.wanted_search import recall_keywords
 
-            keywords = recall_keywords(item)
+            keywords = await hooks.search_keywords(
+                item,
+                recall_keywords(item),
+                subscription_id=attempt.subscription_id,
+                purpose="replacement",
+            )
             # 网络调用前先排一个技术失败兜底，进程中途退出也不会每个 tick 重打站点。
             attempt.status = DownloadAttemptStatus.REPLACEMENT_PENDING
             attempt.last_search_at = now
@@ -472,10 +478,18 @@ async def _try_candidates(
     if subscription is None or subscription.status == SubscriptionStatus.PAUSED:
         return False
     item = await session.get(MediaItem, subscription.media_item_id)
-    rule = await session.get(RuleSet, subscription.rule_set_id)
-    if item is None or rule is None:
+    if subscription.selection_mode == "smart":
+        from movieclaw_api.services.subscription.smart_profiles import read_policy
+        spec = read_policy(subscription)
+        from movieclaw_api.services.subscription.smart_runtime import runtime_settings
+        runtime = await runtime_settings()
+        if not runtime.enabled or runtime.shadow_only:
+            return False
+    else:
+        rule = await session.get(RuleSet, subscription.rule_set_id)
+        spec = RuleSetSpec.model_validate(rule.spec) if rule else None
+    if item is None or spec is None:
         return False
-    spec = RuleSetSpec.model_validate(rule.spec)
     targets = await _current_attempt_wanted(session, attempt)
     if not targets:
         return False
@@ -500,7 +514,7 @@ async def _try_candidates(
         if candidate.seeders == 0:
             continue
         match = match_identity(candidate, identity)
-        if match is None:
+        if match is None or (subscription.selection_mode == "smart" and match.id_conflict):
             continue
         covered = covered_units(
             match,
@@ -509,6 +523,16 @@ async def _try_candidates(
         )
         if not covered:
             continue
+        if subscription.selection_mode == "smart":
+            from movieclaw_api.services.subscription.file_selection import selective_units_for
+
+            if (
+                selective_units_for(
+                    match, [(r.season_number, r.episode_number) for r in covered], subscription.kind
+                )
+                is not None
+            ):
+                continue
         verdict = evaluate_rules(candidate, spec, pack_episode_count=len(covered))
         if not verdict.accepted or not quality_not_lower(candidate, attempt.quality):
             continue
@@ -522,6 +546,7 @@ async def _try_candidates(
         ),
         reverse=True,
     )
+    accepted = await _apply_plugin_hooks(item, subscription, spec, accepted)
     if not accepted:
         return False
 
@@ -552,6 +577,21 @@ async def _try_candidates(
         ).scalars()
     )
     for candidate, covered, _verdict, match in accepted:
+        if subscription.selection_mode == "smart":
+            from movieclaw_api.services.subscription.dispatch import dispatch
+            return await dispatch(
+                session,
+                subscription=subscription,
+                item=item,
+                wanted_rows=[r for r in covered if r.status != WantedStatus.IMPORTED],
+                upgrade_rows=[r for r in covered if r.status == WantedStatus.IMPORTED],
+                candidate=candidate,
+                verdict=_verdict,
+                match=match,
+                source=source,
+                selection_versions={r.id: r.selection_version for r in covered},
+                replacing_attempt=attempt,
+            )
         try:
             result, downloader = await submit_torrent(
                 session,
@@ -567,6 +607,14 @@ async def _try_candidates(
                     subscription.kind,
                 ),
                 known_seasons=subscription.selected_seasons or None,
+                route_hint=hooks.DownloaderQuery(
+                    site_id=candidate.site_id,
+                    title=candidate.title,
+                    size_bytes=candidate.size_bytes,
+                    media_kind=subscription.kind,
+                    category="movieclaw",
+                    tags=("movieclaw-sub", "movieclaw-replacement"),
+                ),
             )
         except Exception as exc:  # noqa: BLE001 -- 单个候选失败继续尝试下一名
             logger.warning(
@@ -666,7 +714,7 @@ async def _remove_just_submitted_task(
     repo = DownloaderRepository(session)
     adapter = create_downloader(
         DownloaderConfig(
-            type=downloader.client_type.value,
+            type=downloader.client_type,
             url=downloader.url,
             username=downloader.username,
             password=repo.decrypted_password(downloader),
@@ -775,6 +823,27 @@ async def _units_have_left_scope(
     )
 
 
+async def _apply_plugin_hooks(item, subscription, spec, accepted: list) -> list:
+    """换源与主流程同一套插件规则（plugin-phase2b.md §2）。
+
+    淘汰的直接跳过（与这里的规则拒绝一样不记动态），剩下的按插件重排。
+    """
+    from movieclaw_api.services.subscription.matching import plugin_rank, plugin_rejections
+    from movieclaw_matcher.smart import candidate_key
+
+    if not accepted:
+        return accepted
+    entries = [(candidate, match, verdict, ()) for candidate, _covered, verdict, match in accepted]
+    covered = {candidate_key(candidate): rows for candidate, rows, _v, _m in accepted}
+    by_key = {candidate_key(entry[0]): entry for entry in accepted}
+    rejected = await plugin_rejections(
+        item, subscription, spec, entries, covered, purpose="replacement"
+    )
+    entries = [e for e in entries if candidate_key(e[0]) not in rejected]
+    entries = await plugin_rank(item, subscription, spec, entries, covered, purpose="replacement")
+    return [by_key[candidate_key(e[0])] for e in entries]
+
+
 async def _excluded_candidates(
     session: AsyncSession,
     subscription_id: int,
@@ -803,7 +872,9 @@ async def _has_trial(session: AsyncSession, attempt_id: int) -> bool:
         await session.execute(
             select(SubscriptionDownloadAttempt.id).where(
                 SubscriptionDownloadAttempt.replaces_attempt_id == attempt_id,
-                SubscriptionDownloadAttempt.status == DownloadAttemptStatus.TRIAL,
+                SubscriptionDownloadAttempt.status.in_(
+                    [DownloadAttemptStatus.TRIAL, DownloadAttemptStatus.SUBMITTING]
+                ),
             )
         )
     ).first() is not None
@@ -1086,7 +1157,7 @@ async def reconcile_pending_cleanup(attempt_id: int) -> bool:
         repo = DownloaderRepository(session)
         adapter = create_downloader(
             DownloaderConfig(
-                type=downloader.client_type.value,
+                type=downloader.client_type,
                 url=downloader.url,
                 username=downloader.username,
                 password=repo.decrypted_password(downloader),
@@ -1234,7 +1305,7 @@ async def _cleanup_failed_trial(
             repo = DownloaderRepository(session)
             adapter = create_downloader(
                 DownloaderConfig(
-                    type=downloader.client_type.value,
+                    type=downloader.client_type,
                     url=downloader.url,
                     username=downloader.username,
                     password=repo.decrypted_password(downloader),
@@ -1337,7 +1408,7 @@ async def _cleanup_replaced_attempt(
     repo = DownloaderRepository(session)
     adapter = create_downloader(
         DownloaderConfig(
-            type=downloader.client_type.value,
+            type=downloader.client_type,
             url=downloader.url,
             username=downloader.username,
             password=repo.decrypted_password(downloader),
@@ -1427,7 +1498,7 @@ async def _converge_upgraded_old_attempt(
     repo = DownloaderRepository(session)
     adapter = create_downloader(
         DownloaderConfig(
-            type=downloader.client_type.value,
+            type=downloader.client_type,
             url=downloader.url,
             username=downloader.username,
             password=repo.decrypted_password(downloader),

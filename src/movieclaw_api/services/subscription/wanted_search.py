@@ -268,6 +268,12 @@ async def _search_one_media(media_id: int, budget: _SearchBudget) -> None:
                 select(Subscription).where(Subscription.media_item_id == media_id)
             )
         ).scalar_one_or_none()
+        if subscription and subscription.selection_mode == "smart":
+            from movieclaw_api.services.subscription.smart_profiles import read_policy
+            from movieclaw_api.services.subscription.smart_runtime import runtime_settings
+            runtime = await runtime_settings()
+            if not runtime.enabled or runtime.shadow_only or read_policy(subscription) is None:
+                return
         # 电影的调度地板：搜索未果后的退避不能早于"上映 + 宽限"——用户强制
         # 搜索一部未上映的电影后，档期要恢复原定节奏，而不是被 15 分钟起步的
         # 退避曲线打乱、在明知没资源的窗口里反复空搜。
@@ -286,7 +292,12 @@ async def _search_one_media(media_id: int, budget: _SearchBudget) -> None:
     if item is None or subscription is None:
         return
 
-    keywords = recall_keywords(item)
+    from movieclaw_api import hooks
+
+    # 插件可以追加别名、按字幕组限定（subscription.search.keywords）
+    keywords = await hooks.search_keywords(
+        item, recall_keywords(item), subscription_id=subscription.id, purpose="wanted"
+    )
     if not keywords:
         # 三个标题字段全空或全是符号（脏数据）。空关键词打到站点上等于"搜全站"，
         # 会把整个索引灌进 site_torrent，比不搜坏得多，所以一次请求都不发。

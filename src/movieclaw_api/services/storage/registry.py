@@ -244,6 +244,23 @@ DATA_DIRS: tuple[DataDir, ...] = (
         busy=_staging_dirs,
     ),
     DataDir(
+        key="cache.reels-clips",
+        title="预切片段",
+        summary="预告与刷片放的 1080p 小片段",
+        description=(
+            "开了「设置 → 播放 → 片段预切」后，后台为每部片挑好的那一段切成的 1080p 小文件，"
+            "电视大图预告与刷片直接放它，一段十几到二十几 MB。清空后预告先显示剧照、"
+            "刷片暂时没有可刷的；开关开着时后台会重新切"
+            "（全库要在空闲时跑很久，有人观看时自动暂停）。"
+        ),
+        default="data/cache/reels-clips",
+        resolve=lambda s: Path(s.reels_clips_dir),
+        group=Group.CACHE,
+        rebuild_cost=RebuildCost.EXPENSIVE,
+        clearable=True,
+        orphans=_orphans_by_id("LibraryFile"),
+    ),
+    DataDir(
         key="cache.reels",
         title="刷片挑点",
         summary="刷片为每个文件挑出的片段位置",
@@ -419,6 +436,61 @@ DATA_DIRS: tuple[DataDir, ...] = (
         ),
         default="data/models",
         resolve=lambda s: Path(s.data_dir) / "models",
+    ),
+    DataDir(
+        key="plugins.patch",
+        title="插件补丁",
+        summary="禁用内置插件、开启本地插件的开关",
+        description=(
+            "插件补丁（plugins.yaml）：可禁用允许关闭的内置子系统，也是开启本地受信插件、"
+            "批准它调用哪些操作的地方；改动在重启后生效，删除即恢复全部默认。"
+        ),
+        default="data/plugins.yaml",
+        resolve=lambda s: Path(s.data_dir) / "plugins.yaml",
+    ),
+    DataDir(
+        key="plugins.local",
+        title="本地插件",
+        summary="用户自己写的插件代码",
+        description=(
+            "本地受信插件的 Python 代码（docs/design/plugin-phase2a.md §6）。只有在 plugins.yaml "
+            "里写了 local: true 的才会加载。packages/ 是安装的第三方插件包（含安装记录），"
+            "data/ 是各插件自己的文件目录（plugin-phase3.md §3、§6）。"
+        ),
+        default="data/plugins",
+        resolve=lambda s: Path(s.data_dir) / "plugins",
+    ),
+    DataDir(
+        key="plugins.boot",
+        title="插件启动记录",
+        summary="插件安全模式用的启动记录",
+        description=(
+            "记录上一次启动加载了哪些本地 / 第三方插件、有没有稳定运行（plugin-phase3.md §5）；"
+            "据此判断是否进入插件安全模式。删除等于忘掉上次启动的情况，不影响数据。"
+        ),
+        default="data/plugins-boot.json",
+        resolve=lambda s: Path(s.data_dir) / "plugins-boot.json",
+    ),
+    DataDir(
+        key="plugins.features",
+        title="功能开关",
+        summary="在「设置 → 插件」停用了哪些功能",
+        description=(
+            "只记停用了的功能（谁、什么时候）；重启后保持（docs/design/plugin-page-tiers.md §6）。"
+            "删除等于把可停用的功能全部重新开启。"
+        ),
+        default="data/plugins-features.json",
+        resolve=lambda s: Path(s.data_dir) / "plugins-features.json",
+    ),
+    DataDir(
+        key="plugins.safe_mode",
+        title="安全模式开关",
+        summary="放一个 SAFE_MODE 文件即以插件安全模式启动",
+        description=(
+            "存在时本次启动跳过全部本地 / 第三方插件；在「设置 → 插件」退出安全模式会删掉它。"
+        ),
+        default="data/SAFE_MODE",
+        resolve=lambda s: Path(s.data_dir) / "SAFE_MODE",
     ),
     DataDir(
         key="site_configs",

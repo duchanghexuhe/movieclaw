@@ -99,8 +99,10 @@ fun HeroCarousel(
     if (slides.isEmpty()) return
     val page = currentPage.coerceIn(0, slides.lastIndex)
 
-    // 自动轮播：每 8s 前进一屏（与进度条同步）
-    LaunchedEffect(page, slides.size) {
+    // 自动轮播：每 8s 前进一屏（与进度条同步）；页签在后台时停表
+    val tabActive = LocalTabActive.current
+    LaunchedEffect(page, slides.size, tabActive) {
+        if (!tabActive) return@LaunchedEffect
         kotlinx.coroutines.delay(HERO_INTERVAL_MS.toLong())
         onPageChange((page + 1) % slides.size)
     }
@@ -127,8 +129,8 @@ fun HeroCarousel(
             )
             // Ken Burns：当前屏 12s 线性推近到 1.10（切换时归零重来）
             val kenBurns = remember(i) { Animatable(1f) }
-            LaunchedEffect(active) {
-                if (active) {
+            LaunchedEffect(active, tabActive) {
+                if (active && tabActive) {
                     kenBurns.snapTo(1f)
                     kenBurns.animateTo(1.1f, tween(durationMillis = 12000, easing = LinearEasing))
                 } else {
@@ -366,8 +368,10 @@ fun HeroProgressIndicator(
     modifier: Modifier = Modifier,
 ) {
     val progress = remember { Animatable(0f) }
-    LaunchedEffect(current, count) {
+    val tabActive = LocalTabActive.current
+    LaunchedEffect(current, count, tabActive) {
         progress.snapTo(0f)
+        if (!tabActive) return@LaunchedEffect
         progress.animateTo(1f, tween(HERO_INTERVAL_MS, easing = LinearEasing))
     }
     Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {

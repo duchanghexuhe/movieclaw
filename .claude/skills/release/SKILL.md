@@ -171,7 +171,9 @@ ffmpeg 版本，发版前按下表逐项过一遍。
    （`security set-key-partition-list …`，要输 Mac 登录密码），否则会弹出几十个授权框。
 2. 从 main 打包上传：`source <本机 env> && apps/apple/scripts/release.sh --upload`
    （不带 `--upload` 只导出，用于先验证签名）。构建号取 UTC 时间自动递增。
-   Apple TV 版加 `--tv`（同一条 App 记录、各自一条构建序列），两端都要发就各跑一次。
+   Apple TV 版加 `--tv`、Mac 版加 `--mac`（同一条 App 记录、各自一条构建序列），几端都要发就各跑一次。
+   TestFlight 的审核账号、备注与「Beta 版 App 描述」三端共用，提审前按 `docs/design/ios-release.md` §4 核对；
+   各端的「测试内容」只写那一端真有的功能。
 3. 上传后 5～30 分钟处理完；可用 ASC API 查 `processingState` / `buildAudienceType`。
    开了自动分发的内部测试组会自动收到；对外测试组按 checklist §5 加构建、提审。
 4. 看 Apple 邮件：ITMS-91053 等警告按邮件补隐私清单。
@@ -207,6 +209,7 @@ GitHub 只允许整次运行结束后再单独重跑某个作业（`gh run rerun
 - [ ] 版本号三处一致（应用发版）
 - [ ] Android 有变化时，已递增 `apps/android/version.properties` 的版本与版本码；
       `android-apk` 成功、正式签名 APK / JSON 在场（详见下节）
+- [ ] Android TV 有变化时，已递增 `apps/android-tv/version.properties`；`android-tv-apk` 结果看一眼（可选附件，失败只告警）
 - [ ] bump 版本号后已跑 `scripts/export-spec.sh`（服务端与 Go CLI 两份 spec）
 - [ ] 本次改动是否触碰运行时依赖？触碰了 → `docker/runtime-version` +1（镜像随发版自动发布）
 - [ ] 改了 Worker 握手协议（`REMOTE_WORKER_PROTOCOL_VERSION` 与 macOS Worker
@@ -247,3 +250,7 @@ applicationId、版本与附件，不预先把尚未实现的产品混入同一�
 
 固定下载地址：`https://github.com/movieclaw/MovieClaw/releases/latest/download/MovieClaw-Android-arm64.apk`。
 APK 是必需附件，缺失时 `publish` 不转正；失败后修复并重跑工作流，不以无签名包或 Exo-only 包绕过。
+
+Android TV：`android-tv-apk` 作业构建或沿用 `MovieClaw-AndroidTV.apk` / `.json`，版本独立
+（`apps/android-tv/version.properties`），签名复用上面同一组 Secrets；目前是可选附件。详见
+`docs/design/android-release.md`「Android TV」。

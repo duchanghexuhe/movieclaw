@@ -108,7 +108,10 @@ import io.movieclaw.android.core.designsystem.Warning
 import io.movieclaw.android.core.model.EpisodeView
 import io.movieclaw.android.core.model.LibraryItemDetailView
 import io.movieclaw.android.core.model.LibraryFileView
+import io.movieclaw.android.core.model.DeleteFollowUpView
+import io.movieclaw.android.core.model.ItemDeletePreviewView
 import io.movieclaw.android.core.model.ItemDeleteResultView
+import io.movieclaw.android.core.model.JobView
 import io.movieclaw.android.core.network.ApiFactory
 import io.movieclaw.android.core.network.dataOrThrow
 import io.movieclaw.android.core.network.friendlyMessage
@@ -117,6 +120,8 @@ import io.movieclaw.android.core.session.SessionRepository
 import javax.inject.Inject
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import androidx.compose.runtime.DisposableEffect
 import io.movieclaw.android.feature.activity.LlmGate
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -137,6 +142,10 @@ import io.movieclaw.android.core.model.PlaybackStateView
 import io.movieclaw.android.core.model.PlaybackMarksRequest
 import androidx.compose.runtime.LaunchedEffect
 import kotlinx.coroutines.flow.update
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 
 @HiltViewModel
 class ItemDetailViewModel @Inject constructor(
@@ -153,6 +162,8 @@ class ItemDetailViewModel @Inject constructor(
     data class Detail(
         val item: LibraryItemDetailView,
         val episodes: Map<Int, List<EpisodeView>> = emptyMap(),
+        /** 每季「接着看」的锚点（服务端 resume_episode，没有就退回客户端原规则，见 [EpisodeRanges.anchor]） */
+        val anchors: Map<Int, Int?> = emptyMap(),
     )
 
     private val _state = MutableStateFlow<Loadable<Detail>>(Loadable.Loading)
@@ -177,6 +188,7 @@ class ItemDetailViewModel @Inject constructor(
     /** 初始选中（= 服务端续播那一集，iOS 由路由 `?season=&episode=` 带进来，这里由详情自己算） */
     private var seedUnit: SelectedUnit? = null
     private var episodesBySeason: Map<Int, List<EpisodeView>> = emptyMap()
+    private var anchorsBySeason: Map<Int, Int?> = emptyMap()
 
     val origin: String? get() = repository.ui.value.origin
 
@@ -482,23 +494,18 @@ class ItemDetailViewModel @Inject constructor(
             try {
                 val api = apiFactory.forOrigin(origin)
                 val detail = api.libraryItemDetail(libraryId, itemId).dataOrThrow()
-                val episodes = if (detail.kind == "tv") {
-                    detail.seasons.associateWith { season ->
-                        api.seasonEpisodes(libraryId, itemId, season).dataOrThrow().episodes
-                    }
-                } else {
-                    emptyMap()
-                }
-                _state.value = Loadable.Ready(Detail(detail, episodes))
+                val (episodes, anchors) = fetchSeasons(detail)
+                _state.value = Loadable.Ready(Detail(detail, episodes, anchors))
                 episodesBySeason = episodes
-                // 初始选中：服务端续播那一个单元（跨季第一个没看的在库集）。
+                anchorsBySeason = anchors
+                // 初始选中：续播那一季的锚点（长剧分段 §3「进详情页」：段锁在它所在的段）。
                 // 季的回退链照 iOS `SeasonEpisodesSection.currentSeason`：
                 // 续播那季 → 第一个在库的季 → 第一个季
                 val seed = pickResumeEpisode(detail, episodes).takeIf { it.second > 0 }
                     ?: detail.seasons.firstOrNull()?.let { season ->
                         episodes[season]?.firstOrNull()?.let { Triple(season, it.episodeNumber, it.name) }
                     }
-                seedUnit = seed?.let { SelectedUnit(it.first, it.second) }
+                seedUnit = seed?.let { SelectedUnit(it.first, anchors[it.first] ?: it.second) }
                 val ownedSeasons = detail.files.map { it.seasonNumber }.toSet()
                 _selectedSeason.value = seed?.first?.takeIf { episodes.containsKey(it) }
                     ?: detail.seasons.firstOrNull { it in ownedSeasons }
@@ -515,18 +522,50 @@ class ItemDetailViewModel @Inject constructor(
 
     /**
      * 换季：**连带把选中集切到这一季**（iOS `SeasonEpisodesSection.load(reset:)` 同口径）——
-     * 优先「初始续播那一集」（若正好是这一季且在库）、否则这一季第一个没看的在库集、
-     * 再次第一个在库集、最后第一集。只换季不换集的话，播放键会拿「第 3 季 + 第 1 季的那一集」
+     * 落在这一季的锚点（服务端 resume_episode；没有就第一个看了一半的 → 第一个没看的 → 第一集，
+     * 有片源的优先）。只换季不换集的话，播放键会拿「第 3 季 + 第 1 季的那一集」
      * 去起播，服务端找不到就退回第一季——现象与用户报的完全一致。
      */
     fun selectSeason(season: Int) {
         _selectedSeason.value = season
-        val list = episodesBySeason[season].orEmpty()
-        val picked = seedUnit?.takeIf { it.season == season && list.any { e -> e.episodeNumber == it.episode && e.owned } }?.episode
-            ?: list.firstOrNull { !it.played && it.owned }?.episodeNumber
-            ?: list.firstOrNull { it.owned }?.episodeNumber
-            ?: list.firstOrNull()?.episodeNumber
+        val picked = anchorsBySeason[season]
         if (picked != null) _selectedEpisode.value = SelectedUnit(season, picked)
+    }
+
+    /** 手动换段：段里有锚点选锚点，否则段首（段跟着选中集走，不单独存） */
+    fun selectRange(season: Int, range: EpisodeRanges.Range) {
+        _selectedEpisode.value = SelectedUnit(season, EpisodeRanges.entryOf(range, anchorsBySeason[season]))
+    }
+
+    /** 拉每一季的分集，并按 resume_episode 算出每季锚点 */
+    private suspend fun fetchSeasons(
+        detail: LibraryItemDetailView,
+    ): Pair<Map<Int, List<EpisodeView>>, Map<Int, Int?>> {
+        if (detail.kind != "tv") return emptyMap<Int, List<EpisodeView>>() to emptyMap()
+        val api = apiFactory.forOrigin(origin ?: return emptyMap<Int, List<EpisodeView>>() to emptyMap())
+        val views = detail.seasons.associateWith { season ->
+            api.seasonEpisodes(libraryId, itemId, season).dataOrThrow()
+        }
+        return views.mapValues { it.value.episodes } to
+            views.mapValues { EpisodeRanges.anchor(it.value.episodes, it.value.resumeEpisode) }
+    }
+
+    /**
+     * 播放回来 / 回到前台：静默重拉分集（不闪加载态）。当前季锚点变了（看完 1050 → 1051）
+     * 就选中新锚点、段跟着锁过去；没变就不动，保留用户在别的段的浏览。
+     */
+    fun refreshEpisodes() {
+        val ready = (_state.value as? Loadable.Ready)?.value ?: return
+        viewModelScope.launch {
+            val (episodes, anchors) = runCatching { fetchSeasons(ready.item) }.getOrNull() ?: return@launch
+            val current = (_state.value as? Loadable.Ready)?.value ?: return@launch
+            _state.value = Loadable.Ready(current.copy(episodes = episodes, anchors = anchors))
+            episodesBySeason = episodes
+            anchorsBySeason = anchors
+            val season = _selectedSeason.value ?: return@launch
+            EpisodeRanges.afterRefresh(current.anchors[season], anchors[season])
+                ?.let { _selectedEpisode.value = SelectedUnit(season, it) }
+        }
     }
 
     /** 点某一集 = 选中它（播放键、续播点、已看、版本都跟着走，iOS 同款） */
@@ -565,13 +604,35 @@ class ItemDetailViewModel @Inject constructor(
         _notice.value = null
     }
 
+    /**
+     * 两个标记的作用域不同（服务端口径）：收藏落在**整个条目**上，「已看」跟着当前播放单元——
+     * 电影是整条，剧集是选中的那一集。剧集一旦按单集取过「已看」，就不让整剧的结果覆盖它。
+     */
+    private var playedIsUnitScoped = false
+    private var unitPlayedJob: kotlinx.coroutines.Job? = null
+
     fun loadMarks(mediaItemId: Long) {
         viewModelScope.launch {
             val origin = repository.ui.value.origin ?: return@launch
             // 查不到收藏态不影响浏览，心按未收藏渲染即可
             runCatching {
                 apiFactory.forOrigin(origin).playbackMarks(mediaItemId).dataOrThrow()
-            }.onSuccess { _marks.value = it }
+            }.onSuccess { m -> _marks.update { s -> m.copy(played = if (playedIsUnitScoped) s.played else m.played) } }
+        }
+    }
+
+    /** 剧集换了选中的集：「已看」按这一集重新取（电影 0/0 用整条的结果，不用单取） */
+    fun loadUnitPlayed(mediaItemId: Long, seasonNumber: Int, episodeNumber: Int) {
+        if (seasonNumber <= 0 && episodeNumber <= 0) return
+        playedIsUnitScoped = true
+        unitPlayedJob?.cancel()   // 快速切集时，晚到的旧集结果不能盖掉新集
+        unitPlayedJob = viewModelScope.launch {
+            val origin = repository.ui.value.origin ?: return@launch
+            runCatching {
+                apiFactory.forOrigin(origin)
+                    .playbackMarks(mediaItemId, seasonNumber, episodeNumber)
+                    .dataOrThrow()
+            }.onSuccess { m -> _marks.update { it.copy(played = m.played) } }
         }
     }
 
@@ -584,8 +645,9 @@ class ItemDetailViewModel @Inject constructor(
                 apiFactory.forOrigin(origin)
                     .setPlaybackMarks(PlaybackMarksRequest(mediaItemId = mediaItemId, favorite = next))
                     .dataOrThrow()
-            }.onSuccess {
-                _marks.value = it
+            }.onSuccess { m ->
+                // 只取收藏：这次查的是整个条目，它的「已看」不是剧集当前那一集的
+                _marks.update { it.copy(isFavorite = m.isFavorite) }
                 // 收藏变了：首页「我的收藏」行与收藏墙立刻重拉（否则那两处还是进页时的快照）
                 io.movieclaw.android.core.model.LibraryMarksBus.bump()
             }
@@ -614,14 +676,15 @@ class ItemDetailViewModel @Inject constructor(
                     )
                     .dataOrThrow()
             }.onSuccess {
-                // 标已看会清零续播位置、取消会清零播放次数——结论以服务端为准，写完重查
+                // 标已看会清零续播位置、取消会清零播放次数——结论以服务端为准，写完重查。
+                // 只取「已看」：剧集这里查的是单集，单集上没有收藏（收藏在整剧上），整份覆盖会把心清掉
                 runCatching {
                     apiFactory.forOrigin(origin).playbackMarks(
                         mediaItemId = mediaItemId,
                         seasonNumber = seasonNumber,
                         episodeNumber = episodeNumber,
                     ).dataOrThrow()
-                }.onSuccess { fresh -> _marks.value = fresh }
+                }.onSuccess { fresh -> _marks.update { it.copy(played = fresh.played) } }
                 // 「已看」会影响首页的「接下来继续」与各行的进度，一起让首页重拉
                 io.movieclaw.android.core.model.LibraryMarksBus.bump()
             }.onFailure {
@@ -637,12 +700,31 @@ class ItemDetailViewModel @Inject constructor(
      * 从磁盘删除一个文件（回收站语义由服务端定）。
      * 返回结果交给调用方：`errors` 为空 + 「这是最后一个文件」= 整条目已删，要离开详情页。
      */
-    suspend fun deleteFile(fileId: Long): Result<io.movieclaw.android.core.model.ItemDeleteResultView> {
+    suspend fun deleteFile(
+        fileId: Long,
+        options: String? = null,
+    ): Result<io.movieclaw.android.core.model.ItemDeleteResultView> {
         val origin = repository.ui.value.origin
             ?: return Result.failure(IllegalStateException("尚未连接服务器"))
         return runCatching {
-            apiFactory.forOrigin(origin).deleteLibraryFile(libraryId, itemId, fileId).dataOrThrow()
+            apiFactory.forOrigin(origin).deleteLibraryFile(libraryId, itemId, fileId, options).dataOrThrow()
+        }.onSuccess { io.movieclaw.android.core.model.LibraryMarksBus.bump() }
+    }
+
+    /** 删除前预览（附加选项）；取不到不挡删除，只是这次没有附加选项 */
+    suspend fun deletePreview(fileId: Long): Result<io.movieclaw.android.core.model.ItemDeletePreviewView> {
+        val origin = repository.ui.value.origin
+            ?: return Result.failure(IllegalStateException("尚未连接服务器"))
+        return runCatching {
+            apiFactory.forOrigin(origin).deletePreview(libraryId, itemId, fileId).dataOrThrow()
         }
+    }
+
+    /** 后续任务的当前状态 */
+    suspend fun job(jobId: String): Result<io.movieclaw.android.core.model.JobView> {
+        val origin = repository.ui.value.origin
+            ?: return Result.failure(IllegalStateException("尚未连接服务器"))
+        return runCatching { apiFactory.forOrigin(origin).job(jobId).dataOrThrow() }
     }
 
     /** 把待回收的文件恢复为在位版本 */
@@ -651,7 +733,7 @@ class ItemDetailViewModel @Inject constructor(
             ?: return Result.failure(IllegalStateException("尚未连接服务器"))
         return runCatching {
             apiFactory.forOrigin(origin).restoreLibraryFile(libraryId, itemId, fileId).dataOrThrow()
-        }.map { }
+        }.map { io.movieclaw.android.core.model.LibraryMarksBus.bump() }
     }
 
     /** 立即清理一个待回收的文件（真删磁盘，不等保留期） */
@@ -660,7 +742,7 @@ class ItemDetailViewModel @Inject constructor(
             ?: return Result.failure(IllegalStateException("尚未连接服务器"))
         return runCatching {
             apiFactory.forOrigin(origin).purgeLibraryFile(libraryId, itemId, fileId).dataOrThrow()
-        }.map { }
+        }.map { io.movieclaw.android.core.model.LibraryMarksBus.bump() }
     }
 }
 
@@ -711,6 +793,11 @@ fun ItemDetailScreen(
         }
     }
 
+    // 播放回来 / 回到前台：静默重拉分集，锚点变了就把选中与集段锁到新锚点（长剧分段 §3）
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+        vm.refreshEpisodes()
+    }
+
     // 只在换条目时拉一次标记（marks 自身变化不能再触发，否则死循环）
     val loadedItemId = (state as? Loadable.Ready)?.value?.item?.mediaItemId
     LaunchedEffect(loadedItemId) {
@@ -746,7 +833,10 @@ fun ItemDetailScreen(
                 marks = marks,
                 resume = resume,
                 unit = selectedUnit,
-                onResumeUnitChanged = { season, episode -> vm.loadResume(s.value.item.mediaItemId, season, episode) },
+                onResumeUnitChanged = { season, episode ->
+                    vm.loadResume(s.value.item.mediaItemId, season, episode)
+                    vm.loadUnitPlayed(s.value.item.mediaItemId, season, episode)
+                },
                 onToggleFavorite = { vm.toggleFavorite(s.value.item.mediaItemId) },
                 onTogglePlayed = { season, episode ->
                     vm.togglePlayed(s.value.item.mediaItemId, season, episode)
@@ -782,6 +872,8 @@ fun ItemDetailScreen(
                         // 分集横滚的选中与滚动定位跟着「选中单元」走（受控，不再各存一份）
                         selectedEpisode = selectedUnit?.takeIf { it.season == selectedSeason }?.episode,
                         onPickEpisode = { ep -> vm.selectEpisode(selectedSeason ?: 0, ep) },
+                        anchor = s.value.anchors[selectedSeason],
+                        onPickRange = { range -> vm.selectRange(selectedSeason ?: 0, range) },
                         origin = origin,
                         onPlay = onPlay,
                         libraryId = libraryId,
@@ -836,7 +928,9 @@ fun ItemDetailScreen(
                 file = file,
                 isLast = readyDetail.files.size == 1,
                 onDismiss = { trashTarget = null },
-                run = { vm.deleteFile(file.id) },
+                run = { options -> vm.deleteFile(file.id, options) },
+                loadOptions = { vm.deletePreview(file.id) },
+                loadJob = { jobId -> vm.job(jobId) },
                 onFinished = { deletedItem ->
                     trashTarget = null
                     // 最后一个文件删成功 = 整条目已删：离开详情页（iOS `onItemDeleted: leaveToLibrary`）
@@ -1158,7 +1252,8 @@ private fun Hero(
                     if (marks.isFavorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
                     marks.isFavorite,
                 ) { onToggleFavorite() }
-                GlassPill("标为已看", Icons.Rounded.CheckCircle, marks.played) {
+                // 已看时换文案（iOS / 网页同口径）：选中色与正文白几乎一样，只靠颜色看不出点没点上
+                GlassPill(if (marks.played) "已看完" else "标为已看", Icons.Rounded.CheckCircle, marks.played) {
                     onTogglePlayed(resumeSeason.takeIf { it > 0 }, resumeEpisode.takeIf { it > 0 })
                 }
             }
@@ -1546,6 +1641,10 @@ private fun SeasonSection(
     /** 选中的集号（受控：来自 VM 的选中单元，不再各存一份） */
     selectedEpisode: Int?,
     onPickEpisode: (Int) -> Unit,
+    /** 本季「接着看」的锚点（长剧分段：橙点、「接着看」标、面板落点都以它为准） */
+    anchor: Int?,
+    /** 手动换段（段胶囊 / 横排两头的「上一段 / 下一段」） */
+    onPickRange: (EpisodeRanges.Range) -> Unit,
     origin: String?,
     onPlay: (PlayTarget) -> Unit,
     libraryId: Long,
@@ -1556,7 +1655,15 @@ private fun SeasonSection(
         val name = if (season == 0) "特别篇" else "第 $season 季"
         if (season in ownedSeasons) name else "$name · 未入库"
     }
-    Column(Modifier.padding(vertical = 6.dp)) {
+    // 长剧分段（docs/design/long-season-episode-ranges.md §4）：本季超过 50 集才分段，
+    // 当前段 = 选中那一集所在的段（换段总会连带选中段里的一集，所以不必单独存）
+    val list = episodes[selected] ?: emptyList()
+    val picked = selectedEpisode ?: list.firstOrNull()?.episodeNumber
+    val ranges = remember(list) { EpisodeRanges.of(list) }
+    val segmented = ranges.isNotEmpty()
+    val currentRange = ranges.firstOrNull { picked != null && picked in it } ?: ranges.firstOrNull()
+    var allSheet by remember { mutableStateOf(false) }
+    Column(Modifier.padding(vertical = 6.dp).semantics { testTagsAsResourceId = true }) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
@@ -1615,9 +1722,22 @@ private fun SeasonSection(
             } else {
                 Text(activeSeason?.let(seasonLabel) ?: "", style = McType.sub, color = TextMuted)
             }
-            // 「在库 X / Y 集」（网页/iOS 都有这一行）：一眼看出这一季收了多少
+            // 「在库 X / Y 集」（网页/iOS 都有这一行）：一眼看出这一季收了多少；
+            // 分段时这个位置换成「全部 N 集 ›」（在库数挪进面板标题）
             val seasonEpisodes = episodes[selected].orEmpty()
-            if (seasonEpisodes.isNotEmpty()) {
+            if (segmented) {
+                Spacer(Modifier.weight(1f))
+                Text(
+                    "全部 ${seasonEpisodes.size} 集 ›",
+                    style = McType.caption,
+                    color = TextMuted,
+                    modifier = Modifier
+                        .testTag("ep-all-button")
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { allSheet = true }
+                        .padding(start = 8.dp, top = 5.dp, bottom = 5.dp),
+                )
+            } else if (seasonEpisodes.isNotEmpty()) {
                 Spacer(Modifier.width(10.dp))
                 Text(
                     "在库 ${seasonEpisodes.count { it.owned }} / ${seasonEpisodes.size} 集",
@@ -1627,16 +1747,35 @@ private fun SeasonSection(
             }
         }
 
-        // 分集横滚卡：一季一屏，点一集 = 选中它（播放是详情页那颗播放键，选中的集就是它要播的）
-        val list = episodes[selected] ?: emptyList()
-        val picked = selectedEpisode ?: list.firstOrNull()?.episodeNumber
+        // 段胶囊：横滑，选中段实心、锚点段右上角橙点
+        if (segmented && currentRange != null) {
+            Spacer(Modifier.height(12.dp))
+            EpisodeRangeChips(
+                ranges = ranges,
+                current = currentRange.index,
+                anchor = anchor,
+                onPick = onPickRange,
+                tagPrefix = "ep-range-chip",
+            )
+        }
+
+        // 分集横滚卡：一季一屏（分段时只放当前段），点一集 = 选中它（播放是详情页那颗播放键，选中的集就是它要播的）
+        val shown = currentRange?.episodes ?: list
+        // 「接着看」只标有观看记录的季：一集都没碰过的季，锚点只是退回规则落的第一集，标了是噪音
+        val watched = list.any { it.played || it.positionMs > 0 }
+        val prevRange = currentRange?.let { c -> ranges.getOrNull(ranges.indexOf(c) - 1) }
+        val nextRange = currentRange?.let { c -> ranges.getOrNull(ranges.indexOf(c) + 1) }
         Spacer(Modifier.height(12.dp))
         val strip = rememberLazyListState()
-        // 进页/换季时把选中那一集滚到可见处（续播进来的那一集常常在列表深处，
-        // 不滚的话得手动滑几十屏；网页/iOS 同样会滚到当前集）
-        LaunchedEffect(selected, list.size, picked) {
-            val index = list.indexOfFirst { it.episodeNumber == picked }
-            if (index > 0) strip.animateScrollToItem((index - 1).coerceAtLeast(0))
+        // 进页/换季/换段时把选中那一集滚到可见处（续播进来的那一集常常在列表深处，
+        // 不滚的话得手动滑几十屏；网页/iOS 同样会滚到当前集）。选中的是第一张也要滚回开头——
+        // 换季/换段后横排还停在旧位置（比如 120 集那季的第 70 张），新选中的第 1 集就看不见了
+        LaunchedEffect(selected, currentRange?.index, list.size, picked) {
+            val index = shown.indexOfFirst { it.episodeNumber == picked }
+            if (index >= 0) {
+                val item = index + (if (prevRange != null) 1 else 0)
+                strip.animateScrollToItem((item - 1).coerceAtLeast(0))
+            }
         }
         LazyRow(
             state = strip,
@@ -1644,15 +1783,33 @@ private fun SeasonSection(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            items(list, key = { it.episodeNumber }) { episode ->
+            prevRange?.let { range ->
+                item(key = "prev") { RangeEdgeCard("← 上一段", range, "ep-edge-prev") { onPickRange(range) } }
+            }
+            items(shown, key = { it.episodeNumber }) { episode ->
                 EpisodeCard(
                     episode = episode,
                     selected = episode.episodeNumber == picked,
                     origin = origin,
                     onSelect = { onPickEpisode(episode.episodeNumber) },
+                    resumeTag = watched && episode.episodeNumber == anchor,
                 )
             }
+            nextRange?.let { range ->
+                item(key = "next") { RangeEdgeCard("下一段 →", range, "ep-edge-next") { onPickRange(range) } }
+            }
         }
+    }
+
+    if (allSheet && segmented) {
+        AllEpisodesSheet(
+            episodes = list,
+            ranges = ranges,
+            anchor = anchor,
+            selected = picked,
+            onPick = { ep -> allSheet = false; onPickEpisode(ep) },
+            onDismiss = { allSheet = false },
+        )
     }
 }
 
@@ -1669,11 +1826,15 @@ private fun EpisodeCard(
     selected: Boolean,
     origin: String?,
     onSelect: () -> Unit,
+    /** 锚点那张卡左上角标「接着看」（本季有观看记录才标，长短季一样；橙点 / 面板橙边不受此限） */
+    resumeTag: Boolean = false,
 ) {
     val progress = if (episode.played) 100f else episode.progressPercent?.toFloat()
     Column(
         Modifier
             .width(200.dp)
+            .testTag("ep-card-${episode.episodeNumber}")
+            .semantics { this.selected = selected }
             .clickable(onClick = onSelect)
             .then(if (episode.owned) Modifier else Modifier.alpha(0.45f)),
     ) {
@@ -1706,6 +1867,7 @@ private fun EpisodeCard(
                     }
                 },
             )
+            if (resumeTag) ResumeTag(Modifier.align(Alignment.TopStart).padding(6.dp))
             // 右上角状态位：缺集与已看对勾同排（看过之后文件丢了两者会同时出现）
             if (!episode.owned || episode.played) {
                 Row(
@@ -2036,20 +2198,36 @@ private fun DeleteFileSheet(
     file: LibraryFileView,
     isLast: Boolean,
     onDismiss: () -> Unit,
-    run: suspend () -> Result<ItemDeleteResultView>,
+    run: suspend (options: String?) -> Result<ItemDeleteResultView>,
+    loadOptions: suspend () -> Result<ItemDeletePreviewView>,
+    loadJob: suspend (jobId: String) -> Result<JobView>,
     onFinished: (deletedItem: Boolean) -> Unit,
 ) {
     var confirmed by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<ItemDeleteResultView?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    // 附加选项：打开时取一次删除预览；默认一律不勾；取不到不挡删除（缺失文件不问）
+    var preview by remember { mutableStateOf<ItemDeletePreviewView?>(null) }
+    var previewFailed by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(emptySet<String>()) }
+    LaunchedEffect(file.id) {
+        if (!file.missing) {
+            loadOptions().onSuccess { preview = it }.onFailure { previewFailed = true }
+        }
+    }
     val scope = rememberCoroutineScope()
     androidx.compose.material3.ModalBottomSheet(
         onDismissRequest = { if (!busy && result == null) onDismiss() },
         containerColor = Color(0xFF15161A),
         contentColor = TextPrimary,
     ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = McMetrics.pagePadding, vertical = 4.dp)) {
+        // 附加选项是别的模块登记的、条数不定：内容超出一屏时可滚，删除按钮不会被挤出屏幕
+        Column(
+            Modifier.fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = McMetrics.pagePadding, vertical = 4.dp),
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(Icons.Rounded.Delete, contentDescription = null, tint = Danger, modifier = Modifier.size(18.dp))
                 Text("删除文件", style = McType.bodySemibold, color = TextPrimary)
@@ -2099,6 +2277,10 @@ private fun DeleteFileSheet(
                 }
                 Spacer(Modifier.height(10.dp))
                 Text("已清理 ${done.rowsDeleted} 条台账，释放 ${McFormat.bytes(done.freedBytes)}。", fontSize = 13.sp, color = TextMuted)
+                done.followUps.orEmpty().forEach { item ->
+                    Spacer(Modifier.height(10.dp))
+                    DeleteFollowUpRow(item, loadJob)
+                }
                 Spacer(Modifier.height(16.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     DangerButton("完成") { onFinished(isLast && done.errors.isEmpty()) }
@@ -2175,6 +2357,16 @@ private fun DeleteFileSheet(
                     color = TextFaint,
                     lineHeight = 16.sp,
                 )
+                if (!file.missing) {
+                    Spacer(Modifier.height(12.dp))
+                    DeleteOptionsSection(
+                        preview = preview,
+                        failed = previewFailed,
+                        selected = selected,
+                        enabled = !busy,
+                        onToggle = { key -> selected = if (key in selected) selected - key else selected + key },
+                    )
+                }
                 Spacer(Modifier.height(14.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(
@@ -2199,7 +2391,7 @@ private fun DeleteFileSheet(
                         scope.launch {
                             busy = true
                             error = null
-                            run()
+                            run(selected.sorted().joinToString(",").ifEmpty { null })
                                 .onSuccess { result = it }
                                 .onFailure { error = friendlyMessage(it) }
                             busy = false
@@ -2209,6 +2401,114 @@ private fun DeleteFileSheet(
                 Spacer(Modifier.height(12.dp))
             }
         }
+    }
+}
+
+/**
+ * 删除单的附加选项（iOS `DeleteOptionsSection`、Web `library-delete-options.tsx` 同款）：
+ * 来自别的模块登记的删除参与方，媒体库不认识它们；不可勾的显示原因，勾上会发生什么逐行说明。
+ */
+@Composable
+private fun DeleteOptionsSection(
+    preview: ItemDeletePreviewView?,
+    failed: Boolean,
+    selected: Set<String>,
+    enabled: Boolean,
+    onToggle: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        when {
+            failed -> Text("附加选项暂时加载不出来，这次只删除媒体库文件。", fontSize = 11.sp, color = TextFaint)
+            preview == null -> Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = TextFaint)
+                Spacer(Modifier.width(8.dp))
+                Text("正在检查关联的下载任务…", fontSize = 11.sp, color = TextFaint)
+            }
+            else -> {
+                if (preview.linkedBytes > 0) {
+                    Text(
+                        "其中 ${McFormat.bytes(preview.linkedBytes)} 与别处的文件是同一份数据（硬链接）：只删媒体库文件不会释放这部分空间。",
+                        fontSize = 13.sp,
+                        color = Color.White.copy(alpha = 0.7f),
+                        lineHeight = 19.sp,
+                    )
+                }
+                preview.options.forEach { option ->
+                    val on = option.available && option.key in selected
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.White.copy(alpha = 0.03f))
+                            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp))
+                            .padding(start = 4.dp, end = 14.dp, top = 4.dp, bottom = 12.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = on,
+                                onCheckedChange = { onToggle(option.key) },
+                                enabled = option.available && enabled,
+                                colors = CheckboxDefaults.colors(checkedColor = Danger, uncheckedColor = TextFaint),
+                            )
+                            Column(Modifier.alpha(if (option.available) 1f else 0.5f)) {
+                                Text(option.label, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+                                if (option.help.isNotEmpty()) {
+                                    Text(option.help, fontSize = 11.sp, color = TextFaint, lineHeight = 16.sp)
+                                }
+                            }
+                        }
+                        Column(Modifier.padding(start = 44.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            if (option.available) {
+                                option.lines.forEach { line ->
+                                    Text(
+                                        line.text,
+                                        fontSize = 12.sp,
+                                        lineHeight = 17.sp,
+                                        color = when (line.tone) {
+                                            "warn" -> Warning
+                                            "danger" -> Danger
+                                            else -> Color.White.copy(alpha = 0.7f)
+                                        },
+                                    )
+                                }
+                            } else {
+                                Text("这次不能勾选：${option.reason ?: "不可用"}", fontSize = 12.sp, color = TextMuted)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 结果步：勾选的选项在后台跑，当场跟进到结束（失败了去「活动 → 任务」重试） */
+@Composable
+private fun DeleteFollowUpRow(item: DeleteFollowUpView, loadJob: suspend (String) -> Result<JobView>) {
+    var job by remember { mutableStateOf<JobView?>(null) }
+    LaunchedEffect(item.jobId) {
+        while (true) {
+            loadJob(item.jobId).onSuccess { job = it }
+            if (job?.status in setOf("succeeded", "failed", "cancelled")) break
+            delay(1500)
+        }
+    }
+    val current = job
+    val message = when (current?.status) {
+        "succeeded" -> (current.result?.get("message") as? JsonPrimitive)?.contentOrNull ?: "已完成"
+        "failed" -> "没能完成：${current.error?.message?.ifEmpty { null } ?: "未知原因"}。可在「活动 → 任务」里重试"
+        "cancelled" -> "已取消"
+        else -> "正在处理…"
+    }
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.White.copy(alpha = 0.03f))
+            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(item.label, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+        Text(message, fontSize = 12.sp, color = if (current?.status == "failed") Danger else TextMuted)
     }
 }
 
@@ -2222,7 +2522,7 @@ private fun PurgeFileDialog(file: LibraryFileView, onDismiss: () -> Unit, onConf
         title = { Text("立即清理「${file.fileName}」？", style = McType.bodySemibold, color = TextPrimary) },
         text = {
             Text(
-                if (seeding) "该文件处于做种保护，可能仍被下载器做种。清理会从磁盘删除文件并可能中断做种任务（PT 站请留意保种要求），此操作不可恢复。"
+                if (seeding) "该文件留在原位置（原盘目录或没能移入回收站），清理会直接从磁盘删除，此操作不可恢复。若它仍被下载器做种，清理会中断做种任务（PT 站请留意保种要求）。"
                 else "将立即从回收站删除该文件，不再等待保留期，此操作不可恢复。",
                 style = McType.sub,
                 color = TextMuted,
@@ -2277,9 +2577,9 @@ private fun mediaSourceLabel(file: LibraryFileView): String {
     return label + if (file.mediaSourceManual && source != "user-lowest") "（人工标注）" else ""
 }
 
-/** 待回收的清理倒计时（iOS `purgeCountdown` 逐字同款）：null = 做种保护中，不自动清理 */
+/** 待回收的清理倒计时（iOS `purgeCountdown` 逐字同款）：null = 不自动清理（旧数据） */
 private fun purgeCountdown(raw: String?): String {
-    if (raw == null) return "做种保护中，不自动清理"
+    if (raw == null) return "不自动清理"
     val instant = runCatching { java.time.OffsetDateTime.parse(raw).toInstant() }
         .recoverCatching { java.time.Instant.parse(raw) }
         .getOrNull() ?: return "即将自动清理"

@@ -234,6 +234,7 @@ class _AppReuse:
         from movieclaw_api.core.config import get_settings
         from movieclaw_api.core.logging import configure_logging
         from movieclaw_api.lifespan import build_lifespan
+        from movieclaw_api.spec_state import mark_baseline_app
 
         settings = get_settings()
         key = (
@@ -257,6 +258,10 @@ class _AppReuse:
             app.user_middleware = list(middleware)
             app.middleware_stack = None
             app.state = State()
+            # 与新建的产品应用一致：规格指纹认基线。前一个用例里插件挂过路由
+            # （挂在共享的插件路由器下，顶层路由数不变、实例照常复用）时，
+            # routes_changed 已把它移出基线集合
+            mark_baseline_app(app)
         return app
 
 
@@ -464,3 +469,16 @@ def _fresh_cover_memos(monkeypatch):
 
     monkeypatch.setattr(cover, "_memos", {})
     monkeypatch.setattr(cover, "_render_tasks", {})
+
+
+@pytest.fixture(autouse=True)
+def _acquisition_bound(monkeypatch):
+    """媒体库与获取领域之间的接口按生产形态绑好（library-boundary.md §10）。
+
+    生产环境里 ``downloads`` 系统模块总会绑定；直接调服务、不起应用的用例也要有同样的行为
+    （认领后关 / 退工单、转移后改挂订阅……）。验证「纯本地库」的用例自己绑 ``NullBridge``。
+    """
+    from movieclaw_api.services.acquisition_bridge import Acquisition
+    from movieclaw_api.services.library import acquisition
+
+    monkeypatch.setattr(acquisition, "_bound", Acquisition())

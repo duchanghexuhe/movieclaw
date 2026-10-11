@@ -1,0 +1,15 @@
+[plugin]
+id = "ntfy-channel"
+title = "ntfy 通道（示例）"
+version = "1.0.0"
+entry = "ntfy_channel"
+runtime = "process"
+sdk = "^1.0"
+description = "在 ntfy 里和 MovieClaw 对话、接收推送"
+
+[requires]
+"im-channels" = "^1.0"
+
+[permissions]
+operations = []
+network = true

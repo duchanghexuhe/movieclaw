@@ -233,8 +233,7 @@ private fun WallSubCard(sub: SubscriptionView, dim: Boolean, origin: String?, on
             modifier = Modifier.padding(top = 6.dp),
         )
         val meta = if (sub.media.kind == "tv") {
-            val season = sub.selectedSeasons.firstOrNull()
-            "第 ${season ?: 1} 季 · ${sub.progress.imported} / ${sub.progress.total}"
+            tvShelfMeta(sub)
         } else {
             listOfNotNull(sub.media.year?.toString(), if (sub.progress.imported > 0) "已入库" else "未入库").joinToString(" · ")
         }

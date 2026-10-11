@@ -118,12 +118,19 @@ async def grab_manual(
     # 单元也是手选的合法目标——「无法确认」的单元靠这条路人工替换。投递带
     # manual 标记，入库后由实测验证裁决：证明更优则替换旧版，否则共存保留
     spec: RuleSetSpec | None = None
-    rule_set = await session.get(RuleSet, subscription.rule_set_id)
+    rule_set = (
+        await session.get(RuleSet, subscription.rule_set_id) if subscription.rule_set_id else None
+    )
     if rule_set is not None:
         try:
             spec = RuleSetSpec.model_validate(rule_set.spec or {})
         except ValueError:
             spec = None
+    if subscription.selection_mode == "smart":
+        from movieclaw_api.services.subscription.smart_profiles import read_policy
+        spec = read_policy(subscription)
+        if spec is None:
+            raise BadRequestException("智能设置快照无效，已暂停选种")
     upgrade_pool: dict[tuple[int, int], WantedItem] = {}
     if spec is not None and spec.upgrade_source is not None:
         upgrade_pool = {
@@ -140,14 +147,20 @@ async def grab_manual(
             .scalars()
             .all()
         }
+    # TMDB 少录集数时手选新集也会撞到这里（issue #640）：告诉用户出路
+    floor_tip = (
+        "；若这部剧实际集数比 TMDB 记录的多，可在「管理订阅 → 调整集数」里补上"
+        if item.kind == "tv"
+        else ""
+    )
     if not open_wanted and not upgrade_pool:
         if spec is None or spec.upgrade_source is None:
             raise BadRequestException(
                 f"《{item.title}》当前没有缺口——所有追踪项都已投递或入库。"
-                "若想手选替换已入库的版本，请先给订阅换用配置了洗版目标的规则组"
+                f"若想手选替换已入库的版本，请先给订阅换用配置了洗版目标的规则组{floor_tip}"
             )
         raise BadRequestException(
-            f"《{item.title}》当前没有缺口，也没有已入库的追踪项可供替换"
+            f"《{item.title}》当前没有缺口，也没有已入库的追踪项可供替换{floor_tip}"
         )
 
     # attrs 是前端原样回传的解析结果：结构不合法（陈旧客户端/字段漂移）不算
@@ -180,6 +193,10 @@ async def grab_manual(
         download_url=download_url,
         publish_time=publish_time,
     )
+    if subscription.selection_mode == "smart":
+        from movieclaw_matcher.smart import eligible
+        if not eligible(candidate, spec):
+            raise BadRequestException("所选资源不满足智能模式的最低要求")
     identity = MediaIdentity(
         kind=item.kind,
         year=item.year,
@@ -208,7 +225,7 @@ async def grab_manual(
         )
         raise BadRequestException(
             f"该种子识别为{_match_text(match)}，但可投递的追踪项是 {target_text}"
-            f"{'…' if len(targets) > 8 else ''}——没有可满足的追踪项"
+            f"{'…' if len(targets) > 8 else ''}——没有可满足的追踪项{floor_tip}"
         )
     upgrade_labels: tuple[str, str] | None = None
     if upgrade_covered:

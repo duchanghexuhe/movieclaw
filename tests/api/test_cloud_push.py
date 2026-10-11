@@ -650,9 +650,9 @@ def test_registration_refreshes_app_version(client: TestClient, world: World) ->
     assert version() == "0.3.0"
 
 
-@pytest.mark.parametrize("kind", ["tvos", "macos"])
+@pytest.mark.parametrize("kind", ["tvos", "macos", "androidtv"])
 def test_apps_without_push_get_no_push_hint(client: TestClient, world: World, kind: str) -> None:
-    """Apple TV 与 Mac 版本期不接推送：设备页不挂「还没有开启通知」，也不能登记。"""
+    """Apple TV、Mac、Android TV 本期不接推送：设备页不挂「还没有开启通知」，也不能登记。"""
     _connect(client, world)
     bearer = _app_login(client, _ADMIN, installation=f"inst-{kind}", name=f"{kind} 设备", kind=kind)
     listed = _data(client.get("/api/v1/auth/devices"))
@@ -1393,6 +1393,37 @@ def test_new_version_pushed_once(client: TestClient, world: World) -> None:
     assert "new_version" not in keys
 
 
+def test_reel_clips_suggestion_pushed_to_admin(client: TestClient, world: World) -> None:
+    from movieclaw_api.services.push import events
+
+    _connect(client, world)
+    _create_member(client)
+    admin_bearer = _app_login(client, _ADMIN, installation="tip-admin-1", name="管理员手机")
+    member_bearer = _app_login(client, _MEMBER, installation="tip-member-1", name="家人手机")
+    _, admin_key = _register(client, admin_bearer, token="a7" * 32)
+    _register(client, member_bearer, token="b7" * 32)
+    relay = world.relays["push.test"]
+    relay.messages.clear()
+
+    _in_app(client, events.reel_clips_suggested)
+    _wait(lambda: len(relay.messages) >= 1)
+    time.sleep(0.3)
+    assert [m["token"] for m in relay.messages] == ["a7" * 32]  # 只推管理员
+    plain = _open(relay.messages[-1], admin_key)
+    assert plain["title"] == "开启片段预切，预告和刷片更流畅"
+    assert plain["open"] == "/settings/playback"
+
+    # 管理员能关掉「使用建议」，成员看不到这个开关
+    _data(client.put("/api/v1/push/me/preferences", json={"events": {"usage_tip": False}}))
+    _in_app(client, events.reel_clips_suggested)
+    time.sleep(0.5)
+    assert len(relay.messages) == 1
+    keys = {
+        e["key"] for e in _data(_as_app(client, member_bearer, "GET", "/api/v1/push/me"))["events"]
+    }
+    assert "usage_tip" not in keys
+
+
 def _notify(client: TestClient, members: set[int], title: str) -> None:
     """在应用的事件循环里推一条简单的「入库完成」（只看收件人、偏好和设备）。"""
     from movieclaw_api.services.push.notify import AlertContent, notify
@@ -2051,3 +2082,39 @@ def test_library_new_kinds_and_unrecognized_files(client: TestClient, world: Wor
     check()
     _wait(lambda: len(relay.messages) >= 1)
     assert _open(relay.messages[-1], key)["title"] == "新片：流浪地球 3"
+
+
+def test_identity_skip_is_one_informational_push_without_actions(
+    client: TestClient, world: World
+) -> None:
+    """同名资源知会经过真实登记、加密与中继；重复评估不再推、不产生待办。"""
+    from movieclaw_api.services.subscription.twins import _inform_user
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import MediaItem
+
+    _connect(client, world)
+    bearer = _app_login(client, _ADMIN, installation="identity-skip-install", name="iPhone")
+    _, key = _register(client, bearer, token="b9" * 32)
+    subscription_id, item_id = _seed_subscription(
+        client, kind="movie", title="奥德赛", creator=None, followers=[]
+    )
+    relay = world.relays["push.test"]
+    relay.messages.clear()
+
+    async def inform():
+        async with get_database().session() as session:
+            item = await session.get(MediaItem, item_id)
+            await _inform_user(session, subscription_id=subscription_id, item=item)
+
+    assert client.portal is not None
+    client.portal.call(inform)
+    _wait(lambda: len(relay.messages) >= 1)
+    plain = _open(relay.messages[0], key)
+    assert plain["title"] == "《奥德赛》仍在寻找资源"
+    assert "已跳过" in plain["body"] and "无需你处理" in plain["body"]
+    assert plain["open"] == f"/subscriptions/{subscription_id}"
+    assert "actions" not in plain and "category" not in plain
+    client.portal.call(inform)
+    time.sleep(0.3)
+    assert len(relay.messages) == 1
+    assert _data(client.get("/api/v1/system/notices")) == []

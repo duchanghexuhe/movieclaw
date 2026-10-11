@@ -147,8 +147,9 @@ data class SubscriptionView(
     val forecastPending: Boolean = false,
 )
 
+/** `PATCH /subscriptions/{id}/follow-future`：服务端字段名是 `enabled`（以前发 follow_future → 422） */
 @Serializable
-data class FollowFutureRequest(val followFuture: Boolean)
+data class FollowFutureRequest(val enabled: Boolean)
 
 /** POST /subscriptions/title-preview 请求 */
 @Serializable

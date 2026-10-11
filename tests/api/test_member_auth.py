@@ -643,6 +643,8 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/playback/files/{file_id}/disc"),
     ("GET", "/api/v1/playback/files/{file_id}/disc/{relative_path}"),
     ("GET", "/api/v1/playback/files/{file_id}/subtitles"),
+    # 预切片段（reels.md §8）：同原文件直出，只凭签名 token（按文件签发）
+    ("GET", "/api/v1/reels/clips/{file_id}/{start_ms}.mp4"),
     ("GET", "/api/v1/playback/files/{file_id}/fonts"),
     ("GET", "/api/v1/playback/files/{file_id}/fonts/{name}"),
     ("GET", "/api/v1/playback/files/{file_id}/trickplay"),
@@ -677,6 +679,8 @@ _MEMBER_ALLOWLIST = {
     ("DELETE", "/api/v1/search/history"),
     # 订阅：读 + 写（写受 allow_subscribe，默认开）；运维接口是管理员专属
     ("GET", "/api/v1/subscriptions"),
+    # 全局智能偏好只读供成员订阅时复用；修改偏好仍限管理员。
+    ("GET", "/api/v1/subscriptions/smart-profiles/{kind}"),
     ("GET", "/api/v1/subscriptions/today-arrivals"),
     # 「刚刚入库」：订阅可见边界同上（自己发起 + 自己关注），文件只列可见库里在位的
     ("GET", "/api/v1/subscriptions/recent-arrivals"),
@@ -691,11 +695,16 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/subscriptions/{subscription_id}/active-downloads"),
     ("PATCH", "/api/v1/subscriptions/{subscription_id}/tracking-state"),
     ("PATCH", "/api/v1/subscriptions/{subscription_id}/follow-future"),
+    # 集数提示的忽略与自动续订同口径：订阅能力 + 归属校验（路由内 assert_can_manage）
+    ("POST", "/api/v1/subscriptions/{subscription_id}/episode-hints/dismiss"),
     ("POST", "/api/v1/subscriptions/{subscription_id}/missing-resource-searches"),
     # 一轮洗版与「立即搜索」同口径：订阅能力 + 归属校验（路由内 assert_can_manage）
     ("POST", "/api/v1/subscriptions/{subscription_id}/upgrade-runs"),
+    # 等待操作还会按订阅归属与订阅能力校验。
+    ("POST", "/api/v1/subscriptions/{subscription_id}/wanted/{wanted_id}/smart-wait"),
     # App 推送（docs/design/cloud-push.md §7.3）：每个人只管自己的通知开关、设备状态、
     # 测试通知；App 登记只认这台设备自己的凭证（服务层判定，网页会话登记不了）
+    ("GET", "/api/v1/app/features"),
     ("GET", "/api/v1/push/me"),
     ("PUT", "/api/v1/push/me/preferences"),
     ("POST", "/api/v1/push/me/test"),
@@ -706,11 +715,21 @@ _MEMBER_ALLOWLIST = {
     ("DELETE", "/api/v1/push/me/registration"),
     # 推送配图：公开区（地址自带签名），成员自然可达
     ("GET", "/api/v1/push/images/{token}"),
+    # 使用提示（docs/design/tips.md）：只读写自己的事件计数与提示记录（按 owner_id 存）
+    ("GET", "/api/v1/tips/state"),
+    ("DELETE", "/api/v1/tips/state"),
+    ("POST", "/api/v1/tips/events/{event_id}"),
+    ("POST", "/api/v1/tips/{tip_id}/displays"),
+    ("POST", "/api/v1/tips/{tip_id}/invalidate"),
 }
 
 # 路径参数哑值（与 test_auth.py 的匿名守护测试保持一致）
 _PATH_DUMMIES = {
+    "{letter_id}": "1",  # 可靠事件死信
+    "{start_ms}": "0",  # 预切片段的起点
     "{task_key}": "library_reconcile",
+    "{event_id}": "x",
+    "{tip_id}": "x",
     "{site_id}": "mteam",
     "{history_id}": "1",
     "{backdrop_id}": "f" * 32,
@@ -729,11 +748,13 @@ _PATH_DUMMIES = {
     "{douban_id}": "26266893",
     "{collection_id}": "movie_top250",
     "{subscription_id}": "1",
+    "{wanted_id}": "1",
     "{rule_set_id}": "1",
     "{library_id}": "1",
     "{media_item_id}": "1",
     "{rule_id}": "1",
     "{entry_id}": "1",
+    "{key_id}": "1",
     "{file_id}": "1",
     "{device_id}": "no-such-device",
     "{user_code}": "MCLW-TEST",
@@ -750,6 +771,8 @@ _PATH_DUMMIES = {
     "{challenge_id}": "test-challenge",
     "{account_id}": "test-bot",
     "{channel}": "weixin",
+    "{channel_id}": "weixin",
+    "{binding_id}": "test-binding",
     "{endpoint_id}": "test-endpoint",
     "{member_id}": "1",
     "{job_id}": "job_test",

@@ -85,6 +85,8 @@ enum AppRoute: Hashable {
     /// 搜索页参数（对应 /search 的查询串）
     struct SearchQuery: Hashable {
         var q: String = ""
+        /// 同搜词：与 q 一起搜、结果按站点合并（详情页「搜索资源」带上英文名/原名，同 Web 的 also 参数）
+        var also: [String] = []
         /// media | torrents | library；nil 表示按权限取第一个可用分区
         var tab: String?
         var scope: String?
@@ -188,9 +190,10 @@ enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
     /// 成员能看到「个人信息」「设备」（自己的设备）与「通知」（自己收什么），其余分区仅超级管理员可见
     var memberVisible: Bool { self == .profile || self == .devices || self == .notifications }
 
-    /// App 不提供的分区：资源与下载的配置（订阅规则、资源站点、下载器、自动入库）只在网页端管理，
-    /// 降低审核按条款 5.2.3（便利文件共享）拒审的风险（2026-09-29 用户决定只维护这一个版本）。
-    /// 「概览」同理：它的主体是订阅链路体检（站点 / 下载器是否配齐），一并交给网页端。
+    /// App 不提供的分区：资源与下载的配置（订阅规则、资源站点、下载器、自动入库）是部署时一次性的
+    /// 服务器配置，表单大、要拖拽排序和多步联调，与 Android 版一样只在网页端管理；资源搜索、订阅、
+    /// 下载任务等日常功能 App 里照常提供。「概览」同理：它的主体是订阅链路体检（站点 / 下载器是否配齐），
+    /// 一并交给网页端。
     /// 「App 推送」（推送通道与自建中继）表单多、低频，也只在网页端管理（docs/design/cloud-push.md §1）。
     /// 设置首页不列出；其他页面写死的跳转与深链照常解析，分区页显示「请在网页端管理」
     var availableInApp: Bool {

@@ -225,6 +225,13 @@ class LibraryFile(TimestampMixin, table=True):
     video_codec: str | None = Field(default=None, description="视频编码：hevc/h264/av1/…")
     hdr: str | None = Field(default=None, description="HDR 格式：HDR10/HLG/…；SDR 为 NULL")
     bit_depth: int | None = Field(default=None, description="位深：8/10/12")
+    # 杜比视界：播放决策要按 profile 分（电视能解哪个 profile 就直放；P8 / P7 带兼容基础层的可以只放
+    # HDR10 基础层；P5 的基础层是 IPT-PQ-c2，解不了杜比视界只能服务端色调映射）
+    dv_profile: int | None = Field(default=None, description="杜比视界 profile；非杜比视界为 NULL")
+    dv_bl_compatible: bool | None = Field(
+        default=None,
+        description="杜比视界基础层能否直接解读（HDR10 / SDR / HLG）；非杜比视界为 NULL",
+    )
     duration_seconds: int | None = Field(default=None, description="时长（秒）")
     bit_rate: int | None = Field(default=None, description="总码率（bps）")
     frame_rate: float | None = Field(default=None, description="视频帧率（fps）")
@@ -306,13 +313,32 @@ class LibraryFile(TimestampMixin, table=True):
     release_group: str | None = Field(default=None, description="发布组")
     # 入库时源文件的原始文件名（不含扩展名），命名模板 {release_name} 的取值。
     # 整理改名后当前文件名就不是它了，所以必须在入库现场落下来；存量扫描
-    # 发现的文件不知道原名，为 NULL
+    # 不知道入库前的原名，取发现时的文件名。旧版本扫描的行为 NULL，整理时
+    # 以当前文件名补上
     release_name: str | None = Field(default=None, description="入库时的原始文件名（不含扩展名）")
 
     # -- 来源与追溯 ----------------------------------------------------------
     source: str = Field(index=True, description="imported（入库管线）/ scanned（存量扫描）")
     site_id: str | None = Field(default=None, description="入库来源站点；scanned 为 NULL")
     torrent_id: str | None = Field(default=None, description="入库来源种子；scanned 为 NULL")
+    # 下载器任务（docs/design/plugin-phase2a.md §5.1）：「删了片子顺手删种子」要知道文件来自哪个
+    # 下载器任务。入库时从订阅下载记录 / 手动下载意图取，原地下载的扫描按下载记录的保存路径反查；
+    # 再次扫描同一路径时不被空值覆盖。NULL = 不知道（外部放进来的文件、上线前的旧行）
+    info_hash: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True, index=True),
+        description="来源种子的 infohash（小写）；NULL=未知",
+    )
+    downloader_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("downloader_client.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+        description="承载来源种子的下载器；NULL=未知或下载器已删除",
+    )
     # 同一次监听入库或存量扫描新发现的文件共享批次号。「最近添加」据此只展示
     # 让条目本次置顶的季集变化，而不是把条目名下全部历史库存误写成新增内容。
     # NULL 是迁移前旧台账；旧应用回退后新增的行也自然落 NULL，由界面退回时间。
@@ -357,14 +383,14 @@ class LibraryFile(TimestampMixin, table=True):
     trashed_at: datetime | None = Field(
         default=None, description="进入待回收的时间；仅 state=trashed 时有意义"
     )
-    # NULL 且 state=trashed = 做种保护形态：文件仍在原位（file_path 未变）
+    # NULL 且 state=trashed = 原地待回收：原盘目录或移动失败，文件仍在原位（file_path 未变）
     trash_original_path: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
         description="移入回收站前的原路径（恢复用）；NULL=文件未被移动（原地待回收）",
     )
     purge_after: datetime | None = Field(
-        default=None, description="预计自动删除时间；NULL=不自动删（做种保护/等联动）"
+        default=None, description="预计自动删除时间；NULL=不自动删（2026-08-17 之前的旧数据）"
     )
     trash_context: dict | None = Field(
         default=None,

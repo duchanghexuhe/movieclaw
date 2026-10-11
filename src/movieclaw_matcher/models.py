@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from movieclaw_enrich.models import TorrentAttrs
 from movieclaw_enrich.vocab import PLATFORM_IDS
@@ -500,6 +500,10 @@ class IdentityMatch:
     # 是否存在同名同年孪生条目等上下文，那些内核拿不到，交给消费侧
     # （docs/design/identity-confidence.md §5.2）
     id_conflict: str | None = None
+    # 包种子声明的总集数（"全 27 集" 的 27），只在整季/全集包上带。TMDB 少录
+    # 集数时，超出部分的占位单元没有播出日期、过不了发布时间上限，只能靠这个
+    # 声明判断包里有没有它（issue #640）
+    declared_total: int | None = None
 
 
 @dataclass(frozen=True)
@@ -543,6 +547,16 @@ class QualitySnapshot(BaseModel):
     video_codec: str | None = None  # 视频编码；probe 定族、名称定写法（见 build_snapshot）
     platforms: list[str] = Field(default_factory=list)  # 流媒体平台；名称来源
     bit_rate: int | None = None  # 实测码率（bps）；留证据供详情页展示，不参与档位
+    resolution_verified: bool = False
+    source_evidence: str | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_evidence(self, handler):
+        result = handler(self)
+        if not self.resolution_verified and self.source_evidence is None:
+            result.pop("resolution_verified", None)
+            result.pop("source_evidence", None)
+        return result
 
 
 @dataclass(frozen=True)

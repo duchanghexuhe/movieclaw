@@ -1,3 +1,21 @@
+app features list
+app features set
+app plugins callbacks list
+app plugins callbacks revoke
+app plugins callbacks rotate
+app plugins dead-letters dismiss
+app plugins dead-letters replay
+app plugins list
+app plugins packages approve
+app plugins packages discard
+app plugins packages list
+app plugins packages rollback
+app plugins packages uninstall
+app plugins packages upload
+app plugins safe-mode exit
+app plugins settings show
+app plugins settings update
+app plugins show
 app port set
 app restart
 app set
@@ -31,19 +49,14 @@ auth bootstrap status
 auth me
 auth password update
 auth profile update
-channels im accounts list
-channels im accounts unbind
-channels im bindings start
-channels im bindings status
-channels im feishu bind
+channels accounts unbind
+channels bindings input
+channels bindings start
+channels bindings status
 channels im push config get
 channels im push config update
 channels im push test
-channels weixin accounts list
-channels weixin accounts unbind
-channels weixin bindings start
-channels weixin bindings status
-channels weixin bindings verify
+channels list
 collection create
 collection delete
 collection get
@@ -67,6 +80,7 @@ discover region show
 dl add
 dl default set
 dl delete
+dl file-sources list
 dl limits
 dl limits set
 dl list
@@ -79,6 +93,7 @@ dl target-prefs list
 dl tasks
 dl torrent delete
 dl torrent replace
+dl types list
 dl update
 dl verify
 extension cookies push
@@ -125,6 +140,7 @@ library identification restore-files
 library items annotate-media-source
 library items delete
 library items delete-file
+library items delete-preview
 library items facets
 library items get
 library items get-transfer-status
@@ -137,6 +153,7 @@ library items purge-file
 library items refresh-metadata
 library items regenerate-chapter-images
 library items reidentify
+library items relations
 library items relax
 library items restore-file
 library items share create
@@ -253,8 +270,10 @@ subscriptions check-automation-readiness
 subscriptions cleanup-seasons
 subscriptions create
 subscriptions delete
+subscriptions dismiss-episode-hint
 subscriptions download-selected-torrent
 subscriptions get
+subscriptions get-smart-profile
 subscriptions list
 subscriptions list-active-downloads
 subscriptions list-activities
@@ -262,10 +281,12 @@ subscriptions list-today-arrivals
 subscriptions preview-download-routing
 subscriptions preview-removal
 subscriptions search-missing-resources
+subscriptions save-smart-profile
 subscriptions set-follow-future
 subscriptions set-tracking-state
 subscriptions unsubscribe
 subscriptions update
+subscriptions update-smart-wait
 subscriptions upgrade-run
 transcode config set
 transcode config show

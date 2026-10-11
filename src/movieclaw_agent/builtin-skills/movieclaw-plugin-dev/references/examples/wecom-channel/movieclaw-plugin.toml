@@ -1,0 +1,16 @@
+[plugin]
+id = "wecom-channel"
+title = "企业微信自建应用"
+version = "1.0.0"
+entry = "wecom_channel"
+runtime = "process"
+sdk = "^1.0"
+description = "用企业微信自建应用和 MovieClaw 对话、接收推送"
+
+[requires]
+"im-channels" = "^1.1"
+
+[permissions]
+operations = []
+network = true
+callbacks = ["webhook"]

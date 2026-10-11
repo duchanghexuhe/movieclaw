@@ -1421,7 +1421,7 @@ export interface LibraryItemFile {
   missing: boolean;
   /** 生命周期：in_place 在位 / missing 缺失 / trashed 待回收 */
   state: "in_place" | "missing" | "trashed";
-  /** 待回收的预计自动清理时间；null 且 trashed = 做种保护，不自动删 */
+  /** 待回收的预计自动清理时间；null = 不自动删（2026-08-17 之前的旧数据） */
   purge_after: string | null;
   /** 待回收原因（中文整句，含触发方） */
   trash_note: string | null;
@@ -1525,6 +1525,8 @@ export interface LibraryItemDetail {
   douban_id: string | null;
   title: string;
   original_title: string;
+  /** 国际英文名：「搜索资源」与中文名、原名一起搜；老服务端没有该字段 */
+  english_title?: string | null;
   year: number | null;
   poster_url: string | null;
   backdrop_url: string | null;
@@ -1587,6 +1589,9 @@ export interface LibraryEpisode {
 export interface SeasonEpisodes {
   season_number: number;
   episodes: LibraryEpisode[];
+  /** 本季接着看的那一集（同首页「接下来继续」规则），分集区按它锁定集段；本季没播放过、
+   *  分享页（访客没有观看记录）为 null */
+  resume_episode: number | null;
 }
 
 /** 剧集条目一季的分集清单（分集横滚区数据源）。 */
@@ -1627,6 +1632,57 @@ export interface ItemDeleteResult {
   rows_deleted: number;
   freed_bytes: number;
   errors: string[];
+  /** 勾选的删除选项各建了一个后续任务，删除提交后执行（旧服务端没有这个字段） */
+  follow_ups?: DeleteFollowUp[];
+}
+
+export interface DeleteFollowUp {
+  option: string;
+  label: string;
+  job_id: string;
+}
+
+export interface DeletePreviewLine {
+  text: string;
+  tone: "info" | "warn" | "danger";
+}
+
+/** 删除弹窗里的附加选项（别的模块登记的删除参与方，如下载模块的「同时删除下载任务和源文件」）；默认一律不勾 */
+export interface DeleteOption {
+  key: string;
+  label: string;
+  help: string;
+  available: boolean;
+  reason: string | null;
+  lines: DeletePreviewLine[];
+}
+
+/** 删除前预览：媒体库自己的计划 + 附加选项（docs/design/library-boundary.md §3） */
+export interface ItemDeletePreview {
+  whole_item: boolean;
+  plan: ItemDeleteResult;
+  /** 要删的文件里与别处是同一份数据（硬链接）的字节数：只删库文件不会释放这部分空间 */
+  linked_bytes: number;
+  options: DeleteOption[];
+}
+
+export function getDeletePreview(
+  libraryId: number,
+  mediaItemId: number,
+  fileId?: number,
+): Promise<ItemDeletePreview> {
+  const query = fileId != null ? `?file_id=${fileId}` : "";
+  return unwrap(
+    request<ApiEnvelope<ItemDeletePreview>>(
+      `/libraries/${libraryId}/items/${mediaItemId}/delete-preview${query}`,
+    ),
+  );
+}
+
+function optionsQuery(options: string[] | undefined): string {
+  return options && options.length > 0
+    ? `?options=${encodeURIComponent(options.join(","))}`
+    : "";
 }
 
 /** 条目详情：基本信息 + NFO 本地刮削元数据 + 逐文件真实介质规格。 */
@@ -1693,11 +1749,13 @@ export function deleteExternalSubtitle(
 export function deleteLibraryItem(
   libraryId: number,
   mediaItemId: number,
+  options?: string[],
 ): Promise<ItemDeleteResult> {
   return unwrap(
-    request<ApiEnvelope<ItemDeleteResult>>(`/libraries/${libraryId}/items/${mediaItemId}`, {
-      method: "DELETE",
-    }),
+    request<ApiEnvelope<ItemDeleteResult>>(
+      `/libraries/${libraryId}/items/${mediaItemId}${optionsQuery(options)}`,
+      { method: "DELETE" },
+    ),
   );
 }
 
@@ -1720,7 +1778,7 @@ export function restoreLibraryFile(
   );
 }
 
-/** 立即清理待回收的文件（真删磁盘；做种保护形态需先向用户确认断种风险）。 */
+/** 立即清理待回收的文件（真删磁盘；原地待回收的需先向用户确认断种风险）。 */
 export function purgeLibraryFile(
   libraryId: number,
   mediaItemId: number,
@@ -1738,10 +1796,11 @@ export function deleteLibraryFile(
   libraryId: number,
   mediaItemId: number,
   fileId: number,
+  options?: string[],
 ): Promise<ItemDeleteResult> {
   return unwrap(
     request<ApiEnvelope<ItemDeleteResult>>(
-      `/libraries/${libraryId}/items/${mediaItemId}/files/${fileId}`,
+      `/libraries/${libraryId}/items/${mediaItemId}/files/${fileId}${optionsQuery(options)}`,
       { method: "DELETE" },
     ),
   );

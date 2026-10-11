@@ -9,6 +9,7 @@ from pydantic import Field
 
 from movieclaw_api.schemas.base import BaseModel
 from movieclaw_api.schemas.library import LibraryItemView
+from movieclaw_api.schemas.reels import ReelClipProgressView
 from movieclaw_media.models import MediaKind
 
 
@@ -374,6 +375,15 @@ class ClientCapabilityIn(BaseModel):
     #: 能经目录取流接口读原盘目录：多剪辑原盘给档 0 目录直推（会话的 ``stream_url``
     #: 是目录清单地址，决策带主播放列表名），NAS 不起 ffmpeg
     disc_folder: bool = False
+    #: 能在本机切换内封音轨（Android TV 的 ExoPlayer）：直出原文件时自己选中计划里的那条，
+    #: 服务端不再为「选中的不是默认轨」重封装。浏览器只放默认轨，不申报
+    local_tracks: bool = False
+    #: 能完整呈现的杜比视界 profile（本机杜比视界解码器支持、屏幕支持杜比视界）：原样直通。
+    #: 老客户端不带 = 空 = 杜比视界一律转码（与原来相同）
+    dolby_vision_profiles: list[int] = []
+    #: 解不了杜比视界时能退回基础层播放的 profile（Android TV 的 ExoPlayer 对 P8 改用 HEVC
+    #: 解码器）：基础层兼容且屏幕能直出 HDR 时直通
+    dolby_vision_base_layer_profiles: list[int] = []
 
 
 class PlaybackDecideRequest(BaseModel):
@@ -818,6 +828,12 @@ class PlaybackPolicyView(BaseModel):
     trickplay_enabled: bool = True
     #: 转码产物是否保留供续播、重看复用（§B）。关闭即会话结束即删。
     transcode_cache_enabled: bool = True
+    #: 片段预切（docs/design/reels.md §8）：预告与刷片放预先切好的 1080p 小文件。
+    #: 声明成可空：生成的 Swift / Kotlin 模型把非空字段当必有，新 App 连老服务器（没有这一项）
+    #: 时整个策略解码失败，连软件转码的同意弹窗都会坏
+    reel_clips_enabled: bool | None = False
+    #: 片段预切进度（开关开着才有）：电影与剧集一共几部、切好了几部、队列状态
+    reel_clips_progress: ReelClipProgressView | None = None
     #: 实测结果而非配置项——用户改不了自己有没有显卡。前端据此说明
     #: 「无可用硬件加速，HDR 片源需要软件转码」这类结论。
     hardware_available: bool = False
@@ -832,6 +848,7 @@ class PlaybackPolicyPayload(BaseModel):
     software_transcode_enabled: bool | None = None
     trickplay_enabled: bool | None = None
     transcode_cache_enabled: bool | None = None
+    reel_clips_enabled: bool | None = None
 
 
 class PlaybackFontsView(BaseModel):

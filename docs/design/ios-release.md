@@ -1,7 +1,7 @@
 # iOS App 打包与上架
 
 > 2026-09-28 开发者账号开通后整理。首发路线：TestFlight 内部测试 → TestFlight 对外公开链接 → App Store。
-> 首版只上 iPhone；只有一个发行版本，App 里不提供资源站点 / 下载器 / 自动入库 / 订阅规则的配置（在网页端管理）。
+> 首版只上 iPhone；只有一个发行版本，所有用户功能相同。资源站点 / 下载器 / 自动入库 / 订阅规则这类服务器配置在网页端管理（与 Android 版一致）。
 > **要亲手做的事按顺序列在 [ios-release-checklist.md](ios-release-checklist.md)（含新机器搭环境）。**
 > 相关：App 设计 [ios-app.md](ios-app.md)，Mac 转码器的签名公证见 `macos/MovieClawTranscoder/README.md`。
 
@@ -9,18 +9,15 @@
 
 同一个构建既进内部 / 对外 TestFlight，也用于提审和上架；开发调试版与发布版功能相同（只差 `#if DEBUG` 的调试开关）。
 
-App 里**不提供**「资源与下载」这组配置（订阅规则、资源站点、下载器、自动入库，见
-`SettingsSection.availableInApp`），也不提供设置「概览」（主体是站点 / 下载器链路体检，订阅页的链路警示钮
-一并去掉，2026-09-29 用户决定）：设置首页不列出；其他页面里去这几项的跳转与深链落到
-「请在网页端管理」页，给出直达网页对应分区的按钮。种子搜索、订阅操作、下载任务等其余功能照常。
+App 里不提供「资源与下载」这组服务器配置（订阅规则、资源站点、下载器、自动入库，见
+`SettingsSection.availableInApp`）和设置「概览」（站点 / 下载器链路体检）：它们是部署时一次性的
+配置，表单大、要拖拽排序和多步联调，与 Android 版一样只在网页端管理。设置首页不列出；其他页面里
+去这几项的跳转与深链落到「请在网页端管理」页，给出直达网页对应分区的按钮。资源搜索、订阅、
+下载任务、刷流等日常功能 App 里都有。
 
-为什么这样划：审核条款 5.2.3（不得便利非法文件共享）是这类 App 最常见的拒审点，
-站点、Cookie、下载器接入是最显眼的一块。如果审核仍以 5.2.3 拒审，按审核意见扩大不提供的范围。
-
-历史：2026-09-28 起曾分「完整版 / 商店版」两个编译版本（`MC_STORE` 与 `release.sh --store`），
-2026-09-29 用户决定只维护一个版本，统一按原商店版的范围，编译开关与 App 内这几页配置代码一并删除
-（需要时从 git 历史找回）。**不要**用远程开关在过审后再打开隐藏功能：违反审核条款 2.3.1，
-处罚可到终止开发者账号。
+所有用户拿到的是同一个构建、同样的功能：没有远程开关，不区分审核员与普通用户。**不要**用远程开关
+让某些功能只在过审后出现——违反审核条款 2.3.1，处罚可到终止开发者账号。提审时如实介绍全部功能，
+并给审核员一个能用全部功能的账号（§4）。
 
 ## 2. 一次性准备（需要账号持有人在网页上操作）
 
@@ -98,37 +95,109 @@ TestFlight 的用户：用 AltStore / SideStore / Sideloadly 以自己的 Apple 
 
 对外 TestFlight 首个构建要过一次 Beta 审核，上架要过正式审核，两者都要：
 
-- **演示服务器与账号**：App 离开服务器无法使用，审核员必须能登录。准备一台公网可达、
-  HTTPS 的演示服务器（不要用自己的真实 NAS），只放开放授权的片源（Big Buck Bunny、
-  Sintel、Tears of Steel 等），不接入任何资源站点和下载器；建一个普通成员账号给审核员。
-  服务器地址与账号密码填在「App 审核信息 → 登录信息」与备注里。
-- **审核备注模板**（2026-09-29 首次 Beta 审核实际提交的版本；账号密码填在「登录信息」栏，不写进备注）：
+- **演示服务器与账号**：App 离开服务器无法使用，审核员必须能登录**并把每个功能真的用一遍**。
+  用演示站 `https://demo.movieclaw.io`（`feat/demo` 分支，部署见该分支的 `demo/README.md`）：
+  媒体库只有开放授权的影片，另有一个只收开放授权影片的演示资源站和一个模拟下载器，搜索、下载、
+  订阅、刷流、自动入库都能端到端跑通，不产生任何真实的 P2P 流量。
+  审核员用部署环境里的**审核账号**（超管，不是登录页公布的公开只读账号），用户名密码填在
+  「App 审核信息 → 登录信息」，不写进备注。提审前用审核账号在 iPhone 上按 `demo/README.md`
+  「App Store 审核」的清单走一遍；审核期间停掉演示站的每日还原，AI 助手接好真实模型。
+- **审核备注模板**（「App 审核信息 → 备注」，TestFlight 是「测试信息 → Beta 版 App 审核信息 → 备注」；
+  纯文本、**上限 4000 字符**，粘贴前量一下，见下文；审核员看英文，界面是简体中文，按钮名后面括注英文）。
+  **iPhone、Apple TV、Mac 三端是同一条 App 记录，审核账号、备注和「Beta 版 App 描述」三端共用**：备注里要写清
+  每一端有什么、没有什么，Apple TV 与 Mac 只看片，不能让审核员照着 iPhone 的功能去电视或 Mac 上找
+  （2026-10-05 Mac 版就是因为测试说明写了它没有的 AI 助手与订阅被拒）。各端更细的测试步骤写在每个构建自己的
+  「测试内容」（What to Test）里，只写那一端真有的功能：
 
-  > MovieClaw is a client for a self-hosted media server (source code: github.com/movieclaw/MovieClaw),
-  > similar to Jellyfin / Plex / Infuse clients. Users connect to a server they deploy themselves;
-  > the app itself hosts or provides no content.
-  >
-  > How to sign in: on first launch tap "连接服务器" (Connect to server), enter the server address
-  > https://…, then the username and password above.
-  >
-  > The demo server only contains open-licensed films (Big Buck Bunny, Sintel, Tears of Steel, Coffee Run).
-  >
-  > AI assistant: the "Agent" chat (Me tab → New conversation) answers questions about the user's own
-  > library and helps find titles. It uses a language model configured by the server owner; on the demo
-  > server it is already set up for the reviewer account.
-  >
-  > Local networking / arbitrary loads: most users run the server on their home LAN over plain HTTP
-  > (e.g. http://192.168.1.10:3000), so the app needs to reach LAN addresses without TLS.
-  > Background audio: used to continue playback and for Picture in Picture.
+```text
+MovieClaw is the client for MovieClaw, a self-hosted media server that people install on their own hardware, such as a NAS. Source code: https://github.com/movieclaw/MovieClaw. One App Store record covers iPhone, Apple TV and Mac. The interface is in Simplified Chinese; English translations of labels are in parentheses.
 
-  写备注的几条经验：
-  - 首屏是「连接服务器」而不是账号密码框，**不写明先填服务器地址，审核员会卡住**。
+PREVIOUS REVIEWS (5.6)
+We are sorry. Last time we mistakenly supplied the read-only visitor account of our public demo site, and our Mac test notes mentioned an AI assistant and subscriptions that the Mac app does not have. Both were our mistakes, never an attempt to hide anything; nothing in any of the apps is hidden or remotely switched. This time the review account has full access, and the notes below say exactly what each app does.
+
+CONTENT AND RESPONSIBILITY
+We do not provide, host or sell any movies, TV shows or torrent files. Like Prowlarr, the server software only includes integration rules for talking to sites, with no content, no accounts and no active source; users add sites they are members of with their own accounts and are responsible for what they download. The apps only talk to the user's own server: they stream video from it, transfer no media or torrent files to the device, and contain no peer-to-peer code.
+
+SIGN IN (all platforms)
+Choose "连接服务器" (Connect to server), enter https://demo.movieclaw.io, choose "连接" (Connect), then sign in with the review account in Sign-In Information (full administrator access).
+
+DEMO SERVER
+The library holds only Creative Commons Blender films. A demo resource site lists only CC-licensed Blender films (Elephants Dream, Charge and Wing It! are not in the library yet) and a demo download client simulates transfers; no peer-to-peer traffic happens. Seeding figures and household playback in Activity are simulated.
+
+IPHONE
+1. Play: "媒体库" (Library), open a film, tap play.
+2. Download: magnifier at top right, search "Elephants", "站点资源" (Site results), tap the result, "下载" (Download), "下载到「电影」" (Download to Movies). It shows in "活动" (Activity), then in Library about a minute later.
+3. Subscribe: search "Charge", open it under "影视" (Titles), "订阅追踪" (Subscribe), "确认订阅" (Confirm). Within minutes it is downloaded and shows as completed in "订阅" (Subscriptions).
+4. Seeding: "活动" (Activity) → "刷流做种" (Seeding).
+5. AI assistant: "我的" (Me) → "新会话" (New session). Before the first message the app explains that messages and looked-up library data go from the user's server to the AI provider its owner configured, and asks for consent.
+6. "我的 → 服务器设置" (Me → Server settings): members, devices, notifications, playback. One-time setup (download sources, download clients, import rules) is in the server's web console on every platform: sign in at https://demo.movieclaw.io in Safari with the review account, not the public visitor accounts listed there. It is locked on the demo.
+7. Accounts: no public sign-up; the server owner creates and deletes accounts in Server settings → "成员" (Members). Optional MovieClaw Cloud (Server settings → MovieClaw Cloud) creates an account on our website; that page links to "管理或删除 MovieClaw 账号" (Manage or delete account).
+
+APPLE TV AND MAC
+These apps are for watching: browse and search the library, play, mark watched, add favourites. They have no resource search, downloads, subscriptions, seeding, AI assistant or settings, and contain no screens for them; the server is managed from iPhone or the web console. Apple TV sidebar: "搜索" (Search), "首页" (Home). Mac sidebar: "搜索" (Search), "首页" (Home), "我的收藏" (Favorites) and each library.
+
+TECHNICAL
+Arbitrary loads: home servers often use plain HTTP on the LAN. Background audio (iPhone): playback and Picture in Picture.
+```
+
+- **回复审核（Resolution Center）**：被拒后重新提交时，在拒审消息下回复。上次是 5.6，用下面这段；
+  以后被别的条款拒，照这个结构写：先说明原因，再说改了什么、去哪里看。
+
+```text
+Hello, and thank you for reviewing MovieClaw.
+
+We are sorry for the confusion in the previous review. It was a mistake on our side, not an attempt to hide anything. For that review we supplied the shared visitor account of our public demo website. Because its password is published on the website for anyone to try, that account is read-only on the server. So when you tried to search, download or subscribe, the demo server refused with messages such as "演示站不会真的订阅和下载" ("the demo site does not actually subscribe or download"). Those refusals came from that public account on our demo server, not from the app; the features were present in the build you reviewed.
+
+We never intended to conceal any functionality from App Review. The app has no hidden, dormant or remotely enabled features and does not detect reviewers; every user gets the same build and the same features.
+
+To correct our mistake, we now provide a dedicated review account with full administrator access (see Sign-In Information) on a demo server where search, download, subscription, seeding and the AI assistant all work end to end, and the review notes walk through each feature step by step.
+
+We do not provide, host or sell any content. MovieClaw is software that users run on their own hardware. Like Prowlarr, it only includes integration rules for talking to sites, with no content, no accounts and no active source; a site is used only after users add one they are a member of with their own account. The demo server contains only Creative Commons Blender films, and its downloads are simulated without any peer-to-peer traffic.
+
+If anything is unclear, we would be glad to explain on a call.
+```
+
+  写备注和回复的几条经验：
+  - **字数**：「备注」栏上限 4000，超了粘不进去。中文按钮名在 UTF-8 里每个占 3 字节，为防按字节计，
+    字符数和 UTF-8 字节数都控制在 4000 以内。改完在仓库根目录量一下（第一个代码块是备注，
+    第二个是回复审核；回复没有这个限制，但也别太长）：
+
+    ```bash
+    python3 - <<'EOF'
+    import re
+    s = open("docs/design/ios-release.md", encoding="utf-8").read()
+    sec = s[s.index("## 4. "):s.index("## 5. ")]
+    for b in re.findall(r"^```text\n(.*?)\n```$", sec, flags=re.S | re.M):
+        print(len(b), "字符,", len(b.encode("utf-8")), "字节")
+    EOF
+    ```
+
+  - **纯文本**：备注和回复都不渲染 Markdown，`**加粗**` 会原样显示成星号，小标题用大写英文。
+  - **每句话都要经得起对照源码**：备注里附了源码链接，审核员可能去翻。服务端自带各站点的接入规则
+    （`sites/configs/`，不含内容和账号），所以不笼统写「没有任何资源来源」，而是写清「只有接入规则、
+    不含内容与账号、默认不启用、用户用自己的账号添加」。App、演示站、文档里的说法要一致。
+  - **首屏**是「连接服务器」而不是账号密码框，**不写明先填服务器地址，审核员会卡住**。
+  - **按钮名照抄界面**：备注里的每个中文按钮名都要和 App 当前文字一致，界面改了要同步改备注；
+    提审前用审核账号按备注逐步点一遍。
+  - **「PREVIOUS REVIEWS (5.6)」一段只在回应这次拒审时保留**，过审后的提交删掉，省下的字数留给新功能。
+  - **演示用的片只能用一次**：Elephants Dream、Charge 被审核员下载 / 订阅后就进库了。重新提交前
+    用 `reset.sh restore` 还原演示站，还原后要重新用审核账号接入 AI 模型（模型配置不在快照里）。
+  - **审核期间不改审核账号密码、不重启演示站换数据**，否则审核员登录会失效；审核可能持续几天。
   - 用「source code」而不是「open source」：本项目许可证带非商业条件，严格说是源码公开，
     中文描述同理写「源码完全公开」。
-  - AI assistant 那段只在审核员账号确实能对话时保留；描述里提到的功能审核员都可能去点。
-
-- **截图**：6.9 英寸 iPhone（1320×2868 或 1290×2796）至少 3 张，用演示服务器的开放授权内容截，
-  不要出现真实影片海报以外的版权敏感画面、种子名或站点名。
+  - 「Content and responsibility」只讲事实，不和别的 App 比较对错，不写「别人也这样所以我们也行」。
+- **App 审核信息里的联系人**：电话、邮箱要能当天联系上；审核员有疑问会先打电话，接不到容易直接拒。
+- **描述、关键词与截图**：
+  - 描述里如实提到资源搜索、下载与订阅（管理用户自己服务器上的下载），功能与描述一致（2.3.1）；
+  - 描述、关键词、截图里不出现具体资源站点名、「免费看片」「种子下载」之类的字眼（2.3.7、5.2.3）；
+  - 截图用演示服务器的开放授权内容截，搜索、下载、订阅的画面也用演示资源站里的开放授权影片；
+    「发现」页的商业影片海报不要出现在截图里（5.2.2）。
+  - 6.9 英寸 iPhone（1320×2868 或 1290×2796）至少 3 张。
+- **年龄分级与隐私标签**：
+  - 年龄分级：App 播放与显示的内容来自用户自己的服务器，开发者无法控制，问卷里涉及「不受限内容」
+    的项如实勾选；
+  - 隐私标签与隐私政策一致：App 本身不收集数据；连接 MovieClaw Cloud 后推送会经官方中继，
+    相关项按实际勾选。
 - **出口合规**：Info.plist 已声明 `ITSAppUsesNonExemptEncryption = NO`，上传不再追问。
 
 ## 5. 已知风险与首次上传要核对的
@@ -148,7 +217,9 @@ TestFlight 的用户：用 AltStore / SideStore / Sideloadly 以自己的 Apple 
 - **调试开关只在调试版**：`-mc…` 启动参数（真机实验台、故障注入、强制通路）都在 `#if DEBUG` 里，
   发布构建不含；提审前不必额外清理。
 - **TMDB 署名**：关于页已注明「本产品使用 TMDB API，但未经 TMDB 认可或认证」。
-- **5.2.3**：见 §1。若被拒，审核意见会点名具体功能，据此扩大 App 内不提供的范围。
+- **5.2.3（不得便利非法文件共享）**：App 有资源搜索、下载与订阅（遥控用户自己的服务器），这是这类
+  App 最常被追问的条款。应对：备注里讲清内容来源与责任归属（§4），演示站只放开放授权影片、下载与
+  做种都是模拟的。若仍被拒，在 Resolution Center 按审核意见逐条说明，必要时申请电话沟通。
 - **最低系统 iOS 26**：只有 iOS 26 及以上的 iPhone 能在商店里看到它。
 - **CI 的 Xcode 比本机旧**：GitHub macos-26 runner 目前最高 Xcode 26.x，本机开发常用更新的版本。
   新 Xcode 能推断通过的写法在旧版上会编译失败甚至让编译器崩溃（v0.28.0 发版因此缺过 IPA）。

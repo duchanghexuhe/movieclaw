@@ -42,11 +42,11 @@ from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.services.library.origin import derive_origins, origin_of
+from movieclaw_api.services.library import acquisition
+from movieclaw_api.services.library.origin import origin_of
 from movieclaw_api.services.library.recycle import recycle_file
-from movieclaw_db.models import FileState, LibraryFile, MediaItem, RuleSet, Subscription, utcnow
+from movieclaw_db.models import FileState, LibraryFile, MediaItem, utcnow
 from movieclaw_db.models.library import Library
-from movieclaw_db.models.subscription import DownloadAttemptStatus, SubscriptionDownloadAttempt
 from movieclaw_matcher.decision import compare_ladder, ladder_vector
 from movieclaw_matcher.models import QualitySnapshot, RuleSetSpec
 
@@ -60,14 +60,6 @@ REASON_DUPLICATE = "duplicate_cleanup"  # trash_context.reason 词表新词：�
 
 # 同内容副本的时长容差：与扫描改名归并（scan._try_relink）同一指纹
 _DURATION_TOLERANCE = 2
-# 洗版在途的投递状态（与 upgrade.run_upgrade 的 in_flight 口径一致）
-_IN_FLIGHT = (
-    DownloadAttemptStatus.ACTIVE,
-    DownloadAttemptStatus.REPLACEMENT_PENDING,
-    DownloadAttemptStatus.TRIAL,
-    DownloadAttemptStatus.CLEANUP_PENDING,
-    DownloadAttemptStatus.COMPLETED,
-)
 # 整理器的多版本退让名：``片名 (2020) - 1080p.mkv``——占着标准名的那个更像"正主"
 _VERSION_SUFFIX = re.compile(
     r" - (?:\d{3,4}p|V\d+|WEB-?DL|WEBRip|Blu-?ray|BluRay|HDTV|Remux|Disc)$", re.I
@@ -290,7 +282,7 @@ def _snapshots_many(rows: list[LibraryFile]) -> dict[int, QualitySnapshot]:
     扫描是几千次：放在循环上就是几十秒的独占。只读已加载的行属性、不碰
     session，所以换线程是安全的。
     """
-    from movieclaw_api.services.subscription.upgrade import snapshot_from_file
+    from movieclaw_api.services.library.quality import snapshot_from_file
 
     return {r.id or -1: snapshot_from_file(r, None) for r in rows}
 
@@ -425,50 +417,20 @@ def fold_seasons(units: list[DupUnit], is_tv: bool) -> list[DupSeason]:
 async def _rule_specs(
     session: AsyncSession, item_ids: set[int]
 ) -> dict[int, tuple[RuleSetSpec, bool]]:
-    """{media_item_id: (阶梯 spec, 是否「保留共存」)}——只有订阅了的条目有。"""
+    """{media_item_id: (阶梯 spec, 是否「保留共存」)}——只有订阅了的条目有（获取领域给）。"""
     if not item_ids:
         return {}
-    rows = (
-        await session.execute(
-            select(Subscription.media_item_id, RuleSet.spec)
-            .join(RuleSet, RuleSet.id == Subscription.rule_set_id)  # type: ignore[arg-type]
-            .where(Subscription.media_item_id.in_(item_ids))  # type: ignore[union-attr]
-        )
-    ).all()
-    out: dict[int, tuple[RuleSetSpec, bool]] = {}
-    for item_id, spec_json in rows:
-        try:
-            spec = RuleSetSpec.model_validate(spec_json or {})
-        except ValueError:
-            spec = _NEUTRAL_SPEC
-        out[int(item_id)] = (spec, bool(spec.upgrade_keep_old))
-    return out
+    return await acquisition.current().item_rules(session, item_ids)
 
 
 async def _in_flight_units(session: AsyncSession, item_ids: set[int]) -> set[tuple[int, int, int]]:
-    """洗版验证在途的 (media_item_id, season, episode)：新版本刚入库、验证还没裁决。"""
+    """洗版验证在途的 (media_item_id, season, episode)：新版本刚入库、验证还没裁决。
+
+    获取领域给。
+    """
     if not item_ids:
         return set()
-    rows = (
-        await session.execute(
-            select(Subscription.media_item_id, SubscriptionDownloadAttempt.units)
-            .join(
-                Subscription,
-                Subscription.id == SubscriptionDownloadAttempt.subscription_id,  # type: ignore[arg-type]
-            )
-            .where(
-                Subscription.media_item_id.in_(item_ids),  # type: ignore[union-attr]
-                SubscriptionDownloadAttempt.purpose == "upgrade",
-                SubscriptionDownloadAttempt.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
-            )
-        )
-    ).all()
-    out: set[tuple[int, int, int]] = set()
-    for item_id, units in rows:
-        for u in units or []:
-            if isinstance(u, list) and len(u) == 2:
-                out.add((int(item_id), int(u[0]), int(u[1])))
-    return out
+    return await acquisition.current().units_in_upgrade(session, item_ids)
 
 
 def unparsed_tv_episode(kind: str | None, episode_number: int) -> bool:
@@ -582,7 +544,7 @@ async def detect_duplicates(
         stats |= await asyncio.to_thread(_stat_many, paths[start : start + _STAT_CHUNK])
         await _tick(report_progress, "fingerprint", "比对文件指纹", len(stats), len(paths))
     inode = {r.id or -1: stats.get(r.file_path) for r in flat}
-    origins = await derive_origins(session, flat)
+    origins = await acquisition.current().describe_origins(session, flat)
     # 「建议保留」要给每个文件跑一遍发布名解析（ONNX NER）。它是纯 CPU 的活，
     # 留在事件循环上会把整个 API 占死：万级台账实测占住 57 秒，期间健康探针
     # 全部超时、后台任务租约心跳续不上，扫描被判超时后又被接管重跑一遍。

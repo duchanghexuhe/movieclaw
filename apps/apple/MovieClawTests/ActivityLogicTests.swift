@@ -126,5 +126,31 @@ struct ActivityLogicTests {
             "payload": [:], "created_at": "", "updated_at": "",
         ])
         #expect(NoticeCenterView.href(cloud) == "/settings/cloud")
+        // 插件：带站内路径就去那里（插件包回滚 → 插件管理页），否则去内置插件诊断；外站地址不认
+        let rolledBack: API.NoticeView = decode([
+            "id": 4, "severity": "warning", "source": "plugin", "title": "t", "message": "m",
+            "payload": ["action_href": "/settings/plugins"], "created_at": "", "updated_at": "",
+        ])
+        #expect(NoticeCenterView.href(rolledBack) == "/settings/plugins")
+        let failed: API.NoticeView = decode([
+            "id": 5, "severity": "warning", "source": "plugin", "title": "t", "message": "m",
+            "payload": ["action_href": "//evil.example"], "created_at": "", "updated_at": "",
+        ])
+        #expect(NoticeCenterView.href(failed) == "/settings/plugins?tab=builtin")
+    }
+
+    /// 播放设备名：去「MovieClaw 」品牌前缀、设备名以客户端名打头时不重复（口径同 Web `deviceLabel`）
+    @Test func deviceLabel() {
+        #expect(WatchFormat.deviceLabel(client: "MovieClaw Web", deviceName: "Safari · iPhone") == "Web · Safari · iPhone")
+        #expect(WatchFormat.deviceLabel(client: "Infuse", deviceName: "Apple TV") == "Infuse · Apple TV")
+        #expect(WatchFormat.deviceLabel(client: "MovieClaw Apple TV", deviceName: "Apple TV · tvOS 27.0") == "Apple TV · tvOS 27.0")
+        #expect(WatchFormat.deviceLabel(client: "MovieClaw Android", deviceName: "Android 16") == "Android 16")
+        #expect(WatchFormat.deviceLabel(client: "MovieClaw iOS", deviceName: "iPhone · iOS 27.0") == "iPhone · iOS 27.0")
+        #expect(WatchFormat.deviceLabel(client: "MovieClaw Android", deviceName: "Pixel 9 · Android 16") == "Pixel 9 · Android 16")
+        #expect(WatchFormat.deviceLabel(client: "MovieClaw Android TV", deviceName: "BRAVIA 4K VH2 · Android 12")
+            == "Android TV · BRAVIA 4K VH2 · Android 12")
+        #expect(WatchFormat.deviceLabel(client: "MovieClaw Android", deviceName: "AndroidTV") == "Android · AndroidTV")
+        #expect(WatchFormat.deviceLabel(client: "", deviceName: "") == "未知设备")
+        #expect(WatchFormat.deviceLabel(client: "Infuse", deviceName: "") == "Infuse")
     }
 }

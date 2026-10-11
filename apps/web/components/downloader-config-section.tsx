@@ -18,7 +18,10 @@ import {
 } from "@/components/settings-ui";
 import {
   type ConfiguredDownloader,
+  BUILTIN_DOWNLOADER_TYPES,
   type DownloaderClientType,
+  type DownloaderTypeInfo,
+  listDownloaderTypes,
   type DownloaderLimits,
   type DownloaderPayload,
   type DownloaderStatus,
@@ -62,17 +65,78 @@ async function boostSitesOn(downloaderId: number): Promise<string[]> {
   }
 }
 
-/** 下载器类型 → 展示名 */
-const TYPE_LABEL: Record<DownloaderClientType, string> = {
-  qbittorrent: "qBittorrent",
-  transmission: "Transmission",
-};
+/**
+ * 可接入的下载器类型：由下载器插件登记（官方的 qBittorrent / Transmission，或第三方插件），
+ * 服务端给出名字、地址叫法与示例。整页共用一份，取一次。
+ */
+let typesCache: Promise<DownloaderTypeInfo[]> | null = null;
 
-/** 各类型的地址占位提示（qB 是 WebUI 地址，Tr 是 RPC 地址，端口不同） */
-const URL_PLACEHOLDER: Record<DownloaderClientType, string> = {
-  qbittorrent: "http://192.168.1.10:8080",
-  transmission: "http://192.168.1.10:9091",
-};
+function useDownloaderTypes(): DownloaderTypeInfo[] {
+  const [types, setTypes] = useState<DownloaderTypeInfo[]>(BUILTIN_DOWNLOADER_TYPES);
+  useEffect(() => {
+    let alive = true;
+    typesCache ??= listDownloaderTypes();
+    void typesCache.then((value) => {
+      if (alive) setTypes(value);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return types;
+}
+
+interface ConnectionField {
+  label: string;
+  placeholder?: string;
+  help?: string;
+}
+
+/**
+ * 表单里地址 / 用户名 / 密码三栏怎么画：以下载器插件声明的连接参数（connection）为准，
+ * 没声明（旧服务端）时退回 url_label / needs_username。不要的栏为 null。
+ */
+function connectionFields(info: DownloaderTypeInfo): {
+  url: ConnectionField;
+  username: ConnectionField | null;
+  password: ConnectionField | null;
+} {
+  const props = info.connection?.properties;
+  const required = new Set(info.connection?.required ?? ["url"]);
+  const label = (name: string, fallback: string) => {
+    const title = props?.[name]?.title || fallback;
+    return required.has(name) ? title : `${title}（可选）`;
+  };
+  if (!props) {
+    return {
+      url: { label: info.url_label, placeholder: info.url_placeholder, help: info.help },
+      username: info.needs_username ? { label: "用户名（可选）" } : null,
+      password: { label: "密码（可选）" },
+    };
+  }
+  return {
+    url: {
+      label: props.url?.title || info.url_label,
+      placeholder: props.url?.examples?.[0] ?? info.url_placeholder,
+      help: info.help || props.url?.description,
+    },
+    username: props.username ? { label: label("username", "用户名") } : null,
+    password: props.password ? { label: label("password", "密码") } : null,
+  };
+}
+
+function typeInfo(types: DownloaderTypeInfo[], type: DownloaderClientType): DownloaderTypeInfo {
+  return (
+    types.find((t) => t.type === type) ?? {
+      type,
+      title: type,
+      url_label: "地址",
+      url_placeholder: "",
+      needs_username: true,
+      help: "这种下载器的插件没装或没在运行",
+    }
+  );
+}
 
 /** 需要轮询测试进度的中间态 */
 const IN_PROGRESS: DownloaderStatus[] = ["pending", "verifying"];
@@ -85,6 +149,7 @@ const IN_PROGRESS: DownloaderStatus[] = ["pending", "verifying"];
  * 直到 active / failed。搜索结果里的"提交下载"以这里配置的实例为目标。
  */
 export function DownloaderConfigSection() {
+  const types = useDownloaderTypes();
   const [downloaders, setDownloaders] = useState<ConfiguredDownloader[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -205,7 +270,7 @@ export function DownloaderConfigSection() {
           <SettingsEmpty
             icon={<DownloadIcon className="size-5" />}
             title="还没有接入任何下载器"
-            description="点「添加下载器」接入，支持 qBittorrent 和 Transmission。"
+            description={`点「添加下载器」接入，支持 ${types.map((t) => t.title).join("、")}；装下载器插件可以接入更多。`}
           />
         ) : (
           <div className="css-glass divide-y divide-[var(--line)] overflow-hidden !rounded-xl">
@@ -286,6 +351,7 @@ function DownloaderRow({
   onRefresh,
   onError,
 }: DownloaderRowProps) {
+  const types = useDownloaderTypes();
   const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const [limitsOpen, setLimitsOpen] = useState(false);
@@ -318,7 +384,7 @@ function DownloaderRow({
 
   // 副标题：类型 + 版本 + 上次检查时间（失败原因另起一行红字，不挤在这里）
   const subtitle = [
-    TYPE_LABEL[downloader.client_type],
+    typeInfo(types, downloader.client_type).title,
     downloader.version,
     downloader.last_checked_at ? `上次检查 ${formatRelativeTime(downloader.last_checked_at)}` : null,
   ]
@@ -933,9 +999,13 @@ function DownloaderForm({
 }: DownloaderFormProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const types = useDownloaderTypes();
   const [clientType, setClientType] = useState<DownloaderClientType>(
     downloader?.client_type ?? "qbittorrent",
   );
+  const info = typeInfo(types, clientType);
+  // 地址 / 用户名 / 密码三栏按下载器插件声明的连接参数画（叫法、示例、要不要、可不可选）
+  const fields = connectionFields(info);
   const [name, setName] = useState(downloader?.name ?? "");
   const [url, setUrl] = useState(downloader?.url ?? "");
   const [username, setUsername] = useState(downloader?.username ?? "");
@@ -984,8 +1054,9 @@ function DownloaderForm({
       name: name.trim(),
       client_type: clientType,
       url: url.trim(),
-      username: username.trim() || null,
-      password: password || null,
+      // 这种下载器不要的栏不提交（切换类型后残留的值不带过去）
+      username: fields.username ? username.trim() || null : null,
+      password: fields.password ? password || null : null,
       save_path: savePath.trim() || null,
       path_mappings: mappings.length
         ? mappings.map((m) => ({ local: m.local.trim(), remote: m.remote.trim() }))
@@ -1034,15 +1105,15 @@ function DownloaderForm({
         <div>
           <label className={labelClass}>下载器类型</label>
           <div className="flex flex-wrap gap-2">
-            {(Object.keys(TYPE_LABEL) as DownloaderClientType[]).map((t) => (
+            {types.map((t) => (
               <button
-                key={t}
+                key={t.type}
                 type="button"
-                onClick={() => setClientType(t)}
-                data-active={clientType === t}
+                onClick={() => setClientType(t.type)}
+                data-active={clientType === t.type}
                 className="glass-row nav-item !w-auto px-3 py-1.5 text-sub font-medium"
               >
-                {TYPE_LABEL[t]}
+                {t.title}
               </button>
             ))}
           </div>
@@ -1061,43 +1132,50 @@ function DownloaderForm({
         </div>
 
         <div>
-          <label className={labelClass}>
-            {clientType === "qbittorrent" ? "WebUI 地址" : "RPC 地址"}
-          </label>
+          <label className={labelClass}>{fields.url.label}</label>
           <input
             type="text"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder={URL_PLACEHOLDER[clientType]}
+            placeholder={fields.url.placeholder}
             autoComplete="off"
             className={inputClass}
           />
+          {fields.url.help && (
+            <p className="mt-1 text-caption text-[var(--text-faint)]">{fields.url.help}</p>
+          )}
         </div>
 
-        {/* 凭证：未开鉴权的下载器可整体留空 */}
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className={labelClass}>用户名（可选）</label>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              autoComplete="off"
-              className={inputClass}
-            />
+        {/* 凭证：只画这种下载器要的栏；未开鉴权的可留空 */}
+        {(fields.username || fields.password) && (
+          <div className={`grid gap-3 ${fields.username && fields.password ? "grid-cols-2" : ""}`}>
+            {fields.username && (
+              <div>
+                <label className={labelClass}>{fields.username.label}</label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  autoComplete="off"
+                  className={inputClass}
+                />
+              </div>
+            )}
+            {fields.password && (
+              <div>
+                <label className={labelClass}>{fields.password.label}</label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder={downloader ? "出于安全，请重新填写" : ""}
+                  autoComplete="new-password"
+                  className={inputClass}
+                />
+              </div>
+            )}
           </div>
-          <div>
-            <label className={labelClass}>密码（可选）</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder={downloader ? "出于安全，请重新填写" : ""}
-              autoComplete="new-password"
-              className={inputClass}
-            />
-          </div>
-        </div>
+        )}
 
         <div>
           <label className={labelClass}>默认保存目录（可选）</label>

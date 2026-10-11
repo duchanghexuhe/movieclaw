@@ -9,6 +9,18 @@ struct LiveDecodeTests {
     @Test func appShow() async throws {
         try await LiveServer.check { try await $0.appShow() }
     }
+    @Test func appFeaturesList() async throws {
+        try await LiveServer.check { try await $0.appFeaturesList() }
+    }
+    @Test func appPluginsList() async throws {
+        try await LiveServer.check { try await $0.appPluginsList() }
+    }
+    @Test func appPluginsCallbacksList() async throws {
+        try await LiveServer.check { try await $0.appPluginsCallbacksList() }
+    }
+    @Test func appPluginsPackagesList() async throws {
+        try await LiveServer.check { try await $0.appPluginsPackagesList() }
+    }
     @Test func appStorageUsage() async throws {
         try await LiveServer.check { try await $0.appStorageUsage() }
     }
@@ -45,6 +57,9 @@ struct LiveDecodeTests {
     @Test func authMe() async throws {
         try await LiveServer.check { try await $0.authMe() }
     }
+    @Test func channelsList() async throws {
+        try await LiveServer.check { try await $0.channelsList() }
+    }
     @Test func channelsImPushConfigGet() async throws {
         try await LiveServer.check { try await $0.channelsImPushConfigGet() }
     }
@@ -68,6 +83,9 @@ struct LiveDecodeTests {
     }
     @Test func dlTasks() async throws {
         try await LiveServer.check { try await $0.dlTasks() }
+    }
+    @Test func dlTypesList() async throws {
+        try await LiveServer.check { try await $0.dlTypesList() }
     }
     @Test func extensionPing() async throws {
         try await LiveServer.check { try await $0.extensionPing() }
@@ -174,6 +192,9 @@ struct LiveDecodeTests {
     @Test func reelsFeed() async throws {
         try await LiveServer.check { try await $0.reelsFeed() }
     }
+    @Test func reelsClipsStats() async throws {
+        try await LiveServer.check { try await $0.reelsClipsStats() }
+    }
     @Test func reelsFacets() async throws {
         try await LiveServer.check { try await $0.reelsFacets() }
     }
@@ -188,6 +209,9 @@ struct LiveDecodeTests {
     }
     @Test func scrapeCountries() async throws {
         try await LiveServer.check { try await $0.scrapeCountries() }
+    }
+    @Test func scrapeFanartShow() async throws {
+        try await LiveServer.check { try await $0.scrapeFanartShow() }
     }
     @Test func scrapeLanguages() async throws {
         try await LiveServer.check { try await $0.scrapeLanguages() }

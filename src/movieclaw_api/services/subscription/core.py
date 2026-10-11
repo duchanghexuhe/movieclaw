@@ -25,6 +25,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api import domain_events
 from movieclaw_api.exceptions import (
     BadRequestException,
     ForbiddenException,
@@ -37,6 +38,13 @@ from movieclaw_api.services.subscription.cleanup import (
     build_cleanup_plan,
     enqueue_cleanup_job,
     reset_cleaned_wanted,
+)
+from movieclaw_api.services.subscription.episode_floor import (
+    FLOOR_MAX,
+    dismiss_hint,
+    floors_of,
+    pending_hints,
+    season_episode_max,
 )
 from movieclaw_api.services.subscription.matching import publish_calendar_date
 from movieclaw_api.services.subscription.release_forecast import (
@@ -124,6 +132,8 @@ class ExpectedUnit:
     season_number: int
     episode_number: int
     air_date: date | None
+    # 集数下限展开的占位单元：TMDB 还没录这一集（issue #640）
+    provisional: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,10 +211,12 @@ def expected_units(
     episodes: list[MediaEpisode],
     selected: list[int],
     follow_future: bool,
+    floors: dict[int, int] | None = None,
 ) -> list[ExpectedUnit]:
     """按 E 的定义展开期望单元（订阅创建/修改与元数据刷新共用）。
 
     E = 勾选季的全部已知集 ∪（follow_future ? 评估时刻之后播出的集 : ∅）
+        ∪ 集数下限超出 TMDB 的占位集（``floors``，issue #640）
 
     集数据来自 ``media_episode`` 表（集数据唯一事实源，metadata.md 第 1 节）。
     追新的锚定取**评估时刻**而非订阅创建时刻：创建时二者等价；后来才打开
@@ -227,6 +239,18 @@ def expected_units(
         elif episode.season_number != 0 and (air is None or air > today):
             # 追新贡献：未勾季里"尚未播出/未定档"的集；特别季不自动追
             units.append(ExpectedUnit(episode.season_number, episode.episode_number, air))
+    # 集数下限：TMDB 已录的最大集号之后、到下限为止补占位单元。占位集没有
+    # 播出日期，与追新的"未定档集"同属一类，所以追新开着时未勾的季也纳入
+    known_max: dict[int, int] = {}
+    for episode in episodes:
+        known_max[episode.season_number] = max(
+            known_max.get(episode.season_number, 0), episode.episode_number
+        )
+    for season, floor in sorted((floors or {}).items()):
+        if season not in selected_set and not (follow_future and season != 0):
+            continue
+        for number in range(known_max.get(season, 0) + 1, floor + 1):
+            units.append(ExpectedUnit(season, number, None, provisional=True))
     return units
 
 
@@ -240,6 +264,10 @@ def schedule_for(kind: str, unit: ExpectedUnit) -> tuple[datetime | None, int]:
     """
     now = utcnow()
     if kind == MediaKind.MOVIE.value:
+        return now, 0
+    if unit.provisional:
+        # 占位集：TMDB 没录、播没播不知道——先真实搜一次，搜不到走退避，
+        # 期间新资源由被动匹配接住
         return now, 0
     if unit.air_date is None:
         return None, 0  # 未定档：不可调度，元数据刷新定档时回填
@@ -304,12 +332,27 @@ async def recompute_subscription_status(
         and subscription.follow_future
         and (item.status or "") not in _ENDED_STATUSES
     )
+    # 集数证据待确认（issue #640）：站点/豆瓣说本季不止这些集，先别判收齐，
+    # 否则订阅一完成用户就不再点开，提示永远没人看见
+    hinted = bool(subscription.episode_evidence) and bool(
+        pending_hints(subscription, await season_episode_max(session, subscription.media_item_id))
+    )
     new_status = (
-        SubscriptionStatus.COMPLETED if not has_open and not growing else SubscriptionStatus.ACTIVE
+        SubscriptionStatus.COMPLETED
+        if not has_open and not growing and not hinted
+        else SubscriptionStatus.ACTIVE
     )
     if subscription.status == new_status:
         return
+    previous = subscription.status
     subscription.status = new_status
+    await domain_events.record_subscription(
+        session,
+        domain_events.SUBSCRIPTION_STATUS_CHANGED,
+        subscription,
+        previous_status=previous,
+        reason="completed" if new_status == SubscriptionStatus.COMPLETED else "reopened",
+    )
     await repo.save(subscription)
     if new_status == SubscriptionStatus.COMPLETED:
         message = "订阅已收齐：期望的内容都已安排完毕，且暂无会新增的内容"
@@ -368,8 +411,13 @@ class SubscriptionService:
         library_id: int | None = None,
         douban_id: str | None = None,
         member_id: int | None = None,
+        selection_mode: str = "rules",
+        smart_profile_revision: int | None = None,
+        episode_floors: dict[int, int] | None = None,
     ) -> Subscription:
         """创建订阅并生成初始工单。同一条目已有订阅时幂等返回已有（不改参数）。
+
+        ``episode_floors``：每季集数下限（订阅弹层里确认了"按豆瓣集数追"时带上）。
 
         ``member_id``：发起成员（None=超管）。已有订阅时成员的"再订"转为
         **关注**（docs/design/member-management.md §3.5）——订阅出现在他的
@@ -391,7 +439,20 @@ class SubscriptionService:
             return existing
         assert item.id is not None
 
+        from movieclaw_api.services.subscription.smart_profiles import freeze_policy
+
+        if selection_mode not in {"rules", "smart"}:
+            raise BadRequestException("订阅模式无效")
+        if selection_mode == "smart" and rule_set_id is not None:
+            raise BadRequestException("智能模式不能同时指定规则组")
+        smart_policy = (
+            await freeze_policy(self._session, kind.value, smart_profile_revision)
+            if selection_mode == "smart" else None
+        )
+
         selected = self._validate_selection(kind, selected_seasons or [], seasons)
+        episodes = await self._media_repo.list_episodes(item.id)
+        floors = self._validate_floors(kind, episode_floors, seasons, episodes)
         # 剧集不勾季又不追新时 E 恒为空：订阅会落库成 0 工单，随即被派生重算判成
         # 「已完成」，用户看到一条绿色的空壳订阅，实际一集都没搜过。Web 弹层的提交
         # 守卫拦的就是这条不变量，API / CLI / Agent 直连服务层，这里补齐。
@@ -424,14 +485,14 @@ class SubscriptionService:
         # 规则组：显式指定优先；否则按适用范围自动选组（docs/design/rule-set-scope.md），
         # 都不命中落默认组。成员订阅、补下缺失单元等不带规则组的路径都走这里
         rule_note: str | None = None
-        if rule_set_id is None:
+        if rule_set_id is None and selection_mode == "rules":
             if not facts_known:
                 facts = await gather_facts(self._session, item)
             pick = await self._rule_sets.pick(kind.value, facts)
             rule_set_id = pick.rule_set.id
             if pick.matched:
                 rule_note = pick.reason
-        assert rule_set_id is not None
+        assert rule_set_id is not None or smart_policy is not None
 
         # 订阅弹层打开时（prepare）用户还没选库，条目多半没有刮削归属；
         # 这里入库目标定格了，同一时刻把归属补上（设计文档 §14），
@@ -450,15 +511,17 @@ class SubscriptionService:
                 selected_seasons=selected,
                 follow_future=follow_future,
                 rule_set_id=rule_set_id,
+                selection_mode=selection_mode,
+                smart_policy=smart_policy,
                 library_id=library_id,
                 status=SubscriptionStatus.ACTIVE,
                 created_by_member_id=member_id,
+                episode_floors=floors,
             )
         )
         assert subscription.id is not None
 
-        episodes = await self._media_repo.list_episodes(item.id)
-        units = expected_units(kind, episodes, selected, follow_future)
+        units = expected_units(kind, episodes, selected, follow_future, floors_of(subscription))
         # 库存联通（媒体库 L3）：库里已有的单元不生成工单——E−H 用真实的 H
         owned = await self._owned_units(item.id)
         skipped_owned = [u for u in units if (u.season_number, u.episode_number) in owned]
@@ -466,6 +529,16 @@ class SubscriptionService:
         movie_plan = await self._movie_plan(item) if kind is MediaKind.MOVIE else None
         rows = [self._to_wanted(subscription, unit, schedule=movie_plan) for unit in units]
         await self._repo.add_wanted(rows)
+        if smart_policy is not None:
+            from movieclaw_api.services.subscription.upgrade import (
+                arm_upgrade_candidates,
+                fill_snapshots,
+                materialize_owned_wanted,
+            )
+            imported = await materialize_owned_wanted(self._session, subscription)
+            await fill_snapshots(self._session, item.id, imported)
+            await arm_upgrade_candidates(self._session, imported)
+            await self._session.commit()
         created_message = self._created_message(item, kind, selected, follow_future, rows)
         if skipped_owned:
             created_message += f"；库里已有 {len(skipped_owned)} 个单元，无需重复下载"
@@ -473,6 +546,7 @@ class SubscriptionService:
             created_message += f"；{route_note}"
         if rule_note:
             created_message += f"；{rule_note}"
+        await self._record(domain_events.SUBSCRIPTION_CREATED, subscription)
         await self._log(
             subscription,
             ActivityType.CREATED,
@@ -510,8 +584,12 @@ class SubscriptionService:
         follow_future: bool | None = None,
         rule_set_id: int | None = None,
         library_id: int | None | EllipsisType = ...,
+        episode_floors: dict[int, int] | None = None,
     ) -> Subscription:
-        """修改 E 的定义（季选择/自动续订/规则组/入库目标库），diff 重算工单。
+        """修改 E 的定义（季选择/自动续订/规则组/入库目标库/集数下限），diff 重算工单。
+
+        ``episode_floors``：整体替换每季集数下限，不传=不变；不超过 TMDB 已录
+        集数的季视为清除（下限只补 TMDB 之外的集）。
 
         ``library_id`` 用 ``...``（Ellipsis）作「未传=不变」的哨兵：显式传 None
         表示清除指定库、改回按默认库路由——旧订阅（library_id 为空）需要这条
@@ -526,6 +604,11 @@ class SubscriptionService:
         item = await self._media_repo_get(subscription.media_item_id)
 
         new_rule_set = None
+        if subscription.selection_mode == "smart":
+            if rule_set_id not in (None, 0):
+                raise BadRequestException("智能订阅不能换绑规则组；请保持当前模式")
+            # 旧客户端可能回传 API 的无规则占位值，不能把它当成真实外键。
+            rule_set_id = None
         if rule_set_id is not None and rule_set_id != subscription.rule_set_id:
             new_rule_set = await self._rule_sets.get(rule_set_id)
             subscription.rule_set_id = rule_set_id
@@ -544,9 +627,19 @@ class SubscriptionService:
             subscription.follow_future = follow_future if kind is MediaKind.TV else False
 
         episodes = await self._media_repo.list_episodes(subscription.media_item_id)
+        floors_before = floors_of(subscription)
+        if episode_floors is not None:
+            subscription.episode_floors = self._validate_floors(
+                kind, episode_floors, seasons, episodes
+            )
         expected = expected_units(
-            kind, episodes, list(subscription.selected_seasons), subscription.follow_future
+            kind,
+            episodes,
+            list(subscription.selected_seasons),
+            subscription.follow_future,
+            floors_of(subscription),
         )
+        known_keys = {(e.season_number, e.episode_number) for e in episodes}
         existing = await self._repo.list_wanted(subscription_id)
         existing_keys = {(w.season_number, w.episode_number) for w in existing}
         selected_set = set(subscription.selected_seasons)
@@ -574,11 +667,13 @@ class SubscriptionService:
             )
 
         def _should_be_in_scope(w: WantedItem) -> bool:
-            return (
-                (w.season_number, w.episode_number) in expected_keys
-                or w.season_number in selected_set
-                or _protected_by_follow(w)
-            )
+            key = (w.season_number, w.episode_number)
+            if key in expected_keys:
+                return True
+            if key not in known_keys and kind is MediaKind.TV:
+                # TMDB 没录的集只由集数下限撑着：下限调低/清除即出域
+                return False
+            return w.season_number in selected_set or _protected_by_follow(w)
 
         reactivated = 0
         deactivated = 0
@@ -621,17 +716,25 @@ class SubscriptionService:
             )
         season_text = self._season_text(list(subscription.selected_seasons))
         rule_note = f"，规则组改为「{new_rule_set.name}」" if new_rule_set is not None else ""
+        floors_after = floors_of(subscription)
+        floor_text = (
+            "、".join(f"第 {s} 季按 {n} 集" for s, n in sorted(floors_after.items()))
+            if floors_after
+            else "改回以 TMDB 为准"
+        )
+        floor_note = f"，集数{floor_text}" if floors_after != floors_before else ""
         await self._log(
             subscription,
             ActivityType.ADJUSTED,
             f"调整订阅：勾选{season_text}，自动续订{'开' if subscription.follow_future else '关'}"
-            f"{rule_note}；新增 {len(to_add)} 个单元，重新纳入 {reactivated} 个，"
+            f"{rule_note}{floor_note}；新增 {len(to_add)} 个单元，重新纳入 {reactivated} 个，"
             f"退出范围 {deactivated} 个"
             "（下载器任务不会自动删除；退出范围后停止搜索与换源）",
             payload={
                 "selected_seasons": list(subscription.selected_seasons),
                 "follow_future": subscription.follow_future,
                 "rule_set_id": subscription.rule_set_id,
+                "episode_floors": subscription.episode_floors,
                 "added": len(to_add),
                 "reactivated": reactivated,
                 "deactivated": deactivated,
@@ -924,8 +1027,16 @@ class SubscriptionService:
     async def set_paused(self, subscription_id: int, paused: bool) -> Subscription:
         """暂停/恢复。暂停是用户显式状态；恢复后由派生重算落到 active/completed。"""
         subscription = await self._get_or_404(subscription_id)
+        previous = subscription.status
         if paused:
             subscription.status = SubscriptionStatus.PAUSED
+            if previous != subscription.status:
+                await self._record(
+                    domain_events.SUBSCRIPTION_STATUS_CHANGED,
+                    subscription,
+                    previous_status=previous,
+                    reason="paused",
+                )
             await self._repo.save(subscription)
             await self._log(
                 subscription,
@@ -934,6 +1045,13 @@ class SubscriptionService:
             )
             return subscription
         subscription.status = SubscriptionStatus.ACTIVE
+        if previous != subscription.status:
+            await self._record(
+                domain_events.SUBSCRIPTION_STATUS_CHANGED,
+                subscription,
+                previous_status=previous,
+                reason="resumed",
+            )
         await self._repo.save(subscription)
         await self._log(subscription, ActivityType.RESUMED, "已恢复追踪")
         item = await self._media_repo_get(subscription.media_item_id)
@@ -1001,6 +1119,7 @@ class SubscriptionService:
                 "订阅 #%d 发起人 #%d 退出，转移给成员 #%d", subscription_id, member_id, heir
             )
             return "你已退出；订阅转由其他关注的家人继续追更"
+        await self._record(domain_events.SUBSCRIPTION_DELETED, subscription, reason="unsubscribed")
         await self._repo.delete(subscription)
         logger.info("成员 #%d 退出并删除无人关注的订阅 #%d", member_id, subscription_id)
         return "已取消订阅"
@@ -1164,6 +1283,12 @@ class SubscriptionService:
                     cleaned.append(f"{len(plan.torrents)} 个下载任务")
                 if delete_library_files and plan.files:
                     cleaned.append(f"{len(plan.files)} 个媒体库文件")
+        await self._record(
+            domain_events.SUBSCRIPTION_DELETED,
+            subscription,
+            reason="deleted",
+            cleanup_job_id=cleanup_job_id,
+        )
         await self._repo.delete(subscription)
         logger.info(
             "管理员已永久删除订阅 #%d%s",
@@ -1489,6 +1614,10 @@ class SubscriptionService:
     # 活动流水（透明化：每个动作落一条中文可读记录）
     # ------------------------------------------------------------------
 
+    async def _record(self, event, subscription: Subscription, **kwargs) -> None:
+        """订阅生命周期的可靠事件（plugin-phase2a.md §4），随接下来那次保存一起提交。"""
+        await domain_events.record_subscription(self._session, event, subscription, **kwargs)
+
     async def _log(
         self,
         subscription: Subscription,
@@ -1616,6 +1745,50 @@ class SubscriptionService:
         if not profile_of(row).subscribable:
             raise BadRequestException(f"媒体库「{row.name}」是本地内容库，不能作为订阅的入库目标")
         return row
+
+    @staticmethod
+    def _validate_floors(
+        kind: MediaKind,
+        floors: dict[int, int] | None,
+        seasons: list[MediaSeason],
+        episodes: list[MediaEpisode],
+    ) -> dict | None:
+        """校验集数下限并归一成落库形态；不超过 TMDB 已录集数的季直接丢弃。"""
+        if not floors:
+            return None
+        if kind is not MediaKind.TV:
+            raise BadRequestException("只有剧集订阅可以调整集数")
+        valid = {row.season_number for row in seasons}
+        known_max: dict[int, int] = {}
+        for episode in episodes:
+            known_max[episode.season_number] = max(
+                known_max.get(episode.season_number, 0), episode.episode_number
+            )
+        cleaned: dict[str, int] = {}
+        for season, count in floors.items():
+            if season not in valid:
+                raise BadRequestException(f"第 {season} 季不在这部剧的季列表里")
+            if not 0 <= count <= FLOOR_MAX:
+                raise BadRequestException(f"集数需在 0～{FLOOR_MAX} 之间")
+            if count > known_max.get(season, 0):
+                cleaned[str(season)] = count
+        return cleaned or None
+
+    async def dismiss_episode_hint(self, subscription_id: int, season_number: int) -> Subscription:
+        """忽略某季的集数提示：只有更大的新证据才会再次提示；随即重算状态。"""
+        subscription = await self._get_or_404(subscription_id)
+        item = await self._media_repo_get(subscription.media_item_id)
+        known_max = await season_episode_max(self._session, subscription.media_item_id)
+        if not dismiss_hint(subscription, season_number, known_max):
+            raise BadRequestException("这一季没有待确认的集数提示")
+        await self._repo.save(subscription)
+        await self._log(
+            subscription,
+            ActivityType.ADJUSTED,
+            f"已忽略第 {season_number} 季的集数提示，继续以 TMDB 集数为准",
+        )
+        await self._recompute_status(subscription, item)
+        return subscription
 
     @staticmethod
     def _validate_selection(

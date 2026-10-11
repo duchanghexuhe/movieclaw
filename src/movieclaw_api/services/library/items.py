@@ -2661,6 +2661,28 @@ class EpisodeInfo:
     position_ms: int = 0
     played: bool = False
     progress_percent: int | None = None  # 1~99；完成态由 played 单独表达
+    last_played_at: datetime | None = None  # 只供 season_resume_episode 定锚点，不出接口
+
+
+def season_resume_episode(infos: list[EpisodeInfo]) -> int | None:
+    """这一季「接着看」的那一集：分集区按它锁定集段、默认选中它。
+
+    与首页「接下来继续」同一条规则（``services/playback_up_next``）：锚点是本季
+    最近播放的那一集；它没看完（或看完后重看到一半）就是它，看完了就往后找第一个
+    没看完且有片源的。往后都看完了停在锚点本身——不回头去找当年跳过的某一集，
+    长剧里「第一个没看过的」可能在几百集之前。本季没播放过返回 None（客户端
+    落第一集没看过的）。
+    """
+    played = [info for info in infos if info.last_played_at is not None]
+    if not played:
+        return None
+    anchor = max(played, key=lambda info: (info.last_played_at, info.episode_number))
+    for info in infos:
+        if info.episode_number < anchor.episode_number or not info.owned:
+            continue
+        if not info.played or info.position_ms > 0:
+            return info.episode_number
+    return anchor.episode_number
 
 
 def episode_view(info: EpisodeInfo) -> EpisodeView:
@@ -2823,6 +2845,7 @@ async def build_season_episodes(
                 continue
             info.played = row.played
             info.position_ms = row.position_ms
+            info.last_played_at = row.last_played_at
             if row.position_ms > 0:
                 # 百分比的分母与首页「最近观看」同口径：在位文件实测时长优先，
                 # 其次分集刮削时长；clamp 到 1~99——完成态由 played 单独表达
@@ -3117,6 +3140,9 @@ async def backfill_streams(
             row.video_codec = row.video_codec or spec.video_codec
             # 新探测能把历史上笼统的 HDR10 细化成 Dolby Vision/HDR10+。
             row.hdr = spec.hdr or row.hdr
+            if spec.dv_profile is not None:
+                row.dv_profile = spec.dv_profile
+                row.dv_bl_compatible = spec.dv_bl_compatible
             row.bit_depth = row.bit_depth or spec.bit_depth
             row.duration_seconds = row.duration_seconds or spec.duration_seconds
             row.bit_rate = row.bit_rate or spec.bit_rate
@@ -3261,6 +3287,9 @@ async def delete_item_files(
     library: Library,
     media_item_id: int,
     files: list[LibraryFile],
+    *,
+    before_commit: Callable[[set[int]], Awaitable[None]] | None = None,
+    dry_run: bool = False,
 ) -> DeleteResult:
     """把条目从库中**彻底删除**：磁盘上的条目目录（视频+NFO+海报+字幕）
     整个清掉，台账行随之删除。
@@ -3322,6 +3351,26 @@ async def delete_item_files(
             result.errors.append(f"「{path}」不在库根路径之内，已跳过（不删库外文件）")
 
     deleted_row_ids: set[int] = set()
+    by_id = {row.id: row for row in files}
+
+    if dry_run:
+        # 演练（plugin-phase2a.md §5.3）：同一套分组判定，只报告将要删的路径与行，不动磁盘和台账
+        for directory in dirs_to_remove:
+            result.removed_paths.append(str(directory))
+            for row in covered_rows.get(directory, []):
+                assert row.id is not None
+                deleted_row_ids.add(row.id)
+                result.freed_bytes += row.size_bytes
+        for row_id, path in files_to_remove.items():
+            result.removed_paths.append(str(path))
+            deleted_row_ids.add(row_id)
+            result.freed_bytes += by_id[row_id].size_bytes
+        for row in files:
+            if row.state == FileState.MISSING:
+                assert row.id is not None
+                deleted_row_ids.add(row.id)
+        result.rows_deleted = len(deleted_row_ids)
+        return result
 
     for directory in dirs_to_remove:
         ok = await asyncio.to_thread(_discard_tree, directory, staging, result)
@@ -3331,7 +3380,6 @@ async def delete_item_files(
                 deleted_row_ids.add(row.id)
                 result.freed_bytes += row.size_bytes
 
-    by_id = {row.id: row for row in files}
     for row_id, path in files_to_remove.items():
         row = by_id[row_id]
         ok = await asyncio.to_thread(_discard_file_with_sidecars, path, staging, result)
@@ -3351,6 +3399,9 @@ async def delete_item_files(
             await session.delete(row)
     result.rows_deleted = len(deleted_row_ids)
     result.pending_purge = staging.dirs
+    if before_commit is not None:
+        # 删除事件与删行同一次提交成立（plugin-phase2a.md §4）
+        await before_commit(deleted_row_ids)
     await session.commit()
     if result.rows_deleted:
         await LibraryRepository(session).refresh_stats([library.id])
@@ -3372,6 +3423,9 @@ async def delete_single_file(
     library: Library,
     row: LibraryFile,
     item_rows: list[LibraryFile],
+    *,
+    before_commit: Callable[[set[int]], Awaitable[None]] | None = None,
+    dry_run: bool = False,
 ) -> DeleteResult:
     """从磁盘删除条目的**单个文件**（多版本洗版 / 删某一集重下的出口）。
 
@@ -3388,13 +3442,26 @@ async def delete_single_file(
     """
     assert row.media_item_id is not None
     if len(item_rows) == 1:
-        return await delete_item_files(session, library, row.media_item_id, item_rows)
+        return await delete_item_files(
+            session,
+            library,
+            row.media_item_id,
+            item_rows,
+            before_commit=before_commit,
+            dry_run=dry_run,
+        )
 
     result = DeleteResult()
     assert library.id is not None
+    if dry_run and row.state == FileState.MISSING:
+        result.rows_deleted = 1
+        return result
     if row.state == FileState.MISSING:
         await session.delete(row)
         result.rows_deleted = 1
+        if before_commit is not None:
+            assert row.id is not None
+            await before_commit({row.id})
         await session.commit()
         await LibraryRepository(session).refresh_stats([library.id])
         return result
@@ -3415,6 +3482,11 @@ async def delete_single_file(
             )
             return result
 
+    if dry_run:
+        result.removed_paths.append(str(path))
+        result.rows_deleted = 1
+        result.freed_bytes = row.size_bytes
+        return result
     staging = _TrashStaging(roots)
     ok = await asyncio.to_thread(_discard_file_with_sidecars, path, staging, result)
     if ok:
@@ -3422,6 +3494,9 @@ async def delete_single_file(
         result.freed_bytes = row.size_bytes
         result.pending_purge = staging.dirs
         await session.delete(row)
+        if before_commit is not None:
+            assert row.id is not None
+            await before_commit({row.id})
         await session.commit()
         await LibraryRepository(session).refresh_stats([library.id])
         logger.info(

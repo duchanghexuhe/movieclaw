@@ -18,7 +18,7 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
 // ---------------------------------------------------------------------------
 
 export type NoticeSeverity = "warning" | "error";
-export type NoticeSource = "subscription" | "ingest" | "downloader" | "site" | "cloud";
+export type NoticeSource = "subscription" | "ingest" | "downloader" | "site" | "cloud" | "plugin";
 
 /** 一条待处理事项 */
 export interface SystemNotice {
@@ -59,6 +59,17 @@ export function noticeHref(notice: SystemNotice): string {
     // 和 MovieClaw Cloud 断开、连不上、版本不受支持（docs/design/cloud-push.md §2.4）
     case "cloud":
       return "/settings/cloud";
+    // 某个插件启动失败（docs/design/plugin-kernel.md §9）；插件运行中报告的
+    // 降级可以带一个站内路径，指向能修它的地方（docs/design/plugin-phase2b.md §5）
+    case "plugin": {
+      const href = notice.payload.action_href;
+      if (typeof href === "string" && href.startsWith("/") && !href.startsWith("//")) return href;
+      // 没带路径：定位到插件页里它那一行（docs/design/plugin-page-tiers.md §4.1）
+      const entry = notice.payload.entry_id;
+      return typeof entry === "string" && entry
+        ? `/settings/plugins?module=${encodeURIComponent(entry)}`
+        : "/settings/plugins";
+    }
     default:
       return "/settings";
   }

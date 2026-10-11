@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query
+from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api import hooks
 from movieclaw_api.api.deps import require_login
 from movieclaw_api.exceptions import BadRequestException, ForbiddenException
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_api.schemas.downloader import (
     DownloaderLimitsUpdate,
     DownloaderLimitsView,
@@ -273,6 +277,13 @@ async def submit_download(
         # 线索只锚**条目级**目录；锚到库主根/监听目录会波及目录下所有文件
         subtitle=payload.subtitle if entry_level else None,
         downloader_id=payload.downloader_id,
+        route_hint=hooks.DownloaderQuery(
+            site_id=payload.site_id,
+            title=payload.title,
+            media_kind=payload.media_kind,
+            category="movieclaw",
+            tags=("movieclaw-manual",),
+        ),
     )
     assert row.id is not None  # 落库记录必有主键
     if manual_item is not None:
@@ -287,6 +298,7 @@ async def submit_download(
             save_path=derived_path,
             site_id=payload.site_id,
             torrent_id=payload.torrent_id,
+            owner=f"plugin:{principal.plugin.entry_id}" if principal.plugin else "manual",
         )
     if result.info_hash:
         # 入库时把「入库完成」推给点下载的人（docs/design/cloud-push.md §5）。
@@ -425,6 +437,48 @@ async def forget_target_pref(
     """
     await DownloadTargetPrefRepository(session).delete(_member_scope(principal), category)
     return ok(None, message="已清除该分类的保存位置记忆")
+
+
+class DownloaderTypeView(BaseModel):
+    """一种可接入的下载器（由官方 / 第三方下载器插件登记，docs/design/downloader-adapters.md）。"""
+
+    type: str = Field(description="配置下载器时填的类型值，如 qbittorrent")
+    title: str = Field(description="名字，如 qBittorrent")
+    connection: dict = Field(
+        description="连接参数的界面描述（JSON Schema 子集，字段取自 url / username / password）"
+    )
+    url_label: str = Field(description="地址一栏的叫法（由 connection 推出，供旧客户端）")
+    url_placeholder: str = Field(description="地址示例（由 connection 推出，供旧客户端）")
+    needs_username: bool = Field(description="是否有用户名一栏（由 connection 推出，供旧客户端）")
+    help: str = Field(description="补充说明")
+
+
+@router.get(
+    "/types",
+    response_model=ApiResponse[list[DownloaderTypeView]],
+    summary="能接入哪些下载器（由下载器插件登记；装了新的下载器插件这里就多一种）",
+    operation_id="dl.types.list",
+)
+async def list_downloader_types() -> ApiResponse[list[DownloaderTypeView]]:
+    from movieclaw_downloader.registry import adapters
+    from movieclaw_sdk.config_schema import connection_schema
+
+    views = []
+    for a in adapters().values():
+        schema = connection_schema(a)
+        url = schema["properties"]["url"]
+        views.append(
+            DownloaderTypeView(
+                type=a.type,
+                title=a.title,
+                connection=schema,
+                url_label=url.get("title") or "地址",
+                url_placeholder=(url.get("examples") or [""])[0],
+                needs_username="username" in schema["properties"],
+                help=a.help or url.get("description") or "",
+            )
+        )
+    return ok(views)
 
 
 @router.get(
@@ -581,6 +635,10 @@ async def delete_download_task_from_downloader(
         default=False,
         description="是否同时删除下载器任务对应的数据文件；默认仅移除任务",
     ),
+    dry_run: Annotated[
+        bool,
+        Query(description="只演练：返回任务是否存在、会牵动哪些订阅季集，不删任何东西"),
+    ] = False,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[DownloadTaskDeleteView]:
     """把这个任务从下载器移除。
@@ -591,9 +649,30 @@ async def delete_download_task_from_downloader(
     如果这个种子是某条订阅投递的，删掉之后那几集会退回「缺资源」状态，
     订阅会重新去找新的资源。
     """
-    from movieclaw_api.services.download_tasks import delete_download_task
+    from movieclaw_api.services.download_tasks import (
+        delete_download_task,
+        plan_delete_download_task,
+    )
 
     normalized_hash = info_hash.lower()
+    if dry_run:
+        plan = await plan_delete_download_task(
+            session, downloader_id=downloader_id, info_hash=normalized_hash
+        )
+        return ok(
+            DownloadTaskDeleteView(
+                downloader_id=downloader_id,
+                info_hash=normalized_hash,
+                delete_files=delete_files,
+                dry_run=True,
+                exists=plan.exists,
+                title=plan.title,
+                manual_intent=plan.manual_intent,
+                requeued_units=[list(unit) for unit in plan.requeued_units],
+                cancelled_attempts=plan.cancelled_attempts,
+            ),
+            message=f"演练：未删除任何东西（下载器「{plan.downloader_name}」）",
+        )
     await delete_download_task(
         session,
         downloader_id=downloader_id,

@@ -8,6 +8,9 @@ import { LiquidGlassButton } from "@/components/liquid-glass";
 
 import { AppPushSection } from "@/components/app-push-section";
 import { AppStorageSection } from "@/components/app-storage-section";
+import { PluginDetailView } from "@/components/plugin-detail";
+import { PluginsPage } from "@/components/plugins-section";
+import { ReelClipsToggleRow } from "@/components/reel-clips-toggle-section";
 import { ScheduledTasksSection } from "@/components/scheduled-tasks-section";
 import { AppUpdateDot, usePendingUpdate } from "@/components/app-update-entry";
 import { AppUpdateSection } from "@/components/app-update-section";
@@ -156,9 +159,11 @@ export function SettingsSidebar({ active, onSelect, onBack }: SettingsSidebarPro
  */
 export interface SettingsPanelProps {
   active: string;
+  /** 分区内的子页面（现在只有插件详情：/settings/plugins/<条目 id>） */
+  item?: string;
 }
 
-export function SettingsPanel({ active }: SettingsPanelProps) {
+export function SettingsPanel({ active, item }: SettingsPanelProps) {
   // 成员直达管理分区地址（书签/手输 URL，含裸 /settings 服务端兜底到的概览）
   // 时回退到首个可见分区——界面兜底，真正的安全边界在后端 403
   const { session } = useSession();
@@ -171,6 +176,8 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
   const section =
     allowed.find((s) => s.id === active) ?? allowed[0] ?? settingsSections[0];
   const Icon = section.icon;
+  // 手机端页顶的返回条已有分区名：订阅分区自带头部，子详情页（插件详情）有自己的标题
+  const hideHeadOnMobile = section.id === "subscription" || item != null;
 
   // 兜底展示的同时把地址替换成实际分区：URL 与内容一致、侧栏高亮不落空，
   // 刷新/分享当前页也不会再落回一个自己看不到的地址
@@ -203,7 +210,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       >
         {/* Netflix 移动端：分区名已由页顶的 NetflixSettingsNav（返回键 + 分区
             名）呈现，这里的大图标头在窄屏上重复占位（globals.css 按主题隐藏） */}
-        <header className="settings-panel-head flex items-center gap-4">
+        <header className={`settings-panel-head flex items-center gap-4 ${hideHeadOnMobile ? "max-md:hidden" : ""}`}>
           <span className="icon-chip size-12 !rounded-2xl">
             <Icon className="size-[22px]" />
           </span>
@@ -225,7 +232,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
         </header>
 
         {/* 发丝分隔线：左亮右隐的渐变，呼应玻璃边缘的受光 */}
-        <div className="settings-panel-head mb-8 mt-7 h-px bg-gradient-to-r from-white/[0.14] via-white/[0.06] to-transparent" />
+        <div className={`settings-panel-head mb-8 mt-7 h-px bg-gradient-to-r from-white/[0.14] via-white/[0.06] to-transparent ${hideHeadOnMobile ? "max-md:hidden" : ""}`} />
 
         {section.id === "overview" ? (
           <SettingsOverviewSection />
@@ -263,6 +270,8 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
           <CloudSection />
         ) : section.id === "app" ? (
           <AppSection />
+        ) : section.id === "plugins" ? (
+          item ? <PluginDetailView id={item} /> : <PluginsPage />
         ) : section.id === "mcp" ? (
           <McpSection />
         ) : section.id === "webhook" ? (
@@ -616,6 +625,8 @@ function WatchHistoryCard() {
  *   - 缓存管理：data/ 各目录的占用与清理（AppStorageSection，内容来自后端登记表）；
  *   - 定时任务：后台任务的周期与启停（ScheduledTasksSection）。
  *
+ * 曾经还有「模块」（内置插件状态）与「插件」（插件包管理）两个标签，已独立成
+ * 「系统 → 插件」分区（PluginsPage）；带 ?tab=plugins / extensions 的老链接在路由层重定向。
  * 设置页按功能重组前这里叫「应用」，还塞着外部访问地址与远程转码——前者迁去
  * 「网络」分区（网络配置只留一个家），后者升级为「媒体库」组的「播放」分区。
  * 曾经还有第三个「维护」标签，但它从头到尾只有一颗「重启应用」按钮：为一个
@@ -660,7 +671,7 @@ function AppSection() {
 /**
  * —— 播放分区（媒体库组）——
  *
- * 住户：进度条预览与转码缓存两颗开关（合成「播放体验」一组）、远程转码
+ * 住户：进度条预览、转码缓存、片段预切三颗开关（合成「播放体验」一组）、远程转码
  * （原「应用 → 远程转码」标签迁来）。
  * 按功能命名为「播放」而不是按实现叫「远程转码」：转码策略、字幕偏好等
  * 播放域设置都落在这里，分区不用再改名。Worker 的审批与吊销仍在
@@ -678,6 +689,7 @@ function PlaybackSection() {
         <SettingsList>
           <TrickplayToggleRow />
           <TranscodeCacheToggleRow />
+          <ReelClipsToggleRow />
         </SettingsList>
       </SettingsSection>
       <RemoteTranscodeSection

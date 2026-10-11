@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Field, field_serializer
+from pydantic import Field, field_serializer, model_validator
 
 from movieclaw_api.schemas.base import BaseModel
 from movieclaw_api.services.tmdb_images import MediaFiles, asset_url, tmdb_image_url
@@ -57,6 +57,9 @@ class MediaBrief(BaseModel):
     douban_id: str | None
     title: str
     original_title: str
+    english_title: str | None = Field(
+        default=None, description="国际英文名；「手动选种」与中文名、原名一起搜"
+    )
     year: int | None
     poster_url: str | None = Field(description="完整海报 URL（按配置的图床基址拼好）")
     backdrop_url: str | None = Field(
@@ -80,6 +83,7 @@ class MediaBrief(BaseModel):
             douban_id=item.douban_id,
             title=item.title,
             original_title=item.original_title,
+            english_title=item.english_title,
             year=item.year,
             poster_url=(
                 asset_url(poster_file)
@@ -154,6 +158,14 @@ class ResolveCandidateView(BaseModel):
         )
 
 
+class DoubanEpisodesView(BaseModel):
+    """订阅弹层的豆瓣集数提示：豆瓣说本季比 TMDB 录的多。"""
+
+    season_number: int
+    douban_count: int
+    tmdb_count: int = Field(description="TMDB 已录到的最大集号")
+
+
 class PrepareView(BaseModel):
     """预检结果三态：ready 可直接渲染弹层；ambiguous 先让用户选候选；
     not_found 提示该条目暂无法订阅。"""
@@ -176,6 +188,13 @@ class PrepareView(BaseModel):
         ),
     )
     candidates: list[ResolveCandidateView] = Field(default_factory=list)
+    douban_episodes: DoubanEpisodesView | None = Field(
+        default=None,
+        description=(
+            "从豆瓣条目订阅、且豆瓣集数多于 TMDB 已录集数时给出（issue #640）；"
+            "弹层据此提示「按豆瓣集数追」，确认后随创建请求带 episode_floors"
+        ),
+    )
 
 
 class DispatchPreviewView(BaseModel):
@@ -266,6 +285,24 @@ class SubscriptionCreatePayload(BaseModel):
         default=None, description="缺省按规则组适用范围自动选组，都不命中用默认规则组"
     )
     library_id: int | None = Field(default=None, description="入库目标库；缺省用该类型默认库")
+    selection_mode: Literal["rules", "smart"] = "rules"
+    smart_profile_revision: int | None = Field(default=None, ge=1)
+    episode_floors: dict[int, int] | None = Field(
+        default=None,
+        description=(
+            "每季集数下限 {季号: 集数}：TMDB 少录集数时按这个数追，超出部分先占位"
+            '（如 {"1": 27}）；不超过 TMDB 已录集数的季忽略'
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_selection_mode(self):
+        if self.selection_mode == "smart":
+            if self.rule_set_id is not None or self.smart_profile_revision is None:
+                raise ValueError("智能模式需提供已保存的设置版本，且不能同时指定规则组")
+        elif self.smart_profile_revision is not None:
+            raise ValueError("规则模式不能指定智能设置")
+        return self
 
 
 class SubscriptionUpdatePayload(BaseModel):
@@ -277,11 +314,24 @@ class SubscriptionUpdatePayload(BaseModel):
     follow_future: bool | None = Field(
         default=None, description="是否自动续订（未来新集与新季自动纳入）；不传=不变"
     )
-    rule_set_id: int | None = Field(default=None, description="换绑规则组 id；不传=不变")
+    rule_set_id: int | None = Field(
+        default=None, description="换绑规则组 id；不传=不变；智能模式回传 0 也保持不变"
+    )
     library_id: int | None = Field(
         default=None,
         description="换入库目标库；显式传 null=清除指定、改回按默认库路由；不传=不变",
     )
+    episode_floors: dict[int, int] | None = Field(
+        default=None,
+        description=(
+            '整体替换每季集数下限 {季号: 集数}，如 {"1": 27}；传 {} 清除、'
+            "改回以 TMDB 为准；不传=不变"
+        ),
+    )
+
+
+class EpisodeHintDismissPayload(BaseModel):
+    season_number: int = Field(description="忽略哪一季的集数提示")
 
 
 class SubscriptionTrackingState(StrEnum):
@@ -421,7 +471,12 @@ class SubscriptionView(BaseModel):
     status: str
     selected_seasons: list[int]
     follow_future: bool
-    rule_set_id: int
+    rule_set_id: int = Field(
+        ge=0, description="规则组 id；智能模式为 0（兼容旧客户端整数契约），以 selection_mode 为准"
+    )
+    selection_mode: Literal["rules", "smart"] = "rules"
+    smart_policy: dict | None = None
+    smart_status: str | None = None
     library_id: int | None = Field(description="入库目标库；null=该类型默认库")
     progress: ProgressView
     season_collection: list[SeasonOverview] = Field(
@@ -430,6 +485,27 @@ class SubscriptionView(BaseModel):
     )
     created_at: datetime
     updated_at: datetime
+
+    @property
+    def list_priority(self) -> int:
+        """先获取尚未入库的内容，再洗版，最后是暂停与完成；不影响调度。"""
+        if self.status == "paused":
+            return 2
+        seasons = [s for s in self.season_collection if s.season_number > 0]
+        selected = {s for s in self.selected_seasons if s > 0}
+        if not selected and seasons:
+            selected = {max(s.season_number for s in seasons)}
+        missing = any(
+            s.aired_count > s.owned_count for s in seasons if s.season_number in selected
+        )
+        progress = self.progress
+        if missing or progress.wanted + progress.grabbed + progress.downloaded > 0:
+            return 0
+        if progress.upgrading > 0:
+            return 1
+        if self.status == "completed" or (self.media.kind == "movie" and progress.imported > 0):
+            return 3
+        return 0
 
     @field_serializer("created_at", "updated_at")
     def _serialize_utc(self, value: datetime | None) -> str | None:
@@ -454,7 +530,10 @@ class SubscriptionView(BaseModel):
             status=sub.status,
             selected_seasons=list(sub.selected_seasons),
             follow_future=sub.follow_future,
-            rule_set_id=sub.rule_set_id,
+            # 旧版 Apple 客户端按必填 Int 解码；0 仅是 API 占位，不写入外键。
+            rule_set_id=sub.rule_set_id if sub.rule_set_id is not None else 0,
+            selection_mode=sub.selection_mode,
+            smart_policy=sub.smart_policy,
             library_id=sub.library_id,
             progress=ProgressView(
                 total=wanted + grabbed + downloaded + imported,
@@ -626,7 +705,8 @@ class UpgradeRunPayload(BaseModel):
 
     rule_set_id: int | None = Field(
         default=None,
-        description="可选：先换用该规则组再触发（组必须已配置洗版目标）；缺省用当前组",
+        description="可选：先换用该规则组再触发（组必须已配置洗版目标）；"
+        "缺省沿用当前设置；智能模式回传 0 也沿用当前设置",
     )
 
 
@@ -646,7 +726,9 @@ class UpgradeRunView(BaseModel):
     """一轮洗版的体检报告（同步返回的一次性快照，不落库）。"""
 
     target_label: str
-    rule_set_id: int = Field(description="本轮实际生效的规则组（换组后为新组）")
+    rule_set_id: int = Field(
+        ge=0, description="本轮实际生效的规则组；智能模式为 0（兼容旧客户端整数契约）"
+    )
     summary: str = Field(description="中文摘要句，前端直接展示")
     counts: dict[str, int]
     units: list[UpgradeRunUnitView]
@@ -694,6 +776,11 @@ class WantedView(BaseModel):
     grab_title: str | None
     # 洗版派生状态；规则组未配洗版目标或单元未入库时为 null
     upgrade: WantedUpgradeView | None = None
+    selection_state: dict | None = None
+    selection_version: int = 0
+    # 集数下限展开的占位集：TMDB 还没录这一集（issue #640）。可空：旧服务端没有
+    # 这个字段，客户端生成器会把带默认值的字段当必有
+    provisional: bool | None = None
 
     @field_serializer(
         "next_search_at", "last_search_at", "grabbed_at", "downloaded_at", "imported_at"
@@ -727,11 +814,42 @@ class WantedView(BaseModel):
             imported_at=w.imported_at,
             last_reject_reason=w.last_reject_reason,
             grab_title=w.grab_title,
+            selection_state=w.selection_state,
+            selection_version=w.selection_version,
         )
+
+
+class EpisodeSeasonView(BaseModel):
+    """「调整集数」编辑器的一行：订阅范围内的一季。"""
+
+    season_number: int
+    tmdb_count: int = Field(description="TMDB 已录到的最大集号")
+    floor: int | None = Field(default=None, description="已设的集数下限；null=以 TMDB 为准")
+
+
+class EpisodeHintView(BaseModel):
+    """待确认的集数提示：站点或豆瓣显示本季比现在追的更多集。"""
+
+    season_number: int
+    tmdb_count: int
+    floor: int | None = None
+    suggested: int = Field(description="建议集数（站点与豆瓣证据取大）")
+    site_episode: int | None = Field(default=None, description="站点种子出现的最大集号")
+    site_title: str | None = Field(default=None, description="给出该集号的种子标题")
+    douban_count: int | None = Field(default=None, description="豆瓣标注的集数")
 
 
 class SubscriptionDetailView(SubscriptionView):
     wanted: list[WantedView] = Field(default_factory=list)
+    # 两个新列表可空：旧服务端没有，客户端生成器会把带默认值的字段当必有
+    episode_seasons: list[EpisodeSeasonView] | None = Field(
+        default=None,
+        description="剧集订阅范围内各季的 TMDB 集数与集数下限；电影为 null",
+    )
+    episode_hints: list[EpisodeHintView] | None = Field(
+        default=None,
+        description="待确认的集数提示；有提示时订阅不会判「已收齐」；电影为 null",
+    )
     can_manage: bool = Field(
         default=True,
         description=(
@@ -793,8 +911,9 @@ def _wanted_upgrades(
         quality_label,
         upgrade_target_label,
     )
+    from movieclaw_matcher.smart import SmartPolicy
 
-    if not isinstance(rule_spec, RuleSetSpec) or rule_spec.upgrade_source is None:
+    if not isinstance(rule_spec, (RuleSetSpec, SmartPolicy)) or rule_spec.upgrade_source is None:
         return {}
     # upgrade_ready 与调度口径同源（含熔断冷却）——否则详情页显示"洗版中"
     # 的同时 system_notice 却说该单元已暂停，两处互相打架

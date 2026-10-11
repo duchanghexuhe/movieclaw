@@ -42,6 +42,13 @@ PUSH_EVENTS: tuple[PushEvent, ...] = (
         default=False,
     ),
     PushEvent(
+        "identity_skipped",
+        "已跳过同名资源",
+        "订阅发现无法确认身份的同名资源时知会一次，无需处理",
+        group="我的订阅",
+        default=True,
+    ),
+    PushEvent(
         "upgraded",
         "洗版完成",
         "你订阅的内容换成了更好的版本时",
@@ -74,6 +81,14 @@ PUSH_EVENTS: tuple[PushEvent, ...] = (
         "new_version",
         "有新版本",
         "MovieClaw 发布了新版本时，每个版本只提醒一次",
+        group="管理员",
+        default=True,
+        admin_only=True,
+    ),
+    PushEvent(
+        "usage_tip",
+        "使用建议",
+        "发现有设置能改善体验时（比如家里有人在用刷片、电视大图预告，建议开启片段预切），每条只提醒一次",
         group="管理员",
         default=True,
         admin_only=True,

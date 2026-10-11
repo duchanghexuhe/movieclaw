@@ -27,6 +27,8 @@ export interface SubscriptionMedia {
   douban_id: string | null;
   title: string;
   original_title: string;
+  /** 国际英文名：「手动选种」与中文名、原名一起搜；老服务端没有该字段 */
+  english_title?: string | null;
   year: number | null;
   poster_url: string | null;
   /** 宽幅剧照（TMDB w1280，沉浸场景可升 original）；老版本服务端没有这个字段 */
@@ -74,6 +76,16 @@ export interface PrepareResult {
    */
   suggested_seasons: number[];
   candidates: ResolveCandidate[];
+  /** 从豆瓣条目订阅、且豆瓣集数多于 TMDB 已录集数时给出（issue #640）；旧服务端没有 */
+  douban_episodes?: DoubanEpisodes | null;
+}
+
+/** 订阅弹层的豆瓣集数提示：豆瓣说本季比 TMDB 录的多。 */
+export interface DoubanEpisodes {
+  season_number: number;
+  douban_count: number;
+  /** TMDB 已录到的最大集号 */
+  tmdb_count: number;
 }
 
 export interface SubscriptionProgress {
@@ -108,7 +120,11 @@ export interface Subscription {
   status: SubscriptionStatus;
   selected_seasons: number[];
   follow_future: boolean;
+  /** 智能模式为 0（兼容旧客户端整数契约）；模式以 selection_mode 为准。 */
   rule_set_id: number;
+  selection_mode?: "rules" | "smart";
+  smart_policy?: SmartPreferences | null;
+  smart_status?: string | null;
   /** 入库目标库；null = 该类型的默认库 */
   library_id: number | null;
   progress: SubscriptionProgress;
@@ -190,6 +206,8 @@ export interface ResourceTiming {
 }
 
 export interface WantedItem {
+  selection_state?: SmartSelectionState | null;
+  selection_version?: number;
   id: number;
   season_number: number;
   episode_number: number;
@@ -212,6 +230,29 @@ export interface WantedItem {
   grab_title: string | null;
   /** 洗版派生状态；规则组未配洗版目标或单元未入库时为 null */
   upgrade: WantedUpgrade | null;
+  /** 集数下限展开的占位集：TMDB 还没录这一集（issue #640） */
+  provisional?: boolean | null;
+}
+
+/** 「调整集数」编辑器的一行：订阅范围内的一季。 */
+export interface EpisodeSeason {
+  season_number: number;
+  /** TMDB 已录到的最大集号 */
+  tmdb_count: number;
+  /** 已设的集数下限；null=以 TMDB 为准 */
+  floor: number | null;
+}
+
+/** 待确认的集数提示：站点或豆瓣显示本季比现在追的更多集。 */
+export interface EpisodeHint {
+  season_number: number;
+  tmdb_count: number;
+  floor: number | null;
+  /** 建议集数（站点与豆瓣证据取大） */
+  suggested: number;
+  site_episode: number | null;
+  site_title: string | null;
+  douban_count: number | null;
 }
 
 export interface SubscriptionDetail extends Subscription {
@@ -223,6 +264,10 @@ export interface SubscriptionDetail extends Subscription {
   forecast_pending: boolean;
   /** 当前观看者能否调整这条订阅：超管与发起人为 true，只关注的成员为 false（只能取消关注） */
   can_manage: boolean;
+  /** 剧集订阅范围内各季的 TMDB 集数与集数下限；电影为空。旧服务端没有 */
+  episode_seasons?: EpisodeSeason[] | null;
+  /** 待确认的集数提示；有提示时订阅不会判「已收齐」。旧服务端没有 */
+  episode_hints?: EpisodeHint[] | null;
 }
 
 /** 规则组过滤条件（见 movieclaw_matcher.RuleSetSpec）：全部键可缺省=不限。 */
@@ -296,6 +341,8 @@ export interface SubscriptionTargetPreviewPayload {
 }
 
 export interface CreateSubscriptionPayload {
+  selection_mode?: "rules" | "smart";
+  smart_profile_revision?: number;
   /** Discover 返回或歧义候选确认后的稳定引用 */
   title_ref: string;
   /** 从豆瓣候选改选 TMDB 条目时保留原始豆瓣身份 */
@@ -305,6 +352,8 @@ export interface CreateSubscriptionPayload {
   rule_set_id?: number | null;
   /** 入库目标库；缺省用该类型的默认库 */
   library_id?: number | null;
+  /** 每季集数下限 {季号: 集数}：确认「按豆瓣集数追」时带上 */
+  episode_floors?: Record<number, number>;
 }
 
 export interface CreateSubscriptionResult {
@@ -575,6 +624,8 @@ export function updateSubscription(
     rule_set_id?: number;
     /** 换入库目标库；显式传 null=清除指定、改回按默认库路由；缺省不变 */
     library_id?: number | null;
+    /** 整体替换每季集数下限 {季号: 集数}；{} 清除、改回以 TMDB 为准；缺省不变 */
+    episode_floors?: Record<number, number>;
   },
 ): Promise<SubscriptionDetail> {
   return unwrap(
@@ -685,6 +736,19 @@ export function setSubscriptionFollowFuture(
     request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}/follow-future`, {
       method: "PATCH",
       body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
+/** 忽略某季的集数提示，继续以 TMDB 集数为准（更大的新证据仍会再提示）。 */
+export function dismissSubscriptionEpisodeHint(
+  id: number,
+  seasonNumber: number,
+): Promise<SubscriptionDetail> {
+  return unwrap(
+    request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}/episode-hints/dismiss`, {
+      method: "POST",
+      body: JSON.stringify({ season_number: seasonNumber }),
     }),
   );
 }
@@ -848,7 +912,8 @@ export interface SubscriptionActivity {
     | "upgrade_grabbed"
     | "upgraded"
     | "upgrade_verify_failed"
-    | "spec_mismatch";
+    | "spec_mismatch"
+    | "episode_hint";
   message: string;
   payload: Record<string, unknown>;
   created_at: string;
@@ -912,4 +977,43 @@ export function setDefaultRuleSet(id: number): Promise<RuleSet> {
 /** 删除规则组（默认组与被订阅引用的组后端会拒绝，错误信息可直接展示）。 */
 export function deleteRuleSet(id: number): Promise<void> {
   return unwrap(request<ApiEnvelope<void>>(`/rule-sets/${id}`, { method: "DELETE" }));
+}
+
+export interface SmartPreferences {
+  resolution: "1080p" | "2160p";
+  source: "web-dl" | "blu-ray" | "remux";
+  wait_seconds: number;
+  allow_upgrade: boolean;
+  strict_resolution: boolean;
+}
+export interface SmartProfile {
+  kind: "movie" | "tv";
+  revision: number;
+  preferences: SmartPreferences | null;
+}
+export interface SmartSelectionState {
+  identity_explanation?: string | null;
+  anchor_source?: "first_seen" | "published_at";
+  first_observed_at?: string | null;
+  wait_explanation?: string | null;
+  manual_extended?: boolean;
+  choice_explanation?: string | null;
+  anchor: string;
+  deadline: string;
+  observation_end: string;
+  reason: string;
+  candidate_key: string | null;
+  candidate_title: string | null;
+  following: string | null;
+  target_reached: boolean;
+  prediction?: { start: string; end: string; episodes: number[]; lag_seconds: number } | null;
+}
+export function getSmartProfile(kind: "movie" | "tv"): Promise<SmartProfile> {
+  return unwrap(request<ApiEnvelope<SmartProfile>>(`/subscriptions/smart-profiles/${kind}`));
+}
+export function saveSmartProfile(kind: "movie" | "tv", preferences: SmartPreferences, revision: number): Promise<SmartProfile> {
+  return unwrap(request<ApiEnvelope<SmartProfile>>(`/subscriptions/smart-profiles/${kind}`, { method: "PUT", body: JSON.stringify({ preferences, revision }) }));
+}
+export function changeSmartWait(subscriptionId: number, wantedId: number, version: number, action: { extend_seconds?: number; candidate_key?: string }): Promise<unknown> {
+  return unwrap(request<ApiEnvelope<unknown>>(`/subscriptions/${subscriptionId}/wanted/${wantedId}/smart-wait`, { method: "POST", body: JSON.stringify({ version, ...action }) }));
 }

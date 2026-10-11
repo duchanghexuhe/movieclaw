@@ -582,15 +582,16 @@ fun SubscribeScreen(
                     )
                     Spacer(Modifier.weight(1f))
                     if (state.existing == null) {
+                        val canSubmit = !state.creating && submitBlockReason(state) == null
                         // 移动端网页实测：确认键就在头部右侧（文字「确认订阅」，不是底部整宽栏）
                         Text(
                             if (state.creating) "提交中…" else "确认订阅",
                             fontSize = 15.sp,
                             fontWeight = FontWeight.Bold,
-                            color = if (state.creating) TextFaint else Accent,
+                            color = if (canSubmit) Accent else TextFaint,
                             modifier = Modifier
                                 .clip(RoundedCornerShape(999.dp))
-                                .clickable(enabled = !state.creating) { vm.create() }
+                                .clickable(enabled = canSubmit) { vm.create() }
                                 .padding(horizontal = 8.dp, vertical = 6.dp),
                         )
                     }
@@ -703,6 +704,10 @@ fun SubscribeScreen(
                             Spacer(Modifier.height(6.dp))
                         }
                         Text("勾选即要整季（含未播出的集）", fontSize = 12.sp, color = TextFaint)
+                        submitBlockReason(state)?.let { reason ->
+                            Spacer(Modifier.height(6.dp))
+                            Text(reason, fontSize = 12.5.sp, color = Warn)
+                        }
                     }
 
                     // 自动续订只对剧集有意义（网页：followFuture !== null 时才给这一项）

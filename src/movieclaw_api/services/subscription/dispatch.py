@@ -19,6 +19,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api import hooks
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.models import (
     ActivityType,
@@ -62,6 +63,9 @@ async def dispatch(
     match: IdentityMatch | None = None,
     shadow_notes: dict | None = None,
     actor_member_id: int | None = None,
+    selection_versions: dict[int, int] | None = None,
+    submission_intent: SubscriptionDownloadAttempt | None = None,
+    replacing_attempt: SubscriptionDownloadAttempt | None = None,
 ) -> bool:
     """把候选投递给下载器，满足给定的一批工单。返回是否有实际投递发生。
 
@@ -91,14 +95,40 @@ async def dispatch(
     )
 
     upgrade_rows = upgrade_rows or []
-    if upgrade_rows:
+    if upgrade_rows and submission_intent is None and replacing_attempt is None:
         # 洗版没有工单认领这道 DB 防线（不改 status），用投递前复查兜住
         # 被动匹配与搜索 worker 的并发窗口：单元已有在途洗版 attempt 即剔除
         upgrade_rows = await _filter_upgrade_in_flight(session, subscription, upgrade_rows)
-    claimed = await _claim(session, wanted_rows)
+    intent = submission_intent
+    if subscription.selection_mode == "smart":
+        from movieclaw_api.services.subscription.smart_submission import claim_intent
+
+        if intent is None:
+            intent = await claim_intent(
+                session,
+                subscription,
+                wanted_rows,
+                upgrade_rows,
+                candidate,
+                selection_versions
+                if selection_versions is not None
+                else (
+                    {r.id: r.selection_version for r in wanted_rows + upgrade_rows}
+                    if manual
+                    else None
+                ),
+                match,
+                replacing_attempt,
+            )
+        if intent is None:
+            return False
+        claimed = wanted_rows
+    else:
+        claimed = await _claim(session, wanted_rows)
     if not claimed and not upgrade_rows:
         return False  # 全部被另一条路径抢先，本候选无事可做
 
+    is_trial = bool(intent and intent.replaces_attempt_id)
     repo = SubscriptionRepository(session)
     assert subscription.id is not None
     dry_run = get_settings().subscription_dispatch_dry_run
@@ -119,6 +149,20 @@ async def dispatch(
         subscription.kind,
     )
 
+    if intent is not None and subscription.kind == "tv":
+        # 首次提交冻结选择范围；恢复时 match 不再存在，必须使用同一范围。
+        payload = dict(intent.submission or {})
+        if "select_units" not in payload and payload.get("stage") == "claimed":
+            payload.update(
+                select_units=[[w.season_number, w.episode_number] for w in all_targets],
+                known_seasons=subscription.selected_seasons,
+                selection_owner=f"movieclaw-intent-{intent.id}",
+            )
+            intent.submission = payload
+            await session.commit()
+        if payload.get("select_units"):
+            selective_units = {tuple(u) for u in payload["select_units"]}
+
     # 入库目标：订阅指定的库（缺省该类型默认库）→ 投递目录三级兜底走全仓
     # 唯一实现 resolve_save_path（口径与预检/体检/手动下载同源）。
     # 完成后的搬运/入账仍由监听导入或库扫描接管，工单由库存对账关闭——
@@ -134,7 +178,7 @@ async def dispatch(
     decision = await resolve_save_path(
         session, library, kind=subscription.kind, title=item.title, year=item.year, item=item
     )
-    dispatch_dir = decision.path
+    dispatch_dir = intent.save_path if intent is not None and intent.save_path else decision.path
     # entry_level = 投递目录就是库内条目目录：可以安全锚定副标题线索，
     # 帮扫描器收敛拼音命名的种子内容（监听目录/默认目录锚线索会波及无关内容）
     entry_level = decision.entry_level
@@ -159,17 +203,76 @@ async def dispatch(
 
     if not dry_run:
         try:
-            submit_result, downloader_row = await _submit_real(
-                session,
-                candidate,
-                save_path=dispatch_dir,
-                subtitle=candidate.subtitle if entry_level else None,
-                select_units=selective_units,
-                known_seasons=subscription.selected_seasons or None,
-            )
+            submit_options = {}
+            if intent is not None:
+                from movieclaw_api.services.subscription.smart_submission import prepare_remote
+
+                async def before_submit(info_hash, downloader_id):
+                    await prepare_remote(session, intent, info_hash, downloader_id, dispatch_dir)
+
+                async def before_resume():
+                    from movieclaw_api.services.subscription.smart_submission import (
+                        ensure_can_submit,
+                    )
+
+                    await ensure_can_submit(session, intent)
+
+                submit_options = {
+                    "before_submit": before_submit,
+                    "downloader_id": intent.downloader_id,
+                    "selection_owner": (intent.submission or {}).get("selection_owner"),
+                    "before_resume": before_resume,
+                }
+            recovered = None
+            if intent is not None:
+                from movieclaw_api.services.subscription.smart_submission import reconcile_remote
+
+                recovered = await reconcile_remote(session, intent)
+            if recovered is not None:
+                submit_result, downloader_row = recovered
+            else:
+                if intent is not None:
+                    from movieclaw_api.services.subscription.smart_submission import (
+                        ensure_can_submit,
+                    )
+
+                    await ensure_can_submit(session, intent)
+                submit_result, downloader_row = await _submit_real(
+                    session,
+                    candidate,
+                    save_path=dispatch_dir,
+                    subtitle=candidate.subtitle if entry_level else None,
+                    select_units=selective_units,
+                    known_seasons=subscription.selected_seasons or None,
+                    media_kind=item.kind,
+                    **submit_options,
+                )
             skipped_files = submit_result.skipped_file_count
         except Exception as exc:  # noqa: BLE001 -- 投递失败退回调度通道重试
             reason = f"{type(exc).__name__}: {exc}"
+            if intent is not None:
+                from movieclaw_api.services.subscription.smart_submission import (
+                    SubmissionRejected,
+                    reject_intent,
+                )
+
+                if isinstance(exc, SubmissionRejected):
+                    await reject_intent(session, intent, all_targets, reason)
+                    return False
+                intent.updated_at = utcnow()
+                intent.cleanup_note = f"提交待恢复：{reason}"
+                for row in all_targets:
+                    row.selection_state = {
+                        **(row.selection_state or {}),
+                        "reason": "reconciling",
+                        "choice_explanation": (
+                            f"提交尚未完成：{reason}；"
+                            "重试同一任务，不自动改为全量下载。"
+                        ),
+                    }
+                await session.commit()
+                logger.warning("智能投递待对账 #%s：%s", intent.id, reason)
+                return False
             await _rollback_claim(session, claimed, retry_delay=DISPATCH_RETRY_DELAY)
             await repo.add_activity(
                 SubscriptionActivity(
@@ -202,7 +305,7 @@ async def dispatch(
             now = utcnow()
             normalized_hash = submit_result.info_hash.lower()
             submitted_info_hash = normalized_hash
-            for wanted in claimed:
+            for wanted in [] if is_trial else claimed:
                 await session.execute(
                     update(WantedItem)
                     .where(
@@ -231,6 +334,15 @@ async def dispatch(
                 .all()
             )
             attempt_alive = bool(active_targets) or any(w.in_scope for w in upgrade_rows)
+            if is_trial:
+                parent = await session.get(
+                    SubscriptionDownloadAttempt, intent.replaces_attempt_id, populate_existing=True
+                )
+                attempt_alive = bool(
+                    parent
+                    and parent.status == DownloadAttemptStatus.REPLACEMENT_PENDING
+                    and any(w.in_scope for w in all_targets)
+                )
             existing_attempt = (
                 await session.execute(
                     select(SubscriptionDownloadAttempt).where(
@@ -266,7 +378,7 @@ async def dispatch(
                 # 同理粘性：承担过手动选种语义就保持（验证裁决据此分流）
                 "manual": manual or (existing_attempt is not None and existing_attempt.manual),
                 "status": (
-                    DownloadAttemptStatus.ACTIVE
+                    (DownloadAttemptStatus.TRIAL if is_trial else DownloadAttemptStatus.ACTIVE)
                     if attempt_alive
                     else DownloadAttemptStatus.CANCELLED
                 ),
@@ -341,6 +453,14 @@ async def dispatch(
                 session.add(existing_attempt)
             await session.commit()
 
+    if intent is not None and dry_run:
+        intent.status = DownloadAttemptStatus.TRIAL if is_trial else DownloadAttemptStatus.ACTIVE
+        await session.commit()
+    if intent is not None:
+        for row in all_targets:
+            row.selection_state = {**(row.selection_state or {}), "reason": "submitted"}
+        await session.commit()
+
     # 活动是投递事实的永久台账：这里把资源发布→首次索引→提交下载器的时间链
     # 一并冻结。不能只在详情页临时查 site_torrent——用户移除站点会清索引，
     # 历史耗时仍应保留。手动选种不落索引，first_seen_at 合理为空。
@@ -376,7 +496,12 @@ async def dispatch(
         if skipped_files
         else ""
     )
-    if upgrade_rows and not claimed:
+    if is_trial:
+        activity_type = ActivityType.REPLACEMENT_TRIAL
+        message = (
+            f"已提交同品质替代源验证{units_label}：{candidate.title[:60]}；确认新源有进度后再切换"
+        )
+    elif upgrade_rows and not claimed:
         activity_type = ActivityType.UPGRADE_GRABBED
         label_text = (
             f"{upgrade_labels[1]}（当前 {upgrade_labels[0]}）" if upgrade_labels else spec_text
@@ -412,6 +537,21 @@ async def dispatch(
                 .where(WantedItem.id == wanted.id)
                 .values(grab_title=grab_note, updated_at=grab_ts)
             )
+    if not dry_run:
+        # 可靠事件随下面这条抓取动态一起提交（plugin-phase2a.md §4）；模拟投递不是事实，不发
+        from movieclaw_api import domain_events
+
+        await domain_events.record_subscription_units(
+            session,
+            domain_events.SUBSCRIPTION_DOWNLOAD_STARTED,
+            subscription_id=subscription.id,
+            item=item,
+            units=[(w.season_number, w.episode_number) for w in all_targets],
+            info_hash=submitted_info_hash,
+            site_id=candidate.site_id,
+            torrent_title=candidate.title,
+            upgrade=bool(upgrade_rows and not claimed),
+        )
     await repo.add_activity(
         SubscriptionActivity(
             subscription_id=subscription.id,
@@ -574,14 +714,12 @@ async def preview_dispatch_route(
         # 判断，不能仍偷看默认下载器，否则「预检可投、提交被拒」会重新出现。
         downloader = await session.get(DownloaderClient, downloader_id)
     else:
-        result = await session.execute(
-            select(DownloaderClient).where(
-                DownloaderClient.is_default.is_(True),  # type: ignore[attr-defined]
-                DownloaderClient.enabled.is_(True),  # type: ignore[attr-defined]
-                DownloaderClient.status == ConfigStatus.ACTIVE,
-            )
+        # 与实际投递同一个选择函数（含插件分流），预检结论不会与投递分家
+        from movieclaw_api.services.torrent_submit import pick_downloader
+
+        downloader = await pick_downloader(
+            session, hooks.DownloaderQuery(title=entry_title, media_kind=kind)
         )
-        downloader = result.scalars().first()
 
     mode = decision.mode
     ok = True
@@ -651,6 +789,7 @@ async def _filter_upgrade_in_flight(
                 SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
                     (
                         DownloadAttemptStatus.ACTIVE,
+                        DownloadAttemptStatus.SUBMITTING,
                         DownloadAttemptStatus.REPLACEMENT_PENDING,
                         DownloadAttemptStatus.TRIAL,
                         DownloadAttemptStatus.CLEANUP_PENDING,
@@ -736,6 +875,11 @@ async def _submit_real(
     subtitle: str | None = None,
     select_units: set[tuple[int, int]] | None = None,
     known_seasons: Collection[int] | None = None,
+    before_submit=None,
+    downloader_id: int | None = None,
+    selection_owner: str | None = None,
+    before_resume=None,
+    media_kind: str | None = None,
 ):
     """真实投递：委托公共编排（站点取种 → 默认下载器提交，幂等判重）。
 
@@ -757,6 +901,18 @@ async def _submit_real(
         subtitle=subtitle,
         select_units=select_units,
         known_seasons=known_seasons,
+        before_submit=before_submit,
+        downloader_id=downloader_id,
+        selection_owner=selection_owner,
+        before_resume=before_resume,
+        route_hint=hooks.DownloaderQuery(
+            site_id=candidate.site_id,
+            title=candidate.title,
+            size_bytes=candidate.size_bytes,
+            media_kind=media_kind,
+            category="movieclaw",
+            tags=("movieclaw-sub",),
+        ),
     )
     return result, row
 

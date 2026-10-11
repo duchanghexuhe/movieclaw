@@ -184,8 +184,13 @@ class SubscribeViewModel @Inject constructor(
                         it.copy(
                             loading = false,
                             preview = preview,
-                            selectedSeasons = preview.suggestedSeasons.toSet(),
-                            followFuture = preview.media?.kind == "tv",
+                            // 默认勾选同网页：服务端建议的季；没有建议时勾上已开播的季。
+                            // 以前没建议就一季不勾，直接点订阅会落下一条空订阅
+                            selectedSeasons = preview.suggestedSeasons.ifEmpty {
+                                preview.seasons.filter { s -> s.seasonNumber > 0 && s.airedCount > 0 }.map { s -> s.seasonNumber }
+                            }.toSet(),
+                            // 自动续订默认只给还在播的剧（网页同口径）：完结剧追新集没有意义
+                            followFuture = preview.media?.kind == "tv" && preview.media?.status == "Returning Series",
                         )
                     }
                     // 已经订阅过：把订阅本体也取回来，弹层切成管理态（iOS：已订阅也打开弹层，
@@ -290,7 +295,7 @@ class SubscribeViewModel @Inject constructor(
 
     fun create() {
         val state = _ui.value
-        if (state.creating) return
+        if (state.creating || submitBlockReason(state) != null) return
         _ui.update { it.copy(creating = true) }
         viewModelScope.launch {
             val origin = origin ?: return@launch
@@ -320,4 +325,16 @@ class SubscribeViewModel @Inject constructor(
                 }
         }
     }
+}
+
+/**
+ * 剧集订阅弹层的提交守卫（网页 subscribe-dialog `canSubmit` 同口径，外加完结剧一条）：
+ * 一季都不勾时只能靠「自动续订」追新集——没开、或剧已经完结（不会再有新集），
+ * 提交出去就是一条 0 集、立刻被判「已收齐」的空订阅。返回 null = 可以提交。
+ */
+internal fun submitBlockReason(state: SubscribeViewModel.UiState): String? {
+    val media = state.preview?.media ?: return null
+    if (media.kind != "tv" || state.existing != null || state.selectedSeasons.isNotEmpty()) return null
+    if (media.status == "Ended" || media.status == "Canceled") return "该剧已完结，没有新集可追，请至少勾选一季"
+    return if (state.followFuture) null else "请选择至少一季，或开启自动续订"
 }

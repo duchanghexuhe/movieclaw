@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from pathlib import Path, PurePath
 from typing import Annotated, Literal
@@ -23,6 +24,7 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api import domain_events
 from movieclaw_api.api.deps import require_admin, require_login
 from movieclaw_api.api.routes.images import WIDTH_QUERY, requested_width, sized_file
 from movieclaw_api.exceptions import BadRequestException, ConflictException, NotFoundException
@@ -39,11 +41,15 @@ from movieclaw_api.schemas.library import (
     ClaimPayload,
     ConsolidateRootsPayload,
     ConsolidateRootsPreviewView,
+    DeleteFollowUpView,
+    DeleteOptionView,
+    DeletePreviewLineView,
     DetachPayload,
     DirectorView,
     FileOriginView,
     IdentityReviewDecision,
     ItemCollectionRef,
+    ItemDeletePreviewView,
     ItemDeleteResultView,
     LastOrganizeView,
     LastScanView,
@@ -87,6 +93,7 @@ from movieclaw_api.schemas.library import (
     ReviewResolvePayload,
     ScanProgressView,
     ScanResultView,
+    ScanStartPayload,
     SeasonEpisodesView,
     SubtitleCueView,
     SubtitleDeleteResultView,
@@ -108,10 +115,10 @@ from movieclaw_api.schemas.library_search import LibrarySearchView
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import jobs, media_scrape
 from movieclaw_api.services.auth import Principal
+from movieclaw_api.services.library import acquisition, source_annotation
 from movieclaw_api.services.library import chapters as chapters_mod
 from movieclaw_api.services.library import claim as library_claim
 from movieclaw_api.services.library import skip_segments as skip_segments_mod
-from movieclaw_api.services.library import source_annotation
 from movieclaw_api.services.library.access import (
     ContentLimit,
     assert_item_visible,
@@ -132,8 +139,18 @@ from movieclaw_api.services.library.batch_transfer import (
 )
 from movieclaw_api.services.library.collections import collections_containing
 from movieclaw_api.services.library.config import LibraryConfigService
-from movieclaw_api.services.library.ingest import _downloader_briefs
+from movieclaw_api.services.library.delete_participants import (
+    DeleteFile,
+    DeleteRequest,
+    enqueue_follow_ups,
+)
+from movieclaw_api.services.library.delete_participants import OptionError as DeleteOptionError
+from movieclaw_api.services.library.delete_participants import check_options as check_delete_options
+from movieclaw_api.services.library.delete_participants import (
+    preview_options as preview_delete_options,
+)
 from movieclaw_api.services.library.items import (
+    DeleteResult,
     HomeKind,
     LibraryFilter,
     _wall_count,
@@ -153,6 +170,7 @@ from movieclaw_api.services.library.items import (
     kind_library_ids,
     local_item_artwork,
     purge_staged_deletions,
+    season_resume_episode,
 )
 from movieclaw_api.services.library.layout import IMAGE_EXTS, entry_dir_of
 from movieclaw_api.services.library.mounts import library_on_network_mount
@@ -163,7 +181,7 @@ from movieclaw_api.services.library.organize import (
     last_organize,
     organize_progress,
 )
-from movieclaw_api.services.library.origin import derive_origins, origin_of
+from movieclaw_api.services.library.origin import origin_of
 from movieclaw_api.services.library.preflight import (
     CONFLICT_LABELS,
     MAX_SELECTION,
@@ -180,6 +198,7 @@ from movieclaw_api.services.library.scan import (
     reidentify_item,
     request_stop_scan,
     scan_progress,
+    scope_entries,
 )
 from movieclaw_api.services.library.series import (
     ensure_series_collections_for_library,
@@ -268,7 +287,7 @@ def _assignment_target(title_ref: str) -> tuple[MediaKind, int]:
 
 def _job_origin(client_name: object) -> str:
     """从统一客户端头识别 Web/CLI；直接调用路由的测试对象安全退回 Web。"""
-    if isinstance(client_name, str) and client_name.lower() in {"web", "cli", "agent"}:
+    if isinstance(client_name, str) and client_name.lower() in {"web", "cli", "agent", "plugin"}:
         return client_name.lower()
     return "web"
 
@@ -1443,11 +1462,21 @@ async def start_scan(
     library_id: int,
     client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
+    payload: ScanStartPayload | None = None,
 ) -> ApiResponse[ScanResultView]:
     """增量扫描：已在台账的文件秒过；新文件走 NFO → 文件名解析 → TMDB
-    识别链，认不出的进「待识别」清单。扫描绝不移动/改名/删除存量文件。"""
+    识别链，认不出的进「待识别」清单。扫描绝不移动/改名/删除存量文件。
+
+    给了 ``paths`` 就只扫这些路径所在的条目目录（与监听触发的扫描同一语义），
+    不在库根之下的路径直接拒绝。"""
     service = LibraryConfigService(session)
     library = await service.get(library_id)
+    scope: list[str] | None = None
+    if payload is not None and payload.paths:
+        try:
+            scope = scope_entries(library, payload.paths)
+        except ValueError as exc:
+            raise BadRequestException(str(exc)) from exc
     phase = busy_phase(library_id)
     if phase is not None:
         raise ConflictException(f"「{library.name}」{PHASE_LABELS[phase]}，请等待完成")
@@ -1456,12 +1485,12 @@ async def start_scan(
     if is_transferring(library_id):
         raise ConflictException(f"「{library.name}」正在转移条目，请等待转移完成后再扫描")
     created = await enqueue_scan_job(
-        session, library_id, library.name, origin=_job_origin(client_name)
+        session, library_id, library.name, origin=_job_origin(client_name), scope_paths=scope
     )
     return ok(
         ScanResultView(
             started=True,
-            message=f"已开始扫描「{library.name}」",
+            message=f"已开始扫描「{library.name}」" + (f"的 {len(scope)} 个目录" if scope else ""),
             job_id=created.job.id,
             created=created.created,
         ),
@@ -2463,7 +2492,7 @@ def _file_view(
 ) -> LibraryFileView:
     """台账行 → 详情页文件视图：内封字幕轨与外挂字幕文件合并成一份清单。
 
-    ``origins`` 是旧行（origin 为空）的读时推导结果（``derive_origins``），
+    ``origins`` 是旧行（origin 为空）的读时推导结果（获取领域的 ``describe_origins``），
     有落库快照的行不看它。``chapters_enabled`` 是所在库的「生成章节」开关：
     关着时章节给 None——详情页与分享页（它投影的就是这份视图）都不出章节横排，
     台账里探到的章节与已生成的图原样留着，重新打开开关即恢复。``defaults`` 是这个成员
@@ -2722,7 +2751,7 @@ async def get_library_item(
         seasons = sorted({s for s in meta_seasons if s > 0} | owned_seasons)
 
     assert item.id is not None
-    origins = await derive_origins(session, rows)
+    origins = await acquisition.current().describe_origins(session, rows)
     # 文件区标「默认」的是这个成员起播时真会放的那条（本集记着的 > 沿用上一集 > 默认轨策略），
     # 不再是片源的默认旗标：观看状态一次查询取完整个条目，其余是内存计算
     watch_states = await playback_state.get_states(session, [media_item_id], member_id=member_id)
@@ -2759,6 +2788,7 @@ async def get_library_item(
             douban_id=item.douban_id,
             title=item.title,
             original_title=item.original_title,
+            english_title=item.english_title,
             year=item.year,
             poster_url=poster_url,
             backdrop_url=backdrop_url,
@@ -2820,6 +2850,7 @@ async def list_item_episodes(
         SeasonEpisodesView(
             season_number=season_number,
             episodes=[episode_view(e) for e in episodes],
+            resume_episode=season_resume_episode(episodes),
         )
     )
 
@@ -3030,6 +3061,160 @@ async def get_item_artwork(
     raise NotFoundException("条目目录里没有本地美术图")
 
 
+def _delete_view(result: DeleteResult, *, dry_run: bool = False) -> ItemDeleteResultView:
+    return ItemDeleteResultView(
+        removed_paths=result.removed_paths,
+        rows_deleted=result.rows_deleted,
+        freed_bytes=result.freed_bytes,
+        errors=result.errors,
+        dry_run=dry_run,
+    )
+
+
+# ---------------------------------------------------------------------- 删除参与方
+# 别的模块在删除时的附加选项（docs/design/library-boundary.md §3）。媒体库只知道「有人给了个
+# 选项、用户勾了没」：预览时问一遍，删除时核对勾选、在同一次提交里为它们建后续任务。
+
+_OPTIONS_QUERY = Query(
+    description=(
+        "勾选的删除选项（逗号分隔的键，来自删除预览接口）；不传 = 都不勾。"
+        "选项不存在或这次不可用时返回 400"
+    )
+)
+
+
+def _delete_request(
+    library_id: int, item: MediaItem, rows: list[LibraryFile], *, whole: bool
+) -> DeleteRequest:
+    assert item.id is not None
+    return DeleteRequest(
+        library_id=library_id,
+        media_item_id=item.id,
+        title=item.title,
+        whole_item=whole,
+        files=tuple(
+            DeleteFile(
+                id=row.id,
+                path=row.file_path,
+                season=row.season_number,
+                episode=row.episode_number,
+                size_bytes=row.size_bytes or 0,
+            )
+            for row in rows
+            if row.id is not None
+        ),
+    )
+
+
+def _linked_bytes(paths: list[str]) -> int:
+    """要删的文件里与别处是同一份数据（硬链接，链接数 > 1）的字节数。只看文件系统，不问来源。"""
+    total = 0
+    for raw in paths:
+        path = Path(raw)
+        try:
+            targets = [f for f in path.rglob("*") if f.is_file()] if path.is_dir() else [path]
+            for target in targets:
+                st = target.stat()
+                if st.st_nlink > 1:
+                    total += st.st_size
+        except OSError:
+            continue
+    return total
+
+
+async def _checked_options(request: DeleteRequest, scope: str, raw: str | None) -> list[str]:
+    keys = [k.strip() for k in (raw or "").split(",") if k.strip()]
+    try:
+        return await check_delete_options(request, scope, keys)
+    except DeleteOptionError as exc:
+        raise BadRequestException(str(exc)) from exc
+
+
+def _with_follow_ups(
+    session: AsyncSession,
+    record_deleted: Callable[[set[int]], Awaitable[None]] | None,
+    library_id: int,
+    item: MediaItem,
+    rows: list[LibraryFile],
+    keys: list[str],
+    scope: str,
+    sink: list[dict[str, str]],
+) -> Callable[[set[int]], Awaitable[None]] | None:
+    """删除提交前：先写删除事件，再为勾选的选项建后续任务（只带实际删掉的文件）。"""
+    if not keys:
+        return record_deleted
+
+    async def before_commit(deleted_ids: set[int]) -> None:
+        if record_deleted is not None:
+            await record_deleted(deleted_ids)
+        deleted = [row for row in rows if row.id in deleted_ids]
+        if not deleted:
+            return
+        request = _delete_request(
+            library_id, item, deleted, whole=len(deleted) == len(rows)
+        )
+        sink.extend(await enqueue_follow_ups(session, request, keys, scope))
+
+    return before_commit
+
+
+@router.get(
+    "/{library_id}/items/{media_item_id}/delete-preview",
+    response_model=ApiResponse[ItemDeletePreviewView],
+    summary="删除前预览：媒体库将删除什么，以及删除弹窗里的附加选项（各自勾上会发生什么）",
+    operation_id="library.items.delete-preview",
+    dependencies=[Depends(require_admin)],
+)
+async def preview_library_delete(
+    library_id: int,
+    media_item_id: int,
+    session: AsyncSession = Depends(get_session),
+    file_id: Annotated[
+        int | None, Query(description="只删这个文件时传它；不传 = 删除整部")
+    ] = None,
+) -> ApiResponse[ItemDeletePreviewView]:
+    """只读。附加选项来自别的模块（例：下载模块的「同时删除下载任务和源文件」），默认一律不勾；
+    勾选时把选项的键传给删除接口的 ``options``。"""
+    service = LibraryConfigService(session)
+    library = await service.get(library_id)
+    item, rows = await _item_rows(session, library_id, media_item_id)
+    if file_id is None:
+        scope, targets = "item", rows
+        plan = await delete_item_files(session, library, media_item_id, rows, dry_run=True)
+    else:
+        row = next((r for r in rows if r.id == file_id), None)
+        if row is None:
+            raise NotFoundException(f"台账文件不存在或不属于「{item.title}」：id={file_id}")
+        scope, targets = "file", rows if len(rows) == 1 else [row]
+        plan = await delete_single_file(session, library, row, rows, dry_run=True)
+    whole = len(targets) == len(rows)
+    request = _delete_request(library_id, item, targets, whole=whole)
+    present = [r.file_path for r in targets if r.state != FileState.MISSING]
+    linked = await asyncio.to_thread(_linked_bytes, present)
+    options = await preview_delete_options(request, scope)
+    return ok(
+        ItemDeletePreviewView(
+            whole_item=whole,
+            plan=_delete_view(plan, dry_run=True),
+            linked_bytes=linked,
+            options=[
+                DeleteOptionView(
+                    key=o.key,
+                    label=o.label,
+                    help=o.help,
+                    available=o.preview.available,
+                    reason=o.preview.reason,
+                    lines=[
+                        DeletePreviewLineView(text=line.text, tone=line.tone)
+                        for line in o.preview.lines
+                    ],
+                )
+                for o in options
+            ],
+        )
+    )
+
+
 @router.delete(
     "/{library_id}/items/{media_item_id}",
     response_model=ApiResponse[ItemDeleteResultView],
@@ -3043,6 +3228,10 @@ async def delete_library_item(
     media_item_id: int,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
+    dry_run: Annotated[
+        bool, Query(description="只演练：返回将要删除的路径与台账行，不动磁盘和台账")
+    ] = False,
+    options: Annotated[str | None, _OPTIONS_QUERY] = None,
 ) -> ApiResponse[ItemDeleteResultView]:
     """全站唯一会删磁盘文件的接口——与「忽略/清理记录」（只动台账）截然
     不同，调用方必须先向用户明确确认再调用（CLI 已强制 --yes）。删除失败的文件保留台账行。"""
@@ -3050,7 +3239,30 @@ async def delete_library_item(
     library = await service.get(library_id)
     await _assert_not_busy(session, library.name, library_id)
     item, rows = await _item_rows(session, library_id, media_item_id)
-    result = await delete_item_files(session, library, media_item_id, rows)
+    if dry_run:
+        plan = await delete_item_files(session, library, media_item_id, rows, dry_run=True)
+        return ok(
+            _delete_view(plan, dry_run=True),
+            message=(
+                f"演练：「{item.title}」将删除 {len(plan.removed_paths)} 个路径（未删除任何东西）"
+            ),
+        )
+    keys = await _checked_options(
+        _delete_request(library_id, item, rows, whole=True), "item", options
+    )
+    record_deleted = await domain_events.deletion_recorder(
+        session, library_id, item, rows, options=keys
+    )
+    follow_ups: list[dict[str, str]] = []
+    result = await delete_item_files(
+        session,
+        library,
+        media_item_id,
+        rows,
+        before_commit=_with_follow_ups(
+            session, record_deleted, library_id, item, rows, keys, "item", follow_ups
+        ),
+    )
 
     # 通知下游媒体服务器刷新库（未配置时空转；失败只告警不阻断）
 
@@ -3061,12 +3273,8 @@ async def delete_library_item(
     # 真正的磁盘回收：文件已 rename 出媒体库，慢 IO 挪到响应之后做
     background_tasks.add_task(purge_staged_deletions, result.pending_purge)
 
-    view = ItemDeleteResultView(
-        removed_paths=result.removed_paths,
-        rows_deleted=result.rows_deleted,
-        freed_bytes=result.freed_bytes,
-        errors=result.errors,
-    )
+    view = _delete_view(result)
+    view.follow_ups = [DeleteFollowUpView(**f) for f in follow_ups]
     if result.errors:
         message = f"「{item.title}」部分删除失败：{'；'.join(result.errors)}"
     else:
@@ -3088,6 +3296,10 @@ async def delete_library_file(
     file_id: int,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
+    dry_run: Annotated[
+        bool, Query(description="只演练：返回将要删除的路径与台账行，不动磁盘和台账")
+    ] = False,
+    options: Annotated[str | None, _OPTIONS_QUERY] = None,
 ) -> ApiResponse[ItemDeleteResultView]:
     """条目删除的文件级姊妹（多版本洗掉一个 / 删某集重下）——同样会真删
     磁盘，调用方必须先向用户明确确认。该文件是条目在本库的最后一个文件时
@@ -3100,7 +3312,30 @@ async def delete_library_file(
     if row is None:
         raise NotFoundException(f"台账文件不存在或不属于「{item.title}」：id={file_id}")
     file_name = PurePath(row.file_path).name
-    result = await delete_single_file(session, library, row, rows)
+    if dry_run:
+        plan = await delete_single_file(session, library, row, rows, dry_run=True)
+        whole = "（这是最后一个文件，将整条删除）" if len(rows) == 1 else ""
+        return ok(
+            _delete_view(plan, dry_run=True),
+            message=f"演练：「{file_name}」将被删除{whole}（未删除任何东西）",
+        )
+    targets = rows if len(rows) == 1 else [row]
+    keys = await _checked_options(
+        _delete_request(library_id, item, targets, whole=len(rows) == 1), "file", options
+    )
+    record_deleted = await domain_events.deletion_recorder(
+        session, library_id, item, rows, options=keys
+    )
+    follow_ups: list[dict[str, str]] = []
+    result = await delete_single_file(
+        session,
+        library,
+        row,
+        rows,
+        before_commit=_with_follow_ups(
+            session, record_deleted, library_id, item, rows, keys, "file", follow_ups
+        ),
+    )
 
     # 与整条目删除同一套善后：通知媒体服务器刷新；条目在所有库都没文件了
     # 且没订阅时连同图片资产一并清掉；磁盘回收挪到响应之后
@@ -3108,12 +3343,8 @@ async def delete_library_file(
     background_tasks.add_task(media_scrape.cleanup_orphan_items, [media_item_id])
     background_tasks.add_task(purge_staged_deletions, result.pending_purge)
 
-    view = ItemDeleteResultView(
-        removed_paths=result.removed_paths,
-        rows_deleted=result.rows_deleted,
-        freed_bytes=result.freed_bytes,
-        errors=result.errors,
-    )
+    view = _delete_view(result)
+    view.follow_ups = [DeleteFollowUpView(**f) for f in follow_ups]
     if result.errors:
         message = f"「{file_name}」删除失败：{'；'.join(result.errors)}"
     elif len(rows) == 1:
@@ -3167,7 +3398,7 @@ async def purge_library_file(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
     """回收机制的「立即清理」：不等保留期，删物理文件 + 删台账行。
-    做种保护形态（原地待回收）的清理可能中断做种——确认弹窗由前端负责，
+    原地待回收（原盘目录 / 移动失败）的清理直接删原位置，可能中断做种——确认弹窗由前端负责，
     调用方必须先向用户明确确认。"""
     from movieclaw_api.services.library.recycle import purge_file
 
@@ -3427,17 +3658,8 @@ async def _batch_transfer_context(
 
 
 async def _seeding_root_names() -> set[str] | None:
-    """下载器当前的落盘根名集合；下载器不可达时返回 None（如实报"无法确认"）。
-
-    用途是识别「下载器直接做种库内路径」这种非常规部署：那种部署下库里的
-    条目目录名就是下载器的落盘根名，搬走（哪怕是同盘 rename）都会让做种任务
-    找不到文件。按正常方式入库的库（复制或硬链接）目录名是规范化过的
-    ``标题 (年份)``，与种子原名不同，不会命中。
-    """
-    briefs = await _downloader_briefs()
-    if briefs is None:
-        return None
-    return {b.content_name for b in briefs if getattr(b, "content_name", "")}
+    """外部下载器正在用的落盘根名（获取领域给，见 acquisition.paths_in_use）；None = 无法确认。"""
+    return await acquisition.current().paths_in_use()
 
 
 @router.post(

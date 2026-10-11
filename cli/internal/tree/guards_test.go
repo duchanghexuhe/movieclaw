@@ -39,6 +39,18 @@ var knownNonGenerated = []string{
 	"auth.devices.deny",
 	// 让成员在全部设备上下线：同属管理别人的设备，只在网页或 App 的成员管理里做
 	"members.sign-out",
+	// 通道插件化之前的通道接口（docs/design/plugin-channels.md §6）：只为已发布的 App 保留，
+	// 命令行走通用的 channels 命令
+	"channels.weixin.accounts.list",
+	"channels.weixin.accounts.unbind",
+	"channels.weixin.bindings.start",
+	"channels.weixin.bindings.status",
+	"channels.weixin.bindings.verify",
+	"channels.im.accounts.list",
+	"channels.im.accounts.unbind",
+	"channels.im.bindings.start",
+	"channels.im.bindings.status",
+	"channels.im.feishu.bind",
 	"images.asset",
 	"images.proxy",
 	// 演职员本地头像（docs/design/image-sizing.md §4.2）：二进制出图，客户端展示用
@@ -165,6 +177,10 @@ var knownNonGenerated = []string{
 	"reels.events",
 	// Apple TV 大图停留后原地放的那一段，只有电视首页 / 详情页用
 	"reels.preview",
+	// 预切片段（reels.md §8）：系统播放器按 Range 取的小文件，以及设置页关开关时的统计与清空
+	"reels.clips.stream",
+	"reels.clips.stats",
+	"reels.clips.clear",
 	// MovieClaw Cloud 与 App 推送（docs/design/cloud-push.md）：连接要在官网批准、看配对码，
 	// 推送通道、通知开关、App 登记都是设置页和 App 的事，命令行没有对应形态
 	"cloud.status",
@@ -189,6 +205,12 @@ var knownNonGenerated = []string{
 	"push.me.registration.set",
 	"push.me.registration.delete",
 	"push.images.get",
+	// 使用提示（docs/design/tips.md）：各端界面内部的提示状态，CLI 无消费方
+	"tips.state.show",
+	"tips.state.reset",
+	"tips.events.donate",
+	"tips.displays.record",
+	"tips.invalidate",
 }
 
 // TestNonGeneratedEndpointsAreAllKnown 强制新端点显式表态：进命令树，或登记豁免。
@@ -261,8 +283,10 @@ func TestDomainCommandSets(t *testing.T) {
 			"subscriptions.cleanup-seasons",
 			"subscriptions.create",
 			"subscriptions.delete",
+			"subscriptions.dismiss-episode-hint",
 			"subscriptions.download-selected-torrent",
 			"subscriptions.get",
+			"subscriptions.get-smart-profile",
 			"subscriptions.list",
 			"subscriptions.list-active-downloads",
 			"subscriptions.list-activities",
@@ -270,11 +294,13 @@ func TestDomainCommandSets(t *testing.T) {
 			"subscriptions.preview-download-routing",
 			"subscriptions.preview-removal",
 			"subscriptions.search-missing-resources",
+			"subscriptions.save-smart-profile",
 			"subscriptions.set-follow-future",
 			"subscriptions.set-tracking-state",
 			"subscriptions.upgrade-run",
 			"subscriptions.unsubscribe",
 			"subscriptions.update",
+			"subscriptions.update-smart-wait",
 		},
 		"library": {
 			"library.artwork.download",
@@ -299,6 +325,7 @@ func TestDomainCommandSets(t *testing.T) {
 			"library.items.annotate-media-source",
 			"library.items.delete",
 			"library.items.delete-file",
+			"library.items.delete-preview",
 			"library.items.facets",
 			"library.items.purge-file",
 			"library.items.restore-file",
@@ -313,6 +340,7 @@ func TestDomainCommandSets(t *testing.T) {
 			"library.items.refresh-metadata",
 			"library.items.regenerate-chapter-images",
 			"library.items.reidentify",
+			"library.items.relations",
 			"library.items.share.create",
 			"library.items.share.get",
 			"library.items.share.revoke",
