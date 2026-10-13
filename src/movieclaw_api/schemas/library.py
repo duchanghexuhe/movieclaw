@@ -964,6 +964,11 @@ class LibraryFileView(BaseModel):
         description="待回收原因（中文整句，含触发方），文件区直接展示",
     )
     origin: FileOriginView = Field(description="来源快照：这个文件是怎么进库的")
+    # 派生资产身份（preload-transcode.md §6）：预转码产物在文件区标注来源与可删性
+    derivation: dict | None = Field(
+        default=None,
+        description='派生元数据 {"kind":"preload","preset_id","task_id"}；NULL=原生文件',
+    )
     kept_at: datetime | None = Field(
         default=None, description="用户在重复文件页点过「都留着」的时间；null=未标记"
     )

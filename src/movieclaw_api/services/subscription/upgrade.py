@@ -106,6 +106,8 @@ async def fill_snapshots(
                 select(LibraryFile).where(
                     LibraryFile.media_item_id == media_item_id,
                     LibraryFile.in_place(),
+                    # 洗版质量比较只看原生文件（预转码便携版不参与）
+                    LibraryFile.native(),
                 )
             )
         )
@@ -201,6 +203,8 @@ async def materialize_owned_wanted(
             select(LibraryFile).where(
                 LibraryFile.media_item_id == subscription.media_item_id,
                 LibraryFile.in_place(),
+                # 洗版质量比较只看原生文件（预转码便携版不参与）
+                LibraryFile.native(),
             )
         )
     ).scalars():
@@ -655,6 +659,8 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                 select(LibraryFile).where(
                     LibraryFile.media_item_id == media_item_id,
                     LibraryFile.in_place(),
+                    # 洗版质量比较只看原生文件（预转码便携版不参与）
+                    LibraryFile.native(),
                 )
             )
         ).scalars()

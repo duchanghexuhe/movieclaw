@@ -43,6 +43,11 @@ from movieclaw_api.settings.network import (
     NetworkEgressSetting,
 )
 from movieclaw_api.settings.playback import PlaybackPolicySetting
+from movieclaw_api.settings.preload_transcode import (
+    DEFAULT_PRELOAD_QUOTA_BYTES,
+    DEFAULT_PRELOAD_STALE_DAYS,
+    PreloadSetting,
+)
 from movieclaw_api.settings.remote_transcode import (
     DEFAULT_REMOTE_TRANSCODE_MAX_ARTIFACT_BYTES,
     MAX_REMOTE_TRANSCODE_ARTIFACT_BYTES,
@@ -108,6 +113,9 @@ __all__ = [
     # 网络与代理
     "NetworkEgressSetting",
     "PlaybackPolicySetting",
+    "PreloadSetting",
+    "DEFAULT_PRELOAD_QUOTA_BYTES",
+    "DEFAULT_PRELOAD_STALE_DAYS",
     "RemoteTranscodeSetting",
     "DEFAULT_REMOTE_TRANSCODE_MAX_ARTIFACT_BYTES",
     "MAX_REMOTE_TRANSCODE_ARTIFACT_BYTES",

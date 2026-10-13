@@ -172,6 +172,12 @@ async def recycle_file(
     file.updated_at = now
     logger.info("文件已移入回收站：%s → %s", src, target)
     await _record(session, "trashed", file)
+    # 洗版换源（upgrade_replaced 等）后旧源的预转码版立即失效（§6）：
+    # 恢复回收站也救不回产物——它是按旧源内容转的，恢复源后可重新下单
+    if reason == "upgrade_replaced":
+        from movieclaw_api.services.preload.service import invalidate_for_source
+
+        await invalidate_for_source(session, file.id)
     return "moved_to_trash"
 
 
@@ -238,6 +244,11 @@ async def purge_file(session: AsyncSession, file: LibraryFile, *, reason: str = 
         return False
     await _record(session, "purged", file, reason=reason)
     await session.delete(file)
+    # 派生物失效（preload-transcode.md §6）：源没了，预转码产物直接清理
+    # 不进回收站——在删行**之前**处理（CASCADE 兜底只删行，文件会成孤儿）
+    from movieclaw_api.services.preload.service import invalidate_for_source
+
+    await invalidate_for_source(session, file.id)
     return True
 
 

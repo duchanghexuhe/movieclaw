@@ -1427,6 +1427,8 @@ export interface LibraryItemFile {
   trash_note: string | null;
   /** 来源快照：这个文件是怎么进库的（docs/design/library-duplicate-files.md §2） */
   origin: FileOrigin;
+  /** 派生元数据（preload-transcode.md）：{"kind":"preload",...}；null=原生文件 */
+  derivation: { kind: string; preset_id?: string; task_id?: number } | null;
   /** 用户在「重复文件」页点过「都留着」的时间；null=未标记 */
   kept_at: string | null;
   /** 音轨列表；null=尚未探测（ffprobe 缺失或文件不可达） */

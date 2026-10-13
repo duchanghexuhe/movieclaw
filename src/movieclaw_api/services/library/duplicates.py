@@ -454,6 +454,8 @@ def _candidate_rows_stmt():
         LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
         LibraryFile.unidentified_code.is_(None),  # type: ignore[union-attr]
         LibraryFile.ignored_at.is_(None),  # type: ignore[union-attr]
+        # 派生行（预转码便携版）不是重复检测的对象：它与源天然同内容
+        LibraryFile.native(),
     )
 
 

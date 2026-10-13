@@ -65,6 +65,8 @@ from movieclaw_api.api.routes.people import router as people_router
 from movieclaw_api.api.routes.playback import router as playback_router
 from movieclaw_api.api.routes.playback import stream_router as playback_stream_router
 from movieclaw_api.api.routes.plugins import router as plugins_router
+from movieclaw_api.api.routes.preload import router as preload_router
+from movieclaw_api.api.routes.preload_worker import router as preload_worker_router
 from movieclaw_api.api.routes.push import admin_router as push_admin_router
 from movieclaw_api.api.routes.push import member_router as push_member_router
 from movieclaw_api.api.routes.push import public_router as push_public_router
@@ -111,6 +113,11 @@ api_router.include_router(extension_router)
 # 使用独立共享令牌。status 路由自身声明 require_admin。
 api_router.include_router(transcode_worker_router)
 
+# ---- 预转码 Worker 数据面（docs/design/preload-transcode.md §7）----------
+# 与上面同构：设备凭证鉴权（require_transcode_worker 在路由级声明），
+# 数据面靠任务级签名 token，不挂成员登录依赖。
+api_router.include_router(preload_worker_router)
+
 # ---- 外观（读公开：登录页也要加载背景图；写在路由级挂 require_login）------
 api_router.include_router(appearance_router)
 
@@ -140,6 +147,9 @@ _MEMBER_ROUTERS = [
     # 我的通知（docs/design/cloud-push.md §7.3）：每个人只管自己的开关和设备；
     # App 登记只接受 App 类设备自己的凭证（服务层判定）
     push_member_router,
+    # 预转码（docs/design/preload-transcode.md）：逐部/逐集手动下单便携版本，
+    # 任务队列与冷数据清理是成员使用面
+    preload_router,
     # 使用提示（docs/design/tips.md）：每个人自己的事件计数与提示展示/作废记录
     tips_router,
     # 功能开关（docs/design/plugin-page-tiers.md §6）：各端都要知道哪些功能停用了好隐藏入口；

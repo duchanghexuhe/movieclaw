@@ -72,3 +72,6 @@ cli/LICENSE
 # CI 都现场导出；本地缺失时服务端从代码现算，编译 Go CLI 前跑一次该脚本。
 src/movieclaw_api/data/spec.json
 cli/internal/spec/data/spec.json
+worker/preload_worker.json
+worker/caps.json
+worker/work/

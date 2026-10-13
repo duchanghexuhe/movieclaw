@@ -65,6 +65,14 @@ import {
   transferLibraryItem,
 } from "@/lib/api/libraries";
 import {
+  type PreloadTaskView,
+  cancelPreloadTask,
+  createPreloadTask,
+  estimatePreload,
+  listPreloadTasks,
+  retryPreloadTask,
+} from "@/lib/api/preload";
+import {
   type PlaybackUnit,
   type PlaybackWatchState,
   fetchPlaybackMarks,
@@ -204,6 +212,9 @@ export function LibraryItemDetailView({
   // 在页面内改写了观看状态（对勾）之后让分集区静默重拉：分集卡的绿色对勾
   // 与 Hero 的「已看完」必须同步，但不能重置当前选中的集
   const [episodesVersion, setEpisodesVersion] = useState(0);
+  // 预转码（preload-transcode.md §3）：本条目相关的任务（按源文件 id 索引）。
+  // 文件区的「转便携版」按钮据此显示状态；进入页面拉一次，动作后局部刷新
+  const [preloadTasks, setPreloadTasks] = useState<PreloadTaskView[]>([]);
 
   /**
    * 播放入口指向的播放单元（media_item + 季集三元组，与播放器同一套约定）。
@@ -472,6 +483,63 @@ export function LibraryItemDetailView({
       }
     },
     [confirm, libraryId, mediaItemId, reload, toast],
+  );
+
+  // -- 预转码（preload-transcode.md §3）------------------------------------
+  // 进入页面拉一次任务列表（只留本条目的）；下单时先查体积预估弹确认
+  const refreshPreloadTasks = useCallback(() => {
+    listPreloadTasks()
+      .then((tasks) =>
+        setPreloadTasks(tasks.filter((t) => t.target_file_id && detail?.files.some((f) => f.id === t.target_file_id))),
+      )
+      .catch(() => {});
+  }, [detail?.files]);
+  useEffect(() => {
+    refreshPreloadTasks();
+  }, [refreshPreloadTasks]);
+  const handlePreloadCreate = useCallback(
+    async (file: LibraryItemFile) => {
+      try {
+        const est = await estimatePreload(file.id);
+        const ok = await confirm({
+          title: `把「${file.file_name}」转成便携版本？`,
+          description: `约多占 ${(est.estimated_bytes / 1024 ** 3).toFixed(1)} GB（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后文件区会出现一个 1080p H.264 的可选版本。`,
+          confirmLabel: "加入转码队列",
+          cancelLabel: "先不",
+        });
+        if (!ok) return;
+        const task = await createPreloadTask(file.id);
+        toast.success(`已加入预转码队列（任务 #${task.id}），等 Worker 领取`);
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "下单失败，请稍后重试");
+      }
+    },
+    [confirm, refreshPreloadTasks, toast],
+  );
+  const handlePreloadCancel = useCallback(
+    async (task: PreloadTaskView) => {
+      try {
+        await cancelPreloadTask(task.id);
+        toast.success("任务已取消");
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "取消失败，请稍后重试");
+      }
+    },
+    [refreshPreloadTasks, toast],
+  );
+  const handlePreloadRetry = useCallback(
+    async (task: PreloadTaskView) => {
+      try {
+        await retryPreloadTask(task.id);
+        toast.success("已重新排队");
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "重试失败，请稍后重试");
+      }
+    },
+    [refreshPreloadTasks, toast],
   );
 
   usePageTitle(detail?.title);
@@ -1094,6 +1162,10 @@ export function LibraryItemDetailView({
               onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
               onRestoreFile={canManageLibraries ? restoreTrashedFile : undefined}
               onPurgeFile={canManageLibraries ? purgeTrashedFile : undefined}
+              preloadTasks={preloadTasks}
+              onPreload={canManageLibraries ? handlePreloadCreate : undefined}
+              onPreloadCancel={canManageLibraries ? handlePreloadCancel : undefined}
+              onPreloadRetry={canManageLibraries ? handlePreloadRetry : undefined}
             />
           );
         })()}
@@ -2379,6 +2451,10 @@ function FileSection({
   onDeleteFile,
   onRestoreFile,
   onPurgeFile,
+  preloadTasks,
+  onPreload,
+  onPreloadCancel,
+  onPreloadRetry,
 }: {
   files: LibraryItemFile[];
   title: string;
@@ -2389,6 +2465,11 @@ function FileSection({
   /** 待回收行的恢复/立即清理（library-file-recycle.md §7）；未传则只读展示 */
   onRestoreFile?: (file: LibraryItemFile) => void;
   onPurgeFile?: (file: LibraryItemFile) => void;
+  /** 预转码任务（preload-transcode.md §3）：按 target_file_id 对应文件行展示状态 */
+  preloadTasks?: PreloadTaskView[];
+  onPreload?: (file: LibraryItemFile) => void;
+  onPreloadCancel?: (task: PreloadTaskView) => void;
+  onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
   return (
     <section>
@@ -2409,15 +2490,22 @@ function FileSection({
         )}
       </h2>
       <div className="overflow-hidden rounded-xl border border-white/[0.04] bg-white/[0.015]">
-        {files.map((file) => (
-          <FileRow
-            key={file.id}
-            file={file}
-            onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
-            onRestore={onRestoreFile ? () => onRestoreFile(file) : undefined}
-            onPurge={onPurgeFile ? () => onPurgeFile(file) : undefined}
-          />
-        ))}
+        {files.map((file) => {
+          const task = preloadTasks?.find((t) => t.target_file_id === file.id) ?? null;
+          return (
+            <FileRow
+              key={file.id}
+              file={file}
+              preloadTask={task}
+              onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
+              onRestore={onRestoreFile ? () => onRestoreFile(file) : undefined}
+              onPurge={onPurgeFile ? () => onPurgeFile(file) : undefined}
+              onPreload={onPreload ? () => onPreload(file) : undefined}
+              onPreloadCancel={onPreloadCancel}
+              onPreloadRetry={onPreloadRetry}
+            />
+          );
+        })}
       </div>
     </section>
   );
@@ -2437,14 +2525,23 @@ function purgeCountdown(purgeAfter: string | null): string {
 
 function FileRow({
   file,
+  preloadTask,
   onDelete,
   onRestore,
   onPurge,
+  onPreload,
+  onPreloadCancel,
+  onPreloadRetry,
 }: {
   file: LibraryItemFile;
+  /** 这个源文件对应的预转码任务；null = 没下过单（或产物已是独立版本行） */
+  preloadTask?: PreloadTaskView | null;
   onDelete?: () => void;
   onRestore?: () => void;
   onPurge?: () => void;
+  onPreload?: () => void;
+  onPreloadCancel?: (task: PreloadTaskView) => void;
+  onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
   // 每个物理文件独立展开，多版本无需再维护额外的版本切换状态。
   const [expanded, setExpanded] = useState(false);
@@ -2500,6 +2597,56 @@ function FileRow({
           <span className="shrink-0 rounded border border-white/15 px-1.5 py-px text-micro text-[var(--text-faint)]">
             待回收
           </span>
+        )}
+        {file.derivation?.kind === "preload" && (
+          <span className="shrink-0 rounded border border-[var(--text-faint)]/25 px-1.5 py-px text-micro text-[var(--text-muted)]">
+            便携版
+          </span>
+        )}
+        {/* 预转码：本行是源文件且该行有活跃/失败任务时展示状态；没下过单给「转便携版」入口 */}
+        {preloadTask && file.state !== "trashed" && (
+          <span
+            className={`shrink-0 rounded border px-1.5 py-px text-micro ${
+              preloadTask.status === "failed"
+                ? "border-[var(--warn)]/40 text-[var(--warn)]"
+                : "border-[var(--text-faint)]/25 text-[var(--text-muted)]"
+            }`}
+          >
+            {preloadTask.status === "queued" && "转码排队中"}
+            {preloadTask.status === "claimed" && "转码已领取"}
+            {preloadTask.status === "running" && "转码进行中"}
+            {preloadTask.status === "failed" && "转码失败"}
+          </span>
+        )}
+        {preloadTask?.status === "failed" && onPreloadRetry && (
+          <button
+            type="button"
+            onClick={() => onPreloadRetry(preloadTask)}
+            className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+          >
+            重试
+          </button>
+        )}
+        {preloadTask &&
+          ["queued", "claimed", "running"].includes(preloadTask.status) &&
+          onPreloadCancel && (
+            <button
+              type="button"
+              onClick={() => onPreloadCancel(preloadTask)}
+              className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+            >
+              取消
+            </button>
+          )}
+        {!preloadTask && onPreload && file.state === "in_place" && !file.derivation && (
+          <button
+            type="button"
+            onClick={onPreload}
+            title="转码为便携版本（1080p H.264，外网播放更省带宽）"
+            className="touch-reveal touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-faint)] opacity-0 transition group-hover/filerow:opacity-100 hover:bg-white/[0.05] hover:text-white"
+          >
+            转便携版
+          </button>
         )}
         {file.state === "trashed" && onRestore && (
           <button

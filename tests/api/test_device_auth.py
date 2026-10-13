@@ -417,6 +417,12 @@ def test_transcoder_token_is_rejected_by_every_business_route(client: TestClient
     allowed = _PUBLIC_ALLOWLIST | {
         ("GET", "/api/v1/auth/devices/current"),
         ("DELETE", "/api/v1/auth/devices/current"),
+        # 预转码 Worker 控制面（preload-transcode.md §7）：与实时转码的
+        # /transcode-worker/ws 同构，本来就是转码凭证专属端点
+        ("POST", "/api/v1/preload-worker/claim"),
+        ("POST", "/api/v1/preload-worker/tasks/{task_id}/progress"),
+        ("POST", "/api/v1/preload-worker/tasks/{task_id}/complete"),
+        ("POST", "/api/v1/preload-worker/tasks/{task_id}/fail"),
     }
     # 同 test_auth.py：spec 直接取自应用，不依赖 /openapi.json 是否对外开放（生产默认关闭）
     openapi = client.app.openapi()

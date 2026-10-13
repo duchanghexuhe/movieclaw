@@ -338,6 +338,11 @@ _PUBLIC_ALLOWLIST = {
     # App 推送的配图（docs/design/cloud-push.md §6）：通知扩展在锁屏时下载，拿不到
     # 登录令牌；地址自带签名（只含一张 TMDB 图片地址和过期时间），签名不对一律 404
     ("GET", "/api/v1/push/images/{token}"),
+    # 预转码 Worker 数据面（preload-transcode.md §7）：与实时转码同构——
+    # 鉴权靠任务级签名 token 与设备凭证（路由内判定），无 token / token 不符
+    # 一律 404，与「资源不存在」不可区分
+    ("PUT", "/api/v1/preload-worker/tasks/{task_id}/artifacts/{name}"),
+    ("GET", "/api/v1/preload-worker/preload-source/{task_id}"),
 }
 
 
@@ -406,6 +411,7 @@ def fill_path_params(path: str) -> str:
         .replace("{letter_id}", "1")  # 可靠事件死信
         .replace("{start_ms}", "0")  # 预切片段的起点
         .replace("{key_id}", "1")  # 插件回调地址
+        .replace("{task_id}", "1")  # 预转码任务号
     )
 
 

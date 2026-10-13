@@ -3396,6 +3396,11 @@ async def delete_item_files(
 
     for row in files:
         if row.id in deleted_row_ids:
+            # 派生物失效（preload-transcode.md §6）：删掉源，它的预转码产物
+            # 一并清理（删物理文件 + 删行），不进回收站
+            from movieclaw_api.services.preload.service import invalidate_for_source
+
+            await invalidate_for_source(session, row.id)
             await session.delete(row)
     result.rows_deleted = len(deleted_row_ids)
     result.pending_purge = staging.dirs
