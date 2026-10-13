@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import binascii
@@ -431,17 +432,14 @@ def _parse_manifest(raw: bytes) -> dict:
     return {"version": version, "requires_runtime": requires, "files": files, "raw": raw}
 
 
-# GitHub 条件请求缓存（ETag → 上次的 Release 列表）：命中 304 时 GitHub
+# GitHub 条件请求缓存（请求地址 → 上次的 ETag 与响应）：命中 304 时 GitHub
 # **不计入**未认证配额（60 次/小时/IP），这是每小时轮询不挤兑同出口 IP
 # 用户配额的关键——绝大多数轮询都是 304，只有真发了新版才付一次完整请求。
-_releases_etag: str | None = None
-_releases_cached: list[dict] | None = None
+_etag_cache: dict[str, tuple[str, object]] = {}
 
 
 def reset_release_cache_for_tests() -> None:
-    global _releases_etag, _releases_cached
-    _releases_etag = None
-    _releases_cached = None
+    _etag_cache.clear()
 
 
 # 网络级失败的退避重试节奏。只重试「线路抖动」：代理链路（尤其 socks5）
@@ -563,24 +561,26 @@ async def save_github_token(token: str) -> GithubTokenView:
     return GithubTokenView(configured=bool(token), masked=_mask_token(token))
 
 
-async def _fetch_releases(what: str) -> list[dict]:
-    """拉全部 Release 列表（应用与模型的 Release 混在同一个仓库里，
-    必须列表过滤，绝不能用 /releases/latest——模型发布会把 latest 顶掉）。"""
-    global _releases_etag, _releases_cached
+async def _github_get(path: str, what: str, *, missing_ok: bool = False) -> object:
+    """GET 更新仓库下的一个 API 路径（如 ``/releases/tags/v0.38.0``），返回解析后的 JSON。
+
+    missing_ok 时 404 返回 None：按 tag 取发布时，tag 已推送、Release 还是草稿
+    （或反代不认这个路径）都会 404，交给调用方跳过或退回整页列表。"""
     settings = get_settings()
     # 反代地址常被写成带尾斜杠的形式，不去掉会拼出 //repos/... ——不少反代
     # 对双斜杠直接 404，而「设置 → 网络」的连通性测试是 rstrip 过的，
     # 于是测试通过、检查更新却失败，两处必须同口径
     base_url = settings.update_api_base_url.rstrip("/")
-    api_url = f"{base_url}/repos/{settings.update_repo}/releases?per_page=100"
+    api_url = f"{base_url}/repos/{settings.update_repo}{path}"
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "movieclaw-updater"}
     # 令牌只加在这一处 API 调用上：清单/产物走 github.com 的下载地址，不需要也不该带；
     # httpx 跨域重定向时会自动丢弃 Authorization，不会泄漏给 CDN
     token = await _read_github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    if _releases_etag and _releases_cached is not None:
-        headers["If-None-Match"] = _releases_etag
+    cached = _etag_cache.get(api_url)
+    if cached:
+        headers["If-None-Match"] = cached[0]
     async with httpx.AsyncClient(
         # 走统一网络出口（服务标签 github）：设置页可为更新流量单独开关代理。
         # 但**不上熔断**：熔断是为「用户正等着结果的高频请求」（发现页曾拖满
@@ -597,8 +597,10 @@ async def _fetch_releases(what: str) -> list[dict]:
         for attempt in range(len(_RETRY_BACKOFF_SECONDS) + 1):
             try:
                 resp = await client.get(api_url)
-                if resp.status_code == 304 and _releases_cached is not None:
-                    return _releases_cached
+                if resp.status_code == 304 and cached:
+                    return cached[1]
+                if resp.status_code == 404 and missing_ok:
+                    return None
                 resp.raise_for_status()
             except _RETRYABLE_NETWORK_ERRORS as exc:
                 if attempt == len(_RETRY_BACKOFF_SECONDS):
@@ -622,15 +624,51 @@ async def _fetch_releases(what: str) -> list[dict]:
                         _describe_github_error(exc, what, has_token=bool(token))
                     ) from exc
             break
-        releases = resp.json()
+        data = resp.json()
         etag = resp.headers.get("etag")
         if etag:
-            _releases_etag = etag
-            _releases_cached = releases
-        return releases
+            _etag_cache[api_url] = (etag, data)
+        return data
+
+
+async def _fetch_releases(what: str) -> list[dict]:
+    """拉 Release 列表第一页（应用、各客户端与模型的 Release 混在同一个仓库里，
+    必须列表过滤，绝不能用 /releases/latest——别的发布会把 latest 顶掉）。
+    只作按 tag 查找失败时的兜底，见 _find_release。"""
+    return await _github_get("/releases?per_page=100", what)
+
+
+# 按 tag 查找时最多取几个发布：只有「tag 已推送、Release 还在草稿」时才会跳过，
+# 留几个余量即可，配额有上限（未认证 60 次/小时）。
+_TAG_LOOKUP_LIMIT = 5
+
+
+async def _find_release(prefix: str, pattern: re.Pattern, order, what: str) -> dict | None:
+    """按 tag 前缀找最新的正式发布：先列出该前缀的全部 tag（体积小、不分页），
+    再从高到低逐个取发布，跳过草稿与预发布。
+
+    仓库里还有各客户端单独发的 Release，拉整页列表时不常发的模型会被挤出
+    第一页，列表也越拉越大，所以不再靠列表。找不到时返回 None，由调用方退回
+    整页列表——自建反代可能只放行 /releases，不认 matching-refs 等路径。"""
+    refs = await _github_get(f"/git/matching-refs/tags/{prefix}", what, missing_ok=True)
+    if not isinstance(refs, list):
+        return None
+    tags = [
+        tag
+        for ref in refs
+        if isinstance(ref, dict)
+        and pattern.match(tag := str(ref.get("ref", "")).removeprefix("refs/tags/"))
+    ]
+    for tag in sorted(tags, key=order, reverse=True)[:_TAG_LOOKUP_LIMIT]:
+        release = await _github_get(f"/releases/tags/{tag}", what, missing_ok=True)
+        if isinstance(release, dict) and not release.get("draft") and not release.get("prerelease"):
+            return release
+    return None
 
 
 _APP_TAG_RE = re.compile(r"^v\d+(?:\.\d+)*(?:[-+].*)?$")
+# 按 tag 查找时只看正式版：带后缀的（v0.3.0-beta.1）由发版流水线标成预发布
+_STABLE_APP_TAG_RE = re.compile(r"^v\d+(?:\.\d+)*$")
 
 
 def _latest_app_release(releases: list[dict]) -> dict | None:
@@ -650,8 +688,9 @@ def _latest_app_release(releases: list[dict]) -> dict | None:
 
 async def _fetch_latest_release() -> tuple[dict, dict]:
     """取最新应用 Release 与其 manifest。返回 (release_json, manifest_dict)。"""
-    releases = await _fetch_releases("更新")
-    release = _latest_app_release(releases)
+    release = await _find_release(
+        "v", _STABLE_APP_TAG_RE, lambda tag: tuple(int(p) for p in tag[1:].split(".")), "更新"
+    ) or _latest_app_release(await _fetch_releases("更新"))
     if release is None:
         raise BadRequestException("未找到任何应用发布（vX.Y.Z 的 Release），暂无可用更新")
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "movieclaw-updater"}
@@ -733,6 +772,49 @@ def _validate_layout(version_dir: Path) -> None:
     ):
         if not (version_dir / rel).is_file():
             raise RuntimeError(f"更新产物解包后布局异常（缺少 {rel}），已放弃本次更新")
+
+
+def _declared_revisions(alembic_dir: Path) -> set[str]:
+    """一个版本产物里全部迁移脚本声明的 revision。只做语法解析、不执行脚本：
+    装之前不能在当前进程里跑另一个版本的代码。"""
+    revisions: set[str] = set()
+    for script in (alembic_dir / "versions").glob("*.py"):
+        for node in ast.parse(script.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if (
+                any(isinstance(t, ast.Name) and t.id == "revision" for t in targets)
+                and isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+            ):
+                revisions.add(value.value)
+    return revisions
+
+
+def _ensure_database_known(version_dir: Path, version: str) -> None:
+    """装之前确认新版本认识数据库当前的迁移位置。
+
+    迁移只向前，正式版本之间新版必然认识旧版的迁移位置；认不出来说明库被
+    自行修改过的代码或非正式版本迁移过。这时装上去新版本启动必挂、连续失败
+    被标坏，用户白白经历一轮重启回落——不如在切换前就拦下并讲清原因。
+    """
+    db_path = _db_path()
+    if db_path is None or not db_path.is_file():
+        return
+    rev = _read_alembic_rev(db_path)
+    if rev is None:
+        return
+    if rev not in _declared_revisions(version_dir / "backend" / "alembic"):
+        raise RuntimeError(
+            f"数据库当前的迁移位置「{rev}」不在 v{version} 的迁移记录里，装上后新版本"
+            "不认识这个数据库、无法启动，已放弃本次更新。通常是数据库被自行修改过的"
+            "代码或非正式版本迁移过：请先把数据库恢复到正式版本的状态"
+            "（data/updates/backup 下有历史备份）再更新"
+        )
 
 
 def _db_path() -> Path | None:
@@ -892,10 +974,16 @@ def _apply_downloaded(
 
     _progress.set("applying", "正在解包并安装新版本……", target_version=version)
     shutil.rmtree(partial_dir, ignore_errors=True)
-    _extract(download_dir / "app-backend.tar.gz", partial_dir / "backend")
-    _extract(download_dir / "app-web.tar.gz", partial_dir / "web")
-    (partial_dir / _MANIFEST_NAME).write_bytes(manifest["raw"])
-    _validate_layout(partial_dir)
+    try:
+        _extract(download_dir / "app-backend.tar.gz", partial_dir / "backend")
+        _extract(download_dir / "app-web.tar.gz", partial_dir / "web")
+        (partial_dir / _MANIFEST_NAME).write_bytes(manifest["raw"])
+        _validate_layout(partial_dir)
+        _ensure_database_known(partial_dir, version)
+    except BaseException:
+        # 半成品别留在 versions/ 下：版本清理会把它当成一个版本占掉保留名额
+        shutil.rmtree(partial_dir, ignore_errors=True)
+        raise
     (partial_dir / _RELEASE_INFO_NAME).write_text(
         json.dumps(
             {
@@ -1152,7 +1240,9 @@ def _parse_model_manifest(raw: bytes) -> dict:
 
 
 async def _fetch_latest_model_release() -> dict:
-    release = _latest_model_release(await _fetch_releases("模型更新"))
+    release = await _find_release(
+        "torrent-ner-v", _MODEL_TAG_RE, _model_tag_num, "模型更新"
+    ) or _latest_model_release(await _fetch_releases("模型更新"))
     if release is None:
         raise BadRequestException("未找到任何模型发布（torrent-ner-v* 的 Release）")
     return release
@@ -1356,9 +1446,13 @@ async def _record_app_check(view: UpdateCheckView) -> None:
         state.app_pushed_version = view.latest_version
     await save_app_update_state(state)
     if push_version:
-        from movieclaw_api.services.push import events as push_events
+        from movieclaw_api import events
+        from movieclaw_sdk.events import SYSTEM_UPDATE_AVAILABLE, UpdateAvailable
 
-        push_events.new_version(version=view.latest_version, compatible=view.compatible)
+        await events.publish_now(
+            SYSTEM_UPDATE_AVAILABLE,
+            lambda: UpdateAvailable(version=view.latest_version, compatible=view.compatible),
+        )
 
 
 async def _record_model_check(view: ModelUpdateCheckView) -> None:

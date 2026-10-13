@@ -171,7 +171,18 @@ fun AppNav() {
         }
         composable("agentConversation/{sessionId}") {
             if (!adminOnly(navController)) return@composable
-            AgentConversationScreen(onBack = { navController.popBackStack() })
+            AgentConversationScreen(
+                onBack = { navController.popBackStack() },
+                // 生成式 UI 媒体卡片的跳转（与其余入口同款路由：影片详情/媒体库/条目/订阅/播放器）
+                onOpenTitle = { ref -> navController.navigate("title?ref=${Uri.encode(ref)}") },
+                onOpenLibrary = { id -> navController.navigate("library/$id") },
+                onOpenItem = { libraryId, itemId -> navController.navigate("item/$libraryId/$itemId") },
+                onOpenSubscription = { id -> navController.navigate("subscription/$id") },
+                onPlay = { target ->
+                    navVm.open(target)
+                    navController.navigate("player")
+                },
+            )
         }
         composable("title?ref={ref}") { entry ->
             TitleDetailScreen(
@@ -401,11 +412,19 @@ fun AppNav() {
             AccountSwitcherScreen(
                 onBack = { navController.popBackStack() },
                 onAddAccount = { navController.navigate("addAccount") },
+                // 点已过期的账号 → 打开预填好地址与账号的登录卡（iOS fullScreenCover 同款，
+                // 当前会话不动）；地址含 :// 与端口，导航参数要编码
+                onReauth = { origin, username ->
+                    val enc = java.net.URLEncoder.encode(origin, "UTF-8")
+                    val encU = java.net.URLEncoder.encode(username, "UTF-8")
+                    navController.navigate("addAccount?server=$enc&username=$encU")
+                },
             )
         }
-        composable("addAccount") {
+        composable("addAccount?server={server}&username={username}") { entry ->
             LoginScreen(
-                presetUsername = null,
+                presetUsername = entry.arguments?.getString("username"),
+                presetServer = entry.arguments?.getString("server"),
                 onDone = { navController.popBackStack() },
             )
         }
@@ -478,6 +497,8 @@ fun AppNav() {
                 onOpenLlmSettings = { navController.navigate("settings/LLM") },
                 // 「交给 Agent 处理」建好会话 → 会话页
                 onOpenAgentSession = { id -> navController.navigate("agentConversation/$id") },
+                onOpenItem = { lib, id -> navController.navigate("item/$lib/$id") },
+                onOpenTitle = { ref -> navController.navigate("title?ref=${Uri.encode(ref)}") },
             )
         }
         composable("player") {

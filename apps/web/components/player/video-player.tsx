@@ -149,6 +149,7 @@ import {
 import { nextSeekTarget, seekBatchWindowMs } from "@/lib/player/seek-batch";
 import { resolveTap } from "@/lib/player/tap";
 import {
+  AUTO_NEXT_MAX_STREAK,
   AUTO_NEXT_MS,
   activeSkipSegment,
   autoNextArmed,
@@ -306,18 +307,21 @@ const SOURCE_MISSING_SUGGESTION =
   "文件可能被移动或删除了。可以回到条目页重新扫描媒体库，或换一个版本播放。";
 
 /**
- * 探片源：取 1 个字节（Range: bytes=0-0），5 秒超时。返回 HTTP 状态；请求本身没成功（断网、
- * 超时）返回 null。结论由 failure-policy.ts 的 sourceProbeVerdict 判。
+ * 探片源：取 1 个字节（Range: bytes=0-0），5 秒超时。返回 HTTP 状态；服务端跳转到网盘直链
+ * （strm 条目）返回 "redirect"，不跟过去；请求本身没成功（断网、超时）返回 null。结论由
+ * failure-policy.ts 的 sourceProbeVerdict 判。
  */
-async function probeSourceStatus(url: string): Promise<number | null> {
+async function probeSourceStatus(url: string): Promise<number | "redirect" | null> {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), 5_000);
   try {
     const response = await fetch(url, {
       headers: { Range: "bytes=0-0" },
       cache: "no-store",
+      redirect: "manual",
       signal: controller.signal,
     });
+    if (response.type === "opaqueredirect") return "redirect";
     void response.body?.cancel().catch(() => undefined);
     return response.status;
   } catch {
@@ -473,6 +477,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
   const failureInFlightRef = useRef(false);
   /** 探片源循环的代号：换集、卸载、开始新的一轮时递增，旧循环醒来发现对不上就退出 */
   const reconnectSeqRef = useRef(0);
+  /** 最近一次探片源看到的是跳转（直出的是网盘直链）：重开用完就降档走服务端中转 */
+  const remoteSourceRef = useRef(false);
   /** 重开会话失败后的退避计时器 */
   const sessionRetryTimerRef = useRef<number | null>(null);
   /**
@@ -525,7 +531,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
     lastActivityBumpRef.current = now;
     setChromeActivity((n) => n + 1);
   }, []);
-  /** 用户明确关掉过本集的「下一集」提示：关掉后不能因为还在片尾窗口里又弹回来 */
+  /**
+   * 用户明确关掉过本集的「下一集」提示：关掉后不能因为还在片尾里又弹回来。
+   * 播完时清掉——关掉是「想看片尾」，片尾看完了照样给卡片接下一集
+   */
   const [nextDismissed, setNextDismissed] = useState(false);
   /**
    * 连续自动播了几集。组件跨集不重建（换集只换 unit），所以计数自然跨集保留；
@@ -1441,8 +1450,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
       const url = resolveStreamUrl(streamUrl);
       void (async () => {
         for (;;) {
-          const verdict = sourceProbeVerdict(await probeSourceStatus(url));
+          const status = await probeSourceStatus(url);
           if (reconnectSeqRef.current !== seq) return;
+          remoteSourceRef.current = status === "redirect";
+          const verdict = sourceProbeVerdict(status);
           if (verdict === "reachable") {
             failureInFlightRef.current = false;
             dispatch({ type: "restart", startMs: positionMs });
@@ -1514,6 +1525,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
       const response = decideFailure({
         cause,
         playsOriginalFile,
+        remoteSource: playsOriginalFile && remoteSourceRef.current,
         copyVideo,
         // 额度只在真要用时才扣
         restartAllowed: cause === "network" && networkBudgetRef.current.allowRestart(),
@@ -2457,6 +2469,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
       probing = true;
       try {
         const alive = await pingPlaybackSession(sessionId, apiRef.current);
+        if (alive === "failed") {
+          // 服务端已判本机转码起不来（issue #763）：这一档放不了，按「确定解不了」降档。
+          // 记成网络问题会先同档重开两次，每次都是同一条起不来的命令
+          if (sessionIdRef.current === sessionId) {
+            handleFailureRef.current("服务端转码起步即失败", "decode-final");
+          }
+          return;
+        }
         // null = 这次请求本身失败（断网/5xx），不能据此判定会话没了
         if (alive !== false) return;
         // 探活途中会话已经换了（换字幕烧录/换音轨/换画质重开）：这个 404
@@ -4069,11 +4089,12 @@ export function VideoPlayer(props: VideoPlayerProps) {
     // chromeActivity：用户的每次操作都重排这个倒计时（声明见 state 注释）
   }, [locked, paused, menuOpen, awaitingUser, scrubbing, chromeVisible, chromeActivity]);
 
-  // 当前手动跳过段优先于最后 40 秒的下一集提示；用户关闭卡片后，本集不再显示。
-  const showNextCard =
-    next !== null &&
-    !nextDismissed &&
-    shouldShowUpNext(segments, positionMs, durationMs, state.phase === "ended");
+  // 认出了片尾就从片尾起点给，否则播完才给；当前手动跳过段优先。用户关闭卡片后，播完前不再显示。
+  const ended = state.phase === "ended";
+  useEffect(() => {
+    if (ended) setNextDismissed(false);
+  }, [ended]);
+  const showNextCard = next !== null && !nextDismissed && shouldShowUpNext(segments, positionMs, ended);
 
   /**
    * 「跳过片头」一类的按钮：位置在片头 / 广告 / 预告 / 其他段 / 非结尾片尾里才出现。
@@ -4084,18 +4105,20 @@ export function VideoPlayer(props: VideoPlayerProps) {
     !locked &&
     state.phase !== "error" &&
     state.phase !== "consent" &&
-    state.phase !== "ended"
+    !ended
       ? activeSkipSegment(segments, positionMs)
       : null;
 
   /**
-   * 自动播下一集（Netflix 同款）：认出了片尾、卡片在显示、没到连播上限时倒计时 AUTO_NEXT_MS，
+   * 自动播下一集（Netflix 同款）：认出了片尾或已播完、卡片在显示、没到连播上限时倒计时 AUTO_NEXT_MS，
    * 走满就换集。暂停时停住（播完 `ended` 也算在走——片尾短于倒计时时不能卡在最后一帧），
    * 拖进度条时不走；关掉卡片 / 拖出片尾 / 换集都归零。点 ✕ 就是「继续看片尾」。
+   * 连播满上限后放完了不自动接，卡片改问「还在看吗？」
    */
   const autoNext =
-    showNextCard && !locked && autoNextArmed(segments, positionMs, autoNextStreak);
-  const autoNextRunning = autoNext && (!paused || state.phase === "ended") && !scrubbing;
+    showNextCard && !locked && autoNextArmed(segments, positionMs, autoNextStreak, ended);
+  const stillWatching = ended && autoNextStreak >= AUTO_NEXT_MAX_STREAK;
+  const autoNextRunning = autoNext && (!paused || ended) && !scrubbing;
   useEffect(() => {
     if (!autoNext) setAutoNextElapsed(0);
   }, [autoNext]);
@@ -4159,7 +4182,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
         ) : null}
         <div className="min-w-0 flex-1 self-center">
           <p className="text-[11px] tracking-wide text-white/50">
-            即将播放{autoNext ? ` · ${autoNextLeftS} 秒` : ""}
+            {stillWatching ? "还在看吗？" : `即将播放${autoNext ? ` · ${autoNextLeftS} 秒` : ""}`}
           </p>
           <p className="mt-0.5 text-[13px] text-white/70">{next.code}</p>
           {next.name ? (

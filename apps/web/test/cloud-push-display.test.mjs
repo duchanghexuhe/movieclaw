@@ -310,6 +310,8 @@ test("设备页：能收到或不是 App 什么都不写，收不到写原因并
   assert.ok(devicePushNote({ status: "bad_token", status_text: "" }).text.includes("重新登记"));
   assert.equal(devicePushNote({ status: "not_registered", status_text: "" }).tone, "neutral");
   assert.equal(devicePushNote({ status: "no_channel", status_text: "x" }).tone, "warn");
+  assert.equal(devicePushNote({ status: "unsupported_build", status_text: "" }).tone, "warn");
+  assert.ok(devicePushNote({ status: "unsupported_build", status_text: "" }).text.includes("TestFlight"));
   assert.equal(myDeviceTone("ok"), "ok");
 });
 
@@ -321,6 +323,8 @@ test("通知页：收不到的设备逐台一句，测试按钮说清发给几�
   assert.ok(attentionLine({ device_name: "iPad", status: "no_channel", status_text: "" }).startsWith("iPad："));
   assert.equal(testTargetHint(2), "发给你的 2 台设备");
   assert.equal(testTargetHint(0), "还没有能收到通知的设备：用 MovieClaw App 登录后会出现");
+  assert.equal(testTargetHint(2, 1), "发给你的 2 台设备和 1 个 IM 账号");
+  assert.equal(testTargetHint(0, 1), "发给你的 1 个 IM 账号");
 });
 
 test("测试通知回执：发出去几台，没发出去的逐台说原因", () => {
@@ -333,6 +337,23 @@ test("测试通知回执：发出去几台，没发出去的逐台说原因", ()
       ],
     }),
     { tone: "success", message: "测试通知已发给 2 台设备，看看手机吧" },
+  );
+  assert.equal(
+    summarizePushTest({
+      sent: 2,
+      results: [
+        { device_id: "ld-1", device_name: "iPhone", result: "ok", message: null },
+        { device_id: "im", device_name: "IM", result: "ok", message: "已交给 1 个 IM 账号发送" },
+      ],
+    }).message,
+    "测试通知已发给 1 台设备和 IM，看看手机吧",
+  );
+  assert.equal(
+    summarizePushTest({
+      sent: 1,
+      results: [{ device_id: "im", device_name: "IM", result: "ok", message: "已交给 1 个 IM 账号发送" }],
+    }).message,
+    "测试通知已发给 IM，去 IM 看看吧",
   );
   const partial = summarizePushTest({
     sent: 1,

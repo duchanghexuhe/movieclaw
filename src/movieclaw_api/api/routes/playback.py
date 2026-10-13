@@ -102,7 +102,9 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     HW_BACKENDS,
     INIT_NAME,
     SEGMENT_SECONDS,
+    VAAPI_LOW_POWER,
     effective_hw_backend,
+    encoder_options,
     is_mpegts,
     segment_pattern,
 )
@@ -173,12 +175,17 @@ from movieclaw_playback.keyframes import read_keyframe_index, schedule_backgroun
 from movieclaw_playback.streaming import (
     ClientDisconnected,
     DisconnectAwareFileResponse,
+    RemoteRelayResponse,
+    StrmError,
+    StrmLink,
     await_unless_disconnected,
     container_mime_type,
     direct_play_byte_patches,
     is_strm,
+    local_strm_container,
+    parse_strm,
     register_device_stream,
-    resolve_strm_url,
+    strm_redirect_target,
     unregister_device_stream,
 )
 from movieclaw_playback.subtitles import (
@@ -248,7 +255,9 @@ def _diagnostic_encoder(session: TranscodeSession) -> str | None:
     if session.hw_backend:
         backend = HW_BACKENDS.get(session.hw_backend)
         if backend is not None:
-            return backend.encoder
+            # 低功耗编码要标出来：同一块核显两种模式表现可能天差地别（issue #763）
+            low_power = encoder_options(backend) == VAAPI_LOW_POWER
+            return f"{backend.encoder}（低功耗）" if low_power else backend.encoder
     return "libx264"
 
 
@@ -1482,11 +1491,24 @@ async def ping_playback_session(
     session_id: Annotated[str, Path()],
     principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict]:
-    """续命。用户关页面不会发任何信号，超时回收是唯一可靠兜底。"""
+    """续命。用户关页面不会发任何信号，超时回收是唯一可靠兜底。
+
+    ``failed``：本机转码已被判死（起步即退出、一段都没产出，issue #763）。这一档在这台
+    机器上放不了，客户端据此直接降档——分片 404 在播放器那边要层层重试十几分钟才会
+    走到降档。远程 Worker 断线不算：那是连接问题，照旧由客户端同档重连。"""
     member_id = principal.member_id if principal.member_id is not None else 0
-    if not get_session_manager().ping(session_id, member_id=member_id):
+    manager = get_session_manager()
+    if not manager.ping(session_id, member_id=member_id):
         raise NotFoundException("会话不存在或已结束")
-    return ok({"alive": True})
+    session = manager.get(session_id, member_id=member_id)
+    failed = session is not None and session.state == "failed" and not session.remote
+    return ok(
+        {
+            "alive": True,
+            "failed": failed,
+            "error": _diagnostic_error(session.error) if failed and session else None,
+        }
+    )
 
 
 @router.delete(
@@ -1997,13 +2019,24 @@ async def stream_library_file(
     # 就能耗尽连接池（5 + 溢出 10），整个服务的接口一起卡 30 秒超时（2026-09-27 NAS 实测）。
     # 往下只用已读出的列，不再访问数据库。
     await session.close()
-    if is_strm(file.file_path):
-        remote = resolve_strm_url(file.file_path)
-        if remote is None:
-            raise NotFoundException("网盘直链无效")
-        return RedirectResponse(remote, status_code=302)
     path = PathLib(file.file_path)
-    media_type = container_mime_type(file.container)
+    container = file.container
+    if is_strm(file.file_path):
+        try:
+            source = parse_strm(file.file_path)
+        except StrmError as exc:
+            raise NotFoundException(f"strm 用不了：{exc}") from exc
+        if isinstance(source, StrmLink):
+            target = await strm_redirect_target(source, request.headers.get("user-agent"))
+            if target is None:
+                # 内网 / 回环 / 容器服务名、跟跳转也落不到外面的直链，或要带请求头的直链：
+                # 播放器自己取不了，服务端按 Range 原样转发
+                return _metered_relay_response(request, grant, file, source)
+            return RedirectResponse(target, status_code=302)
+        # 指向挂载目录里的文件：往下与本地文件同样直出
+        path = source
+        container = local_strm_container(file.container, path)
+    media_type = container_mime_type(container)
     if file.is_disc() and (file.container or "") != "iso":
         # 原盘目录只有单剪辑主片才有「原文件」可直出（disc-playback.md §3.3）。多剪辑由
         # 能读目录的播放器走目录直推（下面的 /disc 接口），其余客户端在决策层已被导向
@@ -2017,9 +2050,13 @@ async def stream_library_file(
         media_type = container_mime_type("m2ts")
     if not path.exists():
         raise NotFoundException("文件已不在磁盘上")
+    # strm 指向的本地文件：台账的大小是 strm 文本的，按真实文件
+    size_bytes = path.stat().st_size if is_strm(file.file_path) else None
     # hev1 标签的 HEVC MP4 在 Safari 上直出必败，流里把标签改成 hvc1（#430）
-    byte_patches = await direct_play_byte_patches(path, file.container, file.video_codec)
-    return _metered_file_response(request, grant, file, path, media_type, byte_patches=byte_patches)
+    byte_patches = await direct_play_byte_patches(path, container, file.video_codec)
+    return _metered_file_response(
+        request, grant, file, path, media_type, byte_patches=byte_patches, size_bytes=size_bytes
+    )
 
 
 def _metered_file_response(
@@ -2035,11 +2072,52 @@ def _metered_file_response(
     """按 Range 出一个磁盘文件，并登记到设备流与活动页（原文件直出与原盘目录直推共用）。"""
     # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计
     probe = qoe.serve_probe(grant.attempt_id)
-    if not grant.device_id or file.media_item_id is None:
-        # 升级前签出的旧地址没有设备标识，不计量；未识别文件没有播放单元可记
+    stream = _register_play_stream(
+        request,
+        grant,
+        file,
+        name=path.name,
+        size_bytes=size_bytes if size_bytes is not None else (file.size_bytes or 0),
+    )
+    if stream is None:
         return DisconnectAwareFileResponse(
             path, media_type=media_type, byte_patches=byte_patches, probe=probe
         )
+    session_stopped, byte_sink, on_close = stream
+    return DisconnectAwareFileResponse(
+        path,
+        media_type=media_type,
+        session_stopped=session_stopped,
+        byte_sink=byte_sink,
+        on_close=on_close,
+        byte_patches=byte_patches,
+        probe=probe,
+    )
+
+
+def _metered_relay_response(request: Request, grant, file: LibraryFile, link: StrmLink) -> Response:
+    """转发网盘直链（``strm_needs_relay``），与磁盘直出同一套设备流与活动页登记。"""
+    probe = qoe.serve_probe(grant.attempt_id)
+    stream = _register_play_stream(request, grant, file, name=PathLib(file.file_path).name)
+    session_stopped, byte_sink, on_close = stream if stream is not None else (None, None, None)
+    return RemoteRelayResponse(
+        link.url,
+        range_header=request.headers.get("range"),
+        upstream_headers=link.headers,
+        session_stopped=session_stopped,
+        byte_sink=byte_sink,
+        on_close=on_close,
+        probe=probe,
+    )
+
+
+def _register_play_stream(
+    request: Request, grant, file: LibraryFile, *, name: str, size_bytes: int = 0
+) -> tuple[asyncio.Event, Callable[[int], None], Callable[[], None]] | None:
+    """登记一条取流：返回（停止信号, 字节计量, 收尾回调）；不计量的取流返回 None。"""
+    if not grant.device_id or file.media_item_id is None:
+        # 升级前签出的旧地址没有设备标识，不计量；未识别文件没有播放单元可记
+        return None
     # 与 Jellyfin 取流同一套登记：按浏览器设备登记这条流，让停止上报能主动
     # 停止读盘（播放器不会因为退出就立刻关闭已建立的 Range 连接）；顺带登记
     # 到活动注册表，活动页据此展示这台浏览器的实时传输速率
@@ -2051,8 +2129,8 @@ def _metered_file_response(
         member_id=grant.member_id,
         unit=(file.media_item_id, file.season_number, file.episode_number),
         file_id=file.id,
-        file_name=path.name,
-        size_bytes=size_bytes if size_bytes is not None else (file.size_bytes or 0),
+        file_name=name,
+        size_bytes=size_bytes,
         client=playback_watch.web_client_info(
             device_id=device_id, user_agent=request.headers.get("user-agent")
         ),
@@ -2062,15 +2140,7 @@ def _metered_file_response(
         unregister_device_stream(device_id, session_stopped)
         activity.unregister_stream(meter)
 
-    return DisconnectAwareFileResponse(
-        path,
-        media_type=media_type,
-        session_stopped=session_stopped,
-        byte_sink=meter.add,
-        on_close=_close,
-        byte_patches=byte_patches,
-        probe=probe,
-    )
+    return session_stopped, meter.add, _close
 
 
 #: 目录直推只放行光盘结构里播放要用的文件（disc-direct-play.md §2.3）。**这是路径穿越的防线**：

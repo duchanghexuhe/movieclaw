@@ -18,7 +18,14 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
 // ---------------------------------------------------------------------------
 
 export type NoticeSeverity = "warning" | "error";
-export type NoticeSource = "subscription" | "ingest" | "downloader" | "site" | "cloud" | "plugin";
+export type NoticeSource =
+  | "subscription"
+  | "ingest"
+  | "downloader"
+  | "site"
+  | "cloud"
+  | "plugin"
+  | "channel";
 
 /** 一条待处理事项 */
 export interface SystemNotice {
@@ -52,6 +59,9 @@ export function noticeHref(notice: SystemNotice): string {
     }
     case "ingest":
       return "/settings/import-watch";
+    // IM 通道账号的凭据失效，通知与 AI 对话断了（重新绑定后自动消退）
+    case "channel":
+      return "/settings/im-push";
     case "downloader":
       return "/settings/downloaders";
     case "site":

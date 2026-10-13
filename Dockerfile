@@ -49,16 +49,17 @@ RUN pnpm config set registry "$NPM_REGISTRY" && pnpm install --frozen-lockfile
 # optimized production build"、CPU 掉到 0）。分阶段后各自从干净的 node-deps
 # 出发，只把最终的 zip 交给前端，互不干扰。
 FROM node-deps AS ext-builder
-RUN pnpm ext:zip \
+RUN pnpm ext:zip && pnpm ext:zip:firefox \
     && mkdir -p /out \
-    && cp "$(ls -t apps/extension/.output/*-chrome.zip | head -1)" /out/movieclaw-extension.zip
+    && cp "$(ls -t apps/extension/.output/*-chrome.zip | head -1)" /out/movieclaw-extension.zip \
+    && cp "$(ls -t apps/extension/.output/*-firefox.zip | head -1)" /out/movieclaw-extension-firefox.zip
 
 FROM node-deps AS web-builder
 # 限制静态生成并发 + 给 Node 明确堆上限：Docker 虚拟机通常核多内存少，
 # 放任 Next 按核数开 worker 会把内存吃干（见 next.config.ts）
 ENV NEXT_BUILD_CPUS=2 \
     NODE_OPTIONS=--max-old-space-size=4096
-COPY --from=ext-builder /out/movieclaw-extension.zip apps/web/public/extension/movieclaw-extension.zip
+COPY --from=ext-builder /out/movieclaw-extension.zip /out/movieclaw-extension-firefox.zip apps/web/public/extension/
 # 输出重定向到文件、仅失败时回放：next build 的输出量很大，直接写 BuildKit
 # 的日志管道会在管道拥塞时把进程永久挂起（表现为日志停在 "Creating an
 # optimized production build"、CPU 掉到 0，可以挂十几个小时）。
@@ -318,7 +319,8 @@ COPY docker/nginx.conf.template /etc/movieclaw/nginx.conf.template
 COPY docker/starting.html /usr/share/movieclaw/starting.html
 # 构建期就校验一次渲染后的配置：模板写错不该等到用户容器起不来才发现
 RUN mkdir -p /run/movieclaw \
-    && sed -e "s|__WEB_PORT__|3000|g" -e "s|__ASSETS_DIR__|/usr/share/movieclaw|g" \
+    && sed -e "s|__WEB_PORT__|3000|g" -e "s|__NEXT_PORT__|3001|g" \
+        -e "s|__ASSETS_DIR__|/usr/share/movieclaw|g" \
         /etc/movieclaw/nginx.conf.template > /run/movieclaw/nginx.conf \
     && nginx -t -c /run/movieclaw/nginx.conf
 

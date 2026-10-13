@@ -62,7 +62,7 @@ export interface PluginInfo {
   permissions?: string[];
   blocked_by: PluginBlockedBy[];
   incompatible: string | null;
-  /** 谁禁用的：patch（data/plugins.yaml）/ env:XXX（环境变量） */
+  /** 谁禁用的：switch（插件页停用）/ feature:XXX（功能开关）/ patch（data/plugins.yaml）/ env:XXX（环境变量） */
   disabled_by: string | null;
   error: string | null;
   apply_ms: number | null;
@@ -82,6 +82,21 @@ export interface PluginInfo {
    * 也算）/ system 系统模块；其余第三方与本地插件为 null，旧服务端没有这个字段
    */
   tier?: PluginTier | null;
+  /** 能在插件页停用 / 启用（官方插件与插件包）；旧服务端没有这个字段 */
+  switchable?: boolean;
+  /** 官方插件，能在插件页卸载（随时能恢复） */
+  removable?: boolean;
+  /** 被 data/plugins.yaml / 环境变量关掉的原因：停用开关锁住 */
+  locked_by?: string | null;
+}
+
+/** 在插件页卸载了的官方插件（可恢复） */
+export interface RemovedPlugin {
+  id: string;
+  title: string;
+  description: string;
+  removed_at: string;
+  removed_by: string | null;
 }
 
 export type PluginTier = "official" | "system";
@@ -146,6 +161,8 @@ export interface PluginsOverview {
   safe_mode?: PluginSafeMode;
   /** 内置插件分组的展示顺序；旧服务端没有这个字段 */
   groups?: string[];
+  /** 卸载了的官方插件；旧服务端没有这个字段 */
+  removed?: RemovedPlugin[];
 }
 
 export async function listPlugins(): Promise<PluginsOverview> {
@@ -180,6 +197,17 @@ export interface OperationDetail {
   dangerous: boolean;
 }
 
+export interface PluginNotification {
+  event: string;
+  /** 标题模板：{字段} 换成事件里的值 */
+  title: string;
+  body: string;
+  audience: string;
+  audience_label: string;
+  reaches_members: boolean;
+  default: boolean;
+}
+
 export interface PackageRequest {
   id: string;
   title: string;
@@ -196,6 +224,14 @@ export interface PackageRequest {
   /** 要开放的回调端点名：外部平台能不登录直接调进来的地址；旧服务端没有这个字段 */
   callbacks?: string[];
   new_callbacks?: string[];
+  /** 插件会发出的事件（别的插件、Webhook 能订）；旧服务端没有这些字段 */
+  events?: { name: string; title: string }[];
+  /** 插件会发的通知：发给谁、写什么 */
+  notifications?: PluginNotification[];
+  /** 要订阅的敏感事件（谁在什么时候看了什么） */
+  sensitive_events?: string[];
+  /** 会给普通成员发通知：批准时须单独确认 */
+  notifies_members?: boolean;
   requires: Record<string, string>;
   installed_version: string | null;
   /** 与随带的内置插件同 id：安装即替换它，卸载后随带版本回来；旧服务端没有这个字段 */
@@ -251,10 +287,12 @@ export async function uploadPackage(file: File): Promise<PackageRequest> {
   ).data;
 }
 
-/** 批准：宿主操作与路径须与插件申请的完全一致（显式同意），进程内运行须 allowInline */
+/** 批准：宿主操作与路径须与插件申请的完全一致（显式同意），进程内运行须 allowInline，
+ * 会给普通成员发通知的须 allowMemberNotifications */
 export async function approvePackage(
   pending: PackageRequest,
   allowInline: boolean,
+  allowMemberNotifications = false,
 ): Promise<PackageResult> {
   return (
     await request<ApiEnvelope<PackageResult>>(
@@ -266,6 +304,7 @@ export async function approvePackage(
           operations: pending.operations,
           paths: pending.paths,
           allow_inline: allowInline,
+          allow_member_notifications: allowMemberNotifications,
         }),
       },
     )
@@ -300,8 +339,31 @@ export async function uninstallPackage(id: string, purgeData: boolean): Promise<
 /* —— 插件详情（设置 → 插件 → 点一个插件） —— */
 
 /** 装了这个插件，系统多了什么（已翻成人话） */
+/** 停用 / 启用插件（官方插件与插件包）：运行中生效，重启后保持；停用会取消它的后台任务 */
+export async function setPluginEnabled(id: string, enabled: boolean): Promise<void> {
+  await request(`/app/plugins/${encodeURIComponent(id)}/enabled`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+/** 卸载官方插件（代码随应用携带，随时能恢复）；返回删除的数据行数 */
+export async function uninstallBundled(id: string, purgeData: boolean): Promise<number> {
+  return (
+    await request<ApiEnvelope<{ cancelled_jobs: number; purged_rows: number }>>(
+      `/app/plugins/${encodeURIComponent(id)}/bundled?purge_data=${purgeData}`,
+      { method: "DELETE" },
+    )
+  ).data.purged_rows;
+}
+
+/** 恢复卸载了的官方插件：当场加载 */
+export async function restoreBundled(id: string): Promise<void> {
+  await request(`/app/plugins/${encodeURIComponent(id)}/bundled/restore`, { method: "POST" });
+}
+
 export interface PluginAdded {
-  /** channel / task / ingest / job / site / command / trigger / decision */
+  /** channel / task / ingest / job / site / command / trigger / decision / event / notification */
   kind: string;
   title: string;
   detail: string;
@@ -311,7 +373,8 @@ export interface PluginAdded {
 
 export interface PluginDurableConsumer {
   consumer_id: string;
-  event: string;
+  /** 订阅的事件（一个消费者可订阅多个，按产生顺序投递） */
+  events: string[];
   /** 事件的人话名字 */
   title: string;
   active: boolean;

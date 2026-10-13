@@ -29,10 +29,16 @@ def build_lifespan(settings: Settings):
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from movieclaw_api.plugins import settings_store
-        from movieclaw_api.services import host_ops
+        from movieclaw_api.services import host_ops, plugin_gateway, plugin_switches
+        from movieclaw_api.services.plugin_events import sensitive_reason
 
-        # 界面保存的插件设置叠在清单配置上（docs/design/plugin-phase4.md §3）
-        kernel = Kernel(settings=settings, config_overlay=settings_store.overlay(settings))
+        # 界面保存的插件设置叠在清单配置上（docs/design/plugin-phase4.md §3）；
+        # 第三方插件订阅敏感事件须经批准（docs/design/domain-events.md §6.3）
+        kernel = Kernel(
+            settings=settings,
+            config_overlay=settings_store.overlay(settings),
+            event_guard=sensitive_reason,
+        )
         app.state.kernel = kernel
         # 宿主操作要经 ASGI 调本进程应用；内核不认识 FastAPI，由这里绑定
         host_ops.bind_app(app)
@@ -51,9 +57,9 @@ def build_lifespan(settings: Settings):
             else [*load_local_entries(settings), *packages.load_package_entries(settings)]
         )
         # 随带的插件包（plugins/bundled.py）也是内置插件；被同 id 插件包替换的跳过（安全模式下插件包
-        # 不加载，随带版本照常）
+        # 不加载，随带版本照常），在插件页卸载了的跳过（services/plugin_switches.py）
         replaced = set() if safe.active else {canonical(i) for i in packages.package_ids(settings)}
-        bundled = load_bundled_entries(replaced)
+        bundled = load_bundled_entries(replaced, plugin_switches.removed_ids(settings))
         await kernel.start((*with_bundled(bundled), *local), patches=load_patches(settings))
         await legacy_ids.migrate_rows(settings)
         logger.info("应用启动完成，数据库就绪")
@@ -67,6 +73,8 @@ def build_lifespan(settings: Settings):
                 await manager.close()
                 del app.state.package_manager
             await kernel.stop()
+            # 插件进程都停了才关网关：插件释放时还可能调宿主服务
+            await plugin_gateway.gateway.stop()
             host_ops.unbind_app(app)
             # 正常停机：这次启动没有把应用拖垮
             safe_mode.mark_settled(settings)

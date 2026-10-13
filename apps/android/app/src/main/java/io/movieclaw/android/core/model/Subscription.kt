@@ -281,6 +281,8 @@ data class SubscriptionDownloadView(
 data class DownloadUnitView(
     val seasonNumber: Int = 0,
     val episodeNumber: Int = 0,
+    /** 下载快照里这一集的进度 0..1（挂了多集的包才有；单集种子 / 认不出集号为空，看整包进度） */
+    val progress: Double? = null,
 )
 
 /** GET /subscriptions/{id}/activities —— 排查记录 */

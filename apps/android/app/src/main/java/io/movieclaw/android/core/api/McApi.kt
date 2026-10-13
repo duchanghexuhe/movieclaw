@@ -282,6 +282,14 @@ interface McApi {
     @GET("libraries")
     suspend fun libraries(): McEnvelope<List<LibraryView>>
 
+    /** 单个媒体库详情（Agent 媒体库卡与 iOS `libraryGet` 同口子） */
+    @GET("libraries/{libraryId}")
+    suspend fun library(@Path("libraryId") libraryId: Long): McEnvelope<LibraryView>
+
+    /** 播放页条目信息（Agent 库内条目卡与 iOS `playbackItemInfo` 同口子；库归属服务端解析） */
+    @GET("playback/items/{mediaItemId}")
+    suspend fun playbackItem(@Path("mediaItemId") mediaItemId: Long): McEnvelope<io.movieclaw.android.core.model.PlaybackItemView>
+
     /* ---------------- 媒体库管理（管理页一库一行的 ⋯ 菜单） ---------------- */
 
     /** 扫描该库的根路径（后台执行）；已在扫会 409，UI 按 `scanning` 换成「停止扫描」 */
@@ -455,6 +463,17 @@ interface McApi {
         @Path("itemId") itemId: Long,
     ): McEnvelope<LibraryItemDetailView>
 
+    /**
+     * 条目详情页的相似推荐：只在当前身份可见的同类型库里挑。
+     * `excludeSeries`：排除同系列的片（详情页另有完整的系列一行时用）
+     */
+    @GET("libraries/{libraryId}/items/{itemId}/similar")
+    suspend fun similarItems(
+        @Path("libraryId") libraryId: Long,
+        @Path("itemId") itemId: Long,
+        @Query("exclude_series") excludeSeries: Boolean? = null,
+    ): McEnvelope<List<LibraryItemView>>
+
     @GET("libraries/{libraryId}/items/{itemId}/episodes")
     suspend fun seasonEpisodes(
         @Path("libraryId") libraryId: Long,
@@ -517,6 +536,12 @@ interface McApi {
     suspend fun collection(
         @Path("collectionId") id: Long,
     ): McEnvelope<io.movieclaw.android.core.model.CollectionView>
+
+    /** 系列合集的「已有 N / 共 M」与缺片名单（详情页「系列」一行） */
+    @GET("collections/{collectionId}/series")
+    suspend fun collectionSeries(
+        @Path("collectionId") id: Long,
+    ): McEnvelope<io.movieclaw.android.core.model.CollectionSeriesView>
 
     /** 合集成员：与单库海报墙同一份聚合，卡片因此长得一模一样（首页合集行也用这个） */
     @GET("collections/{collectionId}/items")
@@ -921,6 +946,10 @@ interface McApi {
     @POST("playback/activity/sessions/{deviceId}/end")
     suspend fun endPlaybackSession(@Path("deviceId") deviceId: String): McEnvelope<JsonElement>
 
+    /** 注销一台播放设备（凭证立即失效，正在播放与下载一并停止；已看/收藏按账号保存） */
+    @DELETE("playback/devices/{deviceId}")
+    suspend fun revokePlaybackDevice(@Path("deviceId") deviceId: String): McEnvelope<JsonElement>
+
     /* ---------------- 发现页与标题详情(M2c) ---------------- */
 
     /**
@@ -1125,4 +1154,27 @@ interface McApi {
     @Multipart
     @POST("sessions/attachments")
     suspend fun uploadAgentAttachment(@Part file: MultipartBody.Part): McEnvelope<AgentAttachment>
+
+    // ---- 实时通知（服务端 cloud-push.md §4.1；长连接 /push/me/stream 见 core/push）----
+
+    @PUT("push/me/registration")
+    suspend fun pushRegister(
+        @Body body: io.movieclaw.android.core.model.PushRegistrationBody,
+    ): McEnvelope<io.movieclaw.android.core.model.PushRegistrationView>
+
+    @POST("push/me/ack")
+    suspend fun pushAck(
+        @Body body: io.movieclaw.android.core.model.PushAckBody,
+    ): McEnvelope<io.movieclaw.android.core.model.PushAckView>
+
+    @POST("push/me/test")
+    suspend fun pushTest(): McEnvelope<io.movieclaw.android.core.model.PushTestView>
+
+    @GET("push/me")
+    suspend fun pushMe(): McEnvelope<io.movieclaw.android.core.model.MyPushView>
+
+    @PUT("push/me/preferences")
+    suspend fun pushPreferences(
+        @Body body: io.movieclaw.android.core.model.PushPreferencesBody,
+    ): McEnvelope<io.movieclaw.android.core.model.MyPushView>
 }

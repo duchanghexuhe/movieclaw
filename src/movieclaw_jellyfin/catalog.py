@@ -2160,7 +2160,10 @@ def media_source_dto(f: LibraryFile, *, resolve_strm: bool = False) -> dict[str,
     而浏览场景根本用不到直链，Path 保留 strm 占位路径即可。
     """
     from movieclaw_jellyfin.ids import media_source_guid
-    from movieclaw_playback.streaming import resolve_strm_url
+
+    # 别名：本函数的布尔参数就叫 resolve_strm，同名导入会把它覆盖成恒真的函数对象
+    from movieclaw_playback.streaming import local_strm_container, strm_needs_relay
+    from movieclaw_playback.streaming import resolve_strm as read_strm
 
     streams = media_streams_dto(f)
     audio_streams = [s for s in streams if s["Type"] == "Audio"]
@@ -2221,9 +2224,28 @@ def media_source_dto(f: LibraryFile, *, resolve_strm: bool = False) -> dict[str,
         source["Protocol"] = "Http"
         source["IsRemote"] = True
         if resolve_strm:
-            url = resolve_strm_url(f.file_path)
-            if url is None:
+            link = read_strm(f.file_path)
+            if link is None:
                 return None
+            if isinstance(link, Path):
+                # 指向服务器挂载目录里的文件：按本地文件呈现，播放器走 /Videos/{id}/stream
+                try:
+                    source["Size"] = link.stat().st_size
+                except OSError:
+                    return None  # 挂载刚掉线：剔除这个版本，与读不出 strm 一样
+                source["Protocol"] = "File"
+                source["IsRemote"] = False
+                source["Container"] = local_strm_container(f.container, link)
+                return {k: v for k, v in source.items() if v is not None}
+            url = link.url
+            if strm_needs_relay(url, link.headers):
+                # 内网 / 回环 / 容器服务名的直链客户端连不上：按本地文件呈现，播放器走
+                # /Videos/{id}/stream，由服务端替它跟跳转或转发（streaming.strm_redirect_target）
+                source["Protocol"] = "File"
+                source["IsRemote"] = False
+                if f.container and f.container != "strm":
+                    source["Container"] = f.container
+                return {k: v for k, v in source.items() if v is not None}
             source["Path"] = url
             ext = Path(url.split("?", 1)[0]).suffix.lstrip(".").lower()
             if ext:

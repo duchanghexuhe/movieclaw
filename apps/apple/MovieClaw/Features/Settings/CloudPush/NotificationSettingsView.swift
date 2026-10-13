@@ -71,7 +71,7 @@ final class NotificationSettingsModel {
     }
 
     /// 「媒体库有新片」的事件键
-    static let libraryEvent = "library_new"
+    static let libraryEvent = "library.items.arrived"
 
     /// 勾 / 取消勾一个库（乐观更新，失败按服务器上的为准）：原来是「全部」就从全部里去掉它；勾到全部都选上回到「全部」
     /// （包括以后新建的库）；一个都不剩 = 关掉「媒体库有新片」并回到「全部」，下次打开就是全勾上（同网页）
@@ -236,7 +236,9 @@ private struct NotificationSettingsContent: View {
                 EmptyView()
             }
         } footer: {
-            if push.permission == .denied {
+            if push.unsupportedBuild {
+                Text("这个安装包收不到推送：侧载版签名里没有推送权限，系统通知开着也没用。改用 TestFlight 或 App Store 版就能收到。")
+            } else if push.permission == .denied {
                 Text("这台手机在系统设置里关掉了 MovieClaw 的通知，哪台服务器的通知都收不到。")
             }
         }
@@ -429,29 +431,40 @@ private struct NotificationSettingsContent: View {
 
     private func testSection(_ settings: API.MyPushView) -> some View {
         let count = settings.readyDevices
+        // IM 也是通知的渠道，测试通知一并发过去（旧服务器没有这个字段）
+        let im = settings.imAccounts ?? 0
         return SettingsFormSection {
             HStack(spacing: 12) {
-                SettingsRowText(title: "发送测试通知",
-                                detail: count > 0 ? "发给你的 \(count) 台设备" : "你的设备现在都收不到通知")
+                SettingsRowText(title: "发送测试通知", detail: Self.testTarget(devices: count, im: im))
                 Spacer(minLength: 8)
                 SettingsBAsyncButton("发送") { await sendTest() }
                     .font(.subheadline.weight(.medium))
                     .buttonStyle(.glass)
-                    .disabled(count == 0)
+                    .disabled(count == 0 && im == 0)
                     .accessibilityIdentifier("notifications-test")
             }
         } footer: {
-            if count == 0 {
+            if count == 0 && im == 0 {
                 Text(settings.instanceReady ? "在「设置 → 设备」里看看是哪台、为什么收不到。" : "服务器开启手机通知后才能发。")
             }
         }
+    }
+
+    /// 「发给你的 2 台设备和 1 个 IM 账号」（与 Web testTargetHint 同一口径）
+    static func testTarget(devices: Int, im: Int) -> String {
+        let targets = [devices > 0 ? "\(devices) 台设备" : nil, im > 0 ? "\(im) 个 IM 账号" : nil].compactMap { $0 }
+        return targets.isEmpty ? "你的设备现在都收不到通知" : "发给你的 " + targets.joined(separator: "和 ")
     }
 
     private func sendTest() async {
         do {
             let result = try await model.sendTest()
             if result.sent > 0 {
-                feedback.success("已发给 \(result.sent) 台设备，稍等就会收到")
+                // IM 也是通知渠道（device_id 为 im），回执里单说，不算进「台设备」
+                let im = result.results.contains { $0.deviceId == "im" && $0.result == "ok" }
+                let devices = result.sent - (im ? 1 : 0)
+                let target = [devices > 0 ? "\(devices) 台设备" : nil, im ? "IM" : nil].compactMap { $0 }
+                feedback.success("已发给 " + target.joined(separator: "和 ") + "，稍等就会收到")
             } else {
                 feedback.info(result.results.map(\.message).first { !$0.isEmpty } ?? "没有能收到通知的设备")
             }

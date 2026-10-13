@@ -428,7 +428,8 @@ internal fun downloadNote(d: io.movieclaw.android.core.model.SubscriptionDownloa
         else -> {
             val parts = mutableListOf(pct)
             d.dlspeedBytes?.takeIf { it > 0 }?.let { parts += "${io.movieclaw.android.core.designsystem.McFormat.bytes(it)}/s" }
-            d.etaSeconds?.let { parts += "剩余约 ${etaText(it)}" }
+            // 剩余超过 3 天基本就是死种速度：写「速度很慢」，不报「剩余约 1769.4 小时」这种数
+            d.etaSeconds?.let { parts += if (it > 72 * 3600) "速度很慢" else "剩余约 ${etaText(it)}" }
             if (parts.size == 1) d.sizeBytes?.let { parts += io.movieclaw.android.core.designsystem.McFormat.bytes(it) }
             parts.filter { it.isNotEmpty() }.joinToString(" · ")
         }

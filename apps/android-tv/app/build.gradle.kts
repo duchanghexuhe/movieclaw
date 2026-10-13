@@ -56,6 +56,12 @@ android {
         compose = true
         buildConfig = true
     }
+    // Robolectric 跑 Compose 焦点 / 遥控器按键测试，并截预览图到 build/ui-previews/
+    testOptions.unitTests.isIncludeAndroidResources = true
+    testOptions.unitTests.all {
+        it.maxHeapSize = "2g"
+        it.systemProperty("robolectric.dependency.repo.url", "https://repo.maven.apache.org/maven2")
+    }
 }
 
 dependencies {
@@ -80,6 +86,10 @@ dependencies {
     implementation(libs.coil.network.okhttp)
     debugImplementation(libs.compose.ui.tooling)
     testImplementation(libs.junit)
+    testImplementation(platform(libs.compose.bom))
+    testImplementation(libs.compose.ui.test.junit4)
+    testImplementation(libs.robolectric)
+    debugImplementation(libs.compose.ui.test.manifest)
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.uiautomator)

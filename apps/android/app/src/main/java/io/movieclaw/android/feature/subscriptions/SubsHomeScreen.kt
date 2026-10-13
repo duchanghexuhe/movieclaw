@@ -179,6 +179,23 @@ internal data class ArrivalGroup(
                 .joinToString(" · ")
         }
 
+    /**
+     * 英雄位用的集号：一季里断成三段以上就只说集数（「S01 · 共 52 集」）。
+     * 补旧番一口气投递几十集时，完整区间能铺满半屏（实机截图：14 段区间、还印了两遍）
+     */
+    val heroLabel: String
+        get() = if (mediaKind == "movie") {
+            "电影"
+        } else {
+            units.groupBy { it.seasonNumber }.toSortedMap()
+                .map { (season, eps) ->
+                    val ranges = episodeRanges(eps.map { it.episodeNumber })
+                    if (ranges.count { it == '、' } >= 2) "S%02d · 共 %d 集".format(season, eps.map { it.episodeNumber }.toSet().size)
+                    else "S%02d%s".format(season, ranges)
+                }
+                .joinToString(" · ")
+        }
+
     /** 组内代表集（时刻文案用）：最慢的一集 */
     val representative: TodayArrivalFull get() = units.first()
 }
@@ -379,18 +396,36 @@ class SubsHomeViewModel @Inject constructor(
             val arr = group.representative
             val pres = group.presentation
             val media = byId[arr.subscriptionId]?.media ?: MediaBrief(title = arr.mediaTitle, kind = arr.mediaKind)
-            val label = if (arr.mediaKind == "tv") group.episodeLabel else null
+            val label = if (arr.mediaKind == "tv") group.heroLabel else null
             when {
                 pres.statusLabel.startsWith("下载中") -> {
-                    // 时刻与进度都来自下载器任务（iOS：`task.etaSeconds` + 「下载完成 → 入库」中位耗时）
+                    // 时刻与进度都来自下载器任务（iOS：`task.etaSeconds` + 「下载完成 → 入库」中位耗时）。
+                    // 集号只出现一次：有入库时刻 → 大字时刻；没有时刻但有进度 → 大字百分比；都没有 → 一行「正在下载」
+                    // （以前没时刻时「正在下载」与「预计可看」两行各印一遍完整集号）
+                    val eta = pres.timeText?.takeIf { it != "稍后" }
+                    val percent = group.progress?.let { "${(it * 100).toInt().coerceIn(0, 100)}%" }
+                    val prefix = label?.let { "$it · " }.orEmpty()
+                    // 下载器已到 100%、还没入库：不再写「下载中 / 已下载 100%」，按整理中讲
+                    if ((group.progress ?: 0.0) >= 0.999) {
+                        slides += SubsHeroSlide(
+                            arr.subscriptionId, media, SubsStage.Organizing,
+                            eyebrow = "整理中", eyebrowDot = Ok,
+                            detail = "${prefix}下载完成",
+                            footnote = "正在整理入库，稍后就能看",
+                        )
+                        return@forEach
+                    }
                     slides += SubsHeroSlide(
                         arr.subscriptionId, media, SubsStage.Downloading,
                         eyebrow = "下载中", eyebrowDot = Color(0xFF7FB0FF),
-                        clockLabel = if (arr.mediaKind == "movie") "预计可看" else "$label · 预计可看",
-                        clock = pres.timeText?.takeIf { it != "稍后" }?.let { "约 $it" },
-                        detail = if (pres.timeText == "稍后" || pres.timeText == null)
-                            (if (arr.mediaKind == "movie") "正在下载" else "$label · 正在下载") else null,
-                        footnote = if (pres.timeText == "稍后" || pres.timeText == null) "下载完成后自动整理入库" else null,
+                        clockLabel = when {
+                            eta != null -> "${prefix}预计可看"
+                            percent != null -> "${prefix}已下载"
+                            else -> null
+                        },
+                        clock = eta?.let { "约 $it" } ?: percent,
+                        detail = if (eta == null && percent == null) "${prefix}正在下载" else null,
+                        footnote = if (eta == null) "下载完成后自动整理入库" else null,
                         progress = group.progress,
                     )
                 }
@@ -652,6 +687,11 @@ fun SubsHomeScreen(
                 .align(Alignment.TopStart)
                 .statusBarsPadding()
                 .padding(start = McMetrics.pagePadding, top = 2.dp)
+                // 跟着页面滚走、边滚边淡（以前一直钉在顶上，压在每张剧照的 Logo 上）
+                .graphicsLayer {
+                    translationY = -scroll.value.toFloat()
+                    alpha = (1f - scroll.value / 160f).coerceIn(0f, 1f)
+                }
                 .zIndex(3f),
         )
         Column(
@@ -869,7 +909,8 @@ private fun SubsHero(
                     )
                     // 压暗层留在渐隐遮罩里（iOS 注释：压暗层若在遮罩外，Hero 底边比氛围色暗一截，切出一道横线）
                     Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0f to Color.Black.copy(alpha = 0.5f), 0.26f to Color.Transparent)))
-                    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0.36f to Color.Transparent, 1f to Color.Black.copy(alpha = 0.5f))))
+                    // 底部压暗从 30% 处起、到底 70%：文字区落在剧照中下部，亮图上原来的 50% 压不住灰字
+                    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0.3f to Color.Transparent, 0.62f to Color.Black.copy(alpha = 0.38f), 1f to Color.Black.copy(alpha = 0.7f))))
                 }
                 Column(
                     Modifier
@@ -900,28 +941,30 @@ private fun SubsHero(
                     if (!s.eyebrow.isNullOrBlank()) {
                         Spacer(Modifier.height(16.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            s.eyebrowDot?.let { Box(Modifier.size(7.dp).clip(CircleShape).background(it)) ; Spacer(Modifier.width(7.dp)) }
-                            Text(s.eyebrow, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color.White.copy(alpha = 0.9f))
+                            s.eyebrowDot?.let { Box(Modifier.size(6.dp).clip(CircleShape).background(it)) ; Spacer(Modifier.width(6.dp)) }
+                            Text(s.eyebrow, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp, color = Color.White.copy(alpha = 0.85f))
                         }
                     }
                     if (!s.detail.isNullOrBlank()) {
                         Spacer(Modifier.height(8.dp))
-                        Text(s.detail, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color.White.copy(alpha = 0.9f))
-                    }
-                    if (!s.footnote.isNullOrBlank()) {
-                        Spacer(Modifier.height(4.dp))
-                        Text(s.footnote, fontSize = 13.sp, color = Color.White.copy(alpha = 0.6f))
+                        Text(
+                            s.detail, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.9f),
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                        )
                     }
                     if (!s.clockLabel.isNullOrBlank()) {
                         Spacer(Modifier.height(10.dp))
-                        Text(s.clockLabel, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color.White.copy(alpha = 0.9f))
+                        Text(
+                            s.clockLabel, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.75f),
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                        )
                     }
                     if (!s.clock.isNullOrBlank()) {
                         val hasDigit = s.clock.any { it.isDigit() }
                         Spacer(Modifier.height(2.dp))
                         Text(
                             s.clock,
-                            fontSize = if (hasDigit) 48.sp else 36.sp,
+                            fontSize = if (hasDigit) 44.sp else 34.sp,
                             fontWeight = if (hasDigit) FontWeight.Thin else FontWeight.Light,
                             color = Color.White,
                         )
@@ -941,6 +984,10 @@ private fun SubsHero(
                             }
                         }
                     }
+                    if (!s.footnote.isNullOrBlank()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(s.footnote, fontSize = 12.5.sp, color = Color.White.copy(alpha = 0.6f), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                    }
                     Spacer(Modifier.height(20.dp))
                     val play = s.play
                     if (play != null) {
@@ -958,7 +1005,7 @@ private fun SubsHero(
                                 Spacer(Modifier.width(6.dp))
                                 Text(
                                     if (s.resumePercent == null || s.resumePercent == 0) "播放" else "继续播放",
-                                    fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF141821),
+                                    fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF141821),
                                 )
                             }
                         }
@@ -972,7 +1019,7 @@ private fun SubsHero(
                                 .clickable { onOpenSubscription(s.subscriptionId) }
                                 .padding(horizontal = 22.dp),
                             contentAlignment = Alignment.Center,
-                        ) { Text("查看订阅", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.White) }
+                        ) { Text("查看订阅", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color.White) }
                     }
                 }
             }

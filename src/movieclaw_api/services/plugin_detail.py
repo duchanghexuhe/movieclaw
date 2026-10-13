@@ -20,7 +20,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from movieclaw_kernel import Delivery, Event, Kernel, Mode
+from movieclaw_kernel import Event, Kernel, Mode
 from movieclaw_kernel.contracts import CATALOG
 
 
@@ -200,6 +200,36 @@ def _adds(
         out.append(
             {"kind": "command", "title": command, "detail": "AI 助手和命令行都能调用", "href": None}
         )
+    # 它会发出的事件、会发的通知（domain-events.md §7）
+    from movieclaw_api.services import plugin_events
+
+    declared = plugin_events.declared(entry_id)
+    if declared is not None:
+        audiences = {
+            "admins": "管理员",
+            "member": "事件里的那个成员",
+            "media": "订阅或关注了那部片的人",
+        }
+        for title in declared.events.values():
+            out.append(
+                {
+                    "kind": "event",
+                    "title": f"会发出「{title}」",
+                    "detail": "别的插件、Webhook 能订",
+                    "href": "/settings/webhook",
+                }
+            )
+        for spec in declared.notifications:
+            who = audiences[spec.audience.partition(":")[0]]
+            allowed = declared.members_allowed or not spec.reaches_members
+            out.append(
+                {
+                    "kind": "notification",
+                    "title": f"会发通知：{declared.events.get(spec.event, spec.event)}",
+                    "detail": f"发给{who}" if allowed else f"发给{who}（没有获得批准，不会发）",
+                    "href": "/settings/notifications",
+                }
+            )
     # 什么时候被触发、会影响哪些判断
     for listener in kernel.bus.owned_by(entry_id):
         out.append(_listener_view(listener.event))
@@ -210,7 +240,7 @@ def _adds(
     for name in durable_events:
         event = CATALOG.get(name)
         if isinstance(event, Event):
-            out.append(_listener_view(event))
+            out.append(_listener_view(event, durable=True))
     seen: set[tuple[str, str]] = set()
     unique = []
     for item in out:
@@ -230,6 +260,8 @@ def _adds(
         "delete",
         "other",
         "command",
+        "event",
+        "notification",
         "trigger",
         "decision",
     ]
@@ -265,10 +297,10 @@ def _event_title(name: str) -> str:
     return (getattr(contract, "doc", "") or name) if contract is not None else name
 
 
-def _listener_view(event: Event[Any, Any]) -> dict:
+def _listener_view(event: Event[Any, Any], *, durable: bool = False) -> dict:
     doc = event.doc or event.name
     if event.mode is Mode.EMIT:
-        if event.delivery is Delivery.DURABLE:
+        if durable:
             return {
                 "kind": "trigger",
                 "title": f"「{doc}」后会自动处理",
@@ -419,7 +451,7 @@ async def plugin_detail(kernel: Kernel, settings: Any, entry_id: str, item: dict
     if store is not None:
         durable = await store.describe()
         consumers = [
-            {**c, "title": _event_title(c["event"])}
+            {**c, "title": "、".join(_event_title(name) for name in c["events"])}
             for c in durable["consumers"]
             if c["consumer_id"].startswith(f"{entry_id}:")
         ]
@@ -440,7 +472,9 @@ async def plugin_detail(kernel: Kernel, settings: Any, entry_id: str, item: dict
         "version": version,
         "network": network,
         "package": package,
-        "adds": _adds(kernel, entry_id, accounts, [c["event"] for c in consumers]),
+        "adds": _adds(
+            kernel, entry_id, accounts, [name for c in consumers for name in c["events"]]
+        ),
         "consumers": consumers,
         "dead_letters": dead_letters,
         "callbacks": await callbacks.overview(entry_id) if callbacks is not None else [],

@@ -14,7 +14,11 @@ from __future__ import annotations
 import asyncio
 import errno
 import itertools
+import re
+import threading
+import time
 from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -135,6 +139,7 @@ async def _seed(
     duration_seconds: int = 600,
     hdr: str | None = None,
     resolution: str = "1080p",
+    strm_url: str = "https://pan.example.com/a.mkv",
 ) -> int:
     """建库 + 建条目 + 落一个真实存在的文件，返回 library_file.id。
 
@@ -146,7 +151,7 @@ async def _seed(
     media_root.mkdir(exist_ok=True)
     name = f"movie{n}.strm" if strm else f"movie{n}.{container}"
     path = media_root / name
-    path.write_text("https://pan.example.com/a.mkv\n") if strm else path.write_bytes(
+    path.write_text(f"{strm_url}\n") if strm else path.write_bytes(
         data if data is not None else b"FAKE-MEDIA-BYTES" * 64
     )
     async with get_database().session() as session:
@@ -465,12 +470,47 @@ def test_direct_play_releases_the_db_connection_before_streaming(client, tmp_pat
 
 
 def test_strm_entry_redirects_to_cloud_url(client, tmp_path):
-    """strm 只允许直连，服务器零流量（硬边界 2）。"""
-    file_id = seed(client, tmp_path, container="strm", strm=True)
-    url = start_session(client, file_id)["stream_url"]
-    resp = client.get(url, follow_redirects=False)
+    """网盘条目能直出时取流 302 到网盘直链，字节不经服务器。"""
+    file_id = seed(client, tmp_path, container="mp4", strm=True)
+    data = start_session(client, file_id)
+    assert data["session_id"] is None
+    resp = client.get(data["stream_url"], follow_redirects=False)
     assert resp.status_code == 302
     assert resp.headers["location"] == "https://pan.example.com/a.mkv"
+
+
+def test_unprobed_strm_entry_still_redirects(client, tmp_path):
+    """读不出规格的网盘条目（探测失败）乐观直连，与原来的行为一致。"""
+    file_id = seed(client, tmp_path, container="strm", codec=None, strm=True)
+    data = start_session(client, file_id)
+    assert data["decision"]["tier"] == 0
+    resp = client.get(data["stream_url"], follow_redirects=False)
+    assert resp.status_code == 302
+
+
+def test_probed_strm_mkv_remuxes_from_the_cloud_url(client, tmp_path, monkeypatch):
+    """浏览器认不了的容器：服务端开换封装会话，ffmpeg 直接读网盘直链。"""
+    builds = []
+
+    def capture_build(plan, *, source_path, session_dir, input_options=(), **_kwargs):
+        builds.append((source_path, list(input_options)))
+        playlist = Path(session_dir) / "index.m3u8"
+        return TranscodeCommand(
+            argv=["python3", "-c", FAKE_FFMPEG, str(playlist)],
+            playlist_path=playlist,
+            init_path=Path(session_dir) / "init.mp4",
+        )
+
+    monkeypatch.setattr(session_mod, "build_hls_command", capture_build)
+    # 虚构直链读不出 Cues：走会话相对模式，不去碰网络
+    monkeypatch.setattr(routes_playback, "read_keyframe_index", lambda *_a, **_k: None)
+    file_id = seed(client, tmp_path, container="mkv", strm=True)
+    data = start_session(client, file_id)
+    assert data["decision"]["tier"] == 1, data["decision"]
+    assert data["session_id"]
+    source, options = builds[0]
+    assert source == "https://pan.example.com/a.mkv"
+    assert "-protocol_whitelist" in options
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +596,38 @@ def test_session_lifecycle_playlist_segment_ping_stop(client, tmp_path):
     # 停掉之后 playlist 与心跳都应 404
     assert client.get(data["stream_url"]).status_code == 404
     assert client.post(f"{_PB}/sessions/{session_id}/ping").status_code == 404
+
+
+def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(client, tmp_path):
+    """回归 issue #763：本机转码起步即退出、会话被判死后，心跳要把「失败」告诉客户端，
+    并且 init.mp4 不再每次干等 15 秒——否则播放器对着死会话缓冲好几分钟也不降档。
+    远程 Worker 断线不算本机失败：那是连接问题，照旧交给客户端同档重连。"""
+    file_id = seed(client, tmp_path, container="mkv")
+    data = start_session(client, file_id)
+    session_id = data["session_id"]
+    token = data["stream_url"].split("token=")[1]
+
+    healthy = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+    assert healthy == {"alive": True, "failed": False, "error": None}
+
+    session = get_session_manager().get(session_id)
+    (session.directory / "init.mp4").unlink(missing_ok=True)
+    session.state = "failed"
+    session.error = "转码进程起步即退出、一段都没产出：Function not implemented"
+    failed = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+    assert failed["alive"] is True
+    assert failed["failed"] is True
+    assert "Function not implemented" in failed["error"]
+
+    started = time.monotonic()
+    init = client.get(f"{_PB}/sessions/{session_id}/init.mp4?token={token}")
+    assert init.status_code == 404
+    assert time.monotonic() - started < 2.0
+
+    session.remote = True
+    remote = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+    assert remote["failed"] is False
+    session.remote = False
 
 
 def test_full_decode_client_gets_the_original_file_without_a_session(client, tmp_path):
@@ -1291,6 +1363,122 @@ def test_remote_source_supports_range_without_mounting_nas(client, tmp_path):
     assert response.status_code == 206
     assert response.content == b"FAKE-MEDIA-BYTES"
     assert response.headers["accept-ranges"] == "bytes"
+
+
+def test_remote_source_redirects_strm_to_the_cloud_url(client, tmp_path):
+    """网盘条目交给远程 Worker 时，取源跳转到网盘直链：Worker 直接从网盘取，不经 NAS。"""
+    file_id = seed(client, tmp_path, container="mkv", strm=True)
+    grants = _install_remote_session(client, tmp_path, file_id)
+    response = client.get(
+        f"/api/v1/transcode-worker/sessions/{grants['session_id']}/source"
+        f"?token={grants['source']}",
+        headers={"Range": "bytes=0-15"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://pan.example.com/a.mkv"
+
+
+# ---------------------------------------------------------------------------
+# 内网直链由服务端转发（streaming.strm_needs_relay）
+# ---------------------------------------------------------------------------
+
+_LAN_BYTES = bytes(range(256)) * 64
+
+
+@pytest.fixture
+def lan_drive():
+    """回环地址上的仿网盘：只认 Range，``/missing`` 回 404。"""
+    seen: list[tuple[str, str | None]] = []
+    agents: list[str | None] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802
+            seen.append((self.path, self.headers.get("Range")))
+            agents.append(self.headers.get("User-Agent"))
+            if self.path.startswith("/missing"):
+                self.send_error(404)
+                return
+            match = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+            start = int(match.group(1)) if match else 0
+            end = int(match.group(2)) if match and match.group(2) else len(_LAN_BYTES) - 1
+            body = _LAN_BYTES[start : end + 1]
+            self.send_response(206 if match else 200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Accept-Ranges", "bytes")
+            if match:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(_LAN_BYTES)}")
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield SimpleNamespace(url=f"http://127.0.0.1:{server.server_port}", seen=seen, agents=agents)
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("url", "relay"),
+    [
+        ("http://127.0.0.1:5244/d/a.mkv", True),
+        ("http://192.168.1.10:5244/d/a.mkv", True),
+        ("http://alist:5244/d/a.mkv", True),
+        ("http://nas.local/d/a.mkv", True),
+        ("http://100.101.102.103/d/a.mkv", True),
+        ("http://[::1]:5244/d/a.mkv", True),
+        ("https://pan.example.com/a.mkv", False),
+        ("https://8.8.8.8/a.mkv", False),
+        ("rtsp://192.168.1.10/live", False),
+    ],
+)
+def test_relay_rule_only_targets_addresses_players_cannot_reach(url, relay):
+    from movieclaw_playback.streaming import strm_needs_relay
+
+    assert strm_needs_relay(url) is relay
+
+
+def test_lan_strm_is_relayed_with_range(client, tmp_path, lan_drive):
+    """回环 / 内网直链不 302（播放器连不上），服务端按 Range 原样转发；上游 404 透传。"""
+    lan = f"{lan_drive.url}/d/a.mp4"
+    file_id = seed(client, tmp_path, container="mp4", strm=True, strm_url=lan)
+    url = start_session(client, file_id)["stream_url"]
+    resp = client.get(url, headers={"Range": "bytes=100-199"}, follow_redirects=False)
+    assert resp.status_code == 206
+    assert resp.content == _LAN_BYTES[100:200]
+    assert resp.headers["content-range"] == f"bytes 100-199/{len(_LAN_BYTES)}"
+    assert lan_drive.seen[-1] == ("/d/a.mp4", "bytes=100-199")
+
+    gone = seed(client, tmp_path, container="mp4", strm=True, strm_url=f"{lan_drive.url}/missing")
+    assert client.get(start_session(client, gone)["stream_url"]).status_code == 404
+
+
+def test_strm_request_headers_are_forwarded_by_the_relay(client, tmp_path, lan_drive):
+    """strm 里写了 User-Agent：一律服务端转发，上游收到的是 strm 指定的头。"""
+    lan = f"{lan_drive.url}/d/a.mp4|User-Agent=115Browser%2F27"
+    file_id = seed(client, tmp_path, container="mp4", strm=True, strm_url=lan)
+    resp = client.get(start_session(client, file_id)["stream_url"], headers={"Range": "bytes=0-9"})
+    assert resp.status_code == 206 and resp.content == _LAN_BYTES[:10]
+    assert lan_drive.agents[-1] == "115Browser/27"
+
+
+def test_remote_worker_source_relays_lan_strm(client, tmp_path, lan_drive):
+    """回环直链在 Worker 那台机器上不是同一个地址：NAS 转发，不 302。"""
+    lan = f"{lan_drive.url}/d/a.mkv"
+    file_id = seed(client, tmp_path, container="mkv", strm=True, strm_url=lan)
+    grants = _install_remote_session(client, tmp_path, file_id)
+    response = client.get(
+        f"/api/v1/transcode-worker/sessions/{grants['session_id']}/source"
+        f"?token={grants['source']}",
+        headers={"Range": "bytes=0-15"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 206
+    assert response.content == _LAN_BYTES[:16]
 
 
 def test_remote_disc_source_is_an_ffconcat_of_clip_urls(client, tmp_path):
@@ -2241,3 +2429,24 @@ def test_only_streaming_clients_get_partial_segments():
     assert not routes_playback._consumes_partial_segments(request(chrome))
     assert routes_playback._consumes_partial_segments(request(chrome, b"partial=1"))
     assert not routes_playback._consumes_partial_segments(request(chrome, b"partial=0"))
+
+
+def test_diagnostic_encoder_marks_vaapi_low_power():
+    """诊断面板要看得出 VAAPI 用的是不是低功耗编码：同一块核显两种模式表现可能
+    天差地别（issue #763），排查时第一眼就要知道。"""
+    from movieclaw_api.services.playback.ffmpeg_args import (
+        VAAPI_LOW_POWER,
+        register_encoder_options,
+    )
+    from movieclaw_playback.decide import VideoPlan
+
+    session = SimpleNamespace(
+        plan=SimpleNamespace(video=VideoPlan(action="transcode", codec="h264")),
+        hw_backend="vaapi",
+    )
+    assert routes_playback._diagnostic_encoder(session) == "h264_vaapi"
+    register_encoder_options("vaapi", VAAPI_LOW_POWER)
+    try:
+        assert routes_playback._diagnostic_encoder(session) == "h264_vaapi（低功耗）"
+    finally:
+        register_encoder_options("vaapi", ())

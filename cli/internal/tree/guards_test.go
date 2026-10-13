@@ -70,6 +70,8 @@ var knownNonGenerated = []string{
 	"ui.library.kind.summary",
 	"ui.library.kind.items",
 	"ui.library.kind.genres",
+	// 详情页的相似推荐行：网页呈现层，命令行查库走 search / libraries 命令
+	"ui.library.items.similar",
 	// 海报行选中展开用的批量展示信息（Apple TV 首页）：纯呈现层数据
 	"ui.library.showcase",
 	"playback.decide",
@@ -204,6 +206,9 @@ var knownNonGenerated = []string{
 	"push.me.muted.remove",
 	"push.me.registration.set",
 	"push.me.registration.delete",
+	// Android 实时通知的长连接与送达确认：只给 App 的前台服务用
+	"push.me.stream",
+	"push.me.ack",
 	"push.images.get",
 	// 使用提示（docs/design/tips.md）：各端界面内部的提示状态，CLI 无消费方
 	"tips.state.show",
@@ -364,6 +369,8 @@ func TestDomainCommandSets(t *testing.T) {
 			"library.scan.start",
 			"library.scan.stop",
 			"library.set-default",
+			"library.strm.list-pending",
+			"library.strm.probe",
 			"library.subtitles.calibrate-timing",
 			"library.subtitles.delete",
 			"library.subtitles.generate",

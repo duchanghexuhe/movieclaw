@@ -114,6 +114,26 @@ nonisolated extension APIClient {
         return try await send("GET", "/app/plugins/\(entryId)")
     }
 
+    /// 卸载官方插件（随时能恢复）；默认保留插件数据，purge_data=true 连同数据删除
+    /// `DELETE /app/plugins/{entry_id}/bundled`
+    func appPluginsBundledUninstall(entryId: String, purgeData: Bool? = nil) async throws -> API.BundledUninstallView {
+        var query: [URLQueryItem] = []
+        if let purgeData { query.append(URLQueryItem(name: "purge_data", value: "\(purgeData)")) }
+        return try await send("DELETE", "/app/plugins/\(entryId)/bundled", query: query)
+    }
+
+    /// 恢复卸载了的官方插件：当场加载
+    /// `POST /app/plugins/{entry_id}/bundled/restore`
+    func appPluginsBundledRestore(entryId: String) async throws -> API.PluginSwitchView {
+        return try await send("POST", "/app/plugins/\(entryId)/bundled/restore")
+    }
+
+    /// 停用 / 启用插件（官方插件与插件包）：运行中生效，重启后保持；停用会取消它的后台任务
+    /// `PUT /app/plugins/{entry_id}/enabled`
+    func appPluginsSwitch(entryId: String, body: API.PluginSwitchPayload) async throws -> API.PluginSwitchView {
+        return try await send("PUT", "/app/plugins/\(entryId)/enabled", body: body)
+    }
+
     /// 插件通用设置：参数的界面描述与当前值（敏感字段只告诉是否已设置）
     /// `GET /app/plugins/{entry_id}/settings`
     func appPluginsSettingsShow(entryId: String) async throws -> API.PluginSettingsView {
@@ -1531,6 +1551,15 @@ nonisolated extension APIClient {
         return try await send("POST", "/libraries/\(libraryId)/items/\(mediaItemId)/share", body: body)
     }
 
+    /// 条目详情页的相似推荐（只在观看者可见的同类型库里挑）
+    /// `GET /libraries/{library_id}/items/{media_item_id}/similar`
+    func uiLibraryItemsSimilar(libraryId: Int, mediaItemId: Int, limit: Int? = nil, excludeSeries: Bool? = nil) async throws -> [API.LibraryItemView] {
+        var query: [URLQueryItem] = []
+        if let limit { query.append(URLQueryItem(name: "limit", value: "\(limit)")) }
+        if let excludeSeries { query.append(URLQueryItem(name: "exclude_series", value: "\(excludeSeries)")) }
+        return try await send("GET", "/libraries/\(libraryId)/items/\(mediaItemId)/similar", query: query)
+    }
+
     /// 预览条目转移：哪些目录/文件搬到目标库的什么位置（只读，不动磁盘）
     /// `GET /libraries/{library_id}/items/{media_item_id}/transfer-preview`
     func libraryItemsPreviewTransfer(libraryId: Int, mediaItemId: Int, targetLibraryId: Int) async throws -> API.TransferPreviewView {
@@ -1621,6 +1650,28 @@ nonisolated extension APIClient {
     /// `POST /libraries/{library_id}/scan/stop`
     func libraryScanStop(libraryId: Int) async throws -> [String: API.JSONValue] {
         return try await send("POST", "/libraries/\(libraryId)/scan/stop")
+    }
+
+    /// 探一个网盘条目的规格（默认遵守失败退避）
+    /// `POST /library-strm/files/{file_id}/probe`
+    func libraryStrmProbe(fileId: Int, respectBackoff: Bool? = nil) async throws -> API.StrmProbeView {
+        var query: [URLQueryItem] = []
+        if let respectBackoff { query.append(URLQueryItem(name: "respect_backoff", value: "\(respectBackoff)")) }
+        return try await send("POST", "/library-strm/files/\(fileId)/probe", query: query)
+    }
+
+    /// 还没探过规格的网盘条目（不含失败退避期内的）
+    /// `GET /library-strm/pending`
+    func libraryStrmListPending(libraryId: Int? = nil, mediaItemId: Int? = nil, season: Int? = nil, excludeContainers: [String]? = nil, order: String? = nil, limit: Int? = nil, cursor: String? = nil) async throws -> API.StrmPendingView {
+        var query: [URLQueryItem] = []
+        if let libraryId { query.append(URLQueryItem(name: "library_id", value: "\(libraryId)")) }
+        if let mediaItemId { query.append(URLQueryItem(name: "media_item_id", value: "\(mediaItemId)")) }
+        if let season { query.append(URLQueryItem(name: "season", value: "\(season)")) }
+        for value in excludeContainers ?? [] { query.append(URLQueryItem(name: "exclude_containers", value: "\(value)")) }
+        if let order { query.append(URLQueryItem(name: "order", value: "\(order)")) }
+        if let limit { query.append(URLQueryItem(name: "limit", value: "\(limit)")) }
+        if let cursor { query.append(URLQueryItem(name: "cursor", value: "\(cursor)")) }
+        return try await send("GET", "/library-strm/pending", query: query)
     }
 
     /// 查看 AI 设定（各用途的默认模型）
@@ -2381,8 +2432,10 @@ nonisolated extension APIClient {
 
     /// 读取会话的完整轨迹
     /// `GET /sessions/{session_id}`
-    func sessionGetTranscript(sessionId: String) async throws -> API.SessionTranscriptView {
-        return try await send("GET", "/sessions/\(sessionId)")
+    func sessionGetTranscript(sessionId: String, view: String? = nil) async throws -> API.SessionTranscriptView {
+        var query: [URLQueryItem] = []
+        if let view { query.append(URLQueryItem(name: "view", value: "\(view)")) }
+        return try await send("GET", "/sessions/\(sessionId)", query: query)
     }
 
     /// 重命名会话
@@ -2781,6 +2834,36 @@ nonisolated extension APIClient {
     /// `POST /system/notices/{notice_id}/dismiss`
     func noticesDismiss(noticeId: Int) async throws -> Void {
         let _: API.JSONValue? = try await send("POST", "/system/notices/\(noticeId)/dismiss")
+    }
+
+    /// 记一次用户行为（计数 +1）
+    /// `POST /tips/events/{event_id}`
+    func tipsEventsDonate(eventId: String) async throws -> API.TipEventView {
+        return try await send("POST", "/tips/events/\(eventId)")
+    }
+
+    /// 重置我的提示状态（所有提示重新按条件出现）
+    /// `DELETE /tips/state`
+    func tipsStateReset() async throws -> Void {
+        let _: API.JSONValue? = try await send("DELETE", "/tips/state")
+    }
+
+    /// 我的提示状态（事件计数 + 各提示的展示/作废记录）
+    /// `GET /tips/state`
+    func tipsStateShow() async throws -> API.TipStateView {
+        return try await send("GET", "/tips/state")
+    }
+
+    /// 记一次提示展示（展示次数 +1）
+    /// `POST /tips/{tip_id}/displays`
+    func tipsDisplaysRecord(tipId: String) async throws -> API.TipRecordView {
+        return try await send("POST", "/tips/\(tipId)/displays")
+    }
+
+    /// 作废一条提示（以后不再出现；已作废的保留第一次的原因）
+    /// `POST /tips/{tip_id}/invalidate`
+    func tipsInvalidate(tipId: String, body: API.InvalidateTipRequest? = nil) async throws -> API.TipRecordView {
+        return try await send("POST", "/tips/\(tipId)/invalidate", body: body)
     }
 
     /// 读取远程转码配置

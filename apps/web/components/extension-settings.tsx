@@ -14,7 +14,11 @@ import {
   SettingsRow,
   SettingsSection,
 } from "@/components/settings-ui";
-import { EXTENSION_ZIP_URL, useExtensionInstalled } from "@/lib/extension-install";
+import {
+  EXTENSION_FIREFOX_ZIP_URL,
+  EXTENSION_ZIP_URL,
+  useExtensionInstalled,
+} from "@/lib/extension-install";
 import {
   type SyncTokenView,
   generateSyncToken,
@@ -59,7 +63,7 @@ export function ExtensionCard() {
           description={
             installed
               ? "打开站点页面，点浏览器工具栏的 MovieClaw 图标即可同步；首次使用先生成同步令牌填入扩展。"
-              : "支持 Chrome / Edge 等 Chromium 内核浏览器。"
+              : "支持 Chrome / Edge 等 Chromium 内核浏览器及 Firefox。"
           }
         >
           <span className="flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
@@ -196,9 +200,24 @@ function InstallModal({
           ))}
         </ol>
 
+        <p className="text-sub leading-5 text-[var(--text-muted)]">
+          Firefox 不能用上面的 Chrome 安装包（会提示「已损坏」），请下载{" "}
+          <a href={EXTENSION_FIREFOX_ZIP_URL} download className="text-[var(--text)] underline">
+            Firefox 安装包
+          </a>
+          ，在{" "}
+          <code className="rounded bg-white/[0.06] px-1 font-mono text-sub">about:debugging</code>{" "}
+          →「此 Firefox」→「临时载入附加组件」中直接选择该 zip（不用解压）。安装包未经 Mozilla
+          签名，正式版 Firefox 重启后需重新载入；开发者版 / Nightly / ESR 可把{" "}
+          <code className="rounded bg-white/[0.06] px-1 font-mono text-sub">
+            xpinstall.signatures.required
+          </code>{" "}
+          设为 false 后从附加组件管理器「从文件安装」长期使用。
+        </p>
+
         <div className="flex items-center justify-between gap-3 pt-1">
           <p className="text-caption text-[var(--text-faint)]">
-            支持 Chrome / Edge 等 Chromium 内核浏览器；安装检测同样仅对 Chromium 生效。
+            支持 Chrome / Edge 等 Chromium 内核浏览器及 Firefox；安装检测仅对 Chromium 生效。
           </p>
           <button type="button" onClick={onClose} className={SETTINGS_BUTTON_CLASS}>
             完成

@@ -115,6 +115,7 @@ async def create_llm_provider(
         default_model=payload.default_model,
         extra_models=payload.extra_models,
         user_agent=payload.user_agent,
+        api_protocol=payload.api_protocol,
     )
     assert row.id is not None
     row = await service.start_verification(row.id)
@@ -148,7 +149,7 @@ async def update_llm_provider(
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[LlmProviderView]:
-    """整体覆盖接入配置（API Key 需重新填写）。"""
+    """整体覆盖接入配置（API Key 留空沿用原 Key；改了类型或端点须重填）。"""
     service = LlmConfigService(session)
     await service.update(
         provider_id,
@@ -159,6 +160,10 @@ async def update_llm_provider(
         default_model=payload.default_model,
         extra_models=payload.extra_models,
         user_agent=payload.user_agent,
+        # 请求没带该字段（老客户端）时沿用原值，不能当成「清空」
+        api_protocol=(
+            payload.api_protocol if "api_protocol" in payload.model_fields_set else ...
+        ),
     )
     row = await service.start_verification(provider_id)
     background_tasks.add_task(verify_llm_provider, provider_id)

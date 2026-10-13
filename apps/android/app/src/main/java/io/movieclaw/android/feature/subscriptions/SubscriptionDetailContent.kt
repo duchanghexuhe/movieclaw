@@ -162,10 +162,10 @@ internal fun SubscriptionDetailContent(
                     }
                 } else if (wanted.isNotEmpty()) {
                     // 电影只有一个单元：在途时把实时进度放进一张卡里
-                    val live = wanted.mapNotNull { u -> u.infoHash?.let { downloads[it] }?.let { u to it } }
+                    val live = liveDownloads(wanted, downloads)
                     if (live.isNotEmpty()) {
                         SectionTitle("下载进度")
-                        Card { live.forEach { (u, d) -> DownloadRow(u, d) } }
+                        Card { live.forEach { (units, d) -> DownloadRow(units, d) } }
                     }
                 }
                 if (activities.isNotEmpty()) {
@@ -400,34 +400,103 @@ private fun SeasonCard(season: Int, items: List<WantedView>, downloads: Map<Stri
             }
         }
         // 在途投递的实时进度（5 秒轮询）：按单元锚定的种子 hash 对上
-        val live = items.mapNotNull { u -> u.infoHash?.let { downloads[it] }?.let { u to it } }
+        val live = liveDownloads(items, downloads)
         if (live.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
-            live.forEach { (u, d) -> DownloadRow(u, d) }
+            live.forEach { (units, d) -> DownloadRow(units, d) }
         }
     }
 }
 
-/** 一集的下载：集号徽标 + 细进度条 + 速度/剩余 */
+/**
+ * 在途下载按**种子**分组：一个全集包挂着几十集时只出一行（以前一集一行，
+ * 同一个任务的进度/速度重复印几十遍，看着像每集都卡在同一个进度）
+ */
+internal fun liveDownloads(
+    units: List<WantedView>,
+    downloads: Map<String, SubscriptionDownloadView>,
+): List<Pair<List<WantedView>, SubscriptionDownloadView>> =
+    // 已入库的单元不算：大包按单集分批入库，入库后工单仍带着种子 hash，
+    // 算进来的话「E84–E102 · 19 集」会一直把已经能看的集也算成在下载
+    units.filter { u -> u.importedAt == null && u.infoHash?.let { downloads[it] } != null }
+        .groupBy { it.infoHash!! }
+        .map { (hash, group) -> group.sortedBy { it.episodeNumber } to downloads.getValue(hash) }
+
+/** 一组单元的集号：「E104」/「E84–E102 · 19 集」/「全片」 */
+internal fun downloadUnitsLabel(units: List<WantedView>): String {
+    val eps = units.filter { it.episodeNumber > 0 }.map { it.episodeNumber }
+    if (eps.isEmpty()) return unitLabel(units.first())
+    val ranges = episodeRanges(eps).replace(Regex("E0*(\\d)"), "E$1")
+    return if (eps.size == 1) ranges else "$ranges · ${eps.size} 集"
+}
+
+/** 一个种子的下载：集号 + 细进度条 + 速度/剩余 */
 @Composable
-private fun DownloadRow(unit: WantedView, d: SubscriptionDownloadView) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            if (unit.episodeNumber > 0) "E${unit.episodeNumber}" else unitLabel(unit),
-            fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary,
-            modifier = Modifier.width(52.dp).clip(RoundedCornerShape(6.dp)).background(Color.White.copy(alpha = 0.08f))
-                .padding(vertical = 3.dp),
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-        )
-        Spacer(Modifier.width(10.dp))
+private fun DownloadRow(units: List<WantedView>, d: SubscriptionDownloadView) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
+            Text(downloadUnitsLabel(units), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(6.dp))
             val frac = (d.progress ?: 0.0).toFloat().coerceIn(0f, 1f)
             Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(999.dp)).background(Color.White.copy(alpha = 0.08f))) {
                 Box(Modifier.fillMaxWidth(frac).height(4.dp).background(if (d.state == "error") io.movieclaw.android.core.designsystem.Danger else Downloading))
             }
             Spacer(Modifier.height(4.dp))
             Text(downloadNote(d), fontSize = 11.5.sp, color = TextMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            // 包内每集的进度（服务端按单文件完成字节算；速度只有整包的）
+            val perEpisode = packEpisodeProgress(units, d)
+            if (perEpisode.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                EpisodeProgressGrid(perEpisode)
+            }
         }
+    }
+}
+
+/** 包内各集进度：挂了多集、且服务端给了单集进度时才有（顺序同集号） */
+internal fun packEpisodeProgress(units: List<WantedView>, d: SubscriptionDownloadView): List<Pair<Int, Double>> {
+    if (units.size < 2) return emptyList()
+    val byUnit = d.units.associateBy({ it.seasonNumber to it.episodeNumber }, { it.progress })
+    val pairs = units.mapNotNull { u -> byUnit[u.seasonNumber to u.episodeNumber]?.let { u.episodeNumber to it } }
+    return if (pairs.isEmpty()) emptyList() else pairs.sortedBy { it.first }
+}
+
+/** 一格一集：集号 + 底部细进度 + 百分比；下完的打勾。超过 24 集折叠 */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun EpisodeProgressGrid(episodes: List<Pair<Int, Double>>) {
+    var expanded by remember { mutableStateOf(false) }
+    val shown = if (expanded || episodes.size <= 24) episodes else episodes.take(24)
+    androidx.compose.foundation.layout.FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        shown.forEach { (ep, p) ->
+            val done = p >= 0.999
+            Column(
+                Modifier.width(62.dp).clip(RoundedCornerShape(8.dp))
+                    .background(if (done) Ok.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f)),
+            ) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 7.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("E$ep", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        if (done) "✓" else "${(p * 100).toInt().coerceIn(0, 99)}%",
+                        fontSize = 10.5.sp, color = if (done) Ok else TextMuted,
+                    )
+                }
+                Box(Modifier.fillMaxWidth().height(2.dp).background(Color.White.copy(alpha = 0.06f))) {
+                    Box(Modifier.fillMaxWidth(p.toFloat().coerceIn(0f, 1f)).height(2.dp).background(if (done) Ok else Downloading))
+                }
+            }
+        }
+    }
+    if (episodes.size > 24) {
+        Text(
+            if (expanded) "收起" else "展开全部 ${episodes.size} 集",
+            fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF9FB0C9),
+            modifier = Modifier.padding(top = 8.dp).clip(RoundedCornerShape(6.dp)).clickable { expanded = !expanded }.padding(vertical = 2.dp),
+        )
     }
 }
 

@@ -157,8 +157,8 @@ class StagePreview(
         current = request
         if (interrupted) return
         cycle = scope.launch {
-            val shownAt = System.currentTimeMillis()
-            val dwell = launch { delay(DWELL_MS) }
+            // 停稳了才去要片段、建播放器：一路划过去的不发请求、不占解码器
+            delay(DWELL_MS)
             // 声明会放预切片段（docs/design/reels.md §8）：服务端开了「片段预切」就只给切好的小文件，没切好为 null（保持剧照）
             val item = runCatching {
                 api.reelsPreview(request.mediaItemId, request.source, request.season, request.episode, modes = "seek,clip")
@@ -168,11 +168,8 @@ class StagePreview(
             // 原盘只有预切成小文件才放得了（Exo 读不了原盘目录 / 镜像）
             if (!clip && item.play.disc != null) return@launch
             val url = server.resolve(raw) ?: return@launch
-            val elapsed = System.currentTimeMillis() - shownAt
-            if (elapsed < ENGINE_DELAY_MS) delay(ENGINE_DELAY_MS - elapsed)
             // 预切片段第 0 秒就是片段起点、文件尾就是终点：整段放，不截
             if (clip) startPlayer(url.toString(), 0, 0) else startPlayer(url.toString(), item.segment.startMs, item.segment.endMs)
-            dwell.join()
             dwellDone = true
             startIfReady()
         }
@@ -252,13 +249,8 @@ class StagePreview(
     private fun teardown(keepEnded: Boolean = false) {
         cycle?.cancel()
         cycle = null
-        player?.let { old ->
-            old.pause()
-            scope.launch {
-                delay(500)
-                old.release()
-            }
-        }
+        // 立刻释放：同一时间只留一个播放器（原先晚 0.5 秒放，换片时新旧两路解码器会叠在一起）
+        player?.release()
         player = null
         showing = false
         dwellDone = false
@@ -270,7 +262,6 @@ class StagePreview(
 
     private companion object {
         const val DWELL_MS = 2_000L
-        const val ENGINE_DELAY_MS = 500L
     }
 }
 

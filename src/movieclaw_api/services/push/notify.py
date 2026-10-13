@@ -8,6 +8,13 @@
 4. 每台设备用自己的密钥加密明文（标出来自哪台服务器、推给哪个账号）；
 5. 交给分发器发出去。
 
+开了实时通知（保持连接）的 Android 设备不走中继：同一份文案写进它的发件箱
+（services/push/outbox.py，cloud-push.md §4.1），由它连着的实时连接送出。偏好、
+收件人筛选和中继完全一样，不会多收也不会少收。
+
+绑定了 IM 的人，同一份文案也发到他的 IM 账号（services/push/im.py）：IM 只是一个渠道，
+推什么同样按「账号 → 通知」的偏好来。
+
 全程在后台任务里，任何失败只记日志。
 """
 
@@ -15,13 +22,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.services.push import crypto, preferences, registration
+from movieclaw_api.services.push import crypto, im, outbox, preferences, registration
 from movieclaw_api.services.push.dispatcher import Outcome, Outgoing, build_message, deliver, spawn
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import LoginDevice, Member, utcnow
@@ -123,6 +130,47 @@ def _plaintext(content: AlertContent, *, server: dict, account: dict) -> dict:
     return message
 
 
+def _stream_payload(
+    content: AlertContent,
+    *,
+    event: str | None,
+    server: dict,
+    account: dict,
+    collapse: str | None,
+) -> dict:
+    """实时通知发件箱里的一条（明文，只经设备自己的凭证、走这台服务器的连接）。
+
+    字段对齐 ``_plaintext``：``deeplink`` 即 ``open``（网页站内路径），``priority`` 即
+    打扰级别，``collapse`` 相同的新通知替换旧的，``event`` 是偏好里的事件键（测试为 test）。
+    """
+    payload: dict = {"event": event or "test", "title": content.title, "priority": content.level}
+    for key, value in (
+        ("subtitle", content.subtitle),
+        ("body", content.body),
+        ("deeplink", content.open),
+        ("thread", content.thread),
+        ("category", content.category),
+        ("source", content.source),
+        ("image", content.image),
+        ("collapse", collapse),
+    ):
+        if value:
+            payload[key] = value
+    payload["server"] = server
+    payload["account"] = account
+    payload["sent_at"] = int(utcnow().timestamp())
+    return payload
+
+
+@dataclass
+class Prepared:
+    """一次推送算出来的结果：要交给中继的、已经写进实时通知发件箱的、要发到 IM 的。"""
+
+    relay: list[Outgoing] = field(default_factory=list)
+    stream: list[Outcome] = field(default_factory=list)
+    im: list[im.ImMessage] = field(default_factory=list)
+
+
 def _deliverable(device: LoginDevice) -> bool:
     return (
         bool(device.push_token and device.push_topic and device.push_environment)
@@ -158,23 +206,34 @@ async def prepare(
     build: ContentBuilder,
     exclude_device_ids: frozenset[int] = frozenset(),
     collapse: tuple[str, str] | None = None,
-) -> list[Outgoing]:
-    """算出这次要发的每一条（已加密）。``event`` 为 None 表示不看偏好（测试推送）。"""
+    to_im: bool = True,
+) -> Prepared:
+    """算出这次要发的每一条。``event`` 为 None 表示不看偏好（测试推送）。
+
+    中继的已加密、待发出；实时通知设备的直接写进发件箱、提交并唤醒在线连接。
+    ``to_im``：也发到收件人的 IM 账号（剧卡的进度更新不发，IM 消息不能原地替换）。
+    """
     recipients = (
         await preferences.wants(session, member_ids, event) if event is not None else member_ids
     )
     if not recipients:
-        return []
+        return Prepared()
     devices = [
         d
         for d in await registration.registered_devices(session, member_ids=recipients)
         if d.id is not None and d.id not in exclude_device_ids
     ]
     devices = await alert_devices(session, devices)
-    if not devices:
-        return []
+    streams = [
+        d
+        for d in await registration.stream_devices(session, member_ids=recipients)
+        if d.id is not None and d.id not in exclude_device_ids
+    ]
+    im_members = sorted(recipients & im.owners()) if to_im else []
+    if not devices and not streams and not im_members:
+        return Prepared()
     server = await server_identity()
-    names = await _account_names(session, {d.member_id for d in devices})
+    names = await _account_names(session, {d.member_id for d in devices + streams})
     collapse_value = None
     if collapse is not None:
         from movieclaw_api.services.push.images import collapse_key
@@ -228,7 +287,43 @@ async def prepare(
                 expires_at=message["expires_at"],
             )
         )
-    return outgoing
+    queued: list[Outcome] = []
+    for device in streams:
+        if device.member_id not in contents:
+            contents[device.member_id] = await build(session, device.member_id)
+        content = contents[device.member_id]
+        if content is None:
+            continue
+        payload = _stream_payload(
+            content,
+            event=event,
+            server=server,
+            account={"id": str(device.member_id), "name": names.get(device.member_id, "")},
+            collapse=collapse_value,
+        )
+        await outbox.enqueue(session, device.id or 0, payload)
+        online = outbox.connected(device.id or 0)
+        queued.append(
+            Outcome(
+                device.id or 0,
+                device.name,
+                "ok" if online else "queued",
+                "已通过实时连接送出" if online else "手机现在没连着，连上后补发",
+                "stream",
+            )
+        )
+    if queued:
+        await session.commit()
+        for item in queued:
+            outbox.wake(item.device_id)
+    im_messages: list[im.ImMessage] = []
+    for member_id in im_members:
+        if member_id not in contents:
+            contents[member_id] = await build(session, member_id)
+        content = contents[member_id]
+        if content is not None:
+            im_messages.append(im.render(member_id, content))
+    return Prepared(relay=outgoing, stream=queued, im=im_messages)
 
 
 def notify(
@@ -238,11 +333,13 @@ def notify(
     *,
     exclude_device_ids: frozenset[int] = frozenset(),
     collapse: tuple[str, str] | None = None,
+    to_im: bool = True,
 ) -> None:
     """业务侧唯一入口：后台推送，不阻塞、不抛错。
 
     ``build(session, member_id)`` 给每个收件人写文案；返回 None 表示这个人不该收到。
     查询都在后台任务自己的会话里做，调用方的会话提交之后就可以关掉。
+    ``to_im`` 见 ``prepare``。
     """
 
     async def _run() -> None:
@@ -251,26 +348,27 @@ def notify(
                 member_ids = (
                     recipients if isinstance(recipients, set) else await recipients(session)
                 )
-                items = await prepare(
+                prepared = await prepare(
                     session,
                     event=event,
                     member_ids=member_ids,
                     build=build,
                     exclude_device_ids=exclude_device_ids,
                     collapse=collapse,
+                    to_im=to_im,
                 )
-            if not items:
+            if not prepared.relay and not prepared.stream and not prepared.im:
                 return
-            outcomes = await deliver(items)
+            outcomes = (
+                prepared.stream + await deliver(prepared.relay) + await im.deliver(prepared.im)
+            )
             logger.info(
-                "App 推送「%s」：%s",
-                preferences.EVENTS_BY_KEY[event].title
-                if event in preferences.EVENTS_BY_KEY
-                else event,
+                "推送「%s」：%s",
+                found.title if (found := preferences.spec(event)) is not None else event,
                 "、".join(f"{o.device_name}={o.result}" for o in outcomes),
             )
         except Exception:  # noqa: BLE001 -- 推送绝不能影响业务主链路
-            logger.exception("App 推送失败（已忽略）")
+            logger.exception("推送失败（已忽略）")
 
     spawn(_run())
 
@@ -287,5 +385,5 @@ async def send_test(member_id: int) -> list[Outcome]:
         )
 
     async with get_database().session() as session:
-        items = await prepare(session, event=None, member_ids={member_id}, build=build)
-    return await deliver(items)
+        prepared = await prepare(session, event=None, member_ids={member_id}, build=build)
+    return prepared.stream + await deliver(prepared.relay) + await im.deliver(prepared.im)

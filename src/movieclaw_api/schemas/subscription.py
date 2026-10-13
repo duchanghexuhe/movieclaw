@@ -358,6 +358,11 @@ class DownloadUnitView(BaseModel):
 
     season_number: int
     episode_number: int
+    progress: float | None = Field(
+        default=None,
+        description="下载快照里这一集的进度 0.0~1.0（挂了多集的包按单文件完成字节算）；"
+        "单集种子、认不出集号或手动选种结果为空——看整包进度",
+    )
 
 
 class SearchNowView(BaseModel):

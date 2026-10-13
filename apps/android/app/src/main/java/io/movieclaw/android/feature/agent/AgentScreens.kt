@@ -1,6 +1,7 @@
 package io.movieclaw.android.feature.agent
 
 import io.movieclaw.android.core.designsystem.LocalFeedback
+import io.movieclaw.android.core.playback.PlayTarget
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -172,6 +173,12 @@ private fun SessionRow(session: SessionSummary, onOpen: () -> Unit, onDelete: ()
 @Composable
 fun AgentConversationScreen(
     onBack: () -> Unit,
+    /** 生成式 UI 媒体卡片的跳转（默认空实现，预览/测试环境不受影响） */
+    onOpenTitle: (String) -> Unit = {},
+    onOpenLibrary: (Long) -> Unit = {},
+    onOpenItem: (Long, Long) -> Unit = { _, _ -> },
+    onOpenSubscription: (Long) -> Unit = {},
+    onPlay: (PlayTarget) -> Unit = {},
     vm: AgentConversationViewModel = hiltViewModel(),
 ) {
     val state by vm.ui.collectAsStateWithLifecycle()
@@ -235,7 +242,21 @@ fun AgentConversationScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                 ) {
-                    items(state.bubbles, key = { it.id }) { bubble -> BubbleRow(bubble) }
+                    items(state.bubbles, key = { it.id }) { bubble ->
+                        BubbleRow(
+                            bubble = bubble,
+                            origin = state.origin,
+                            onOpenCard = { open ->
+                                when (open) {
+                                    is AgentMediaCardOpen.Title -> onOpenTitle(open.titleRef)
+                                    is AgentMediaCardOpen.Library -> onOpenLibrary(open.libraryId)
+                                    is AgentMediaCardOpen.Item -> onOpenItem(open.libraryId, open.mediaItemId)
+                                    is AgentMediaCardOpen.Subscription -> onOpenSubscription(open.subscriptionId)
+                                }
+                            },
+                            onPlay = onPlay,
+                        )
+                    }
                     if (state.running && state.bubbles.isEmpty()) {
                         item {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -287,7 +308,7 @@ fun AgentConversationScreen(
                 TextField(
                     value = state.input,
                     onValueChange = vm::onInput,
-                    placeholder = { Text("问点什么,或让我干活…", fontSize = 13.sp, color = TextFaint) },
+                    placeholder = { Text("问点什么,或让我干活…", fontSize = 15.sp, color = TextFaint) },
                     maxLines = 5,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(onSend = { vm.send() }),
@@ -329,7 +350,12 @@ fun AgentConversationScreen(
 }
 
 @Composable
-private fun BubbleRow(bubble: AgentConversationViewModel.Bubble) {
+private fun BubbleRow(
+    bubble: AgentConversationViewModel.Bubble,
+    origin: String?,
+    onOpenCard: (AgentMediaCardOpen) -> Unit,
+    onPlay: (PlayTarget) -> Unit,
+) {
     when (bubble.role) {
         "user" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             MarkdownText(
@@ -353,7 +379,10 @@ private fun BubbleRow(bubble: AgentConversationViewModel.Bubble) {
                     .padding(horizontal = 10.dp, vertical = 4.dp),
             )
         }
-        "tool" -> Column(
+        "tool" -> if (bubble.mediaCards != null) {
+            // 生成式 UI：工具行被卡片组替代（iOS 同口径，卡片就是这次调用的呈现）
+            AgentMediaCardsRow(bubble.mediaCards, origin = origin, onOpen = onOpenCard, onPlay = onPlay)
+        } else Column(
             Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
@@ -368,7 +397,7 @@ private fun BubbleRow(bubble: AgentConversationViewModel.Bubble) {
                     modifier = Modifier.size(15.dp),
                 )
                 Spacer(Modifier.width(7.dp))
-                Text(bubble.text, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                Text(bubble.text, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
                 if (bubble.streaming) {
                     CircularProgressIndicator(color = Info, modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
                 }
@@ -377,8 +406,8 @@ private fun BubbleRow(bubble: AgentConversationViewModel.Bubble) {
                 Spacer(Modifier.height(6.dp))
                 Text(
                     it,
-                    fontSize = 10.5.sp,
-                    lineHeight = 15.sp,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
                     fontFamily = FontFamily.Monospace,
                     color = if (bubble.toolError) Warning else TextMuted,
                     maxLines = 12,
@@ -390,7 +419,7 @@ private fun BubbleRow(bubble: AgentConversationViewModel.Bubble) {
             bubble.thinking?.takeIf { it.isNotBlank() }?.let { thinking ->
                 MarkdownText(
                     markdown = "思考:$thinking",
-                    baseSize = 11.sp,
+                    baseSize = 13.sp,
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(max = 160.dp)
@@ -401,10 +430,14 @@ private fun BubbleRow(bubble: AgentConversationViewModel.Bubble) {
                 Spacer(Modifier.height(6.dp))
             }
             if (bubble.text.isEmpty() && bubble.streaming) {
-                Text("…", fontSize = 13.5.sp, lineHeight = 21.sp, color = Color.White.copy(alpha = 0.92f))
-            } else {
-                // AI 回复按 Markdown 渲染(标题/列表/代码块/表格/引用)
+                Text("…", fontSize = 14.sp, lineHeight = 21.sp, color = Color.White.copy(alpha = 0.92f))
+            } else if (bubble.text.isNotBlank() || bubble.mediaCards == null) {
+                // AI 回复按 Markdown 渲染(标题/列表/代码块/表格/引用)；只有卡片没有正文时不画空块
                 MarkdownText(markdown = bubble.text, baseSize = 14.sp)
+            }
+            bubble.mediaCards?.let { group ->
+                if (bubble.text.isNotBlank()) Spacer(Modifier.height(8.dp))
+                AgentMediaCardsRow(group, origin = origin, onOpen = onOpenCard, onPlay = onPlay)
             }
         }
     }

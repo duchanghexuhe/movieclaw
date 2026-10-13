@@ -81,7 +81,8 @@ struct CollectionDetailView: View {
 
     private var sortKey: String { "\(sort.sort == "default" ? "" : sort.sort)\(sort.reversed ? ":rev" : "")" }
     private var rows: [API.LibraryItemView] { pager.items ?? [] }
-    private var galleryOn: Bool { gallery.galleryMode && !rows.isEmpty }
+    private var galleryLibraryId: Int? { libraryId ?? collection?.libraryId }
+    private var galleryOn: Bool { gallery.galleryMode(libraryId: galleryLibraryId) && !rows.isEmpty }
     private var homePrefsOwner: String { LibraryHomePrefs.ownerKey(api: api, username: model.session?.username) }
 
     private var homeRow: API.HomeRowPref? { homePrefs.rows?.first { $0.collectionId == collectionId } }
@@ -100,16 +101,6 @@ struct CollectionDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if let collection {
-                if !rows.isEmpty {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            gallery.galleryMode.toggle()
-                        } label: {
-                            Image(systemName: galleryOn ? "square.grid.2x2" : "photo.on.rectangle.angled")
-                        }
-                        .accessibilityLabel(galleryOn ? "回到海报墙" : "图床浏览")
-                    }
-                }
                 ToolbarItem(placement: .topBarTrailing) { menu(collection) }
             }
         }
@@ -353,6 +344,11 @@ struct CollectionDetailView: View {
 
     private func menu(_ collection: API.CollectionView) -> some View {
         Menu {
+            if !rows.isEmpty {
+                Button(galleryOn ? "回到海报墙" : "图床浏览") {
+                    gallery.setGalleryMode(!galleryOn, libraryId: galleryLibraryId)
+                }
+            }
             if galleryOn {
                 GalleryPrefMenuItems()
                 Divider()
@@ -588,8 +584,11 @@ private struct CollectionRulesSheet: View {
 ///
 /// 「追踪中」= 接口标了已订阅，**或**全站订阅索引里已有这部 TMDB 电影（刚在别处订上、合集数据还没刷新）；
 /// 已追踪时长按给「管理订阅」而不是再订一遍。只压暗海报图、不压暗片名（同 Web）。
-private struct MissingPartCell: View {
+/// 系列里缺的那一部（合集页的海报墙、条目详情页的系列一行共用）：压暗，点进 TMDB 详情，长按订阅
+struct MissingPartCell: View {
     let part: API.SeriesPartView
+    /// 取图宽度（点）：海报墙按格宽，横排按卡宽
+    var imageWidth: CGFloat = LibraryGridColumn.width(minimum: 140)
     @Environment(\.api) private var api
     @Environment(\.permissions) private var permissions
     @Environment(Router.self) private var router
@@ -605,7 +604,7 @@ private struct MissingPartCell: View {
                 title: part.title,
                 year: part.releaseDate.flatMap { Int($0.prefix(4)) },
                 extent: tracked ? "追踪中" : "未入库",
-                url: api.image(part.posterUrl, width: ImageWidth.points(LibraryGridColumn.width(minimum: 140))),
+                url: api.image(part.posterUrl, width: ImageWidth.points(imageWidth)),
                 artworkOpacity: 0.4
             )
         }

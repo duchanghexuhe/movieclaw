@@ -24,6 +24,8 @@ _NO_LIST_MARK = "nolist"
 
 # 每次验证收到的领域配置，供断言"传给协议层的 key 已解密"
 _captured_configs: list[LlmProviderConfig] = []
+# 每次验证实际走的协议实现（假协议类名），供断言实例协议选择生效
+_captured_protocols: list[str] = []
 
 
 class _FakeProtocol(BaseLlmProtocol):
@@ -31,6 +33,7 @@ class _FakeProtocol(BaseLlmProtocol):
 
     async def chat(self, request, model_id):
         _captured_configs.append(self.config)
+        _captured_protocols.append(type(self).__name__)
         if _BAD_KEY_MARK in self.config.api_key:
             raise LlmConnectError("连接模型服务失败，请检查网络与 base_url 配置")
         return ChatResponse(content="pong", finish_reason="stop")
@@ -47,6 +50,10 @@ class _FakeProtocol(BaseLlmProtocol):
         pass
 
 
+class _FakeResponsesProtocol(_FakeProtocol):
+    """Responses 协议的替身：行为同 _FakeProtocol，只靠类名区分走了哪套协议。"""
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     # 每个测试用独立临时 SQLite 库与密钥文件，保证隔离
@@ -59,7 +66,9 @@ def client(tmp_path, monkeypatch):
     # 配置存储是进程级单例且带缓存，用例间必须重置，否则上一个用例的 AI 设定会串进来
     reset_setting_store()
     _captured_configs.clear()
+    _captured_protocols.clear()
     monkeypatch.setitem(PROTOCOLS, "openai_chat", _FakeProtocol)
+    monkeypatch.setitem(PROTOCOLS, "openai_responses", _FakeResponsesProtocol)
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
@@ -292,6 +301,60 @@ def test_update_instance_reverifies(client) -> None:
     assert _captured_configs[-1].name == "百炼-改名"
 
 
+def test_create_requires_api_key(client) -> None:
+    c, _ = client
+    payload = {k: v for k, v in _PAYLOAD.items() if k != "api_key"}
+    for body in (payload, {**payload, "api_key": "  "}):
+        r = c.post("/api/v1/llm/providers", json=body)
+        assert r.status_code == 400, r.text
+        assert "API Key" in r.json()["message"]
+    assert _list(c) == []
+
+
+def test_update_blank_api_key_keeps_existing(client) -> None:
+    """编辑只改名/模型时 API Key 留空（不传或空串）沿用原 Key。"""
+    c, db_file = client
+    created = c.post("/api/v1/llm/providers", json=_PAYLOAD).json()["data"]
+    stored = sqlite3.connect(db_file).execute("SELECT api_key FROM llm_provider").fetchone()[0]
+    payload = {k: v for k, v in _PAYLOAD.items() if k != "api_key"}
+    for i, body in enumerate(
+        ({**payload, "name": "百炼-a"}, {**payload, "name": "百炼-b", "api_key": ""})
+    ):
+        r = c.put(f"/api/v1/llm/providers/{created['id']}", json=body)
+        assert r.status_code == 200, (i, r.text)
+        assert _first(c)["status"] == "active"
+        assert _captured_configs[-1].api_key == "sk-live-123456"
+    # 密文原样未动（没有被重新加密成别的值）
+    row = sqlite3.connect(db_file).execute("SELECT name, api_key FROM llm_provider").fetchone()
+    assert row == ("百炼-b", stored)
+
+
+def test_update_endpoint_change_requires_api_key(client) -> None:
+    """改了端点或类型却不重填 Key → 400，防止已存的 Key 被发往新地址。"""
+    c, _ = client
+    created = c.post("/api/v1/llm/providers", json=_PAYLOAD).json()["data"]
+    payload = {k: v for k, v in _PAYLOAD.items() if k != "api_key"}
+    for body in (
+        {**payload, "base_url": "https://evil.example.com/v1"},
+        {**payload, "provider_type": "openai", "default_model": None},
+    ):
+        r = c.put(f"/api/v1/llm/providers/{created['id']}", json=body)
+        assert r.status_code == 400, r.text
+        assert "重新填写 API Key" in r.json()["message"]
+    assert _first(c)["base_url"] is None
+    # 端点、类型都没变 → 留空照常保存
+    r = c.put(f"/api/v1/llm/providers/{created['id']}", json=payload)
+    assert r.status_code == 200, r.text
+    # 重填了 Key 就允许换端点
+    r = c.put(
+        f"/api/v1/llm/providers/{created['id']}",
+        json={**payload, "base_url": "https://new.example.com/v1", "api_key": "sk-new"},
+    )
+    assert r.status_code == 200, r.text
+    assert _captured_configs[-1].api_key == "sk-new"
+    assert _captured_configs[-1].base_url == "https://new.example.com/v1"
+
+
 def test_model_options_bare_ids_when_unique(client) -> None:
     """只有一家时清单里全是裸 id；智能体默认模型（未设定时兜底到测试模型）带 is_default。"""
     c, _ = client
@@ -472,6 +535,56 @@ def test_user_agent_rejects_header_injection(client) -> None:
     assert any("ASCII" in d["message"] for d in r.json()["details"])
 
 
+_OPENAI_PAYLOAD = {"name": "官方", "provider_type": "openai", "api_key": "sk-openai"}
+
+
+def test_openai_defaults_to_responses_protocol(client) -> None:
+    """issue #768：OpenAI 预设不选协议即走 Responses API（带工具也能调思考强度）。"""
+    c, _ = client
+    r = c.post("/api/v1/llm/providers", json=_OPENAI_PAYLOAD)
+    assert r.status_code == 200, r.text
+    assert _first(c)["api_protocol"] is None
+    assert _captured_protocols[-1] == "_FakeResponsesProtocol"
+
+
+def test_compat_endpoint_can_switch_to_responses(client) -> None:
+    c, _ = client
+    r = c.post(
+        "/api/v1/llm/providers", json={**_COMPAT_PAYLOAD, "api_protocol": "openai_responses"}
+    )
+    assert r.status_code == 200, r.text
+    assert _first(c)["api_protocol"] == "openai_responses"
+    assert _captured_configs[-1].api_protocol == "openai_responses"
+    assert _captured_protocols[-1] == "_FakeResponsesProtocol"
+
+
+def test_protocol_not_selectable_for_fixed_presets(client) -> None:
+    """百炼等国内端点只有 Chat Completions：不开放切换，传了就 400。"""
+    c, _ = client
+    r = c.post("/api/v1/llm/providers", json={**_PAYLOAD, "api_protocol": "openai_responses"})
+    assert r.status_code == 400
+    assert "不支持协议" in r.json()["message"]
+    assert _list(c) == []
+
+
+def test_update_without_protocol_field_keeps_stored_value(client) -> None:
+    """不认识该字段的老客户端编辑实例：不传即沿用原值，显式 null 才回到预设默认。"""
+    c, _ = client
+    created = c.post(
+        "/api/v1/llm/providers", json={**_OPENAI_PAYLOAD, "api_protocol": "openai_chat"}
+    ).json()["data"]
+    assert _captured_protocols[-1] == "_FakeProtocol"
+    legacy = {k: v for k, v in _OPENAI_PAYLOAD.items() if k != "api_key"}
+    r = c.put(f"/api/v1/llm/providers/{created['id']}", json={**legacy, "name": "官方-改名"})
+    assert r.status_code == 200, r.text
+    assert _first(c)["api_protocol"] == "openai_chat"
+    assert _captured_protocols[-1] == "_FakeProtocol"
+    r = c.put(f"/api/v1/llm/providers/{created['id']}", json={**legacy, "api_protocol": None})
+    assert r.status_code == 200, r.text
+    assert _first(c)["api_protocol"] is None
+    assert _captured_protocols[-1] == "_FakeResponsesProtocol"
+
+
 def test_openai_compat_requires_base_url(client) -> None:
     c, _ = client
     r = c.post(
@@ -513,6 +626,11 @@ def test_presets_endpoint(client) -> None:
     assert {"openai", "bailian", "openai_compat"} <= set(presets)
     assert presets["bailian"]["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert presets["openai_compat"]["requires_base_url"] is True
+    # 协议选择器的数据源：默认协议 + 可切换列表（空 = 隐藏选择器）
+    assert presets["openai"]["protocol"] == "openai_responses"
+    assert presets["openai"]["selectable_protocols"] == ["openai_responses", "openai_chat"]
+    assert presets["openai_compat"]["protocol"] == "openai_chat"
+    assert presets["bailian"]["selectable_protocols"] == []
     assert any(m["id"] == "qwen3.7-max" for m in presets["bailian"]["models"])
     # SDK 自带 UA 按内部公式现算（AsyncOpenAI/Python x.y.z），设置页占位提示用
     import openai

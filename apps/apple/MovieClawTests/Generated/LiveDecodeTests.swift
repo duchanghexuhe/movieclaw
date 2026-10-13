@@ -132,6 +132,9 @@ struct LiveDecodeTests {
     @Test func libraryRecycleList() async throws {
         try await LiveServer.check { try await $0.libraryRecycleList() }
     }
+    @Test func libraryStrmListPending() async throws {
+        try await LiveServer.check { try await $0.libraryStrmListPending() }
+    }
     @Test func llmDefaultsShow() async throws {
         try await LiveServer.check { try await $0.llmDefaultsShow() }
     }
@@ -272,6 +275,9 @@ struct LiveDecodeTests {
     }
     @Test func noticesList() async throws {
         try await LiveServer.check { try await $0.noticesList() }
+    }
+    @Test func tipsStateShow() async throws {
+        try await LiveServer.check { try await $0.tipsStateShow() }
     }
     @Test func transcodeConfigShow() async throws {
         try await LiveServer.check { try await $0.transcodeConfigShow() }

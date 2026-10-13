@@ -6,7 +6,7 @@ import io.movieclaw.androidtv.core.model.generated.EpisodeView
 data class EpisodeRange(val index: Int, val first: Long, val last: Long) {
     val label: String get() = "$first–$last"
 
-    fun contains(episodeNumber: Long): Boolean = EpisodeRanges.indexOf(episodeNumber) == index
+    fun contains(episodeNumber: Long): Boolean = episodeNumber in first..last
 }
 
 object EpisodeRanges {
@@ -25,6 +25,12 @@ object EpisodeRanges {
             else result += EpisodeRange(index, number, number)
         }
         return result
+    }
+
+    /** 选集面板的段：长季同 [ranges]，50 集以内整季一段（面板照样左栏选段、右边宫格） */
+    fun panelRanges(episodes: List<EpisodeView>): List<EpisodeRange> {
+        val numbers = episodes.map { it.episodeNumber }
+        return ranges(episodes).ifEmpty { listOfNotNull(numbers.minOrNull()?.let { EpisodeRange(0, it, numbers.max()) }) }
     }
 
     /** 某集所在的段（在 [ranges] 里的位置）；不分段或找不到时为 -1 */

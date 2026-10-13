@@ -71,6 +71,14 @@ class LoginDevice(MemberScopedMixin, TimestampMixin, table=True):
         default=None, description="系统通知权限：authorized / provisional / denied ……"
     )
     push_problem: str | None = Field(
-        default=None, description="推送暴露的问题：bad_token（令牌和环境对不上等）"
+        default=None,
+        description="推送暴露的问题：bad_token（令牌和环境对不上等）、unsupported_build（安装包没有推送权限）",
     )
     push_registered_at: datetime | None = Field(default=None, description="最近一次登记时间")
+    # 自托管实时通知（cloud-push.md §4.1）：Android App 开了「实时通知（保持连接）」，
+    # 推送不走中继，写进这台设备的发件箱（push_outbox），由它连着的 /push/me/stream 送出
+    push_stream: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": "0"},
+        description="走自托管实时连接收通知",
+    )

@@ -31,10 +31,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from movieclaw_api.domain_events import LIBRARY_FILE_DELETED, LIBRARY_ITEM_DELETED, LibraryDeleted
+from movieclaw_sdk.events import LIBRARY_FILE_DELETED, LIBRARY_ITEM_DELETED, LibraryDeleted
 from movieclaw_api.plugins.keys import HOST_OPS
-from movieclaw_api.services.host_ops import OpsError
 from movieclaw_kernel import DURABLE_EVENTS, Context, plugin
+from movieclaw_sdk.ops import OpsError
 
 
 class Config(BaseModel):
@@ -125,5 +125,5 @@ async def delete_cascade(ctx: Context[Config]) -> None:
             else:
                 log.info("《%s》已删除，种子 %s 一并删除", title, info_hash)
 
-    ctx.on(LIBRARY_ITEM_DELETED, on_deleted, id="item")
-    ctx.on(LIBRARY_FILE_DELETED, on_deleted, id="file")
+    ctx.on(LIBRARY_ITEM_DELETED, on_deleted, id="item", durable=True)
+    ctx.on(LIBRARY_FILE_DELETED, on_deleted, id="file", durable=True)

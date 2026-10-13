@@ -7,7 +7,12 @@ import time
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.exceptions import BadRequestException, ForbiddenException, NotFoundException
+from movieclaw_api.exceptions import (
+    BadRequestException,
+    ConflictException,
+    ForbiddenException,
+    NotFoundException,
+)
 from movieclaw_api.schemas.cloud import (
     MyPushView,
     PushAttentionView,
@@ -26,7 +31,7 @@ from movieclaw_api.services.push.notify import alert_devices, send_test
 from movieclaw_db.models import LoginDevice
 
 #: 需要本人处理的状态（还没登记的多半是旧版 App，升级后自动登记，不在这里打扰）
-ATTENTION_STATUSES = ("permission_denied", "no_channel", "bad_token")
+ATTENTION_STATUSES = ("unsupported_build", "permission_denied", "no_channel", "bad_token")
 
 #: 测试推送的节流：每人 10 秒一次（防止连点把额度刷光）
 _TEST_INTERVAL_S = 10
@@ -35,8 +40,18 @@ _last_test: dict[int, float] = {}
 
 def device_status(device: LoginDevice, channels: list[Channel]) -> tuple[str, str, str | None]:
     """一台设备能不能收到：(status, 给人看的说明, 走哪个通道)。"""
+    if not device.push_token and device.push_problem == "unsupported_build":
+        # 先于权限：安装包本身收不到，叫人去开系统通知也没用
+        return (
+            "unsupported_build",
+            "这个安装包收不到推送：侧载版没有推送权限，改用 TestFlight 或 App Store 版",
+            None,
+        )
     if device.push_permission == "denied":
         return "permission_denied", "系统通知已关闭，在这台设备的设置里打开", None
+    if device.push_stream:
+        # 实时通知不经任何通道，服务器自己送（cloud-push.md §4.1）
+        return "ok", "能收到", "实时连接"
     if not device.push_token or not device.push_topic:
         return "not_registered", "还没有开启通知，打开最新版 App 后会自动开启", None
     if device.push_problem == "bad_token":
@@ -77,6 +92,7 @@ async def build_view(session: AsyncSession, principal: Principal) -> MyPushView:
         and device.push_key_id
         and registration.decrypt_key(device) is not None
     }
+    streams = [d for d in devices if d.push_stream and device_status(d, channels)[0] == "ok"]
     attention: list[PushAttentionView] = []
     for device in devices:
         status, text, _channel = device_status(device, channels)
@@ -112,12 +128,15 @@ async def build_view(session: AsyncSession, principal: Principal) -> MyPushView:
             muted.append(
                 PushMutedItemView(id=item_id, title=item.title, year=item.year, kind=item.kind)
             )
+    from movieclaw_api.services.push import im
+
     return MyPushView(
         muted_items=muted,
-        instance_ready=any(c.usable for c in channels),
+        im_accounts=im.count(principal.owner_id),
+        instance_ready=any(c.usable for c in channels) or bool(streams),
         is_admin=principal.is_admin,
         events=events,
-        ready_devices=len(ready_tokens),
+        ready_devices=len(ready_tokens) + len(streams),
         attention=attention,
         libraries=libraries,
         library_ids=(
@@ -138,6 +157,19 @@ async def _current_push_device(session: AsyncSession, principal: Principal) -> L
     return device
 
 
+async def stream_device(session: AsyncSession, principal: Principal) -> LoginDevice:
+    """实时通知的长连接和确认只认开了实时通知的 Android 设备自己的凭证。
+
+    网页会话、iOS 本来就没有实时通知：同 ``unregister`` 返回 404。
+    """
+    if principal.device is None or principal.device.kind not in registration.STREAM_KINDS:
+        raise NotFoundException("这台设备没有实时通知")
+    device = await _current_push_device(session, principal)
+    if not device.push_stream:
+        raise ConflictException("这台设备还没有开启实时通知，请先登记")
+    return device
+
+
 async def register(
     session: AsyncSession,
     principal: Principal,
@@ -150,8 +182,12 @@ async def register(
     key: str | None,
     permission: str,
     client_version: str | None = None,
+    unsupported_build: bool = False,
+    stream: bool | None = None,
 ) -> PushRegistrationView:
     device = await _current_push_device(session, principal)
+    if stream and device.kind not in registration.STREAM_KINDS:
+        raise BadRequestException("只有 Android App 能开实时通知")
     # 版本是登录时记下的，App 升级后不重新登录就一直是旧的；每次启动的登记顺手刷新
     if client_version and client_version.strip():
         device.client_version = client_version.strip()
@@ -163,11 +199,13 @@ async def register(
         types=types,
         key_id=key_id,
         key=key,
+        unsupported_build=unsupported_build,
+        stream=stream,
     )
     device = await registration.save(session, device, reg)
     status, text, channel_name = device_status(device, await channel_registry.load_channels())
     return PushRegistrationView(
-        registered=bool(device.push_token),
+        registered=bool(device.push_token) or device.push_stream,
         status=status,
         status_text=text,
         channel_name=channel_name,
@@ -194,7 +232,7 @@ async def test(principal: Principal) -> PushTestView:
         sent=sum(1 for o in outcomes if o.result in ("ok", "queued")),
         results=[
             PushTestResultView(
-                device_id=f"ld-{o.device_id}",
+                device_id="im" if o.channel_id == "im" else f"ld-{o.device_id}",
                 device_name=o.device_name,
                 result=o.result,
                 message=o.message or ("已送达苹果推送服务" if o.result == "ok" else ""),

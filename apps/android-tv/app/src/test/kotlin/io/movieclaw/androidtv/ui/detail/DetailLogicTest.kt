@@ -11,6 +11,7 @@ import io.movieclaw.androidtv.core.model.generated.PersonCreditView
 import io.movieclaw.androidtv.core.model.generated.PersonView
 import io.movieclaw.androidtv.ui.stage.StageBadge
 import io.movieclaw.androidtv.ui.stage.episodeLine
+import io.movieclaw.androidtv.ui.stage.episodeTitle
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -183,6 +184,12 @@ class DetailLogicTest {
         assertEquals("第 2 季 第 6 集", episodeLine(2, 6, "episode 6"))
         assertEquals("第 2 季 第 6 集", episodeLine(2, 6, "  "))
         assertEquals("第 1 季 第 1 集", episodeLine(1, 1, null))
+        // 分集卡、全部分集、下一集卡片共用：占位名不算名字
+        assertEquals("归来", episodeTitle(" 归来 "))
+        assertNull(episodeTitle("第 1 集"))
+        assertNull(episodeTitle("第1集"))
+        assertNull(episodeTitle("Episode 12"))
+        assertNull(episodeTitle(null))
     }
 
     @Test
@@ -217,9 +224,9 @@ class DetailLogicTest {
 
     @Test
     fun lowerGeometry() {
-        assertEquals(82, DetailLogic.lowerGap(isMovie = false, hasSeries = false))
-        assertEquals(20, DetailLogic.lowerGap(isMovie = true, hasSeries = true))
-        assertEquals(164, DetailLogic.lowerGap(isMovie = true, hasSeries = false))
+        assertEquals(82, DetailLogic.lowerGap(isMovie = false))
+        // 电影露演职员一行的上沿（竖版人物卡，与原先露系列一行同样多）
+        assertEquals(20, DetailLogic.lowerGap(isMovie = true))
         assertEquals(330, DetailLogic.lowerScreenTop(true))
         assertEquals(250, DetailLogic.lowerScreenTop(false))
         assertEquals(330, DetailLogic.lowerScreenTop(false, hasRangeTabs = true))

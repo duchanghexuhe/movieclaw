@@ -24,7 +24,6 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api import domain_events
 from movieclaw_api.api.deps import require_admin, require_login
 from movieclaw_api.api.routes.images import WIDTH_QUERY, requested_width, sized_file
 from movieclaw_api.exceptions import BadRequestException, ConflictException, NotFoundException
@@ -149,6 +148,7 @@ from movieclaw_api.services.library.delete_participants import check_options as 
 from movieclaw_api.services.library.delete_participants import (
     preview_options as preview_delete_options,
 )
+from movieclaw_api.services.library.events import deletion_recorder
 from movieclaw_api.services.library.items import (
     DeleteResult,
     HomeKind,
@@ -205,6 +205,7 @@ from movieclaw_api.services.library.series import (
     series_collection_id_for,
 )
 from movieclaw_api.services.library.showcase import MAX_SHOWCASE_IDS, load_showcase
+from movieclaw_api.services.library.similar import build_similar_wall
 from movieclaw_api.services.library.subtitle_preview import (
     SubtitlePreviewError,
     SubtitleTrackNotFound,
@@ -226,7 +227,6 @@ from movieclaw_api.services.library.transfer import (
 )
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
-from movieclaw_api.services.media_server_notify import notify_media_server_refresh
 from movieclaw_api.services.network_egress import effective_tmdb_image_base_url
 from movieclaw_api.services.people_images import avatar_url
 from movieclaw_api.services.playback import warmup as playback_warmup
@@ -2627,6 +2627,16 @@ async def get_library_item(
         user_agent=user_agent,
         context=track_context,
     )
+    # 「打开条目详情」事件（domain-events.md §8）：例如网盘预探插件把前几集先探好
+    from movieclaw_api.services.playback.events import publish_viewed
+    from movieclaw_playback.events import ClientInfo
+
+    await publish_viewed(
+        session,
+        media_item_id,
+        member_id=principal.member_id if principal.member_id is not None else 0,
+        client=ClientInfo(name="web"),
+    )
     # 章节场景图懒触发（docs/design/video-chapters.md §4.5）：有在位文件的图
     # 还没抓齐就后台抓这一个条目，前端按 chapters_pending 轮询几轮把图补上——
     # 升级后第一次打开旧条目不用等整库作业排到它。判据与整库作业同源
@@ -2851,6 +2861,47 @@ async def list_item_episodes(
             season_number=season_number,
             episodes=[episode_view(e) for e in episodes],
             resume_episode=season_resume_episode(episodes),
+        )
+    )
+
+
+@router.get(
+    "/{library_id}/items/{media_item_id}/similar",
+    response_model=ApiResponse[list[LibraryItemView]],
+    summary="条目详情页的相似推荐（只在观看者可见的同类型库里挑）",
+    operation_id="ui.library.items.similar",
+    dependencies=[Depends(require_library_visible)],
+    openapi_extra={"x-cli-hidden": True},
+)
+async def list_similar_items(
+    library_id: int,
+    media_item_id: int,
+    limit: Annotated[int, Query(ge=1, le=30, description="最多返回几部")] = 12,
+    exclude_series: Annotated[
+        bool, Query(description="排除同系列的片（客户端另有完整的系列一行时用，如 Apple TV）")
+    ] = False,
+    session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
+) -> ApiResponse[list[LibraryItemView]]:
+    """范围与首页「全部电影/剧集」同一口径（可见、同类型、没被排除出首页的库），
+    再并上当前这个库——儿童库这类被排除出首页的库，进去看片时相似推荐仍从库里出。
+    """
+    await assert_item_visible(session, principal, media_item_id)
+    item = await session.get(MediaItem, media_item_id)
+    if item is None or item.kind not in ("movie", "tv"):
+        return ok([])
+    library_ids = await kind_library_ids(
+        session, item.kind, await visible_library_ids(session, principal)
+    )
+    return ok(
+        await build_similar_wall(
+            session,
+            media_item_id,
+            library_ids=library_ids | {library_id},
+            member_id=principal.member_id if principal.member_id is not None else 0,
+            content_limit=await content_limit_for(session, principal),
+            limit=limit,
+            exclude_series=exclude_series,
         )
     )
 
@@ -3250,7 +3301,7 @@ async def delete_library_item(
     keys = await _checked_options(
         _delete_request(library_id, item, rows, whole=True), "item", options
     )
-    record_deleted = await domain_events.deletion_recorder(
+    record_deleted = await deletion_recorder(
         session, library_id, item, rows, options=keys
     )
     follow_ups: list[dict[str, str]] = []
@@ -3264,11 +3315,8 @@ async def delete_library_item(
         ),
     )
 
-    # 通知下游媒体服务器刷新库（未配置时空转；失败只告警不阻断）
-
-    background_tasks.add_task(notify_media_server_refresh)
-    # 条目在所有库都没文件了、也没订阅 → 连同图片资产一并清掉，不留孤儿
-
+    # 条目在所有库都没文件了、也没订阅 → 连同图片资产一并清掉，不留孤儿（下游媒体服务器
+    # 刷新由订阅删除事件的内置插件做）
     background_tasks.add_task(media_scrape.cleanup_orphan_items, [media_item_id])
     # 真正的磁盘回收：文件已 rename 出媒体库，慢 IO 挪到响应之后做
     background_tasks.add_task(purge_staged_deletions, result.pending_purge)
@@ -3323,7 +3371,7 @@ async def delete_library_file(
     keys = await _checked_options(
         _delete_request(library_id, item, targets, whole=len(rows) == 1), "file", options
     )
-    record_deleted = await domain_events.deletion_recorder(
+    record_deleted = await deletion_recorder(
         session, library_id, item, rows, options=keys
     )
     follow_ups: list[dict[str, str]] = []
@@ -3337,9 +3385,8 @@ async def delete_library_file(
         ),
     )
 
-    # 与整条目删除同一套善后：通知媒体服务器刷新；条目在所有库都没文件了
-    # 且没订阅时连同图片资产一并清掉；磁盘回收挪到响应之后
-    background_tasks.add_task(notify_media_server_refresh)
+    # 与整条目删除同一套善后：条目在所有库都没文件了且没订阅时连同图片资产一并清掉；
+    # 磁盘回收挪到响应之后（下游媒体服务器刷新由订阅删除事件的内置插件做）
     background_tasks.add_task(media_scrape.cleanup_orphan_items, [media_item_id])
     background_tasks.add_task(purge_staged_deletions, result.pending_purge)
 

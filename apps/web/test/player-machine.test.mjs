@@ -4,7 +4,6 @@ import test from "node:test";
 import { initialPlayerState, isBusy, playerReducer } from "../lib/player/machine.ts";
 import {
   formatClock,
-  isInEndCredits,
   planSeek,
   toFileMs,
   toSessionSeconds,
@@ -63,7 +62,9 @@ test("降档是逐级的：档 1 失败后只把 1 标失败，仍会试档 2", 
   assert.deepEqual(state.failedTiers, [1]);
 });
 
-test("连败两次直接跳兜底档：兜底档以下全部标失败", () => {
+test("连败两次跳过剩下的直通档，但不替没试过的硬件档报失败", () => {
+  // 真机：4K HEVC 直通在 hls.js 里 bufferAddCodecError，档 1、档 2 连败。
+  // 以前这里把档 3 也标失败，服务端明明有 VAAPI 也直接落档 4（软件转码同意框）。
   const state = run([
     { type: "request", startMs: 0 },
     { type: "session", session: planSession(1) },
@@ -72,6 +73,21 @@ test("连败两次直接跳兜底档：兜底档以下全部标失败", () => {
     { type: "session", session: planSession(2) },
     { type: "failed", reason: "第二次" },
   ]);
+  assert.equal(state.phase, "degrading");
+  assert.deepEqual(state.failedTiers, [0, 1, 2]);
+});
+
+test("硬件档真失败了才把档 3 记为失败，下一轮落到软件兜底档", () => {
+  const state = run([
+    { type: "request", startMs: 0 },
+    { type: "session", session: planSession(1) },
+    { type: "failed", reason: "直通解不了" },
+    { type: "session", session: planSession(2) },
+    { type: "failed", reason: "直通还是解不了" },
+    { type: "session", session: planSession(3) },
+    { type: "failed", reason: "硬件转码也坏了" },
+  ]);
+  assert.equal(state.phase, "degrading");
   assert.deepEqual(state.failedTiers, [0, 1, 2, 3]);
 });
 
@@ -319,13 +335,6 @@ test("档 0 没有会话，怎么拖都是就地跳", () => {
     planSeek(3_600_000, { startMs: 0, seekableEndSeconds: 60, hasSession: false }),
     { kind: "native", seconds: 3600 },
   );
-});
-
-test("片尾倒计时按剩余秒数而不是百分比", () => {
-  // 3 小时的电影按 5% 算会提前 9 分钟弹倒计时
-  assert.equal(isInEndCredits(10_780_000, 10_800_000), true);
-  assert.equal(isInEndCredits(10_000_000, 10_800_000), false);
-  assert.equal(isInEndCredits(1000, null), false);
 });
 
 test("时间显示是钟表格式，不足一小时不补出零点位", () => {

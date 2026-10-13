@@ -50,8 +50,15 @@ function acceptsMediaEvent(phase: PlayerPhase): boolean {
   return phase === "buffering" || phase === "playing" || phase === "seeking" || phase === "ended";
 }
 
-/** 最高兜底档：软件转码。连败两次后直接跳到它，不再逐级试。 */
+/** 最高兜底档：软件转码。它也失败就没有可退的档了。 */
 const FALLBACK_TIER = 4;
+
+/**
+ * 第一个转码视频的档（档 3 硬件转码）。连败两次后跳过的只是它以下的直通档
+ * （0–2，都是 `-c:v copy`）——转码档一次都还没试过，不能替服务端判它失败。
+ * 有没有显卡只有服务端知道：有就落档 3，没有它自己越过档 3 落档 4。
+ */
+const FIRST_TRANSCODE_TIER = 3;
 
 /** 连续失败到这个次数就放弃逐级降档（§6.3）。 */
 const MAX_STEPWISE_FAILURES = 2;
@@ -121,14 +128,17 @@ export type PlayerEvent =
  * 给不出可靠的失败归因，多试一档只浪费几秒（一次性），跳过档 2 却可能让
  * 本可直通的视频每次播放都多转一路。
  *
- * 连败两次说明「逐级试」这个假设本身不成立，此时把兜底档以下全标失败，
- * 一步到位。
+ * 连败两次说明「逐级试」这个假设本身不成立，此时把剩下的直通档全标失败，
+ * 一步跳到转码。**只标直通档，不标档 3**：以前把兜底档以下（含档 3）全标失败，
+ * 浏览器解不了的 4K HEVC 直通两次失败后，服务端看到档 3 也「失败过」，
+ * 明明有 VAAPI 也直接要求软件转码（弹同意框）。硬件档真失败了会以它自己的
+ * 档位进来，再降到档 4。
  */
 function nextFailedTiers(state: PlayerState, failedTier: number): number[] {
   const accumulated = new Set(state.failedTiers);
   accumulated.add(failedTier);
   if (state.failureCount + 1 >= MAX_STEPWISE_FAILURES) {
-    for (let tier = 0; tier < FALLBACK_TIER; tier += 1) accumulated.add(tier);
+    for (let tier = 0; tier < FIRST_TRANSCODE_TIER; tier += 1) accumulated.add(tier);
   }
   return [...accumulated].sort((a, b) => a - b);
 }

@@ -16,7 +16,7 @@ from urllib.parse import quote
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from fastapi import Path as PathParam
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect
@@ -76,8 +76,13 @@ from movieclaw_events import new_ulid
 from movieclaw_playback.streaming import (
     DisconnectAwareFileResponse,
     FileWindowResponse,
+    RemoteRelayResponse,
+    StrmError,
+    StrmLink,
     container_mime_type,
     is_strm,
+    parse_strm,
+    strm_redirect_target,
 )
 
 logger = logging.getLogger("movieclaw_api.playback.transcode_worker")
@@ -454,7 +459,7 @@ async def _remote_source_file(
     ):
         raise NotFoundException("远程转码会话不存在")
     file = await session.get(LibraryFile, grant.file_id)
-    if file is None or is_strm(file.file_path):
+    if file is None:
         raise NotFoundException("远程转码源文件不存在")
     return file
 
@@ -544,12 +549,34 @@ async def transcode_source(
     token: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ):
-    """给 Worker 提供支持 Range 的源文件读取；不允许读取 strm 占位文件。"""
+    """给 Worker 提供支持 Range 的源文件读取。
+
+    网盘（strm）条目跳转到网盘直链：Worker 直接从网盘取源，不经 NAS 中转。Worker 的
+    取源代理与 ffmpeg 都跟随跳转，跳转后照常按 Range 取；每次取数都经这里现读 strm，
+    直链过期了也能拿到新的。strm 指向 NAS 挂载目录里的文件时与本地文件同样出字节。
+    """
     file = await _remote_source_file(session_id, token, session)
-    if file.is_disc():
+    path = Path(file.file_path)
+    if is_strm(file.file_path):
+        try:
+            source = parse_strm(file.file_path)
+        except StrmError as exc:
+            raise NotFoundException(f"strm 用不了：{exc}") from exc
+        if isinstance(source, StrmLink):
+            target = await strm_redirect_target(source, request.headers.get("user-agent"))
+            if target is None:
+                # 回环 / 容器服务名的直链 Worker 连不上（它在另一台机器上），要带请求头的直链
+                # Worker 也不知道该带什么：NAS 原样转发
+                return RemoteRelayResponse(
+                    source.url,
+                    range_header=request.headers.get("range"),
+                    upstream_headers=source.headers,
+                )
+            return RedirectResponse(target, status_code=302)
+        path = source
+    elif file.is_disc():
         # 原盘是目录，没有单一源文件；新版 Worker 读 source.ffconcat，走不到这里
         raise NotFoundException("原盘没有单一源文件，请改读 source.ffconcat 清单")
-    path = Path(file.file_path)
     if not path.is_file():
         raise _missing_source(session_id, file, path)
     return DisconnectAwareFileResponse(

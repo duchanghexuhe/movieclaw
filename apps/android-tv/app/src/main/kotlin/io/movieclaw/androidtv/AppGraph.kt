@@ -4,6 +4,9 @@ import android.app.Application
 import android.os.Build
 import android.provider.Settings
 import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import io.movieclaw.androidtv.core.model.generated.SessionView
 import io.movieclaw.androidtv.core.network.ClientIdentity
 import io.movieclaw.androidtv.core.network.ServerAddress
@@ -54,12 +57,26 @@ class AppGraph(app: Application) {
     /** 待处理的深链（「继续观看」点进来、或冷启动带的），主界面取走后清空 */
     val deepLinks = kotlinx.coroutines.flow.MutableStateFlow<io.movieclaw.androidtv.system.DeepLink?>(null)
 
+    /**
+     * 首页 / 详情页大图上自动播放预告片段（「谁在看」页底部的开关）。默认关：电视盒子上多一路视频解码、
+     * 每换一部就请求一次片段，整个 App 跟着卡；关着时大图只放静态剧照
+     */
+    var autoPreview by mutableStateOf(store.string(AUTO_PREVIEW) == "on")
+        private set
+
+    fun saveAutoPreview(on: Boolean) {
+        autoPreview = on
+        store.putString(AUTO_PREVIEW, if (on) "on" else null)
+    }
+
     /** 调试包：实验台让正在放的播放器跳到某个文件时间（毫秒，`am start … --el mc_seek_ms`），量跳转耗时用 */
     val labSeeks = kotlinx.coroutines.flow.MutableSharedFlow<Long>(extraBufferCapacity = 4)
 
     /** 调试包：实验台切音轨 / 字幕（`--es mc_audio embedded:2`、`--es mc_subtitle off`），量换轨耗时用 */
     val labTracks = kotlinx.coroutines.flow.MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 4)
 }
+
+private const val AUTO_PREVIEW = "stage_auto_preview"
 
 /** 一个已登录账号的一切：服务器、令牌、带令牌的接口、会话（权限）。 */
 class AccountSession(val server: ServerAddress, val token: String, val session: SessionView, val api: McApi) {

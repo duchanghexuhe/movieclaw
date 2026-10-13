@@ -329,9 +329,14 @@ fun StageInfo(
 /** 「第 1 季 第 3 集 · 名」；名字为空或就是「第 N 集 / Episode N」时省掉 */
 fun episodeLine(season: Long, episode: Long, name: String?): String {
     val number = "第 $season 季 第 $episode 集"
+    return episodeTitle(name)?.let { "$number · $it" } ?: number
+}
+
+/** 分集的真名：空的、或只是「第 N 集 / Episode N」这种占位名（TMDB 没有中文集名时就给这个）返回 null，界面只写一次集号 */
+fun episodeTitle(name: String?): String? {
     val trimmed = name?.trim().orEmpty()
-    if (trimmed.isEmpty() || Regex("^(第\\s*\\d+\\s*集|Episode\\s*\\d+)$", RegexOption.IGNORE_CASE).matches(trimmed)) return number
-    return "$number · $trimmed"
+    if (trimmed.isEmpty() || Regex("^(第\\s*\\d+\\s*集|Episode\\s*\\d+)$", RegexOption.IGNORE_CASE).matches(trimmed)) return null
+    return trimmed
 }
 
 /**

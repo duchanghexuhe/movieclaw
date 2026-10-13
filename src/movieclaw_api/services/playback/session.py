@@ -69,6 +69,7 @@ from movieclaw_events import new_ulid
 from movieclaw_playback import activity
 from movieclaw_playback.decide import PlaybackPlan, PlaybackTier
 from movieclaw_playback.hls_vod import SegmentPlan
+from movieclaw_playback.streaming import StrmError, is_strm, parse_strm, strm_source_input
 
 logger = logging.getLogger("movieclaw_api.playback.session")
 
@@ -1023,9 +1024,19 @@ class TranscodeSessionManager:
     def _local_command(self, session: TranscodeSession, *, start_number: int | None):
         """本地 ffmpeg 命令：起播与 seek 重启共用一处装配，输入形态在这里分叉。"""
         # 只在 concat 形态下才传 input_format：普通文件的调用形状保持不变
-        extra: dict[str, str] = {}
+        extra: dict[str, Any] = {}
         source_path = session.source_path
-        if session.concat_list is not None:
+        if is_strm(source_path):
+            # 网盘（strm）条目：ffmpeg 直接读直链（或 strm 指向的挂载文件）。每轮（含 seek
+            # 重启）都现读 strm——直链多带时效签名，开播时解析的那条可能已经过期；缓存指纹仍按
+            # strm 文件算（cache.py）
+            try:
+                source = parse_strm(source_path)
+            except StrmError as exc:
+                session.error = f"strm 用不了：{exc}"
+                raise SessionStartError(session.error) from exc
+            source_path, extra["input_options"] = strm_source_input(source)
+        elif session.concat_list is not None:
             source_path = str(session.directory / CONCAT_LIST_NAME)
             extra["input_format"] = "concat"
             if "'subfile," in session.concat_list or "'concat:subfile," in session.concat_list:
@@ -1411,11 +1422,15 @@ class TranscodeSessionManager:
         # 先把进程抓在手里：seek 重启会把 session.process 换成新进程
         process = session.process
         assert process is not None and process.stderr is not None
+        # 只属于这个进程的输出：会话级的 stderr_tail 跨重启累积，拿它记退出原因会把
+        # 上一轮的行混进来
+        own_tail: deque[str] = deque(maxlen=_STDERR_KEEP_LINES)
         try:
             async for raw in process.stderr:
                 line = raw.decode(errors="replace").rstrip()
                 if line:
                     session.stderr_tail.append(line)
+                    own_tail.append(line)
             # stderr 读到头 = 进程在退出。此前转码中途崩溃没有任何日志，只剩下一次
             # 分片请求触发的重启，看不出它为什么死。我们自己杀的（stop / seek 重启）
             # 不记；起步阶段就死的由开会话那条路径带着 stderr 报错，这里也不重复。
@@ -1435,7 +1450,9 @@ class TranscodeSessionManager:
                     session.display_name or "-",
                     returncode,
                     signal_note,
-                    " | ".join(list(session.stderr_tail)[-5:]) or "（无输出）",
+                    # 整段都记：-loglevel warning 下本来就没几行，真正的原因常在
+                    # 倒数第五行之前（issue #763 只留了末尾的连带报错）
+                    " | ".join(own_tail) or "（无输出）",
                 )
         except asyncio.CancelledError:
             raise
@@ -1459,7 +1476,7 @@ class TranscodeSessionManager:
                 return
             process = session.process
             if process is not None and process.returncode is not None:
-                tail = " / ".join(list(session.stderr_tail)[-5:])
+                tail = " / ".join(session.stderr_tail)
                 session.error = tail or f"ffmpeg 退出码 {process.returncode}"
                 raise SessionStartError(f"转码进程启动失败：{session.error}")
             await asyncio.sleep(0.05)
@@ -1900,6 +1917,21 @@ class TranscodeSessionManager:
                 session.empty_restarts[wanted] = empties
                 if empties > self._MAX_EMPTY_RESTARTS:
                     session.unreachable_segments.add(wanted)
+                    if not session.remote and not session.completed_segments:
+                        # 本会话一段都没产出过：不是源短，是这条命令在这台机器上就起不来
+                        # （issue #763：VAAPI 链路起步即退出）。判会话失败，init/分片
+                        # 立即 404、诊断带上原因，播放器才能走降档换一档，而不是对着
+                        # 一个死会话一直缓冲
+                        self._mark_failed(
+                            session,
+                            "转码进程起步即退出、一段都没产出："
+                            # 两轮进程报的是同一套错：去重，免得一条原因念两遍
+                            + (
+                                " / ".join(dict.fromkeys(session.stderr_tail))
+                                or "（ffmpeg 无输出）"
+                            ),
+                        )
+                        return
                     logger.warning(
                         "转码进程从第 %d 段起转了 %d 次都没产出它就退出了，本会话不再为它"
                         "重启（源文件可能比台账时长短、还在下载或已损坏）：session=%s（%s）",

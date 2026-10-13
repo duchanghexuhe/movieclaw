@@ -25,6 +25,7 @@ import asyncio
 import logging
 import re
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -71,6 +72,7 @@ from movieclaw_api.services.playback.session import (
     get_session_manager,
 )
 from movieclaw_api.services.playback.signing import issue_stream_token, verify_stream_token
+from movieclaw_api.services.playback.strm_probe import ensure_strm_spec
 from movieclaw_api.services.playback.track_context import files_with_contexts, track_context
 from movieclaw_api.settings import PlaybackPolicySetting
 from movieclaw_api.settings.store import get_setting_store
@@ -124,11 +126,15 @@ from movieclaw_playback.hls_vod import (
 from movieclaw_playback.profile import media_profile_from_file
 from movieclaw_playback.streaming import (
     DisconnectAwareFileResponse,
+    RemoteRelayResponse,
+    StrmLink,
     container_mime_type,
     direct_play_byte_patches,
     is_strm,
+    local_strm_container,
     register_device_stream,
-    resolve_strm_url,
+    resolve_strm,
+    strm_redirect_target,
     unregister_device_stream,
 )
 from movieclaw_playback.subtitles import (
@@ -311,6 +317,9 @@ async def playback_info(
     selected = _select_source(files, media_source_id, item_id)
     if not selected:
         return JSONResponse({"MediaSources": [], "ErrorCode": "NoCompatibleStream"})
+    # 网盘（strm）版本第一次播放时现探规格并落库（strm_probe）：码率协商、音轨字幕都要它
+    for f in selected:
+        await ensure_strm_spec(f)
     # 播放协商是唯一现读 strm 的场景：直链多带时效签名，须现读现用；
     # 解析失败的版本剔除，全部失败按"无可播源"应答
     pairs = [(f, s) for f in selected if (s := media_source_dto(f, resolve_strm=True))]
@@ -328,11 +337,11 @@ async def playback_info(
             session, unit, member_id=identity.device.member_id
         )
     play_session_id = secrets.token_hex(16)
-    # 策略（硬件自检 + 软转开关）只在有普通本地文件时读一次：strm 与原盘
-    # 不走码率协商，纯 strm 条目不为此碰硬件探测
+    # 策略（硬件自检 + 软转开关）只在有非原盘文件时读一次：原盘不走码率协商；
+    # 网盘（strm）版本与本地文件一样协商（服务端的 ffmpeg 直接读直链）
     policy = (
         await _load_policy_for(negotiation.segment_container)
-        if any(not f.is_disc() and not is_strm(f.file_path) for f, _ in pairs)
+        if any(not f.is_disc() for f, _ in pairs)
         else None
     )
     for f, source in pairs:
@@ -343,7 +352,7 @@ async def playback_info(
             _apply_disc_transcoding(
                 source, f, ref, identity.device.token, play_session_id, audio_stream_index
             )
-        elif policy is not None and not is_strm(f.file_path):
+        elif policy is not None:
             _apply_transcode_negotiation(
                 source, f, ref, identity.device.token, play_session_id, negotiation, policy
             )
@@ -675,17 +684,37 @@ async def video_stream(
         raise not_found()
     f = selected[0]
 
-    if is_strm(f.file_path):
-        url = resolve_strm_url(f.file_path)
-        if url is None:
-            raise not_found()
-        # 302 直链：HEAD 同样 302、不塞 body；重定向目标自己支持 Range
-        return RedirectResponse(url, status_code=302)
-
     path = Path(f.file_path)
+    file_container = f.container
+    if is_strm(f.file_path):
+        source = resolve_strm(f.file_path)
+        if source is None:
+            raise not_found()
+        if isinstance(source, StrmLink):
+            target = await strm_redirect_target(source, request.headers.get("user-agent"))
+            if target is None:
+                # 内网 / 回环 / 容器服务名、跟跳转也落不到外面的直链，或要带请求头的直链：
+                # 播放器自己取不了，服务端按 Range 原样转发
+                session_stopped, byte_sink, on_close = await _register_stream(
+                    request, identity, ref, f, name=path.name
+                )
+                return RemoteRelayResponse(
+                    source.url,
+                    range_header=request.headers.get("range"),
+                    upstream_headers=source.headers,
+                    session_stopped=session_stopped,
+                    byte_sink=byte_sink,
+                    on_close=on_close,
+                )
+            # 302 直链：HEAD 同样 302、不塞 body；重定向目标自己支持 Range
+            return RedirectResponse(target, status_code=302)
+        # 指向挂载目录里的文件：往下与本地文件同样直出
+        path = source
+        file_container = local_strm_container(f.container, path)
+
     # MIME 优先级对齐 StreamingHelpers：URL 后缀 → ?container= query → 真实容器
     media_type = container_mime_type(
-        container or request.query_params.get("container") or f.container or path.suffix
+        container or request.query_params.get("container") or file_container or path.suffix
     )
     if f.is_disc() and (f.container or "") != "iso":
         # 原盘（disc-playback.md §3.3）：单剪辑主片直接按 m2ts 供流；多剪辑
@@ -706,7 +735,32 @@ async def video_stream(
         raise not_found()
     # hev1 标签的 HEVC MP4 在 AVPlayer 系播放器上直出必败，流里改成 hvc1（#430）；
     # 用自带解码器的 Infuse 之流两种标签都认，不受影响
-    byte_patches = await direct_play_byte_patches(path, f.container, f.video_codec)
+    byte_patches = await direct_play_byte_patches(path, file_container, f.video_codec)
+    # strm 指向的本地文件：台账的大小是 strm 文本的，按真实文件
+    size_bytes = path.stat().st_size if is_strm(f.file_path) else None
+    session_stopped, byte_sink, on_close = await _register_stream(
+        request, identity, ref, f, name=path.name, size_bytes=size_bytes
+    )
+    return DisconnectAwareFileResponse(
+        path,
+        media_type=media_type,
+        session_stopped=session_stopped,
+        byte_sink=byte_sink,
+        on_close=on_close,
+        byte_patches=byte_patches,
+    )
+
+
+async def _register_stream(
+    request: Request,
+    identity: RequestIdentity,
+    ref: EntityRef,
+    f: LibraryFile,
+    *,
+    name: str,
+    size_bytes: int | None = None,
+) -> tuple[asyncio.Event, Callable[[int], None], Callable[[], None]]:
+    """登记一条取流：返回（停止信号, 字节计量, 收尾回调）。磁盘直出与网盘直链转发共用。"""
     # 停止播放并不保证客户端立刻关闭 Range 连接。按已认证设备登记这条流，
     # 让 /Sessions/Playing/Stopped 能主动停止读盘；TCP 断连仍是第二道兜底。
     device_id = identity.device.device_id
@@ -727,8 +781,8 @@ async def video_stream(
         member_id=identity.device.member_id,
         unit=unit,
         file_id=f.id,
-        file_name=path.name,
-        size_bytes=f.size_bytes,
+        file_name=name,
+        size_bytes=size_bytes if size_bytes is not None else f.size_bytes,
         client=_identity_client(identity),
     )
 
@@ -736,14 +790,7 @@ async def video_stream(
         unregister_device_stream(device_id, session_stopped)
         activity.unregister_stream(meter)
 
-    return DisconnectAwareFileResponse(
-        path,
-        media_type=media_type,
-        session_stopped=session_stopped,
-        byte_sink=meter.add,
-        on_close=_close,
-        byte_patches=byte_patches,
-    )
+    return session_stopped, meter.add, _close
 
 
 @router.get("/Items/{item_id}/Download")
@@ -778,13 +825,22 @@ async def download_item(
         raise not_found()
     f = selected[0]
 
-    if is_strm(f.file_path):
-        url = resolve_strm_url(f.file_path)
-        if url is None:
-            raise not_found()
-        return RedirectResponse(url, status_code=302)
-
     path = Path(f.file_path)
+    if is_strm(f.file_path):
+        source = resolve_strm(f.file_path)
+        if source is None:
+            raise not_found()
+        if isinstance(source, StrmLink):
+            target = await strm_redirect_target(source, request.headers.get("user-agent"))
+            if target is None:
+                # 播放器取不了的直链：与取流同样由服务端转发
+                return RemoteRelayResponse(
+                    source.url,
+                    range_header=request.headers.get("range"),
+                    upstream_headers=source.headers,
+                )
+            return RedirectResponse(target, status_code=302)
+        path = source  # 指向挂载目录里的文件：按本地文件下载
     if f.is_disc() or not path.is_file():
         # 原盘是目录，没有"一个文件"可下（CanDownload 已恒 false，这里是兜底）
         raise not_found()
@@ -800,13 +856,17 @@ async def download_item(
         unit=_stream_unit(ref),
         file_id=f.id,
         file_name=path.name,
-        size_bytes=f.size_bytes,
+        size_bytes=path.stat().st_size if is_strm(f.file_path) else f.size_bytes,
         client=_identity_client(identity),
         start_offset=_range_start(request),
     )
     return DisconnectAwareFileResponse(
         path,
-        media_type=container_mime_type(f.container or path.suffix),
+        media_type=container_mime_type(
+            local_strm_container(f.container, path)
+            if is_strm(f.file_path)
+            else f.container or path.suffix
+        ),
         filename=path.name if is_download else None,
         byte_sink=meter.add,
         on_close=lambda: activity.unregister_stream(meter),
@@ -963,8 +1023,7 @@ async def video_hls_master(
     if not selected:
         raise not_found()
     f = selected[0]
-    if f.id is None or is_strm(f.file_path):
-        # strm 只直连（硬边界：转码要先把云端内容拉到服务器）
+    if f.id is None:
         raise not_found()
     if activity.device_ended(identity.device.device_id):
         raise bad_request_text("播放已被管理员结束")

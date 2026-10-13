@@ -36,14 +36,21 @@ def _reserved(kernel: Kernel, settings: object) -> set[str]:
     return {e.id for e in BUILTIN_MANIFEST} | {s.id for s in local_specs(settings)}
 
 
-async def _restore_bundled(kernel: Kernel, entry_id: str) -> None:
-    """插件包卸下后，同 id 的随带插件包回来（plugin-channels.md §7）。"""
+async def _restore_bundled(kernel: Kernel, settings: object, entry_id: str) -> None:
+    """插件包卸下后，同 id 的随带插件包回来（plugin-channels.md §7）；随带包已被卸载的不回来，
+    已被停用的回来后照旧停用（plugin-strm-prefetch.md §1）。"""
     from movieclaw_api.plugins.bundled import bundled, canonical, entry
+    from movieclaw_api.services import plugin_switches
 
     package = bundled().get(canonical(entry_id))
     if package is None or kernel.fiber(package.id) is not None:
         return
+    switches = plugin_switches.read_switches(settings)
+    if package.id in switches.removed:
+        return
     fiber = await kernel.mount(entry(package))
+    if package.id in switches.disabled:
+        await kernel.disable(package.id, source=plugin_switches.SOURCE)
     logger.info("随带插件包 %s 已恢复（%s）", package.id, fiber.state.value)
 
 
@@ -53,13 +60,32 @@ def _operations() -> set[str]:
     return set(_operation_index())
 
 
+_AGENT_TIERS = {
+    "none": "不带工具，纯对话",
+    "mclaw": "可调用服务操作",
+    "full": "可执行命令、读写文件",
+}
+
+
 def operation_details(patterns: list[str]) -> list[dict[str, Any]]:
     """宿主操作 → 给人看的说明（管理页的批准抽屉逐项列出，危险操作标红）。"""
     from movieclaw_api.services.host_ops import _operation_index
+    from movieclaw_sdk.agent import PERMISSION_PREFIX
 
     index = _operation_index()
     details: list[dict[str, Any]] = []
     for pattern in patterns:
+        if pattern.startswith(PERMISSION_PREFIX):
+            tier = pattern[len(PERMISSION_PREFIX) :]
+            details.append(
+                {
+                    "id": pattern,
+                    "summary": f"调用 AI 助手（{_AGENT_TIERS.get(tier, tier)}）：以管理员身份运行、"
+                    "按模型用量计费，插件可以把回复转给它自己的调用方",
+                    "dangerous": True,
+                }
+            )
+            continue
         if pattern.endswith(".*"):
             details.append(
                 {
@@ -99,10 +125,64 @@ def _view(manifest: pkg.Manifest, current: pkg.Installed | None) -> dict[str, An
         "new_paths": [p for p in paths if p not in approved_paths],
         "callbacks": list(manifest.permissions.callbacks),
         "new_callbacks": [c for c in manifest.permissions.callbacks if c not in approved_callbacks],
+        **_event_view(manifest),
         "requires": manifest.requires,
         "installed_version": current.version if current else None,
         "replaces_builtin": _replaces_builtin(plugin.id),
     }
+
+
+def _event_view(manifest: pkg.Manifest) -> dict[str, Any]:
+    """批准页要给用户看的：会发出的事件、会通知谁通知什么、要订阅的敏感事件。"""
+    try:
+        events, notifications, sensitive = manifest.declarations()
+    except Exception:  # noqa: BLE001 -- 不合规的上传时就拒了，这里兜底
+        return {}
+    audiences = {
+        "admins": "管理员",
+        "member": "事件里的那个成员",
+        "media": "订阅或关注了那部片的人",
+    }
+    return {
+        "events": [{"name": name, "title": title} for name, title in events.items()],
+        "notifications": [
+            {
+                "event": n.event,
+                "title": n.title,
+                "body": n.body,
+                "audience": n.audience,
+                "audience_label": audiences[n.audience.partition(":")[0]],
+                "reaches_members": n.reaches_members,
+                "default": n.default,
+            }
+            for n in notifications
+        ],
+        "sensitive_events": list(sensitive),
+        "notifies_members": any(n.reaches_members for n in notifications),
+    }
+
+
+async def _forget_events(entry_id: str) -> None:
+    """卸载：撤下插件的事件声明，删掉每个人对它的通知开关。"""
+    from movieclaw_api.services import plugin_events
+
+    plugin_events.forget(entry_id)
+    try:
+        from sqlmodel import select
+
+        from movieclaw_db.engine import get_database
+        from movieclaw_db.models import PushPreference
+
+        prefix = f"{entry_id}."
+        async with get_database().session() as session:
+            rows = (await session.execute(select(PushPreference))).scalars().all()
+            for row in rows:
+                if isinstance(row.events, dict) and any(k.startswith(prefix) for k in row.events):
+                    row.events = {k: v for k, v in row.events.items() if not k.startswith(prefix)}
+                    session.add(row)
+            await session.commit()
+    except Exception:  # noqa: BLE001 -- 清理偏好失败不影响卸载
+        logger.warning("清理插件 %s 的通知开关失败", entry_id, exc_info=True)
 
 
 def _replaces_builtin(entry_id: str) -> bool:
@@ -192,6 +272,7 @@ class PackageManager:
         operations: list[str],
         allow_inline: bool,
         paths: list[dict[str, str]] | None = None,
+        allow_member_notifications: bool = False,
     ) -> dict[str, Any]:
         """用户批准：安装并当场挂载；激活失败自动回滚。返回挂载结果。"""
         async with self._lock:
@@ -218,6 +299,8 @@ class PackageManager:
                 raise pkg.PackageError(
                     "这个插件申请在主进程里运行，拥有与主程序相同的系统权限，须单独确认"
                 )
+            if manifest.notifies_members and not allow_member_notifications:
+                raise pkg.PackageError("这个插件会给普通成员发通知，须单独确认")
             # 重新检查一遍：上传之后内置插件 / 本地插件 / 契约可能变了
             pkg.check_compat(
                 manifest,
@@ -236,9 +319,14 @@ class PackageManager:
                 title=manifest.plugin.title,
                 entry=manifest.plugin.entry,
                 runtime=manifest.plugin.runtime,
+                command=manifest.plugin.command,
                 operations=list(requested),
                 paths=requested_paths,
                 callbacks=list(manifest.permissions.callbacks),
+                events=[dict(e) for e in manifest.events],
+                notifications=[dict(n) for n in manifest.notifications],
+                sensitive=list(manifest.permissions.events),
+                members_allowed=manifest.notifies_members,
                 previous=current.snapshot() if current else None,
                 bad=[v for v in (current.bad if current else []) if v != version],
                 installed_at=pkg.now(),
@@ -325,7 +413,7 @@ class PackageManager:
         else:
             packages.pop(entry_id)
             pkg.save(self._settings, packages)
-            await _restore_bundled(self._kernel, entry_id)
+            await _restore_bundled(self._kernel, self._settings, entry_id)
             message = f"v{failed} 没能正常运行（{reason}），已撤销安装"
         logger.error("插件包 %s：%s", entry_id, message)
         await _notice(entry_id, record.title, message)
@@ -365,8 +453,13 @@ class PackageManager:
             if entry_id not in packages:
                 raise LookupError(f"没有安装插件包 {entry_id}")
             self._cancel_watch(entry_id)
+            from movieclaw_api.services.plugin_switches import cancel_plugin_jobs, forget
+
+            await cancel_plugin_jobs(self._kernel, entry_id, reason="插件已卸载")
             if self._kernel.fiber(entry_id) is not None:
                 await self._kernel.unmount(entry_id)
+            if not _replaces_builtin(entry_id):
+                forget(self._settings, entry_id)
             packages.pop(entry_id)
             pkg.save(self._settings, packages)
             shutil.rmtree(pkg.root(self._settings) / entry_id, ignore_errors=True)
@@ -376,7 +469,8 @@ class PackageManager:
             if callbacks is not None:
                 # 回调地址随插件一起作废：卸载后外部平台再调进来一律 404
                 await callbacks.revoke_all(entry_id)
-            await _restore_bundled(self._kernel, entry_id)
+            await _restore_bundled(self._kernel, self._settings, entry_id)
+            await _forget_events(entry_id)
             purged = 0
             if purge_data:
                 from movieclaw_api.plugins.keys import PLUGIN_DATA

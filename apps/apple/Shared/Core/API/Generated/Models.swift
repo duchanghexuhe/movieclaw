@@ -689,6 +689,18 @@ nonisolated extension API {
         }
     }
 
+    struct BundledUninstallView: Codable, Hashable, Sendable {
+        /// 取消了的后台任务数
+        var cancelledJobs: Int
+        /// 删除的插件数据行数（没勾选删除数据为 0）
+        var purgedRows: Int
+
+        enum CodingKeys: String, CodingKey {
+            case cancelledJobs = "cancelled_jobs"
+            case purgedRows = "purged_rows"
+        }
+    }
+
     struct CalibratePayload: Codable, Hashable, Sendable {
         var filename: String
 
@@ -1523,7 +1535,8 @@ nonisolated extension API {
         var provider: String?
         var contributions: [API.ContributionView]?
         var mode: String?
-        var delivery: String?
+        /// 事件能否被可靠订阅
+        var durable: Bool?
         var listeners: [String]?
 
         enum CodingKeys: String, CodingKey {
@@ -1535,7 +1548,7 @@ nonisolated extension API {
             case provider
             case contributions
             case mode
-            case delivery
+            case durable
             case listeners
         }
     }
@@ -1718,7 +1731,8 @@ nonisolated extension API {
     struct DetailConsumerView: Codable, Hashable, Sendable {
         /// <条目 id>:<监听器 id>
         var consumerId: String
-        var event: String
+        /// 订阅的事件（一个消费者可订阅多个，按产生顺序投递）
+        var events: [String]
         /// 订阅它的插件当前是否在运行
         var active: Bool
         /// 尚未处理的事件数
@@ -1732,7 +1746,7 @@ nonisolated extension API {
 
         enum CodingKeys: String, CodingKey {
             case consumerId = "consumer_id"
-            case event
+            case events
             case active
             case backlog
             case attempts
@@ -1918,7 +1932,7 @@ nonisolated extension API {
 
     /// App 设备能不能收到推送（docs/design/cloud-push.md §4）。界面只在不是 ok 时提示。
     struct DevicePushView: Codable, Hashable, Sendable {
-        /// ok / permission_denied / no_channel / bad_token / not_registered
+        /// ok / unsupported_build / permission_denied / no_channel / bad_token / not_registered
         var status: String
         var statusText: String
 
@@ -2739,10 +2753,13 @@ nonisolated extension API {
     struct DownloadUnitView: Codable, Hashable, Sendable {
         var seasonNumber: Int
         var episodeNumber: Int
+        /// 下载快照里这一集的进度 0.0~1.0（挂了多集的包按单文件完成字节算）；单集种子、认不出集号或手动选种结果为空——看整包进度
+        var progress: Double?
 
         enum CodingKeys: String, CodingKey {
             case seasonNumber = "season_number"
             case episodeNumber = "episode_number"
+            case progress
         }
     }
 
@@ -3157,7 +3174,8 @@ nonisolated extension API {
     struct DurableConsumerView: Codable, Hashable, Sendable {
         /// <条目 id>:<监听器 id>
         var consumerId: String
-        var event: String
+        /// 订阅的事件（一个消费者可订阅多个，按产生顺序投递）
+        var events: [String]
         /// 订阅它的插件当前是否在运行
         var active: Bool
         /// 尚未处理的事件数
@@ -3169,7 +3187,7 @@ nonisolated extension API {
 
         enum CodingKeys: String, CodingKey {
             case consumerId = "consumer_id"
-            case event
+            case events
             case active
             case backlog
             case attempts
@@ -4369,6 +4387,14 @@ nonisolated extension API {
         }
     }
 
+    struct InvalidateTipRequest: Codable, Hashable, Sendable {
+        var reason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case reason
+        }
+    }
+
     /// 作品详情页那一行「合集」的一项：只要名字和落点。
     /// **刻意不带封面与成员数**。合集封面是从成员海报里借的——在《千与千寻》
     /// 的页面上摆「日本动画」的封面卡，那张图很可能就是《千与千寻》自己；
@@ -4594,6 +4620,8 @@ nonisolated extension API {
     struct JobView: Codable, Hashable, Sendable {
         var id: String
         var jobType: String
+        /// 任务类型在任务中心显示的名字（插件任务由处理器给出）；没有时显示端自己兜底
+        var jobTypeLabel: String?
         var subject: String?
         var definitionVersion: Int
         var handlerRevision: String
@@ -4631,6 +4659,7 @@ nonisolated extension API {
         enum CodingKeys: String, CodingKey {
             case id
             case jobType = "job_type"
+            case jobTypeLabel = "job_type_label"
             case subject
             case definitionVersion = "definition_version"
             case handlerRevision = "handler_revision"
@@ -5696,6 +5725,10 @@ nonisolated extension API {
         var baseUrl: String?
         var requiresBaseUrl: Bool
         var defaultUserAgent: String
+        /// 默认 API 协议：openai_chat / openai_responses
+        var `protocol`: String?
+        /// 实例可切换的协议（含默认）；空或 null = 不可切换，隐藏选择器
+        var selectableProtocols: [String]?
         var models: [API.ModelInfo]
 
         enum CodingKeys: String, CodingKey {
@@ -5704,12 +5737,15 @@ nonisolated extension API {
             case baseUrl = "base_url"
             case requiresBaseUrl = "requires_base_url"
             case defaultUserAgent = "default_user_agent"
+            case `protocol`
+            case selectableProtocols = "selectable_protocols"
             case models
         }
     }
 
     /// 新增 / 编辑 LLM 供应商实例的请求体。
-    /// API Key 出于安全不回显，编辑时需要重新填写。
+    /// API Key 出于安全不回显：编辑时留空沿用原 Key；但改了供应商类型或端点
+    /// 必须重填，免得旧 Key 被发往新地址。
     struct LlmProviderPayload: Codable, Hashable, Sendable {
         /// 实例名（全局唯一，不含斜杠），如「官方 OpenAI」
         var name: String
@@ -5719,8 +5755,10 @@ nonisolated extension API {
         var baseUrl: String?
         /// 自定义 User-Agent 请求头（留空使用 openai SDK 自带 UA）
         var userAgent: String?
-        /// API Key
-        var apiKey: String
+        /// API 协议：openai_chat（Chat Completions）/ openai_responses（Responses API）；留空跟随预设默认，仅预设 selectable_protocols 非空时可选。编辑时不传沿用原值
+        var apiProtocol: String?
+        /// API Key；新增必填，编辑时留空沿用原 Key（改了供应商类型或端点须重填）
+        var apiKey: String?
         /// 连接测试用的模型 id；留空取目录里第一个（预设目录或自定义目录）
         var defaultModel: String?
         /// 自定义模型目录 JSON 数组，元素形如 {"id":"模型id","context_window":131072,"max_output_tokens":8192}（openai_compat 端点至少一条）
@@ -5731,6 +5769,7 @@ nonisolated extension API {
             case providerType = "provider_type"
             case baseUrl = "base_url"
             case userAgent = "user_agent"
+            case apiProtocol = "api_protocol"
             case apiKey = "api_key"
             case defaultModel = "default_model"
             case extraModels = "extra_models"
@@ -5746,6 +5785,8 @@ nonisolated extension API {
         var baseUrl: String?
         /// 自定义 User-Agent；null 表示用 SDK 默认 UA
         var userAgent: String?
+        /// 选用的 API 协议；null 表示跟随预设默认（见预设 protocol）
+        var apiProtocol: String?
         /// 连接测试用的模型 id（目录里第一个）
         var defaultModel: String
         var status: API.ConfigStatus
@@ -5767,6 +5808,7 @@ nonisolated extension API {
             case providerType = "provider_type"
             case baseUrl = "base_url"
             case userAgent = "user_agent"
+            case apiProtocol = "api_protocol"
             case defaultModel = "default_model"
             case status
             case usable
@@ -6738,6 +6780,8 @@ nonisolated extension API {
         var attention: [API.PushAttentionView]
         /// 静音了的片（长按通知「这部剧不再提醒」），最近静音的在前
         var mutedItems: [API.PushMutedItemView]?
+        /// 我在运行的 IM 账号数（IM 也按这里的开关推送）
+        var imAccounts: Int?
 
         enum CodingKeys: String, CodingKey {
             case instanceReady = "instance_ready"
@@ -6748,6 +6792,7 @@ nonisolated extension API {
             case libraryIds = "library_ids"
             case attention
             case mutedItems = "muted_items"
+            case imAccounts = "im_accounts"
         }
     }
 
@@ -7012,12 +7057,15 @@ nonisolated extension API {
         var allowInline: Bool?
         /// 批准的路径授权，须与插件申请的完全一致
         var paths: [[String: String]]?
+        /// 插件会给普通成员发通知时，须显式确认
+        var allowMemberNotifications: Bool?
 
         enum CodingKeys: String, CodingKey {
             case version
             case operations
             case allowInline = "allow_inline"
             case paths
+            case allowMemberNotifications = "allow_member_notifications"
         }
     }
 
@@ -7041,6 +7089,14 @@ nonisolated extension API {
         var callbacks: [String]
         /// 相比当前已安装版本新增的
         var newCallbacks: [String]
+        /// 插件会发出的事件（别的插件、Webhook 能订）
+        var events: [API.PluginEventView]
+        /// 插件会发的通知：发给谁、写什么
+        var notifications: [API.PluginNotificationView]
+        /// 要订阅的敏感事件（谁在什么时候看了什么）
+        var sensitiveEvents: [String]
+        /// 会给普通成员发通知：批准时须单独确认
+        var notifiesMembers: Bool
         var requires: [String: String]
         var installedVersion: String?
         /// 与随带的内置插件同 id：安装即替换它，卸载后随带版本回来
@@ -7059,6 +7115,10 @@ nonisolated extension API {
             case newPaths = "new_paths"
             case callbacks
             case newCallbacks = "new_callbacks"
+            case events
+            case notifications
+            case sensitiveEvents = "sensitive_events"
+            case notifiesMembers = "notifies_members"
             case requires
             case installedVersion = "installed_version"
             case replacesBuiltin = "replaces_builtin"
@@ -8343,6 +8403,38 @@ nonisolated extension API {
         }
     }
 
+    struct PluginEventView: Codable, Hashable, Sendable {
+        var name: String
+        var title: String
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case title
+        }
+    }
+
+    struct PluginNotificationView: Codable, Hashable, Sendable {
+        var event: String
+        /// 标题模板（{字段} 替换成事件里的值）
+        var title: String
+        var body: String
+        /// admins / member:<字段> / media:<字段>
+        var audience: String
+        var audienceLabel: String
+        var reachesMembers: Bool
+        var `default`: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case event
+            case title
+            case body
+            case audience
+            case audienceLabel = "audience_label"
+            case reachesMembers = "reaches_members"
+            case `default`
+        }
+    }
+
     struct PluginPackageDetailView: Codable, Hashable, Sendable {
         var version: String
         /// 安装时间（Unix 秒）
@@ -8440,6 +8532,26 @@ nonisolated extension API {
         }
     }
 
+    struct PluginSwitchPayload: Codable, Hashable, Sendable {
+        /// true 启用，false 停用
+        var enabled: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case enabled
+        }
+    }
+
+    struct PluginSwitchView: Codable, Hashable, Sendable {
+        var id: String
+        /// 切换后的状态
+        var state: String
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case state
+        }
+    }
+
     struct PluginView: Codable, Hashable, Sendable {
         var id: String
         var plugin: String
@@ -8472,6 +8584,12 @@ nonisolated extension API {
         var group: String?
         /// inline：主进程里运行；process：独立进程（第三阶段）
         var runtime: String
+        /// 能在插件页停用 / 启用（官方插件与已安装的插件包；docs/design/plugin-strm-prefetch.md §1）
+        var switchable: Bool
+        /// 是官方插件、能在插件页卸载（代码随应用携带，卸了能恢复）
+        var removable: Bool
+        /// 被 data/plugins.yaml / 环境变量关掉时的原因：停用开关锁住，要在那里改回来
+        var lockedBy: String?
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -8499,6 +8617,9 @@ nonisolated extension API {
             case dataRows = "data_rows"
             case group
             case runtime
+            case switchable
+            case removable
+            case lockedBy = "locked_by"
         }
     }
 
@@ -8511,6 +8632,8 @@ nonisolated extension API {
         var durable: API.DurableView?
         /// 插件安全模式（docs/design/plugin-phase3.md §5）
         var safeMode: API.SafeModeView
+        /// 在插件页卸载了的官方插件（可恢复）
+        var removed: [API.RemovedPluginView]
 
         enum CodingKeys: String, CodingKey {
             case plugins
@@ -8518,6 +8641,7 @@ nonisolated extension API {
             case contracts
             case durable
             case safeMode = "safe_mode"
+            case removed
         }
     }
 
@@ -8833,6 +8957,10 @@ nonisolated extension API {
         var permission: String
         /// App 当前版本（登录时记下的会过时，借登记刷新）
         var clientVersion: String?
+        /// 这个安装包签名里没有推送权限、拿不到 APNs 令牌（侧载包），重装商店版才能收到
+        var unsupportedBuild: Bool?
+        /// 实时通知（保持连接，仅 Android）：true 开、false 关、不传不改
+        var stream: Bool?
 
         enum CodingKeys: String, CodingKey {
             case token
@@ -8843,6 +8971,8 @@ nonisolated extension API {
             case key
             case permission
             case clientVersion = "client_version"
+            case unsupportedBuild = "unsupported_build"
+            case stream
         }
     }
 
@@ -9699,6 +9829,23 @@ nonisolated extension API {
             case maxArtifactBytes = "max_artifact_bytes"
             case ready
             case issues
+        }
+    }
+
+    struct RemovedPluginView: Codable, Hashable, Sendable {
+        var id: String
+        var title: String
+        var description: String
+        /// 卸载时间（ISO 8601 UTC）
+        var removedAt: String
+        var removedBy: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case title
+            case description
+            case removedAt = "removed_at"
+            case removedBy = "removed_by"
         }
     }
 
@@ -10563,6 +10710,8 @@ nonisolated extension API {
         var createdAt: String
         /// 会话最近活动时间（ISO 8601 UTC）
         var updatedAt: String
+        /// 会话归属：空 = 网页 / 管理员发起；plugin:<条目 id> = 插件发起的会话
+        var owner: String?
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -10572,6 +10721,7 @@ nonisolated extension API {
             case running
             case createdAt = "created_at"
             case updatedAt = "updated_at"
+            case owner
         }
     }
 
@@ -11185,6 +11335,65 @@ nonisolated extension API {
         }
     }
 
+    struct StrmPendingFile: Codable, Hashable, Sendable {
+        var fileId: Int
+        var libraryId: Int
+        var mediaItemId: Int?
+        var season: Int
+        var episode: Int
+        /// 直链看得出的容器（后缀）；看不出为空
+        var container: String?
+        /// 入账时间
+        var createdAt: String
+
+        enum CodingKeys: String, CodingKey {
+            case fileId = "file_id"
+            case libraryId = "library_id"
+            case mediaItemId = "media_item_id"
+            case season
+            case episode
+            case container
+            case createdAt = "created_at"
+        }
+    }
+
+    struct StrmPendingView: Codable, Hashable, Sendable {
+        var items: [API.StrmPendingFile]
+        /// 符合条件的待探文件数（不计排除的容器）
+        var total: Int
+        /// 下一页的游标；没有了为空
+        var nextCursor: String?
+
+        enum CodingKeys: String, CodingKey {
+            case items
+            case total
+            case nextCursor = "next_cursor"
+        }
+    }
+
+    struct StrmProbeView: Codable, Hashable, Sendable {
+        var fileId: Int
+        /// probed：这次探出了规格；ready：本来就有；failed：没探成；backoff：还在失败退避期没探；not_strm：不是网盘条目
+        var status: String
+        /// 没探成的原因
+        var error: String?
+        /// 失败退避到什么时候
+        var nextRetryAt: String?
+        var container: String?
+        var videoCodec: String?
+        var resolution: String?
+
+        enum CodingKeys: String, CodingKey {
+            case fileId = "file_id"
+            case status
+            case error
+            case nextRetryAt = "next_retry_at"
+            case container
+            case videoCodec = "video_codec"
+            case resolution
+        }
+    }
+
     /// 从 Discover 条目创建订阅的公开请求。
     /// 调用方只传递上游返回的稳定引用；来源识别、豆瓣到 TMDB 的锚定、媒体
     /// 建档和初始工单生成均由服务端完成。豆瓣发生歧义时，错误详情会返回可重试
@@ -11629,6 +11838,51 @@ nonisolated extension API {
         enum CodingKeys: String, CodingKey {
             case type
             case text
+        }
+    }
+
+    /// 一种行为事件的累计情况。
+    struct TipEventView: Codable, Hashable, Sendable {
+        var eventId: String
+        var count: Int
+        var firstAt: String
+        var lastAt: String
+
+        enum CodingKeys: String, CodingKey {
+            case eventId = "event_id"
+            case count
+            case firstAt = "first_at"
+            case lastAt = "last_at"
+        }
+    }
+
+    /// 一条提示的展示与作废情况；没出现在列表里的提示 = 从没展示过、仍有效。
+    struct TipRecordView: Codable, Hashable, Sendable {
+        var tipId: String
+        var displayCount: Int
+        var firstDisplayedAt: String?
+        var lastDisplayedAt: String?
+        var invalidatedAt: String?
+        var invalidatedReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case tipId = "tip_id"
+            case displayCount = "display_count"
+            case firstDisplayedAt = "first_displayed_at"
+            case lastDisplayedAt = "last_displayed_at"
+            case invalidatedAt = "invalidated_at"
+            case invalidatedReason = "invalidated_reason"
+        }
+    }
+
+    /// 一个人的全部提示状态，各端启动时拉一次。
+    struct TipStateView: Codable, Hashable, Sendable {
+        var events: [API.TipEventView]
+        var tips: [API.TipRecordView]
+
+        enum CodingKeys: String, CodingKey {
+            case events
+            case tips
         }
     }
 

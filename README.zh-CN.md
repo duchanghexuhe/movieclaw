@@ -83,6 +83,8 @@
 网页端是液态玻璃：侧栏、输入框、悬浮按钮会折射你设的背景图，边缘带一点色差。背景图在「设置 → 外观」里换，跨设备访问同一实例保持一致。
 
 
+Windows 客户端源码位于 [`apps/desktop`](apps/desktop/README.md)，使用 Tauri/WebView2 和内置 mpv。开发、打包及验证范围见该目录说明。
+
 ## 说一句，它全都搞定
 
 MovieClaw 把一个自主的通用 Agent 装进了影音服务器。打理片库、做字幕、处理各种零碎又个性的需求，你只需要开口：
@@ -414,8 +416,10 @@ python -m movieclaw_api.reset_password
 加 `-e MOVIECLAW_WEB_PORT=8096`，或装好后在"设置 → 网络"里改（保存后自动重启生效）。
 
 **但 host 网络还有个坑**：容器内部的前端（3001）和后端（8000）也会直接占用宿主的这两个端口，
-它们目前不可改，`MOVIECLAW_WEB_PORT` 管不到。任一个被别的服务占了，容器会启动失败并退出，
-`docker logs` 里是一行英文 `EADDRINUSE: address already in use`。另外 host 网络下还会监听
+`MOVIECLAW_WEB_PORT` 只改 nginx 对外端口。若 3001 被占用，加 `MOVIECLAW_NEXT_PORT=13001`
+（或其他空闲端口）改内部前端端口；后端仍固定为 8000，须确保它空闲。host 网络下应删除
+`ports`，因为端口映射无效。此选项需要拉取更新后的 Docker 镜像并重建容器，应用内更新无法
+替换启动脚本和 nginx 模板。另外 host 网络下还会监听
 UDP 7359（Jellyfin 局域网自动发现），和已有的 Jellyfin / Emby 会撞。
 
 **所以：除非你确实需要局域网自动发现，否则用上面改冒号左边的办法，别上 host 网络。**

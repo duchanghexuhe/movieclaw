@@ -8,7 +8,7 @@
   按「这个监听器不存在」处理（内核隔离 + 调用方校验）。
 - 载荷是冻结模型，监听器要改就构造新的传给 ``next``。
 
-业务代码拿不到内核总线，所以由内置插件 ``core.registries`` 在启动时 ``bind_bus``；
+业务代码拿不到内核总线，由内置插件 ``core.registries`` 在启动时绑到 ``movieclaw_api.events``；
 没绑（命令行、单测）时一切走默认实现。
 """
 
@@ -29,40 +29,35 @@ logger = logging.getLogger("movieclaw_api.hooks")
 P = TypeVar("P")
 R = TypeVar("R")
 
-_bus: EventBus | None = None
+def _bus() -> EventBus | None:
+    from movieclaw_api import events
 
-
-def bind_bus(bus: EventBus) -> None:
-    global _bus
-    _bus = bus
-
-
-def unbind_bus(bus: EventBus) -> None:
-    global _bus
-    if _bus is bus:
-        _bus = None
+    return events.bus()
 
 
 def active(event: Event[Any, Any]) -> bool:
-    """有没有插件在听：没有就不必构造载荷（零开销的前半段）。"""
-    return _bus is not None and bool(_bus.listeners(event))
+    """有没有插件在听：没有就不必构造载荷（零开销的前半段）。
+
+    系统事件（「发生了什么」）不走这里，经 ``movieclaw_api.events.publish`` 产生。"""
+    bus = _bus()
+    return bus is not None and bool(bus.listeners(event))
 
 
 async def waterfall(
     event: Event[P, R], payload: P, *, terminal: Callable[[P], R | Awaitable[R]]
 ) -> R:
-    if not active(event):
+    bus = _bus()
+    if bus is None or not bus.listeners(event):
         result = terminal(payload)
         return await result if inspect.isawaitable(result) else result  # type: ignore[return-value]
-    assert _bus is not None
-    return await _bus.waterfall(event, payload, terminal=terminal)
+    return await bus.waterfall(event, payload, terminal=terminal)
 
 
 async def bail(event: Event[P, R], payload: P) -> R | None:
-    if not active(event):
+    bus = _bus()
+    if bus is None or not bus.listeners(event):
         return None
-    assert _bus is not None
-    return await _bus.bail(event, payload)
+    return await bus.bail(event, payload)
 
 
 class _Frozen(BaseModel):

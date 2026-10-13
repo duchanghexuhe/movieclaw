@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from movieclaw_kernel import Entry, Plugin
 from movieclaw_kernel.contracts import Version, check_requires, satisfies
@@ -88,8 +88,11 @@ class _Plugin(BaseModel):
     id: str = Field(max_length=64)
     title: str = Field(min_length=1, max_length=60)
     version: str
-    entry: str
-    runtime: Literal["process", "inline"] = "process"
+    entry: str = ""
+    runtime: Literal["process", "inline", "exec"] = "process"
+    #: 非 Python 插件（``exec``，plugin-ipc-http.md §9）：包里的可执行文件与它支持的平台
+    command: str | None = None
+    platforms: list[str] = Field(default_factory=list)
     sdk: str = "^1.0"
     description: str = Field(default="", max_length=500)
 
@@ -111,9 +114,24 @@ class _Plugin(BaseModel):
     @field_validator("entry")
     @classmethod
     def _entry(cls, value: str) -> str:
-        if not _MODULE.match(value):
+        if value and not _MODULE.match(value):
             raise ValueError("entry 须是模块名（如 group_blocklist）")
         return value
+
+    @model_validator(mode="after")
+    def _runtime_fields(self) -> _Plugin:
+        if self.runtime != "exec":
+            if not self.entry:
+                raise ValueError("entry 必填（入口模块名，如 group_blocklist）")
+            return self
+        parts = (self.command or "").split("/")
+        if not self.command or any(not p or p in (".", "..") for p in parts):
+            raise ValueError(
+                "runtime = exec 须给 command（包内可执行文件的相对路径，如 bin/bridge）"
+            )
+        if not self.platforms:
+            raise ValueError('runtime = exec 须给 platforms（如 ["linux/amd64", "linux/arm64"]）')
+        return self
 
 
 class _Permissions(BaseModel):
@@ -124,6 +142,9 @@ class _Permissions(BaseModel):
     network: bool = False
     callbacks: list[str] = Field(default_factory=list, max_length=8)
     """要开放的回调端点名（docs/design/plugin-callbacks.md §4.3）：外部平台能直接调进来的地址。"""
+    events: list[str] = Field(default_factory=list)
+    """要订阅的敏感事件（谁在什么时候看了什么，domain-events.md §6.3）：``playback.*``
+    或具体名字。"""
 
     @field_validator("callbacks")
     @classmethod
@@ -145,6 +166,27 @@ class Manifest(BaseModel):
     plugin: _Plugin
     requires: dict[str, str] = Field(default_factory=dict)
     permissions: _Permissions = Field(default_factory=_Permissions)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    """插件自己的事件（domain-events.md §7.2）：``{name, title}``，名字以插件 id 开头。"""
+    notifications: list[dict[str, Any]] = Field(default_factory=list)
+    """插件事件对应的通知规则：``{event, title, body, audience, level, default, open}``。"""
+
+    def declarations(self) -> Any:
+        """解析事件 / 通知 / 敏感事件声明；不合规抛 ``DeclarationError``。"""
+        from movieclaw_api.services.plugin_events import parse
+
+        return parse(
+            self.plugin.id,
+            self.plugin.title,
+            events=self.events,
+            notifications=self.notifications,
+            sensitive=self.permissions.events,
+        )
+
+    @property
+    def notifies_members(self) -> bool:
+        _, notifications, _ = self.declarations()
+        return any(n.reaches_members for n in notifications)
 
 
 # ---------------------------------------------------------------------- 校验
@@ -184,9 +226,25 @@ def read_archive(data: bytes) -> tuple[Manifest, zipfile.ZipFile]:
         raise PackageError(f"{MANIFEST} 的 {where} 不合规：{first['msg']}") from exc
     entry = manifest.plugin.entry
     names = set(archive.namelist())
-    if f"{entry}.py" not in names and f"{entry}/__init__.py" not in names:
+    if manifest.plugin.runtime == "exec":
+        if manifest.plugin.command not in names:
+            raise PackageError(f"插件包里找不到可执行文件 {manifest.plugin.command}")
+        here = current_platform()
+        if here not in manifest.plugin.platforms:
+            supported = "、".join(manifest.plugin.platforms)
+            raise PackageError(f"插件包只支持 {supported}，这台服务器是 {here}")
+    elif f"{entry}.py" not in names and f"{entry}/__init__.py" not in names:
         raise PackageError(f"插件包里找不到入口模块 {entry}.py 或 {entry}/__init__.py")
     return manifest, archive
+
+
+def current_platform() -> str:
+    """这台服务器的平台，写法与清单的 platforms 一致：``linux/amd64``、``darwin/arm64``。"""
+    import platform
+
+    machine = platform.machine().lower()
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    return f"{sys.platform.removesuffix('2')}/{arch.get(machine, machine)}"
 
 
 def check_compat(manifest: Manifest, *, reserved: set[str], operations: set[str]) -> None:
@@ -205,13 +263,26 @@ def check_compat(manifest: Manifest, *, reserved: set[str], operations: set[str]
     reason = check_requires(manifest.requires, third_party=True)
     if reason:
         raise PackageError(f"契约不兼容：{reason}")
+    from movieclaw_api.services.plugin_events import DeclarationError
+
+    try:
+        manifest.declarations()
+    except DeclarationError as exc:
+        raise PackageError(f"事件与通知声明不合规：{exc}") from exc
     from movieclaw_api.services.plugin_files import parse_grants
 
     try:
         parse_grants(manifest.permissions.paths)
     except ValueError as exc:
         raise PackageError(f"路径授权不合规：{exc}") from exc
+    from movieclaw_sdk.agent import PERMISSION_PREFIX
+
     for pattern in manifest.permissions.operations:
+        if pattern.startswith(PERMISSION_PREFIX):
+            # 调用 AI 助手（plugin-agent.md §5）：插件包最高 mclaw，能执行命令的不交给下载来的包
+            if pattern not in ("agent:none", "agent:mclaw"):
+                raise PackageError(f"插件包只能申请 agent:none 或 agent:mclaw（当前 {pattern}）")
+            continue
         if pattern.endswith(".*"):
             domain = pattern[:-2] + "."
             if not any(op.startswith(domain) for op in operations):
@@ -229,10 +300,20 @@ class Installed:
     entry: str
     runtime: str
     operations: list[str]
+    command: str | None = None
+    """``exec`` 插件包的可执行文件（相对版本目录）。"""
     paths: list[dict[str, str]] = field(default_factory=list)
     """批准的路径授权（``PLUGIN_FILES``）。"""
     callbacks: list[str] = field(default_factory=list)
     """批准开放的回调端点名（``PLUGIN_CALLBACKS``）。"""
+    events: list[dict[str, Any]] = field(default_factory=list)
+    """批准的插件事件声明（清单 ``[[events]]``）。"""
+    notifications: list[dict[str, Any]] = field(default_factory=list)
+    """批准的通知规则（清单 ``[[notifications]]``）。"""
+    sensitive: list[str] = field(default_factory=list)
+    """批准订阅的敏感事件（清单 ``[permissions] events``）。"""
+    members_allowed: bool = False
+    """用户批准了通知到普通成员。"""
     previous: dict[str, Any] | None = None
     """上一版的安装记录（version、title、entry、runtime、operations），回滚用。"""
     bad: list[str] = field(default_factory=list)
@@ -245,9 +326,14 @@ class Installed:
             "title": self.title,
             "entry": self.entry,
             "runtime": self.runtime,
+            "command": self.command,
             "operations": list(self.operations),
             "paths": [dict(p) for p in self.paths],
             "callbacks": list(self.callbacks),
+            "events": [dict(e) for e in self.events],
+            "notifications": [dict(n) for n in self.notifications],
+            "sensitive": list(self.sensitive),
+            "members_allowed": self.members_allowed,
         }
 
 
@@ -332,6 +418,9 @@ def extract(archive: zipfile.ZipFile, target: Path) -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(info) as src, dest.open("wb") as out:
                 shutil.copyfileobj(src, out)
+            # zip 里记着可执行位（非 Python 插件的二进制）：解出来要保留
+            if (info.external_attr >> 16) & 0o111:
+                os.chmod(dest, 0o755)
         if target.exists():
             shutil.rmtree(target)
         os.replace(tmp, target)
@@ -389,8 +478,36 @@ def _inline(path: Path, package: Installed) -> Plugin:
     raise PackageError(f"模块 {package.entry} 里没有名为 {package.id} 的插件")
 
 
+def declare(package: Installed) -> None:
+    """把用户批准的事件 / 通知 / 敏感事件声明交给插件事件服务（domain-events.md §7）。"""
+    from movieclaw_api.services import plugin_events
+
+    try:
+        events, notifications, sensitive = plugin_events.parse(
+            package.id,
+            package.title,
+            events=package.events,
+            notifications=package.notifications,
+            sensitive=package.sensitive,
+        )
+    except plugin_events.DeclarationError as exc:
+        logger.warning("插件包 %s 的事件声明不合规，按没有声明处理：%s", package.id, exc)
+        events, notifications, sensitive = {}, (), ()
+    plugin_events.declare(
+        plugin_events.Declared(
+            entry_id=package.id,
+            title=package.title,
+            events=events,
+            notifications=notifications,
+            sensitive=sensitive,
+            members_allowed=package.members_allowed,
+        )
+    )
+
+
 def entry_for(settings: object, package: Installed) -> Entry:
     """一个已安装的包 → 内核条目（独立进程或进程内）。出错只影响它自己。"""
+    declare(package)
     path = version_dir(settings, package.id, package.version)
     try:
         if package.runtime == "inline":
@@ -398,12 +515,16 @@ def entry_for(settings: object, package: Installed) -> Entry:
         else:
             from movieclaw_api.services.plugin_runtime import describe, remote_plugin
 
-            declared = describe(path, package.entry, package.id)
+            if package.command is not None:
+                # 打包时没记可执行位的也能跑：可执行文件由清单指名
+                os.chmod(path / package.command, 0o755)
+            declared = describe(path, package.entry, package.id, package.command)
             plugin = remote_plugin(
                 package.id,
                 title=f"{declared['title']}（独立进程）",
                 path=path,
                 module=package.entry,
+                command=package.command,
                 inject=tuple(declared["inject"]),
                 permissions=tuple(declared["permissions"]),
                 config_description=declared.get("config"),

@@ -951,8 +951,11 @@ def _device_view(
     assert device.id is not None
     spec = login_devices.spec_of(device.kind)
     push = None
-    if push_channels is not None and device.kind in push_registration.PUSH_KINDS:
-        status, text, _channel = push_me.device_status(device, push_channels)
+    # 实时通知设备不靠通道（cloud-push.md §4.1）：服务器没开推送通道时也照常显示
+    if device.kind in push_registration.PUSH_KINDS and (
+        push_channels is not None or device.push_stream
+    ):
+        status, text, _channel = push_me.device_status(device, push_channels or [])
         push = DevicePushView(status=status, status_text=text)
     username, nickname = owners.get(device.member_id, (f"#{device.member_id}", "已删除的成员"))
     return LoginDeviceView(
@@ -1212,9 +1215,7 @@ async def revoke_current_device(
     )
     await login_devices.revoke(session, device)
     # 设备自己退出登录：之后同一台登录回来，不给本人的其他设备推「新设备登录」
-    from movieclaw_api.services.push import events as push_events
-
-    await push_events.remember_signed_out(member_id, kind, installation_id)
+    await login_devices.remember_signed_out(member_id, kind, installation_id)
     return ok(None, message=f"已注销「{name}」")
 
 

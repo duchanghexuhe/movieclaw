@@ -24,10 +24,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusRestorer
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.input.key.KeyEventType
@@ -56,6 +54,11 @@ class ShellChrome {
 
 val LocalShellChrome = compositionLocalOf { ShellChrome() }
 
+/** 外壳记下的栈顶那页（只在回调里读，不参与界面刷新） */
+private class TopLayer {
+    var memory: io.movieclaw.androidtv.ui.components.LayerFocusMemory? = null
+}
+
 /** 这一页现在是否在屏幕上（页签根页在压栈期间仍然存活，但不可见） */
 val LocalPageVisible = compositionLocalOf { true }
 
@@ -68,10 +71,9 @@ val LocalStagePreview = compositionLocalOf<io.movieclaw.androidtv.ui.stage.Stage
 /**
  * 主界面外壳（TVMainView）：
  * - 左侧可收起的侧边栏（账号 / 搜索 / 首页）。平时只有左上角一枚「‹ 当前页」胶囊；在页面最左边再按左、
- *   或在页签根页按返回，展开侧边栏并把焦点交给它。侧边栏里上下移动不换页，按确认才切过去；选当前页签退回根页。
+ *   展开侧边栏并把焦点交给它。侧边栏里上下移动不换页，按确认才切过去；选当前页签退回根页。
  * - 每个页签一个导航栈，各自记住浏览位置；二级页盖满整屏、不显示胶囊。
- * - 返回键：页面里有二级页就退一层；焦点在侧边栏时收起侧边栏、焦点还给页面；页签根页上第一次返回展开侧边栏、
- *   第二次退出 App。
+ * - 返回键：侧边栏开着先收起它、焦点还给页面（同选当前页签）；页面里有二级页就退一层；页签根页上退出 App。
  * - 播放器盖在整个界面之上，有自己的返回键处理。
  */
 @OptIn(ExperimentalComposeUiApi::class)
@@ -81,7 +83,6 @@ fun MainShell(args: LaunchArgs) {
     val chrome = remember { ShellChrome() }
     val activity = androidx.activity.compose.LocalActivity.current
     var sidebarOpen by remember { mutableStateOf(false) }
-    var focusInSidebar by remember { mutableStateOf(false) }
     val pageFocus = remember { FocusRequester() }
     val sidebarFocus = remember { FocusRequester() }
     val saveable = rememberSaveableStateHolder()
@@ -126,9 +127,15 @@ fun MainShell(args: LaunchArgs) {
         sidebarOpen = true
     }
 
+    // 栈顶那页的焦点记忆：收起侧边栏、关掉播放器时焦点回到离开时那颗，没有记录再交给页面自己挑
+    val topLayer = remember { TopLayer() }
+    fun focusPage() {
+        if (topLayer.memory?.restore() != true) runCatching { pageFocus.requestFocus() }
+    }
+
     fun closeSidebar() {
         sidebarOpen = false
-        runCatching { pageFocus.requestFocus() }
+        focusPage()
     }
 
     LaunchedEffect(sidebarOpen) {
@@ -140,14 +147,14 @@ fun MainShell(args: LaunchArgs) {
 
     BackHandler(enabled = router.player == null) {
         when {
-            focusInSidebar && router.stack.isNotEmpty() -> closeSidebar()
-            focusInSidebar -> activity?.finish()
+            sidebarOpen -> closeSidebar()
             router.pop() -> Unit
-            else -> openSidebar()
+            else -> activity?.finish()
         }
     }
 
-    CompositionLocalProvider(LocalRouter provides router, LocalShellChrome provides chrome, LocalStagePreview provides preview,
+    // 自动播放预告默认关：不提供预告控制器，首页 / 详情页只放静态剧照（开关在「谁在看」页）
+    CompositionLocalProvider(LocalRouter provides router, LocalShellChrome provides chrome, LocalStagePreview provides preview.takeIf { graph.autoPreview },
         LocalHomeStore provides homeStore,
         io.movieclaw.androidtv.ui.detail.LocalUpNextUnit provides upNextUnit,
     ) {
@@ -159,7 +166,6 @@ fun MainShell(args: LaunchArgs) {
                     .fillMaxSize()
                     .focusRequester(pageFocus)
                     .focusRestorer()
-                    .focusProperties { canFocus = !sidebarOpen }
                     // 页面最左边再按左：展开侧边栏。按键冒泡到这里说明页面里没人处理，先试着往左挪焦点，挪不动才展开
                     .onKeyEvent { event ->
                         if (event.type != KeyEventType.KeyDown || event.nativeKeyEvent.keyCode != android.view.KeyEvent.KEYCODE_DPAD_LEFT) {
@@ -179,6 +185,7 @@ fun MainShell(args: LaunchArgs) {
                     androidx.compose.runtime.key(key) {
                         val layerFocus = remember { FocusRequester() }
                         val memory = remember { io.movieclaw.androidtv.ui.components.LayerFocusMemory() }
+                        if (visible) androidx.compose.runtime.SideEffect { topLayer.memory = memory }
                         Box(
                             Modifier
                                 .fillMaxSize()
@@ -234,7 +241,6 @@ fun MainShell(args: LaunchArgs) {
                 Sidebar(
                     current = router.tab,
                     focusRequester = sidebarFocus,
-                    modifier = Modifier.onFocusChanged { focusInSidebar = it.hasFocus },
                     onSelect = {
                         router.select(it)
                         closeSidebar()
@@ -245,7 +251,7 @@ fun MainShell(args: LaunchArgs) {
             router.player?.let { request ->
                 PlayerScreen(request, onClose = {
                     router.closePlayer()
-                    runCatching { pageFocus.requestFocus() }
+                    focusPage()
                 })
             }
         }

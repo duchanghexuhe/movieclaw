@@ -39,7 +39,6 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -187,7 +186,8 @@ fun GenreCard(label: String, count: Long, mediaKind: String, cover: String?, onC
             )
             Text(
                 "$count 部${if (mediaKind == "tv") "剧集" else "电影"}",
-                style = McType.size(24).copy(fontFamily = FontFamily.Monospace),
+                // 数字等宽即可（原先整行等宽字体：西文是 Droid Sans Mono，「12  部剧集」中间空出一大截）
+                style = McType.size(24).copy(fontFeatureSettings = "tnum"),
                 color = Color.White.copy(alpha = 0.72f),
                 modifier = Modifier.align(Alignment.BottomStart).padding(start = 30.pt, bottom = 29.pt),
             )

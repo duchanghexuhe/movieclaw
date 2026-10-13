@@ -53,6 +53,7 @@ import androidx.tv.material3.Surface
 import io.movieclaw.androidtv.core.model.generated.EpisodeView
 import io.movieclaw.androidtv.ui.components.McIcons
 import io.movieclaw.androidtv.ui.components.Text
+import io.movieclaw.androidtv.ui.stage.episodeTitle
 import io.movieclaw.androidtv.ui.theme.McColors
 import io.movieclaw.androidtv.ui.theme.McType
 import io.movieclaw.androidtv.ui.theme.pt
@@ -74,6 +75,8 @@ internal fun EpisodePanel(
     startRange: Int,
     onPick: (Long) -> Unit,
     onClose: () -> Unit,
+    heading: String = "全部分集",
+    pickHint: String = "按确认回到详情页，焦点落在这一集",
 ) {
     var range by remember { mutableIntStateOf(startRange.coerceIn(0, ranges.lastIndex)) }
     var focused by remember { mutableStateOf<EpisodeView?>(null) }
@@ -103,7 +106,7 @@ internal fun EpisodePanel(
             .focusGroup(),
     ) {
         Row(Modifier.padding(start = 96.pt, top = 70.pt), verticalAlignment = Alignment.Bottom) {
-            Text("全部分集", style = McType.size(44, FontWeight.Bold))
+            Text(heading, style = McType.size(44, FontWeight.Bold))
             val owned = episodes.count { it.owned }
             Text(
                 listOfNotNull(title, "在库 $owned / ${episodes.size}").joinToString(" · "),
@@ -182,11 +185,11 @@ internal fun EpisodePanel(
             val current = focused
             if (current != null) {
                 Text(
-                    listOfNotNull("第 ${current.episodeNumber} 集", current.name).joinToString(" · "),
+                    listOfNotNull("第 ${current.episodeNumber} 集", episodeTitle(current.name)).joinToString(" · "),
                     style = McType.size(28, FontWeight.SemiBold),
                     maxLines = 1,
                 )
-                Text("${cellStatus(current)} · 按确认回到详情页，焦点落在这一集", style = McType.size(24), color = McColors.TextMuted)
+                Text("${cellStatus(current)} · $pickHint", style = McType.size(24), color = McColors.TextMuted)
             } else {
                 Text("上下换段，往右进宫格", style = McType.size(24), color = McColors.TextMuted)
             }

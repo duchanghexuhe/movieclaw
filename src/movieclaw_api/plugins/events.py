@@ -4,6 +4,9 @@
 监听器。本插件停用时那些插件因缺依赖进入等待；业务侧照常写事件行（名单由库里的消费者行决定），恢复后补投。
 
 ``kernel.host-ops`` 提供 ``HOST_OPS``：插件以自己的身份调用本进程的 OpenAPI 操作。
+
+``kernel.plugin-jobs`` 提供 ``PLUGIN_JOBS``：插件建自己的后台任务
+（docs/design/plugin-strm-prefetch.md §2）。
 """
 
 from __future__ import annotations
@@ -18,6 +21,8 @@ from movieclaw_api.plugins.keys import (
     PLUGIN_ROUTES,
 )
 from movieclaw_kernel import DURABLE_EVENTS, Context, plugin
+from movieclaw_sdk.events import PLUGIN_EVENTS
+from movieclaw_sdk.jobs import JOB_HANDLERS, PLUGIN_JOBS
 
 
 @plugin(
@@ -36,6 +41,21 @@ async def durable_events(ctx: Context) -> None:
     ctx.effect(store.close, label="close-durable-events")
     store.start_housekeeping()
     ctx.provide(DURABLE_EVENTS, store)
+
+
+@plugin(
+    "kernel.plugin-events",
+    title="插件事件",
+    provides=(PLUGIN_EVENTS,),
+    disableable=True,
+    reloadable=True,
+)
+async def plugin_events(ctx: Context) -> None:
+    """让插件登记并发出自己的事件：别的插件、Webhook 能订；插件声明了通知、经你批准的，
+    会推到手机和 IM。"""
+    from movieclaw_api.services.plugin_events import PluginEvents
+
+    ctx.provide(PLUGIN_EVENTS, PluginEvents())
 
 
 @plugin(
@@ -75,6 +95,21 @@ async def plugin_data(ctx: Context) -> None:
     from movieclaw_api.services.plugin_data import PluginDataService
 
     ctx.provide(PLUGIN_DATA, PluginDataService(ctx.use(DB)))
+
+
+@plugin(
+    "kernel.plugin-jobs",
+    title="插件任务",
+    inject=(DB,),
+    provides=(PLUGIN_JOBS,),
+    disableable=True,
+    reloadable=True,
+)
+async def plugin_jobs(ctx: Context) -> None:
+    """让插件把耗时的活交给后台任务：排队、进度、断点续跑、取消都由任务中心统一管理。"""
+    from movieclaw_api.services.plugin_jobs import PluginJobsService
+
+    ctx.provide(PLUGIN_JOBS, PluginJobsService(ctx.registry(JOB_HANDLERS)))
 
 
 @plugin(

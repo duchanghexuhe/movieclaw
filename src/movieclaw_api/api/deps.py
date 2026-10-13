@@ -10,7 +10,7 @@ from movieclaw_api.exceptions import AppException, ForbiddenException, Unauthori
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.settings.schemas import get_sync_setting
-from movieclaw_kernel import Origin, current_origin
+from movieclaw_kernel import AGENT_MARK, Origin, current_origin
 
 
 def _extract_bearer(authorization: str | None) -> str | None:
@@ -63,6 +63,11 @@ async def optional_login(
             session_token, ip=ip, user_agent=user_agent
         )
     elif bearer := _extract_bearer(authorization):
+        if bearer.startswith(auth_service.PLUGIN_TOKEN_PREFIX) and not connection.scope.get(
+            auth_service.PLUGIN_GATEWAY_SCOPE
+        ):
+            # 插件令牌只在插件网关上有效：泄露了也不能从网络入口使用（plugin-ipc-http.md §4.6）
+            raise UnauthorizedException("插件凭证只能经插件网关使用")
         principal = await auth_service.verify_bearer_token(bearer, ip=ip, user_agent=user_agent)
     if principal is not None:
         _attribute(principal)
@@ -78,6 +83,10 @@ def _attribute(principal: Principal) -> None:
     origin = current_origin.get()
     if principal.plugin is not None:
         current_origin.set(Origin(kind="plugin", id=principal.plugin.entry_id, chain=origin.chain))
+    elif principal.kind == "agent":
+        # Agent 的工具调用：链首打上标记，之后经事件、插件一路带着，插件据此不能再发起 Agent
+        chain = origin.chain if AGENT_MARK in origin.chain else (AGENT_MARK, *origin.chain)
+        current_origin.set(Origin(kind="agent", id=principal.name, chain=chain))
     elif origin.kind == "system" and not origin.chain:
         if principal.kind == "member":
             current_origin.set(Origin(kind="member", id=str(principal.member_id)))

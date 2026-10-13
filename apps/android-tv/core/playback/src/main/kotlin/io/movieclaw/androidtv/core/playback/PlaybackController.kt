@@ -463,6 +463,13 @@ class PlaybackController(
         startUnit(PlaybackUnit(unit.mediaItemId, unit.season, previous.episodeNumber))
     }
 
+    /** 选集面板挑的一集（同一季、有片源）；正在放的这一集不动 */
+    fun playEpisode(number: Long) {
+        noteUserActivity()
+        if (!unit.isEpisode || number == unit.episode || s.episodes.none { it.episodeNumber == number && it.owned }) return
+        startUnit(PlaybackUnit(unit.mediaItemId, unit.season, number))
+    }
+
     // ======================================================================
     // 自动播下一集 / 跳过
     // ======================================================================

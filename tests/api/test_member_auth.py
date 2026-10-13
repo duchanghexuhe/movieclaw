@@ -590,6 +590,8 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/artwork"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/episodes"),
+    # 详情页相似推荐：候选按 visible_library_ids 与内容分级收窄（与跨库墙同一口径）
+    ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/similar"),
     # 合集是成员的浏览面：列表按三层可见性收口（私有只对本人、库不可见就不下发、
     # 成员条目再过一遍），私有合集与不可见库里的合集一律按 404 拒绝而不是空列表。
     # 写操作（建/改/删）同样开放给成员——那是他自己的合集，household 的合集
@@ -713,6 +715,9 @@ _MEMBER_ALLOWLIST = {
     ("DELETE", "/api/v1/push/me/muted-items/{item_id}"),
     ("PUT", "/api/v1/push/me/registration"),
     ("DELETE", "/api/v1/push/me/registration"),
+    # 实时通知（cloud-push.md §4.1）：只读、只确认这台设备自己的发件箱（按设备凭证定位）
+    ("GET", "/api/v1/push/me/stream"),
+    ("POST", "/api/v1/push/me/ack"),
     # 推送配图：公开区（地址自带签名），成员自然可达
     ("GET", "/api/v1/push/images/{token}"),
     # 使用提示（docs/design/tips.md）：只读写自己的事件计数与提示记录（按 owner_id 存）

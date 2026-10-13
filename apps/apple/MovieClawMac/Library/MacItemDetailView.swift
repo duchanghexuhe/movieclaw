@@ -5,7 +5,7 @@ import SwiftUI
 ///   下面一排按钮：主按钮写明播哪一集、从哪儿接着播（「继续 第 1 季第 3 集 · 12:34」），「从头播放」，
 ///   收藏、标为已看折成圆形玻璃钮；右下角浮「导演 / 主演」两行（同 Apple TV App）；
 /// - **往下**（垫着同一张剧照的模糊版）：选季（一排胶囊）→ 分集横排（剧照、第几集、集名、简介、首播日期，点一下就播）
-///   → 电影的作品系列 → 演职员（圆头像，点进影人页）→ 所属合集 → 信息（原名、类型、评分、文件版本），
+///   → 演职员（竖版人物卡，点进影人页）→ 相似推荐 → 电影的作品系列 → 所属合集 → 信息（原名、类型、评分、文件版本），
 ///   相当于 Apple Music 专辑页的曲目表与底部的发行信息。
 ///
 /// 数据与 iPhone、Apple TV 版同一套：`libraryItemsGet` 拿详情（含演职员）、`playbackResume` 拿续播点、
@@ -40,6 +40,8 @@ struct MacItemDetailView: View {
     @State private var showsAllEpisodes = false
     @State private var watched: API.PlaybackStateView?
     @State private var series: API.CollectionSeriesView?
+    /// 相似推荐（只在自己库里挑；有系列一行时排除同系列的片，见 `ItemRelated`）
+    @State private var similar: [API.LibraryItemView] = []
     @State private var favorite: Bool?
     @State private var marking = false
     /// 在下面点播的那一集：播完回来头图改讲它
@@ -266,13 +268,12 @@ struct MacItemDetailView: View {
                 episodeShelf(detail)
             }
         }
-        if let series { seriesShelf(series) }
         let people = Self.castPeople(detail)
         if !people.isEmpty {
-            MacShelf(title: "演职员", artHeight: MacMetrics.avatarSize) {
+            MacShelf(title: "演职员", artHeight: MacMetrics.castWidth * 1.5) {
                 ForEach(Array(people.enumerated()), id: \.offset) { _, person in
                     MacPersonCard(name: person.name, role: person.role,
-                                  avatarURL: api.image(person.avatar, width: ImageWidth.points(MacMetrics.avatarSize)),
+                                  avatarURL: api.image(person.avatar, width: ImageWidth.points(MacMetrics.castWidth)),
                                   linked: person.personId != nil) {
                         guard let id = person.personId else { return }
                         router.push(.person(tmdbId: id, name: person.name, avatar: person.avatar, fromItem: itemId))
@@ -281,6 +282,9 @@ struct MacItemDetailView: View {
                 }
             }
         }
+        // 演职员 → 相似推荐 → 系列（与 iPhone、Apple TV、Web 同一个顺序，2026-10-12 用户定）
+        if !similar.isEmpty { similarShelf }
+        if let series { seriesShelf(series) }
         if !otherCollections(detail).isEmpty { collectionsRow(detail) }
         infoSection(detail)
     }
@@ -393,6 +397,23 @@ struct MacItemDetailView: View {
         let missing = episodes.filter { !$0.owned }.count
         if missing > 0 { parts.append("缺 \(missing) 集") }
         return parts.joined(separator: " · ")
+    }
+
+    /// 相似推荐：只推自己库里有的片，点进那一部的详情
+    private var similarShelf: some View {
+        MacShelf(title: "相似推荐", artHeight: MacMetrics.posterWidth * 1.5) {
+            ForEach(similar, id: \.mediaItemId) { item in
+                MacPosterCard(
+                    title: item.title,
+                    subtitle: item.year.map(String.init),
+                    imageURL: api.image(item.posterUrl, width: ImageWidth.macCard(MacMetrics.posterWidth)),
+                    play: { router.play(PlayRequest(mediaItemId: item.mediaItemId)) }
+                ) {
+                    router.push(.item(libraryId: item.libraryId ?? libraryId, itemId: item.mediaItemId))
+                }
+                .accessibilityIdentifier("mac-similar-\(item.mediaItemId)")
+            }
+        }
     }
 
     /// 电影的作品系列：整个系列按上映顺序，库里没有的置灰标「未入库」，这一部标「本片」
@@ -529,6 +550,8 @@ struct MacItemDetailView: View {
     private func reload() async {
         do {
             let fresh = try await api.libraryItemsGet(libraryId: libraryId, mediaItemId: itemId)
+            // 相似推荐与系列和分集并行拉（规则见 `ItemRelated`）
+            async let related = ItemRelated.load(api: api, libraryId: libraryId, detail: fresh)
             if fresh.kind == "tv", season == nil {
                 // 在「接下来继续」里的剧打开那一季；别的打开第一个有片源的季（综艺常只收了最新一季）。集取这一季的锚点。
                 // 分集读完再出页面，不闪「还没有可播放的分集」
@@ -546,24 +569,15 @@ struct MacItemDetailView: View {
                     lockBrowse(selectedEpisode?.episodeNumber)
                 }
             }
-            await loadSeries(fresh)
+            let rows = await related
+            series = rows.series
+            similar = rows.similar
             detail = fresh
             failed = nil
         } catch is CancellationError {
         } catch {
             if detail == nil { failed = "条目可能已被删除或重新识别为其他作品。（\(error.localizedDescription)）" }
         }
-    }
-
-    /// 电影所属的作品系列：只有一部、或拉不到上游档案时不出这一行
-    private func loadSeries(_ detail: API.LibraryItemDetailView) async {
-        guard detail.kind != "tv", let id = detail.seriesCollectionId,
-              let fresh = try? await api.collectionSeriesGet(collectionId: id),
-              fresh.available, fresh.parts.count > 1 else {
-            series = nil
-            return
-        }
-        series = fresh
     }
 
     @discardableResult
@@ -833,7 +847,7 @@ private struct MacEpisodeCard: View {
     }
 }
 
-/// 演职员一格：圆头像 + 姓名 + 身份（导演 / 饰 X）。有 TMDB 影人 id 的点进影人页；悬停时头像套一圈亮边
+/// 演职员一格：2:3 竖版照片（同 iPhone / Apple TV，2026-10-12 用户要求换掉圆头像；没照片画姓名首字）+ 姓名 + 身份（导演 / 饰 X）。有 TMDB 影人 id 的点进影人页；悬停时照片套一圈亮边
 struct MacPersonCard: View {
     let name: String
     let role: String?
@@ -844,11 +858,24 @@ struct MacPersonCard: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 8) {
-                MacAvatar(url: avatarURL, name: name, size: MacMetrics.avatarSize)
-                    .overlay { Circle().strokeBorder(.white.opacity(hovering && linked ? 0.8 : 0.1), lineWidth: hovering && linked ? 2 : 0.5) }
-                    .shadow(color: .black.opacity(0.3), radius: hovering ? 8 : 3, y: 2)
-                VStack(spacing: 2) {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack {
+                    LinearGradient(colors: [Color(white: 0.3), Color(white: 0.16)], startPoint: .top, endPoint: .bottom)
+                    Text(MacAvatar.initials(name))
+                        .font(.system(size: MacMetrics.castWidth * 0.3, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.35))
+                    if let avatarURL {
+                        RemoteImage(url: avatarURL, placeholderText: "")
+                    }
+                }
+                .frame(width: MacMetrics.castWidth, height: MacMetrics.castWidth * 1.5)
+                .clipShape(.rect(cornerRadius: MacMetrics.cardCorner))
+                .overlay {
+                    RoundedRectangle(cornerRadius: MacMetrics.cardCorner)
+                        .strokeBorder(.white.opacity(hovering && linked ? 0.8 : 0.1), lineWidth: hovering && linked ? 2 : 0.5)
+                }
+                .shadow(color: .black.opacity(0.3), radius: hovering ? 8 : 3, y: 2)
+                VStack(alignment: .leading, spacing: 2) {
                     Text(name)
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
@@ -858,7 +885,7 @@ struct MacPersonCard: View {
                         .lineLimit(1)
                 }
             }
-            .frame(width: MacMetrics.avatarSize + 24)
+            .frame(width: MacMetrics.castWidth)
             .contentShape(.rect)
         }
         .buttonStyle(MacCardButtonStyle())

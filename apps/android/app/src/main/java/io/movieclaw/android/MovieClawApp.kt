@@ -42,5 +42,7 @@ class MovieClawApp : Application() {
                 if (phase == SessionPhase.READY) qoe.flushPending()
             }
         }
+        // 实时通知（core/push）：用户开着就随 App 启动拉起前台服务（开机由 PushStreamBootReceiver 拉起）
+        scope.launch { io.movieclaw.android.core.push.PushStreamController.startIfEnabled(this@MovieClawApp) }
     }
 }

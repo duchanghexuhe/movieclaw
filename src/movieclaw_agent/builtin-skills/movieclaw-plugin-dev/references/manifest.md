@@ -24,12 +24,12 @@ id = "media-stats"          # 必填。小写字母开头，字母、数字、�
 title = "媒体统计"              # 必填。1～60 字，管理页显示
 version = "0.1.0"              # 必填。主.次.修订，可带 -后缀（开发循环自动加 -dev.<时间戳>）
 entry = "media_stats"          # 必填。入口模块名（不是路径，不带 .py）
-runtime = "process"            # process（默认）| inline（需单独批准）
+runtime = "process"            # process（默认）| inline（需单独批准）| exec（非 Python 插件，见下）
 sdk = "^1.0"                   # 要求的 movieclaw_sdk 版本区间
 description = "一句话说明"       # 可选，500 字以内；展示在「设置 → 插件」详情页给用户看，写它能做什么，别写文档路径、开发备注
 
 [requires]                     # 用到的契约 = 版本区间；名字见 scripts/contracts.py
-"library.ingest.imported" = "^1.0"
+"library.ingest.completed" = "^1.0"
 "subscription.candidates.filter" = "^1.0"
 
 [permissions]
@@ -37,9 +37,41 @@ operations = ["library.list", "subscriptions.get"]       # 宿主操作 id
 paths = [{ path = "staging", mode = "read" }]            # 路径授权，mode = read | rw
 network = true                                           # 需要直连外网（仅声明）
 callbacks = ["push"]                                     # 要开放的回调端点名（外部平台调进来的地址，见 recipes 第 14 节）
+events = ["playback.*"]                                  # 要订阅的敏感事件（谁在什么时候看了什么）：用户单独批准
+
+[[events]]                     # 插件自己会发的事件（recipes 第 17 节）：名字以插件 id 开头
+name = "media-stats.weekly-report"
+title = "周报生成了"
+
+[[notifications]]              # 事件对应的通知：经用户批准后由宿主推到手机和 IM
+event = "media-stats.weekly-report"
+title = "本周看了 {hours} 小时"  # {字段} 换成事件载荷里的值（{media.title} 这样取嵌套字段）
+body = "最常看的是《{top_title}》"
+audience = "admins"            # admins | member:<字段> | media:<字段>；<字段> 是事件载荷里的字段名（嵌套用 a.b）：
+                               #   member: 那个字段的值是成员 id（整数）；media: 那个字段的值是片 {id, kind, title}
+                               #   （Python 插件用 MediaRef），推给订阅或关注了这部片的人
+level = "active"               # active（响）| passive（安静送达）
+default = true                 # 每个人的开关默认开不开
+open = "plugin"                # 点开去哪：plugin（插件页）| media（载荷里那部片的条目页）
 ```
 
-清单不允许出现未知字段（写错字段名会被拒）。
+清单不允许出现未知字段（写错字段名会被拒）。会通知到普通成员的（`member:` / `media:`）批准时要单独勾选；
+通知上会标「来自 插件名」。
+
+
+**非 Python 插件**（Go、Rust 等，`runtime = "exec"`）：不写 `entry`，改写包里的可执行文件和它支持的平台。
+宿主先经可信启动器降权，再执行它；协议见 `$SRC/movieclaw_sdk/protocol/`（`gateway.json`、`control.json`），
+完整示例是 `examples/go-a2a-bridge/`（用 Go 写的 A2A 桥，驱动 AI 助手）。
+
+```toml
+[plugin]
+id = "go-a2a-bridge"
+title = "A2A 桥（Go）"
+version = "0.1.0"
+runtime = "exec"
+command = "bin/bridge"                        # 包内可执行文件（打包前编好，按服务器平台编译）
+platforms = ["linux/amd64", "linux/arm64"]    # 必填；与服务器平台不符的包装不上
+```
 
 ## 3. 版本区间写法
 

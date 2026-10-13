@@ -33,9 +33,22 @@ def friendly_error(exc: Exception) -> str:
     if isinstance(exc, (TrackerNetworkError, httpx.TimeoutException, httpx.ConnectError)):
         return "无法连接站点，请检查网络、代理，或确认站点当前是否可访问"
     if isinstance(exc, TrackerParseError):
+        if (exc.details or {}).get("login_redirect"):
+            return (
+                "登录已失效：站点把请求重定向到了登录页（Cookie 已过期或不完整），"
+                "请在浏览器重新登录该站点后再同步 Cookie"
+            )
         return "站点响应格式异常：可能站点已改版，或凭据实际已失效导致返回了登录页"
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
+        # Cloudflare 人机挑战（Managed Challenge）会带 cf-mitigated: challenge 响应头。
+        # 这与凭据本身无关：cf_clearance 绑定浏览器的 User-Agent 与出口 IP，
+        # 服务端换了 UA/IP 去请求依然会被拦截
+        if exc.response.headers.get("cf-mitigated") == "challenge":
+            return (
+                f"被 Cloudflare 人机验证拦截（状态码 {code}）：cf_clearance 绑定浏览器的 "
+                "User-Agent 与出口 IP，仅同步 Cookie 通常无法通过"
+            )
         if code in (401, 403):
             return f"站点拒绝访问（状态码 {code}），凭据可能已失效，请重新验证或更新凭据"
         if code == 429:

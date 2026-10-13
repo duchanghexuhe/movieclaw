@@ -84,4 +84,16 @@ class EpisodeRangesTest {
         assertNull(EpisodeRanges.resumeTag(fresh, null))
         assertEquals(1L, EpisodeRanges.anchor(fresh, null)?.episodeNumber)
     }
+
+    @Test
+    fun panelRangesCoverShortSeasonsWithOneRange() {
+        // 播放器的选集面板：50 集以内整季一段（编号不从 1 开始也照实写）
+        assertEquals(listOf("1–24"), EpisodeRanges.panelRanges(season(24)).map { it.label })
+        val numbered = (61L..90L).map { ep(it) }
+        val single = EpisodeRanges.panelRanges(numbered).single()
+        assertEquals("61–90", single.label)
+        assertTrue(single.contains(75) && !single.contains(91))
+        assertEquals(EpisodeRanges.ranges(season(175)), EpisodeRanges.panelRanges(season(175)))
+        assertTrue(EpisodeRanges.panelRanges(emptyList()).isEmpty())
+    }
 }

@@ -3,6 +3,7 @@ package io.movieclaw.androidtv.ui.components
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Backspace
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Language
@@ -61,6 +62,8 @@ object McIcons {
     val Restart = Icons.Filled.SkipPrevious
     /** forward.end.fill */
     val SkipForward = Icons.Filled.SkipNext
+    /** list.number（播放器的「选集」） */
+    val Episodes = Icons.AutoMirrored.Filled.PlaylistPlay
     /** plus */
     val Plus = Icons.Filled.Add
     /** rectangle.portrait.and.arrow.right */
