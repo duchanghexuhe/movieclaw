@@ -2753,7 +2753,7 @@ function FileRow({
             预转码
           </span>
         )}
-        {/* 预转码：本行是源文件且该行有活跃/失败任务时展示状态；没下过单给「转便携版」入口 */}
+        {/* 预转码：本行是源文件且该行有活跃/失败任务时展示状态；没下过单给「预转码」入口 */}
         {preloadTask && file.state !== "trashed" && (
           <span
             className={`shrink-0 rounded border px-1.5 py-px text-micro ${

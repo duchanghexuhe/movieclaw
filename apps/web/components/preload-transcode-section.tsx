@@ -79,7 +79,7 @@ export function TranscodeSection() {
   const runCleanup = useCallback(async () => {
     if (!cleanupPreview) return;
     const ok = await confirm({
-      title: `清理 ${cleanupPreview.count} 个长期未播的便携版本？`,
+      title: `清理 ${cleanupPreview.count} 个长期未播的预转码产物？`,
       description: `将释放约 ${formatGB(cleanupPreview.total_bytes)}。删除后可在影片详情页重新下单转码。`,
       confirmLabel: "确认清理",
       cancelLabel: "先不",
@@ -135,7 +135,7 @@ export function TranscodeSection() {
         <>
           <SettingsList>
             {tasks.length === 0 ? (
-              <SettingsEmpty title="还没有预转码任务" description="在影片详情页的文件区点「转便携版」下单。" />
+              <SettingsEmpty title="还没有预转码任务" description="在影片详情页的文件区或「预转码」弹窗里下单。" />
             ) : (
               tasks.map((task) => (
                 <SettingsRow
@@ -199,7 +199,7 @@ export function TranscodeSection() {
 
           <SettingsSection
             title="清理冷数据"
-            description="删除「N 天未播」的便携版本。执行前先预览将删列表与可释放总量。"
+            description="删除「N 天未播」的预转码产物。执行前先预览将删列表与可释放总量。"
           >
             <SettingsList>
               <SettingsRow label="未播天数" description="超过这么多天没有播放记录的版本视为冷数据">
@@ -223,7 +223,7 @@ export function TranscodeSection() {
             {cleanupPreview && (
               <Banner tone="info">
                 {cleanupPreview.count === 0 ? (
-                  "没有超过阈值的便携版本。"
+                  "没有超过阈值的预转码产物。"
                 ) : (
                   <>
                     将删除 {cleanupPreview.count} 个版本，释放约{" "}
