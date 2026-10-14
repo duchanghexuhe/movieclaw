@@ -654,6 +654,7 @@ _MEMBER_ALLOWLIST = {
     # 预转码用户面（preload-transcode.md §3）：逐部/逐集手动下单便携版本，
     # 详情页按钮是成员使用面（配额预检是机制行为，下单不涉及管理权）
     ("GET", "/api/v1/preload/presets"),
+    ("GET", "/api/v1/preload/overview"),
     ("POST", "/api/v1/preload/estimate"),
     ("POST", "/api/v1/preload/tasks"),
     ("GET", "/api/v1/preload/tasks"),

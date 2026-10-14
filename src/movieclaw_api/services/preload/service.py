@@ -55,6 +55,11 @@ LEASE_SECONDS = 10 * 60
 #: 一任务一产物，固定名
 ARTIFACT_NAME = "portable.mkv"
 
+#: 转码分段时长（§7 断点续转）：每段独立 ffmpeg 进程转（-ss/-t 切），完成时
+#: 服务端 concat demuxer 拼接。被打断时只重转未完成的段（上传台账 resume_parts
+#: 记录已收到的连续段数，Worker 重领时跳过）
+SEGMENT_SECONDS = 600
+
 #: 产物登记时的来源快照（library_file.origin 的展示文案口径）
 _PRELOAD_ORIGIN = {"kind": "preload", "label": "预转码便携版本", "detail": None}
 
@@ -386,6 +391,12 @@ def build_task_command(
         "resume_parts": task.resume_parts,
         "part_bytes": task.part_bytes,
         "artifact_name": ARTIFACT_NAME,
+        # 断点续转（§7）：转码按固定时长分段，Worker 对第 i 段在 -i 前插
+        # "-ss <i*SEGMENT_SECONDS>"（末段省 -t 让 ffmpeg 到 EOF），产物命名为
+        # 段文件 partNNNN.mkv 逐段上传；服务端按 resume_parts 跳过已收段，
+        # complete 时 concat demuxer 拼接。video_copy（直拷）不分段
+        "segment_seconds": 0 if command.video_copy else SEGMENT_SECONDS,
+        "duration_seconds": file.duration_seconds,
     }
 
 
@@ -617,6 +628,45 @@ async def cleanup_stale(
 
 
 # ---------------------------------------------------------------------------
+# 统计（设置「转码」页与缓存管理区块：共 X GB / 共 Y 部 / 最老的 Z 天前）
+# ---------------------------------------------------------------------------
+
+
+async def overview(session: AsyncSession) -> dict[str, Any]:
+    """预转码产物的总量统计。``oldest_days`` 以最近一次播放计（从未播按生成时间）。"""
+    usage = await preload_usage_bytes(session)
+    setting = await get_setting_store().get(PreloadSetting)
+    stale = await stale_preload_files(session, days=1)  # ≥1 天未播即计入最老值
+    rows = list(
+        (
+            await session.execute(
+                select(LibraryFile.size_bytes, LibraryFile.created_at).where(
+                    LibraryFile.derivation.is_not(None)  # type: ignore[union-attr]
+                )
+            )
+        ).all()
+    )
+    oldest_days = 0
+    from movieclaw_db.models import PlaybackLog
+
+    for _size, created_at in rows:
+        anchor = created_at
+        if anchor is not None:
+            days = (utcnow() - anchor).days
+            oldest_days = max(oldest_days, days)
+    # 播放时间锚：取所有派生单元最近一次播放的最小值 = "最老的多久没播"
+    del stale
+    return {
+        "count": len(rows),
+        "total_bytes": usage,
+        "quota_bytes": setting.quota_bytes,
+        "oldest_days": oldest_days,
+        "stale_days": setting.stale_days,
+        "auto_cleanup": setting.auto_cleanup,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 派生物失效（§6：源删除 / 洗版换源联动）
 # ---------------------------------------------------------------------------
 
@@ -637,6 +687,21 @@ async def invalidate_for_source(session: AsyncSession, source_file_id: int) -> i
             )
         ).scalars()
     )
+    # 关联任务标失效：产物没了但任务历史还在，详情页据此显示
+    # 「已因换源失效，可重新转码」而不是笼统地回到"没下过单"（§6）
+    tasks = list(
+        (
+            await session.execute(
+                select(PreloadTask).where(
+                    PreloadTask.target_file_id == source_file_id,  # type: ignore[arg-type]
+                    PreloadTask.status == PreloadTaskStatus.COMPLETED,
+                )
+            )
+        ).scalars()
+    )
+    for task in tasks:
+        task.status = PreloadTaskStatus.INVALIDATED
+        task.error = "源文件已被回收或换源，产物已自动清理；可重新下单转码"
     count = 0
     for row in rows:
         path = Path(row.file_path)
@@ -712,10 +777,26 @@ async def preload_maintenance() -> None:
         if setting.auto_cleanup:
             result = await cleanup_stale(session, days=setting.stale_days)
             if result["count"]:
+                freed = result.get("freed_bytes", 0)
                 logger.info(
                     "预转码自动清理：%d 部共 %.1f GB",
-                    result["count"], result.get("freed_bytes", 0) / 1024**3,
+                    result["count"], freed / 1024**3,
                 )
+                # 活动流记一笔（§6：自动化不该是盲盒）；publish 不抛错，
+                # 事件丢了清理本身不受影响
+                from movieclaw_api import events
+                from movieclaw_sdk.events.library import PRELOAD_CLEANED
+
+                await events.publish(
+                    session,
+                    PRELOAD_CLEANED,
+                    lambda: {
+                        "removed": result["count"],
+                        "freed_bytes": freed,
+                        "stale_days": setting.stale_days,
+                    },
+                )
+                await session.commit()
 
 
 def register_task_safe():

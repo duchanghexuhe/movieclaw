@@ -191,6 +191,7 @@ export const settingsSectionGroups: SettingsSectionGroup[] = [
     items: [
       { id: "scrape", label: "刮削与整理", description: "海报、简介、命名与目录整理的全局默认", icon: PhotosStackIcon },
       { id: "playback", label: "播放", description: "远程转码与播放体验", icon: PlayRectangleIcon },
+      { id: "transcode", label: "转码", description: "预转码优化版本：任务队列、Worker 与冷数据清理", icon: PlayRectangleIcon },
     ],
   },
   {

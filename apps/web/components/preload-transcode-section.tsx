@@ -13,10 +13,12 @@ import {
   SettingsSection,
 } from "@/components/settings-ui";
 import {
+  type PreloadOverview,
   type PreloadTaskView,
   type StaleCleanupResult,
   cancelPreloadTask,
   cleanupStalePreload,
+  getPreloadOverview,
   listPreloadTasks,
   retryPreloadTask,
 } from "@/lib/api/preload";
@@ -34,6 +36,7 @@ const STATUS_LABELS: Record<PreloadTaskView["status"], string> = {
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
+  invalidated: "已失效（可重新转码）",
 };
 
 /**
@@ -42,7 +45,8 @@ const STATUS_LABELS: Record<PreloadTaskView["status"], string> = {
  * 管理任务队列（取消/重试）与「清理冷数据」（预览 → 执行）。Worker 的
  * 配对与授权在「设备」分区（与实时转码 Worker 同一套）。
  */
-export function PreloadTranscodeSection() {
+export function TranscodeSection() {
+  const [overview, setOverview] = useState<PreloadOverview | null>(null);
   const [tasks, setTasks] = useState<PreloadTaskView[] | null>(null);
   const [cleanupPreview, setCleanupPreview] = useState<StaleCleanupResult | null>(null);
   const [staleDays, setStaleDays] = useState("90");
@@ -54,6 +58,9 @@ export function PreloadTranscodeSection() {
     listPreloadTasks()
       .then(setTasks)
       .catch(() => setTasks([]));
+    getPreloadOverview()
+      .then(setOverview)
+      .catch(() => {});
   }, []);
   useEffect(reload, [reload]);
 
@@ -96,6 +103,32 @@ export function PreloadTranscodeSection() {
       title="预转码（便携版本）"
       description="预转码 Worker 闲时把指定影片转成 1080p H.264 的低码率版本，外网播放时直接发小文件。Worker 在「设备」分区配对。"
     >
+      {overview && (
+        <div className="mb-4 grid grid-cols-3 gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sub">
+          <div>
+            <div className="tnum text-body font-semibold text-[var(--text)]">
+              {(overview.total_bytes / GB).toFixed(1)} GB
+            </div>
+            <div className="mt-0.5 text-caption text-[var(--text-faint)]">
+              共 {overview.count} 部 · 配额 {(overview.quota_bytes / GB).toFixed(0)} GB
+            </div>
+          </div>
+          <div>
+            <div className="tnum text-body font-semibold text-[var(--text)]">
+              {overview.oldest_days > 0 ? `${overview.oldest_days} 天` : "—"}
+            </div>
+            <div className="mt-0.5 text-caption text-[var(--text-faint)]">最老未播</div>
+          </div>
+          <div>
+            <div className="tnum text-body font-semibold text-[var(--text)]">
+              {overview.stale_days} 天
+            </div>
+            <div className="mt-0.5 text-caption text-[var(--text-faint)]">
+              未播阈值{overview.auto_cleanup ? " · 自动清理开" : ""}
+            </div>
+          </div>
+        </div>
+      )}
       {tasks === null ? (
         <SettingsEmpty title="加载中…" />
       ) : (

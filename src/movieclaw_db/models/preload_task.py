@@ -34,6 +34,9 @@ class PreloadTaskStatus(StrEnum):
     COMPLETED = "completed"  # 产物已校验并登记为版本
     FAILED = "failed"  # Worker 失败上报 / 租约超时回收，可重试
     CANCELLED = "cancelled"  # 用户取消（产物半成品一并清理）
+    # 源被回收/换源/冷数据清理后，曾完成的任务产物已删——区别于失败：
+    # 「已失效，可重新转码」（preload-transcode.md §6 洗版联动提示）
+    INVALIDATED = "invalidated"
 
 
 class PreloadTask(TimestampMixin, table=True):

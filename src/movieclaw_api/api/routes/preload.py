@@ -95,6 +95,17 @@ async def get_setting_store_dep():
     return await get_setting_store().get(PreloadSetting)
 
 
+@router.get(
+    "/overview",
+    summary="预转码统计（共 X GB / 共 Y 部 / 最老 Z 天前）",
+    operation_id="preload.overview",
+)
+async def overview(
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[dict[str, Any]]:
+    return ok(await preload_service.overview(session))
+
+
 @router.post(
     "/tasks",
     summary="下单预转码任务",

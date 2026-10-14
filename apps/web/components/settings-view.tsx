@@ -30,7 +30,7 @@ import { ImPushSection } from "@/components/im-push-section";
 import { NetworkConfigSection } from "@/components/network-config-section";
 import { NotificationsSection } from "@/components/notifications-section";
 import { RemoteTranscodeSection } from "@/components/remote-transcode-section";
-import { PreloadTranscodeSection } from "@/components/preload-transcode-section";
+import { TranscodeSection } from "@/components/preload-transcode-section";
 import { ScrapeSettingsSection } from "@/components/scrape-settings-section";
 import { SiteConfigSection, SitesSectionSubtitle } from "@/components/site-config-section";
 import { SubscriptionSettingsSection } from "@/components/subscription-settings-section";
@@ -253,6 +253,8 @@ export function SettingsPanel({ active, item }: SettingsPanelProps) {
           <ScrapeSettingsSection />
         ) : section.id === "playback" ? (
           <PlaybackSection />
+        ) : section.id === "transcode" ? (
+          <TranscodeSection />
         ) : section.id === "llm" ? (
           <LlmConfigSection />
         ) : section.id === "ai" ? (
@@ -696,7 +698,6 @@ function PlaybackSection() {
       <RemoteTranscodeSection
         onOpenDevices={() => router.push("/settings/devices" as Route)}
       />
-      <PreloadTranscodeSection />
     </div>
   );
 }

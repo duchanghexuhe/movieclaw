@@ -16,7 +16,7 @@ export interface PreloadTaskView {
   id: number;
   target_file_id: number;
   preset_id: string;
-  status: "queued" | "claimed" | "running" | "completed" | "failed" | "cancelled";
+  status: "queued" | "claimed" | "running" | "completed" | "failed" | "cancelled" | "invalidated";
   estimated_bytes: number;
   actual_bytes: number;
   resume_parts: number;
@@ -45,6 +45,20 @@ export interface StaleCleanupResult {
     size_bytes: number;
     days_since_play: number;
   }[];
+}
+
+export interface PreloadOverview {
+  count: number;
+  total_bytes: number;
+  quota_bytes: number;
+  oldest_days: number;
+  stale_days: number;
+  auto_cleanup: boolean;
+}
+
+/** 预转码统计（共 X GB / 共 Y 部 / 最老 Z 天前）。 */
+export function getPreloadOverview(): Promise<PreloadOverview> {
+  return unwrap(request<ApiEnvelope<PreloadOverview>>("/preload/overview"));
 }
 
 /** 可用档位。 */

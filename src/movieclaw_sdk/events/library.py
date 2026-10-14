@@ -192,3 +192,24 @@ LIBRARY_FILE_PURGED = define(
 LIBRARY_ITEM_MOVED = define(
     "library.item.moved", ItemMoved, title="条目转移到了另一个库", group="媒体库"
 )
+
+
+class PreloadCleaned(Frozen):
+    """预转码产物被自动清理（docs/design/preload-transcode.md §6：自动化不该是盲盒，
+    发生时必须在活动流记一笔）。"""
+
+    removed: int
+    """本次清理的版本数。"""
+    freed_bytes: int
+    """释放的磁盘字节。"""
+    stale_days: int
+    """触发的「N 天未播」阈值。"""
+
+
+PRELOAD_CLEANED = define(
+    "library.preload.cleaned",
+    PreloadCleaned,
+    title="预转码产物自动清理",
+    group="预转码",
+    doc="按「N 天未播」规则自动清理便携版本",
+)

@@ -16,7 +16,10 @@ remote_signing 的签名 URL 域（kind 扩展 ``preload.source`` / ``preload.ar
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import subprocess
+import time
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -163,7 +166,7 @@ async def put_preload_artifact(
         return Response(status_code=409, headers={"Cache-Control": "no-store"})
     directory = preload_service.artifact_dir_for(task_id)
     directory.mkdir(parents=True, exist_ok=True)
-    part_path = directory / f".{name}.part{part:05d}"
+    part_path = directory / f"seg{part:05d}.mkv"
 
     part_bytes = task.part_bytes or _PART_BYTES
     committed = part_path.stat().st_size if part_path.exists() else 0
@@ -224,15 +227,28 @@ async def complete_preload_task(
     final_path = directory / ARTIFACT_NAME
     if final_path.exists():
         final_path.unlink()  # 重跑 complete 的兜底
-    # 按段号合并分片 → 最终产物
-    parts = sorted(directory.glob(f".{ARTIFACT_NAME}.part*"))
+    # 按段号拼接：转码分段（§7 断点续转）每段是独立编码的 MKV，用 concat
+    # demuxer -c copy 免重编码拼回整文件；直拷/旧单段形态只有一段，同样适用
+    parts = sorted(directory.glob("seg*.mkv"))
     if not parts:
         raise BadRequestException("没有收到任何产物分段")
-    with open(final_path, "wb") as output:
+    concat_list = directory / "concat.txt"
+    with open(concat_list, "w", encoding="utf-8") as listing:
         for part_path in parts:
-            with open(part_path, "rb") as piece:
-                while chunk := piece.read(4 * 1024 * 1024):
-                    output.write(chunk)
+            # 单引号转义防路径特殊字符；absolute 可读（同目录相对亦可）
+            listing.write("file '" + part_path.resolve().as_posix() + "'\n")
+    concat = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-c", "copy", "-map_chapters", "0", str(final_path),
+        ],
+        capture_output=True, text=True, timeout=3600,
+    )
+    concat_list.unlink(missing_ok=True)
+    if concat.returncode != 0:
+        logger.warning("预转码 concat 失败：task=%s %s", task_id, concat.stderr[-500:])
+        raise BadRequestException("产物分段拼接失败，整件作废")
     for part_path in parts:
         part_path.unlink()
     size = final_path.stat().st_size

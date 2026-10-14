@@ -14,7 +14,11 @@ tests/api/test_preload_command.py。
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import tempfile
 from functools import partial
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -126,18 +130,29 @@ def _seed_file(client: TestClient, tmp_path, *, hdr=None, codec="hevc", resoluti
 
 
 def _claim_and_upload(client: TestClient, token: str, task_id: int) -> dict:
-    """领取任务并把一小段产物真实上传（后续测试共用）。"""
+    """领取任务并上传一段**真实 MKV**（complete 走 concat demuxer，假字节过不了
+    EBML 解析）。ffmpeg 是服务端运行时的既有依赖，测试环境缺失时跳过。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("concat 校验需要 ffmpeg")
     task = client.post(f"{_WORKER}/claim", headers=_worker_headers(token)).json()["data"]["task"]
     assert task is not None and task["task_id"] == task_id
     artifact_url = "/" + task["artifact_url"]
     sep = "&" if "?" in artifact_url else "?"
-    part_a = b"DERIVED" * 147  # 1029 字节
+    seg = Path(tempfile.gettempdir()) / f"preload-seg-{task_id}.mkv"
+    subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=duration=1:size=320x180:rate=10",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(seg)],
+        check=True, timeout=60,
+    )
     put = client.put(
         f"{artifact_url}{sep}part=0",
-        content=part_a,
+        content=seg.read_bytes(),
         headers={"Content-Type": "application/octet-stream"},
     )
     assert put.status_code == 201, put.text
+    seg.unlink(missing_ok=True)
     return task
 
 
@@ -285,7 +300,16 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
     # 分段上传（两段，第二段故意乱序一次验证 409）
     artifact_url = "/" + task["artifact_url"]
     sep = "&" if "?" in artifact_url else "?"
-    part_a = b"A" * 1024
+    ffmpeg = shutil.which("ffmpeg")
+    assert ffmpeg, "concat 校验需要 ffmpeg"
+    seg = Path(tmp_path) / "roundtrip-seg0.mkv"
+    subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=duration=1:size=320x180:rate=10",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(seg)],
+        check=True, timeout=60,
+    )
+    part_a = seg.read_bytes()
     first = client.put(
         f"{artifact_url}{sep}part=0", content=part_a, headers={"Content-Type": "application/octet-stream"}
     )
@@ -305,9 +329,6 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
             audio_streams=[{"codec": "aac"}], subtitle_streams=[{"codec": "subrip"}],
         ),
     )
-    preload_dir = tmp_path / "preload" / str(task_id)
-    preload_dir.mkdir(parents=True, exist_ok=True)
-    (preload_dir / "portable.mkv").write_bytes(part_a + b"TAIL")
     done = client.post(f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token))
     assert done.status_code == 200, done.text
     assert done.json()["data"]["file_id"] > 0
