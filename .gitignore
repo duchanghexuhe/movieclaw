@@ -82,3 +82,7 @@ worker/remote_caps.json
 worker/remote_worker.py
 worker/realtime-cli.log
 apps/web/s7.json
+
+# worker 运行期日志
+worker/*.err.log
+worker/*.log
