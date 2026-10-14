@@ -1051,6 +1051,9 @@ export function LibraryItemDetailView({
                       !isMovie && selectedSeriesEpisode
                         ? selectedSeriesEpisode.episode.episode_number
                         : undefined,
+                    // 用户在版本选择器里明确选过：播放页锁定这个文件起播，
+                    // 不做多版本自动择优（否则 720p 测试直出会压过 4K 转码）
+                    fileId: selectedTrackFile?.id,
                   }) as Route,
                 );
               }}
@@ -1075,7 +1078,7 @@ export function LibraryItemDetailView({
           {/* 元数据刷新的失败提示（识别相关的结论都在「修正识别结果」弹窗里给） */}
           {refreshError && (
             // solid-card：Netflix 卡面钩子接管材质并关 blur（银玻璃零变化）；
-            // 字色保留 #ff9f9f 浅红字面量——:root --danger=#ff6b6b 与之不同值，
+            // 字色保留 #ff9f9f 浅红字面量——:root --danger=var(--danger) 与之不同值，
             // 收口会让银玻璃可见变化，待设计决策
             <div className="solid-card mt-4 max-w-2xl rounded-xl border border-white/[0.1] bg-[rgba(14,16,22,0.6)] px-4 py-3 text-sub leading-6 text-[#ff9f9f] backdrop-blur-md">
               {refreshError}
@@ -3250,7 +3253,7 @@ function TransferPlanPreview({
   return (
     <div className="mt-4 space-y-3">
       {preview.blocked.length > 0 && (
-        <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/[0.08] px-4 py-3 text-sub leading-6 text-[#ffb4b4]">
+        <div className="rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/[0.08] px-4 py-3 text-sub leading-6 text-[#ffb4b4]">
           {preview.blocked.map((b) => (
             <p key={b}>{b}</p>
           ))}
@@ -3459,7 +3462,7 @@ function DeleteDialog({
                 type="checkbox"
                 checked={confirmed}
                 onChange={(e) => setConfirmed(e.target.checked)}
-                className="mt-1 size-4 accent-[#ff6b6b]"
+                className="mt-1 size-4 accent-[var(--danger)]"
               />
               我已明白：以上目录及其中全部文件将被永久删除，无法恢复。
             </label>
@@ -3643,7 +3646,7 @@ function DeleteFileDialog({
                 type="checkbox"
                 checked={confirmed}
                 onChange={(e) => setConfirmed(e.target.checked)}
-                className="mt-1 size-4 accent-[#ff6b6b]"
+                className="mt-1 size-4 accent-[var(--danger)]"
               />
               我已明白：{isLast ? "整个条目目录及其中全部文件" : "该文件及其同名附属文件"}
               将被永久删除，无法恢复。

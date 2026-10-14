@@ -23,14 +23,27 @@ export function parseUnitSegment(segment: string | undefined): {
 /** 生成播放页地址。季集号补零是媒体库的通用写法（s01e03），别自创。 */
 export function playHref(
   mediaItemId: number,
-  options?: { season?: number; episode?: number; tSeconds?: number },
+  options?: {
+    season?: number;
+    episode?: number;
+    tSeconds?: number;
+    /** 用户在详情页明确选中的版本：播放页锁定该文件起播（跳过自动择优） */
+    fileId?: number;
+  },
 ): string {
-  const { season, episode, tSeconds } = options ?? {};
+  const { season, episode, tSeconds, fileId } = options ?? {};
   let href = `/play/${mediaItemId}`;
   if (season !== undefined && episode !== undefined) {
     href += `/s${String(season).padStart(2, "0")}e${String(episode).padStart(2, "0")}`;
   }
-  if (tSeconds !== undefined && tSeconds > 0) href += `?t=${Math.floor(tSeconds)}`;
+  const query: string[] = [];
+  if (tSeconds !== undefined && tSeconds > 0) {
+    query.push(`t=${Math.floor(tSeconds)}`);
+  }
+  if (fileId !== undefined && fileId > 0) {
+    query.push(`file=${fileId}`);
+  }
+  if (query.length > 0) href += `?${query.join("&")}`;
   return href;
 }
 
