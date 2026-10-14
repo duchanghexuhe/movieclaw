@@ -88,14 +88,24 @@ def _gpu_filters(
     height_cap: int,
     color_space: str | None,
     has_tonemapx: bool,
+    has_tonemap_cuda: bool,
 ) -> list[str]:
     """NVENC 链的滤镜序列（帧全程或大部分留在 GPU 上）。
 
     SDR：``scale_cuda``（输出 nv12 8-bit，NVENC 只吃这个）。
-    HDR：下载回内存做软件 tonemap（GPU 滤镜缺 tonemap_cuda 的唯一解），
-    色调映射完的帧是 nv12，再回传 GPU 缩放/编码。tonemapx 探测命中时
-    色调映射留在 CPU 但输出直接对齐（少一次 zscale）。
+    HDR 有 ``tonemap_cuda``（jellyfin-ffmpeg）：色调映射也在 GPU 上
+    （参数与软件档同源，BT.2390 + DV 元数据由滤镜的 apply_dovi 还原），
+    整条链硬解→映射→缩放→编码帧不出 GPU——真机实测 4K DV 源 14× 实时，
+    比回内存软件映射快 5 倍以上（2026-10-14，RTX 2070 SUPER）。
+    HDR 只有 tonemapx：下载回内存做软件色调映射，再回传 GPU 编码（慢路）。
     """
+    if needs_tone_map and has_tonemap_cuda:
+        parts = [
+            "tonemap_cuda=tonemap=bt2390:desat=0:p=bt709:t=bt709:m=bt709:format=nv12"
+        ]
+        if needs_scale:
+            parts.append(f"scale_cuda=-2:{height_cap}:format=nv12")
+        return parts
     if needs_tone_map:
         parts = [f"hwdownload,format=p010le,{_SW_TONEMAP_JELLYFIN}"]
         if needs_scale:
@@ -205,7 +215,7 @@ def build_preload_command(
     # 滤镜又只吃 linear 输入——没有 tonemapx 时 HDR 源装不出任何正确的链。
     # 拒绝比转出一部偏色的片子好：错误信息直接告诉用户换 build。
     unusable_reason: str | None = None
-    if needs_tone_map and not has_tonemapx:
+    if needs_tone_map and not has_tonemapx and "tonemap_cuda" not in filters_available:
         unusable_reason = (
             "HDR 源需要 jellyfin-ffmpeg（tonemapx 滤镜）做色调映射，"
             "当前 Worker 的 ffmpeg 不含它；请给 Worker 换 jellyfin-ffmpeg "
@@ -226,16 +236,20 @@ def build_preload_command(
     if not video_copy:
         if use_nvenc:
             needs_scale = src_height is None or src_height > height_cap
+            has_tonemap_cuda = "tonemap_cuda" in filters_available
             filters = _gpu_filters(
                 needs_tone_map=needs_tone_map,
                 needs_scale=needs_scale,
                 height_cap=height_cap,
                 color_space=source.get("color_space"),
                 has_tonemapx=has_tonemapx,
+                has_tonemap_cuda=has_tonemap_cuda,
             )
-            # 需要下载回内存做 CPU 滤镜（HDR / 色彩转换）时，硬解帧也要能
-            # hwdownload——用 nv12/p010 硬解输出格式
-            needs_download = needs_tone_map or _source_color_convert(source.get("color_space"))
+            # 需要下载回内存做 CPU 滤镜（HDR 走软件 tonemapx / BT.2020 SDR 色彩
+            # 转换）时，硬解帧也要能 hwdownload——用 nv12/p010 硬解输出格式；
+            # tonemap_cuda 全 GPU 链不需要下载
+            needs_download = needs_tone_map and not has_tonemap_cuda
+            needs_download = needs_download or bool(_source_color_convert(source.get("color_space")))
             if hw_decodable and not needs_download:
                 # 整链留 GPU：硬解输出 cuda 帧
                 input_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
