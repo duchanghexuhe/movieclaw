@@ -66,10 +66,12 @@ import {
   transferLibraryItem,
 } from "@/lib/api/libraries";
 import {
+  type PreloadPreset,
   type PreloadTaskView,
   cancelPreloadTask,
   createPreloadTask,
   estimatePreload,
+  getPreloadPresets,
   listPreloadTasks,
   retryPreloadTask,
 } from "@/lib/api/preload";
@@ -501,17 +503,17 @@ export function LibraryItemDetailView({
     refreshPreloadTasks();
   }, [refreshPreloadTasks]);
   const handlePreloadCreate = useCallback(
-    async (file: LibraryItemFile) => {
+    async (file: LibraryItemFile, presetId?: string) => {
       try {
-        const est = await estimatePreload(file.id);
+        const est = await estimatePreload(file.id, presetId);
         const ok = await confirm({
           title: `把「${file.file_name}」预转码？`,
-          description: `约多占 ${(est.estimated_bytes / 1024 ** 3).toFixed(1)} GB（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后文件区会出现一个 1080p H.264 的可选版本。`,
+          description: `约多占 ${(est.estimated_bytes / 1024 ** 3).toFixed(1)} GB（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后文件区会出现一个 1080p 低码率的可选版本。`,
           confirmLabel: "加入转码队列",
           cancelLabel: "先不",
         });
         if (!ok) return;
-        const task = await createPreloadTask(file.id);
+        const task = await createPreloadTask(file.id, presetId);
         toast.success(`已加入转码队列（任务 #${task.id}），等 Worker 领取`);
         refreshPreloadTasks();
       } catch (e) {
@@ -2465,7 +2467,8 @@ function fileDirectory(filePath: string): string {
 /**
  * 「预转码」选版本弹窗（preload-transcode.md §8 显眼入口）：把条目全部在位
  * 原生版本列出来，逐个展示转码任务状态与下单入口——文件区行内按钮之外的
- * 正门，多版本条目（4K + 1080p 并存）在这里一次看清。
+ * 正门，多版本条目（4K + 1080p 并存）在这里一次看清。档位切换在弹窗顶部
+ * （省流=默认，手机外网；高清=局域网大屏），行内按钮不带弹窗、走默认档。
  */
 function PreloadDialog({
   open,
@@ -2483,10 +2486,29 @@ function PreloadDialog({
   /** 只收在位且非派生的原生文件（弹窗是下单入口，产物行不进来） */
   files: LibraryItemFile[];
   tasks: PreloadTaskView[];
-  onPreload?: (file: LibraryItemFile) => void;
+  onPreload?: (file: LibraryItemFile, presetId?: string) => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
+  const [presets, setPresets] = useState<PreloadPreset[] | null>(null);
+  const [presetId, setPresetId] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    getPreloadPresets()
+      .then((list) => {
+        if (!alive) return;
+        setPresets(list);
+        setPresetId((current) => current ?? list[0]?.id);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [open]);
+
+  const selectedPreset = presetId ?? presets?.[0]?.id;
   return (
     <Modal open={open} onClose={onClose} label="预转码" width="lg">
       <div className="p-6">
@@ -2498,6 +2520,27 @@ function PreloadDialog({
           提前转好的 <span className="text-white/80">1080p 低码率版本</span>：外网播放直接发小文件，
           NAS 不用实时转码。由预转码 Worker 在后台完成（设置 → 转码），完成后文件区多出一个可选版本。
         </p>
+        {presets && presets.length > 1 && (
+          // 胶囊底材与发现页 SourceSwitcher 逐类一致；选中态白系语言原样
+          <div className="mt-4 inline-flex rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl">
+            {presets.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                aria-pressed={selectedPreset === preset.id}
+                title={preset.title}
+                onClick={() => setPresetId(preset.id)}
+                className={`rounded-full px-2.5 py-1.5 text-sub font-semibold transition ${
+                  selectedPreset === preset.id
+                    ? "bg-white/15 text-white shadow-sm"
+                    : "text-[var(--text-muted)] hover:text-white"
+                }`}
+              >
+                {preset.short}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
           {files.length === 0 && (
             <p className="px-4 py-6 text-center text-sub text-[var(--text-faint)]">
@@ -2505,7 +2548,11 @@ function PreloadDialog({
             </p>
           )}
           {files.map((file) => {
-            const task = tasks.find((t) => t.target_file_id === file.id) ?? null;
+            // 任务状态跟所选档位走：高清档已有任务不挡省流档下单（反之亦然）
+            const task =
+              tasks.find(
+                (t) => t.target_file_id === file.id && t.preset_id === selectedPreset,
+              ) ?? null;
             return (
               <div
                 key={file.id}
@@ -2561,7 +2608,7 @@ function PreloadDialog({
                 {(!task || task.status === "invalidated") && onPreload && (
                   <button
                     type="button"
-                    onClick={() => onPreload(file)}
+                    onClick={() => onPreload(file, selectedPreset)}
                     className="shrink-0 rounded-full border border-white/[0.14] px-3 py-1 text-caption font-medium text-[var(--text)] transition hover:border-white/[0.25]"
                   >
                     转码

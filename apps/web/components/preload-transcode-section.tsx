@@ -14,11 +14,13 @@ import {
 } from "@/components/settings-ui";
 import {
   type PreloadOverview,
+  type PreloadPreset,
   type PreloadTaskView,
   type StaleCleanupResult,
   cancelPreloadTask,
   cleanupStalePreload,
   getPreloadOverview,
+  getPreloadPresets,
   listPreloadTasks,
   retryPreloadTask,
 } from "@/lib/api/preload";
@@ -48,6 +50,7 @@ const STATUS_LABELS: Record<PreloadTaskView["status"], string> = {
 export function TranscodeSection() {
   const [overview, setOverview] = useState<PreloadOverview | null>(null);
   const [tasks, setTasks] = useState<PreloadTaskView[] | null>(null);
+  const [presets, setPresets] = useState<PreloadPreset[]>([]);
   const [cleanupPreview, setCleanupPreview] = useState<StaleCleanupResult | null>(null);
   const [staleDays, setStaleDays] = useState("90");
   const [cleaning, setCleaning] = useState(false);
@@ -63,6 +66,11 @@ export function TranscodeSection() {
       .catch(() => {});
   }, []);
   useEffect(reload, [reload]);
+  useEffect(() => {
+    getPreloadPresets()
+      .then(setPresets)
+      .catch(() => {});
+  }, []);
 
   const previewCleanup = useCallback(async () => {
     setCleaning(true);
@@ -101,7 +109,7 @@ export function TranscodeSection() {
   return (
     <SettingsSection
       title="预转码"
-      description="预转码 Worker 闲时把指定影片转成 1080p H.264 的低码率版本，外网播放时直接发小文件。Worker 在「设备」分区配对。"
+      description="预转码 Worker 闲时把指定影片提前转成小体积版本（默认省流档 1080p HEVC，约 0.8GB/小时；可选高清档 1080p H.264），外网播放时直接发小文件。Worker 在「设备」分区配对。"
     >
       {overview && (
         <div className="mb-4 grid grid-cols-3 gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sub">
@@ -144,7 +152,9 @@ export function TranscodeSection() {
                     <>
                       任务 #{task.id}
                       <span className="ml-2 text-caption font-normal text-[var(--text-faint)]">
-                        源文件 #{task.target_file_id}
+                        {presets.find((p) => p.id === task.preset_id)?.short ?? task.preset_id}
+                        {" · 源文件 #"}
+                        {task.target_file_id}
                       </span>
                     </>
                   }

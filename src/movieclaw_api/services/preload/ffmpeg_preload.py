@@ -9,11 +9,12 @@
 
 硬件优先（用户拍板：全功率越快越好）：
 - Worker 上报本机能力（``claim`` 携带 ``encoders``/``gpu_filters``）；
-- SDR 源 + NVENC：硬解 → ``scale_cuda`` → ``h264_nvenc`` 整链留 GPU；
+- SDR 源 + NVENC：硬解 → ``scale_cuda`` → NVENC 整链留 GPU（编码器随档位：
+  省流= ``hevc_nvenc``，高清= ``h264_nvenc``）；
 - HDR 源 + NVENC：硬解 → 下载回内存 → 软件 ``tonemap``（上游 ffmpeg 没有
   jellyfin 的 ``tonemapx``/``tonemap_cuda``，色调映射只能 CPU；用 hable
   算法——上游 ``tonemap`` 的可选算法里高光滚降最接近 BT.2390 的观感）→
-  回传 GPU → ``h264_nvenc``。色调映射只是一趟滤镜，编码大头仍在 GPU；
+  回传 GPU → NVENC。色调映射只是一趟滤镜，编码大头仍在 GPU；
 - 无 NVENC / 探测失败：libx264 软编回退，参数与原第一版一致。
 
 字幕与音轨（§5）：全部音轨内封（AAC 转码 / 原轨 AAC 直拷），文本字幕全部
@@ -29,16 +30,31 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     _COLOR_CONVERT_INPUT,
 )
 
-#: 档位注册表（§2「档位是接口」）：第二版加档只是新增枚举。
+#: 档位注册表（§2「档位是接口」）：加档只是新增枚举。省流档是用户拍板的
+#: 默认（预转码产物只给手机外网看，家里电视看原画）——HEVC 同画质省一半
+#: 流量，一部 2 小时电影约 1.5 GB；高清档留给局域网大屏。
+PRESET_SAVER_1080P = "saver_1080p"
 PRESET_PORTABLE_1080P = "portable_1080p"
+PRESET_DEFAULT = PRESET_SAVER_1080P
 
 PRESETS: dict[str, dict] = {
+    PRESET_SAVER_1080P: {
+        "short": "省流",
+        "title": "省流 1080p（HEVC · 视频上限 1.5 Mbps · 手机/外网）",
+        "height": 1080,
+        "maxrate": "1.5M",
+        "bufsize": "3M",
+        "audio_bitrate": "192k",
+        "video_codec": "hevc",
+    },
     PRESET_PORTABLE_1080P: {
-        "title": "便携 1080p（H.264 / AAC / 约 4 Mbps）",
+        "short": "高清",
+        "title": "高清 1080p（H.264 · 视频上限 4 Mbps · 局域网/大屏）",
         "height": 1080,
         "maxrate": "4M",
         "bufsize": "8M",
         "audio_bitrate": "256k",
+        "video_codec": "h264",
     },
 }
 
@@ -124,18 +140,28 @@ def _gpu_filters(
     return parts
 
 
+#: NVENC 编码器随档位：省流= HEVC（同画质省一半流量），高清= H.264。
+#: HEVC 的编码器名是 hevc_nvenc（2026-10-14 jf-ffmpeg 8.1.3 实测 -encoders
+#: 只此一名，无 h265_nvenc 别名），必须与 Worker 上报的 caps 名一致
+_NVENC_ENCODER_BY_CODEC = {"h264": "h264_nvenc", "hevc": "hevc_nvenc"}
+
+
 def _nvenc_video_args(preset: dict, filters: list[str]) -> list[str]:
     """NVENC 编码参数：p4 质量档 + maxrate 约束（NVENC 不认 CRF 模式下的
     恒质量……实际上支持 -cq，但与 maxrate 混用的行为随驱动版本漂；用
-    纯码率模式最稳，速度是第一目标）。"""
+    纯码率模式最稳，速度是第一目标）。编码器与 profile 随档位。"""
+    codec = preset.get("video_codec", "h264")
     args: list[str] = []
     if filters:
         args += ["-vf", ",".join(filters)]
+    args += ["-c:v", _NVENC_ENCODER_BY_CODEC.get(codec, "h264_nvenc")]
+    if codec == "hevc":
+        # HEVC 没有 high profile（main 起步）；level 交给驱动按分辨率定
+        args += ["-profile:v", "main"]
+    else:
+        args += ["-profile:v", "high", "-level:v", "4.1"]
     args += [
-        "-c:v", "h264_nvenc",
         "-preset", "p4",
-        "-profile:v", "high",
-        "-level:v", "4.1",
         "-b:v", "0",  # 交给 -maxrate 均值码率模式
         "-maxrate", preset["maxrate"],
         "-bufsize", preset["bufsize"],
@@ -145,7 +171,9 @@ def _nvenc_video_args(preset: dict, filters: list[str]) -> list[str]:
 
 
 def _x264_video_args(preset: dict, filters: list[str]) -> list[str]:
-    """软编回退：质量优先参数（无 NVENC 的机器仍能干活）。"""
+    """软编回退：质量优先参数（无 NVENC 的机器仍能干活）。两个档位都用
+    libx264——libx265 软编慢一个量级（一部电影要转大半天），回退场景要的
+    是"能出活"，体积目标靠档位的 maxrate 帽兜住。"""
     args: list[str] = []
     if filters:
         args += ["-vf", ",".join(filters)]
@@ -166,7 +194,7 @@ def build_preload_command(
     *,
     source_path: str,
     output_path: str,
-    preset_id: str = PRESET_PORTABLE_1080P,
+    preset_id: str = PRESET_DEFAULT,
     source: dict,
     hw_backend: str | None = None,
     worker_caps: dict | None = None,
@@ -196,16 +224,23 @@ def build_preload_command(
     src_codec = (source.get("video_codec") or "").lower()
     src_height = _height_of(source.get("resolution"))
     needs_tone_map = _source_needs_tone_map(source.get("hdr"), source.get("dv_profile"))
+    # 直拷只属于高清档（§2：源 ≤1080p 且已是 H.264/SDR = 已经是目标档）。
+    # 省流档永远重编码：台账没有源视频码率，判断不了"已经够小"，而省流的
+    # 全部意义在体积上限，宁可多转一次
     video_copy = (
-        src_codec == "h264" and src_height is not None and 0 < src_height <= height_cap
+        preset.get("video_codec", "h264") == "h264"
+        and src_codec == "h264"
+        and src_height is not None
+        and 0 < src_height <= height_cap
         and not needs_tone_map
     )
 
-    # 硬编可用性：NVENC 编码器 + scale_cuda 都在才算全 GPU 链可用（缺
-    # scale_cuda 时 4K 源没法在 GPU 上缩放，链会断）
+    # 硬编可用性：档位要的 NVENC 编码器 + scale_cuda 都在才算全 GPU 链可用
+    # （缺 scale_cuda 时 4K 源没法在 GPU 上缩放，链会断）
+    preset_encoder = _NVENC_ENCODER_BY_CODEC.get(preset.get("video_codec", "h264"), "h264_nvenc")
     use_nvenc = (
         hw_backend == "nvenc"
-        and "h264_nvenc" in encoders
+        and preset_encoder in encoders
         and "scale_cuda" in filters_available
     )
     has_tonemapx = "tonemapx" in filters_available
@@ -245,11 +280,17 @@ def build_preload_command(
                 has_tonemapx=has_tonemapx,
                 has_tonemap_cuda=has_tonemap_cuda,
             )
-            # 需要下载回内存做 CPU 滤镜（HDR 走软件 tonemapx / BT.2020 SDR 色彩
-            # 转换）时，硬解帧也要能 hwdownload——用 nv12/p010 硬解输出格式；
-            # tonemap_cuda 全 GPU 链不需要下载
+            # 需要下载回内存做 CPU 滤镜（HDR 走软件 tonemapx）时，硬解帧也要能
+            # hwdownload——用 nv12/p010 硬解输出格式；tonemap_cuda 全 GPU 链不
+            # 需要下载。BT.2020 色彩转换只在 SDR 源才轮得到：HDR 源的色调映射
+            # 滤镜（tonemap_cuda/tonemapx）本身就把画面转到 BT.709，再挂
+            # colorspace 是重复转换；若因它强制下载，全 GPU 滤镜链会吃到系统
+            # 内存帧直接报错（真机 -40，2026-10-14 冒烟实测）
             needs_download = needs_tone_map and not has_tonemap_cuda
-            needs_download = needs_download or bool(_source_color_convert(source.get("color_space")))
+            if not needs_tone_map:
+                needs_download = needs_download or bool(
+                    _source_color_convert(source.get("color_space"))
+                )
             if hw_decodable and not needs_download:
                 # 整链留 GPU：硬解输出 cuda 帧
                 input_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
@@ -350,17 +391,26 @@ def build_preload_command(
 def estimate_size_bytes(
     *,
     duration_seconds: int | None,
-    bitrate_cap_bps: int = 4_000_000,
+    preset: dict,
 ) -> int:
     """体积预估（§2）：码率 × 时长 + 音轨/字幕开销（±20% 内即可）。
 
-    视频按码率上限算保守值，音频每轨 256 kbps，字幕每轨忽略不计。
+    视频按档位码率上限算保守值，音频按档位码率算一轨，字幕每轨忽略不计。
     """
     if not duration_seconds or duration_seconds <= 0:
         return 0
-    audio_streams = 1  # 典型单音轨；多轨影响在 ±20% 容差内
-    total_bps = bitrate_cap_bps + audio_streams * 256_000
+    total_bps = _bitrate_bps(preset["maxrate"]) + _bitrate_bps(preset["audio_bitrate"])
     return int(duration_seconds * total_bps / 8)
+
+
+def _bitrate_bps(spec: str) -> int:
+    """ffmpeg 码率字面量（"1.5M"/"256k"）→ bps。"""
+    text = spec.strip().lower()
+    if text.endswith("k"):
+        return int(float(text[:-1]) * 1_000)
+    if text.endswith("m"):
+        return int(float(text[:-1]) * 1_000_000)
+    return int(float(text))
 
 
 def _height_of(resolution: str | None) -> int | None:

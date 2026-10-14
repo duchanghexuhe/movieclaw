@@ -40,7 +40,7 @@ from movieclaw_db.models import (
     utcnow,
 )
 from movieclaw_api.services.preload.ffmpeg_preload import (
-    PRESET_PORTABLE_1080P,
+    PRESET_DEFAULT,
     PRESETS,
     PRELOAD_PART_BYTES,
     build_preload_command,
@@ -61,7 +61,12 @@ ARTIFACT_NAME = "portable.mkv"
 SEGMENT_SECONDS = 600
 
 #: 产物登记时的来源快照（library_file.origin 的展示文案口径）
-_PRELOAD_ORIGIN = {"kind": "preload", "label": "预转码便携版本", "detail": None}
+_PRELOAD_ORIGIN = {"kind": "preload", "label": "预转码版本", "detail": None}
+
+
+def _preset_of(task: PreloadTask) -> dict:
+    """任务的档位定义（历史任务的档位可能已被移除：回退默认档）。"""
+    return PRESETS.get(task.preset_id) or PRESETS[PRESET_DEFAULT]
 
 
 class PreloadQuotaExceeded(AppException):
@@ -149,12 +154,12 @@ async def create_preload_task(
     session: AsyncSession,
     *,
     file_id: int,
-    preset_id: str = PRESET_PORTABLE_1080P,
+    preset_id: str = PRESET_DEFAULT,
 ) -> PreloadTask:
     """下单：源文件 → 预转码任务（§3 入口；预估 + 配额预检后排队）。
 
     - 同源同档已有活跃任务时幂等返回现有任务（详情页按钮防连点）；
-    - 源已是目标档（直拷判定：≤1080p H.264 SDR）时拒绝——没有要转的东西；
+    - 高清档的直拷判定（源已是 ≤1080p H.264 SDR）拒绝——没有要转的东西；
     - 原盘目录、已有派生产物再派生同样拒绝。
     """
     if preset_id not in PRESETS:
@@ -194,7 +199,9 @@ async def create_preload_task(
         # 明确拒绝而不是白耗一次上传下载
         raise BadRequestException("这个版本已经是便携档（≤1080p H.264 SDR），无需转码")
 
-    estimated = estimate_size_bytes(duration_seconds=file.duration_seconds)
+    estimated = estimate_size_bytes(
+        duration_seconds=file.duration_seconds, preset=PRESETS[preset_id]
+    )
     await check_quota(session, needed_bytes=estimated)
 
     task = PreloadTask(
@@ -365,9 +372,9 @@ def build_task_command(
     """领取响应里的命令载荷：argv + 元数据（Worker 原样执行 argv）。
 
     ``worker_caps`` 是 Worker 在 claim 请求里上报的本机能力
-    （``{encoders, filters, hw_decoders}``）。有 ``h264_nvenc`` + ``scale_cuda``
-    就下发 NVENC 链（用户拍板：高功耗机器专门开机干活，全功率越快越好）；
-    没有或能力不全自动落回 libx264 软编。
+    （``{encoders, filters, hw_decoders}``）。有 NVENC + ``scale_cuda``
+    就下发硬编链（编码器随档位，用户拍板：高功耗机器专门开机干活，
+    全功率越快越好）；没有或能力不全自动落回 libx264 软编。
     """
     hw_backend = "nvenc" if _caps_have_nvenc(worker_caps) else None
     command = build_preload_command(
@@ -478,12 +485,15 @@ async def complete_task(
                 f"产物时长与源偏差 {drift:.0%}（>5%），整件作废"
             )
     if not command_acceptable(task, video_codec):
-        raise BadRequestException("产物视频编码不是档位要求的 H.264")
+        raise BadRequestException(
+            f"产物视频编码不是档位要求的 {_preset_of(task).get('video_codec', 'h264').upper()}"
+        )
 
     # 登记为派生行：规格用产物自己的探测结果，来源快照标派生身份
     target = await session.get(LibraryFile, task.target_file_id)
     if target is None:
         raise BadRequestException("源文件已不存在，产物作废")
+    preset = _preset_of(task)
     derived = LibraryFile(
         library_id=target.library_id,
         media_item_id=target.media_item_id,
@@ -493,10 +503,13 @@ async def complete_task(
         size_bytes=size,
         container=container,
         resolution="1080p",
-        video_codec=video_codec or "h264",
+        video_codec=video_codec or preset.get("video_codec", "h264"),
         duration_seconds=duration_seconds,
         source="imported",
-        origin={**_PRELOAD_ORIGIN, "detail": f"预转码（{task.preset_id}）· 任务 #{task.id}"},
+        origin={
+            **_PRELOAD_ORIGIN,
+            "detail": f"预转码 · {preset.get('short', task.preset_id)} · 任务 #{task.id}",
+        },
         derives_from_file_id=task.target_file_id,
         derivation={
             "kind": "preload",
@@ -522,9 +535,10 @@ async def complete_task(
 
 
 def command_acceptable(task: PreloadTask, video_codec: str | None) -> bool:
-    """产物编码符合档位（直拷任务的源编码也可能是 H.264 以外？不——直拷只在
-    源是 H.264 时成立；这里统一要求 h264）。"""
-    return (video_codec or "").lower() == "h264"
+    """产物编码符合档位（高清档= h264；直拷只在源是 H.264 时成立，所以两种
+    档位的产物编码都由档位定义说了算）。"""
+    expected = _preset_of(task).get("video_codec", "h264")
+    return (video_codec or "").lower() == expected
 
 
 async def fail_task(session: AsyncSession, task: PreloadTask, error: str) -> PreloadTask:
@@ -798,25 +812,6 @@ async def preload_maintenance() -> None:
                     },
                 )
                 await session.commit()
-
-
-def register_task_safe():
-    """把维护任务注册进调度器；注册失败（测试环境无调度器）不炸导入。"""
-    def decorator(fn):
-        try:
-            from movieclaw_scheduler.registry import register_task
-            from movieclaw_db.models.scheduled_task import TriggerType
-
-            return register_task(
-                "preload_maintenance",
-                title="预转码维护",
-                trigger_type=TriggerType.INTERVAL,
-                interval_seconds=3600,
-                description="回收超时租约、清理孤儿目录与超期产物（自动清理开启时）",
-            )(fn)
-        except Exception:  # pragma: no cover - 测试环境
-            return fn
-    return decorator
 
 
 __all__ = [

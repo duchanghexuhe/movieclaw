@@ -61,27 +61,34 @@ export function getPreloadOverview(): Promise<PreloadOverview> {
   return unwrap(request<ApiEnvelope<PreloadOverview>>("/preload/overview"));
 }
 
-/** 可用档位。 */
-export function getPreloadPresets(): Promise<{ id: string; title: string }[]> {
-  return unwrap(request<ApiEnvelope<{ id: string; title: string }[]>>("/preload/presets"));
+export interface PreloadPreset {
+  id: string;
+  /** 档位短名（省流/高清），切换胶囊与任务行用 */
+  short: string;
+  title: string;
 }
 
-/** 体积预估（价格标签）。 */
-export function estimatePreload(fileId: number): Promise<PreloadEstimate> {
+/** 可用档位（省流在前=默认档）。 */
+export function getPreloadPresets(): Promise<PreloadPreset[]> {
+  return unwrap(request<ApiEnvelope<PreloadPreset[]>>("/preload/presets"));
+}
+
+/** 体积预估（价格标签）。缺省档位由后端默认（省流）。 */
+export function estimatePreload(fileId: number, presetId?: string): Promise<PreloadEstimate> {
   return unwrap(
     request<ApiEnvelope<PreloadEstimate>>("/preload/estimate", {
       method: "POST",
-      body: JSON.stringify({ file_id: fileId }),
+      body: JSON.stringify({ file_id: fileId, ...(presetId ? { preset_id: presetId } : {}) }),
     }),
   );
 }
 
 /** 下单预转码任务（同源同档有活跃任务时幂等返回现有任务）。 */
-export function createPreloadTask(fileId: number): Promise<PreloadTaskView> {
+export function createPreloadTask(fileId: number, presetId?: string): Promise<PreloadTaskView> {
   return unwrap(
     request<ApiEnvelope<PreloadTaskView>>("/preload/tasks", {
       method: "POST",
-      body: JSON.stringify({ file_id: fileId }),
+      body: JSON.stringify({ file_id: fileId, ...(presetId ? { preset_id: presetId } : {}) }),
     }),
   );
 }

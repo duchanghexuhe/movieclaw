@@ -8,8 +8,8 @@
 4. 冷数据清理预览与执行。
 
 不跑真 ffmpeg：complete 的产物用手工构造的最小 MKV 片段 + monkeypatch
-probe_media 的探测结果校验服务端逻辑；ffmpeg 参数构造的正确性在
-tests/api/test_preload_command.py。
+probe_media 的探测结果校验服务端逻辑；命令构造（NVENC 链选择/编码器随
+档位/直拷判定）经由 claim 响应的 argv 断言覆盖。
 """
 
 from __future__ import annotations
@@ -77,7 +77,10 @@ def client(tmp_path, monkeypatch):
 _seed_counter = {"n": 0}
 
 
-def _seed_file(client: TestClient, tmp_path, *, hdr=None, codec="hevc", resolution="2160p") -> int:
+def _seed_file(
+    client: TestClient, tmp_path, *, hdr=None, codec="hevc", resolution="2160p",
+    color_space: str | None = None,
+) -> int:
     """造一个源文件行（4K HEVC HDR 是预转码的典型对象）。"""
     _seed_counter["n"] += 1
     n = _seed_counter["n"]
@@ -118,6 +121,7 @@ def _seed_file(client: TestClient, tmp_path, *, hdr=None, codec="hevc", resoluti
                 video_codec=codec,
                 resolution=resolution,
                 hdr=hdr,
+                color_space=color_space,
                 duration_seconds=7200,
                 audio_streams=[{"codec": "eac3", "channels": 6}],
                 subtitle_streams=[{"codec": "subrip"}, {"codec": "hdmv_pgs_subtitle"}],
@@ -130,13 +134,23 @@ def _seed_file(client: TestClient, tmp_path, *, hdr=None, codec="hevc", resoluti
 
 
 def _claim_and_upload(client: TestClient, token: str, task_id: int) -> dict:
-    """领取任务并上传一段**真实 MKV**（complete 走 concat demuxer，假字节过不了
-    EBML 解析）。ffmpeg 是服务端运行时的既有依赖，测试环境缺失时跳过。"""
+    """领取任务并上传第一段**真实 MKV**；ffmpeg 缺失时跳过。"""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         pytest.skip("concat 校验需要 ffmpeg")
     task = client.post(f"{_WORKER}/claim", headers=_worker_headers(token)).json()["data"]["task"]
     assert task is not None and task["task_id"] == task_id
+    _upload_segment(client, task)
+    return task
+
+
+def _upload_segment(client: TestClient, task: dict) -> None:
+    """给已领取的任务上传 seg00000（真实 MKV：complete 走 concat demuxer，
+    假字节过不了 EBML 解析）。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("concat 校验需要 ffmpeg")
+    task_id = task["task_id"]
     artifact_url = "/" + task["artifact_url"]
     sep = "&" if "?" in artifact_url else "?"
     seg = Path(tempfile.gettempdir()) / f"preload-seg-{task_id}.mkv"
@@ -155,12 +169,10 @@ def _claim_and_upload(client: TestClient, token: str, task_id: int) -> dict:
     # 服务端落盘的段必须是合法 MKV（EBML 魔数 0x1A45DFA3）；曾经因追加模式
     # 写坏段文件，concat 才报 EBML 解析失败——此断言防回归
     from movieclaw_api.services.preload import service as _svc
-    from movieclaw_api.core.config import get_settings as _gs
 
     part_file = _svc.artifact_dir_for(task_id) / "seg00000.mkv"
     assert part_file.read_bytes()[:4] == bytes([0x1A, 0x45, 0xDF, 0xA3]), part_file.read_bytes()[:16]
     seg.unlink(missing_ok=True)
-    return task
 
 
 def _fake_probe(monkeypatch) -> None:
@@ -200,10 +212,25 @@ def test_estimate_and_create_task(client, tmp_path):
     assert data["estimated_bytes"] > 0
     assert data["quota_bytes"] > 0
 
+    # 省流是默认档；同片源高清档的预估必然更大（码率帽 4M vs 1.5M）
+    portable = client.post(
+        f"{_PRELOAD}/estimate", json={"file_id": file_id, "preset_id": "portable_1080p"}
+    )
+    assert portable.json()["data"]["estimated_bytes"] > data["estimated_bytes"]
+
+    # 未知档位明确拒绝
+    assert client.post(
+        f"{_PRELOAD}/estimate", json={"file_id": file_id, "preset_id": "nope"}
+    ).status_code == 400
+    assert client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "nope"}
+    ).status_code == 400
+
     created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
     assert created.status_code == 200, created.text
     task = created.json()["data"]
     assert task["status"] == PreloadTaskStatus.QUEUED.value
+    assert task["preset_id"] == "saver_1080p"
 
     # 幂等：再下一次还是同一个任务
     again = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
@@ -211,7 +238,7 @@ def test_estimate_and_create_task(client, tmp_path):
 
 
 def test_claim_selects_nvenc_when_worker_reports_caps(client, tmp_path):
-    """Worker 上报 NVENC 能力 → 下发全 GPU 链；HDR 源下色调映射回内存。"""
+    """Worker 上报 NVENC 能力 → 下发全 GPU 链（编码器随档位）；HDR 源下色调映射回内存。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
     task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
     token = _pair_worker(client)
@@ -234,14 +261,16 @@ def test_claim_selects_nvenc_when_worker_reports_caps(client, tmp_path):
     client.post(f"{_PRELOAD}/tasks/{task['task_id']}/cancel")
     client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
 
-    # 补 tonemapx 能力再领：HDR → 硬解下载回内存 tonemapx + NVENC 编码
+    # 补 tonemapx 能力再领：省流档（默认）→ HDR 硬解下载回内存 tonemapx
+    # + HEVC NVENC，码率帽 1.5M
     caps_tx = {**caps, "filters": [*caps["filters"], "tonemapx"]}
     task_tx = client.post(
         f"{_WORKER}/claim", json={"caps": caps_tx}, headers=_worker_headers(token)
     ).json()["data"]["task"]
     argv = " ".join(task_tx["argv"])
-    assert "h264_nvenc" in argv, argv
+    assert "hevc_nvenc" in argv and "h264_nvenc" not in argv, argv
     assert "hwdownload" in argv and "tonemapx=tonemap=bt2390" in argv, argv
+    assert task_tx["argv"][task_tx["argv"].index("-maxrate") + 1] == "1.5M", task_tx["argv"]
     assert task_tx["hw_backend"] == "nvenc"
 
     # 换 SDR 4K 源再领：全 GPU 链（硬解 + scale_cuda，无 hwdownload）
@@ -252,14 +281,32 @@ def test_claim_selects_nvenc_when_worker_reports_caps(client, tmp_path):
     ).json()["data"]["task"]
     argv2 = " ".join(task2["argv"])
     assert "scale_cuda" in argv2 and "hwdownload" not in argv2, argv2
-    assert "-hwaccel_output_format" in argv2, argv2
+    assert "-hwaccel_output_format" in argv2 and "hevc_nvenc" in argv2, argv2
+
+    # 同源下高清档：h264_nvenc + 4M 码率帽
+    client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file2, "preset_id": "portable_1080p"}
+    )
+    task3 = client.post(
+        f"{_WORKER}/claim", json={"caps": caps_tx}, headers=_worker_headers(token)
+    ).json()["data"]["task"]
+    argv3 = " ".join(task3["argv"])
+    assert "h264_nvenc" in argv3 and "hevc_nvenc" not in argv3, argv3
+    assert task3["argv"][task3["argv"].index("-maxrate") + 1] == "4M", task3["argv"]
 
 
 def test_create_rejects_already_portable_source(client, tmp_path):
-    """源已是便携档（1080p H.264 SDR）时明确拒绝。"""
+    """高清档：源已是便携档（1080p H.264 SDR）时明确拒绝；省流档仍可下单
+    （HEVC 重编码，无直拷判定）。"""
     file_id = _seed_file(client, tmp_path, codec="h264", resolution="1080p")
-    resp = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
+    resp = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "portable_1080p"}
+    )
     assert resp.status_code == 400
+
+    saver = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
+    assert saver.status_code == 200, saver.text
+    assert saver.json()["data"]["preset_id"] == "saver_1080p"
 
 
 def test_create_rejects_over_quota(client, tmp_path, monkeypatch):
@@ -281,7 +328,9 @@ def test_create_rejects_over_quota(client, tmp_path, monkeypatch):
 def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
     """全链路：下单 → Worker 领取 → 进度 → 分段上传 → complete → 派生版本。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
-    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    task_id = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "portable_1080p"}
+    ).json()["data"]["id"]
     token = _pair_worker(client)
 
     # 领取
@@ -355,10 +404,110 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
     assert derived.derivation["preset_id"] == "portable_1080p"
 
 
+def test_saver_preset_roundtrip_hevc(client, tmp_path, monkeypatch):
+    """省流档（默认档）全链路：HEVC NVENC 链 + complete 登记 hevc 派生版本。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    token = _pair_worker(client)
+    caps = {
+        "encoders": ["h264_nvenc", "hevc_nvenc"],
+        "filters": ["scale_cuda", "hwdownload", "hwupload_cuda", "tonemapx"],
+        "hw_decoders": ["h264", "hevc"],
+    }
+    claim = client.post(f"{_WORKER}/claim", json={"caps": caps}, headers=_worker_headers(token))
+    assert claim.status_code == 200, claim.text
+    task = claim.json()["data"]["task"]
+    assert task is not None and task["task_id"] == task_id
+    argv = " ".join(task["argv"])
+    assert "hevc_nvenc" in argv and "h264_nvenc" not in argv, argv
+    assert task["argv"][task["argv"].index("-maxrate") + 1] == "1.5M", task["argv"]
+
+    _upload_segment(client, task)
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.preload_worker.probe_media",
+        lambda path: MediaSpec(
+            resolution="1080p", video_codec="hevc", hdr=None, bit_depth=8,
+            duration_seconds=7200, bit_rate=1_400_000,
+        ),
+    )
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
+    assert done.status_code == 200, done.text
+    derived_id = done.json()["data"]["file_id"]
+
+    async def _check() -> tuple[str | None, str]:
+        async with get_database().session() as session:
+            row = await session.get(LibraryFile, derived_id)
+            return (
+                row.video_codec if row else None,  # type: ignore[union-attr]
+                row.derivation["preset_id"],  # type: ignore[union-attr]
+            )
+
+    codec, preset_id = client.portal.call(partial(_check))  # type: ignore[attr-defined]
+    assert codec == "hevc" and preset_id == "saver_1080p"
+
+
+def test_complete_rejects_wrong_codec_for_preset(client, tmp_path, monkeypatch):
+    """产物编码不符合档位（省流档收了 H.264 产物）→ 整件作废。"""
+    file_id = _seed_file(client, tmp_path)  # SDR 4K HEVC 源 → 默认省流档
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    token = _pair_worker(client)
+    caps = {
+        "encoders": ["h264_nvenc", "hevc_nvenc"],
+        "filters": ["scale_cuda"],
+        "hw_decoders": ["h264", "hevc"],
+    }
+    claim = client.post(f"{_WORKER}/claim", json={"caps": caps}, headers=_worker_headers(token))
+    task = claim.json()["data"]["task"]
+    assert task is not None and "hevc_nvenc" in " ".join(task["argv"]), task
+
+    _upload_segment(client, task)
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.preload_worker.probe_media",
+        lambda path: MediaSpec(
+            resolution="1080p", video_codec="h264", hdr=None, bit_depth=8,
+            duration_seconds=7200, bit_rate=3_900_000,
+        ),
+    )
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
+    assert done.status_code == 400, done.text
+    assert "HEVC" in done.json()["message"], done.text
+
+
+def test_hdr_tonemap_cuda_stays_full_gpu(client, tmp_path):
+    """HDR + tonemap_cuda 必须整链留 GPU：-hwaccel_output_format cuda 在位，
+    且不再叠加 BT.2020 colorspace 转换（色调映射滤镜本身转 BT.709；曾因转换
+    判定强制下载、GPU 滤镜吃到系统内存帧报 -40，真机冒烟抓到）。"""
+    file_id = _seed_file(
+        client, tmp_path, hdr="HDR10", color_space="BT.2020"
+    )
+    client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
+    token = _pair_worker(client)
+    caps = {
+        "encoders": ["h264_nvenc", "hevc_nvenc"],
+        "filters": ["scale_cuda", "hwdownload", "hwupload_cuda", "tonemap_cuda"],
+        "hw_decoders": ["h264", "hevc"],
+    }
+    task = client.post(
+        f"{_WORKER}/claim", json={"caps": caps}, headers=_worker_headers(token)
+    ).json()["data"]["task"]
+    argv = " ".join(task["argv"])
+    # 滤镜链里不许出现下载/转换滤镜（输出侧的 -colorspace bt709 标签不在检查内）
+    filter_chain = task["argv"][task["argv"].index("-vf") + 1]
+    assert "-hwaccel_output_format cuda" in argv, argv
+    assert "hwdownload" not in filter_chain and "colorspace=" not in filter_chain, filter_chain
+    assert "tonemap_cuda=tonemap=bt2390" in filter_chain and "hevc_nvenc" in argv, argv
+
+
 def test_source_delete_invalidates_derived(client, tmp_path, monkeypatch):
     """源删除 → 预转码产物直接清理（§6）。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
-    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    task_id = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "portable_1080p"}
+    ).json()["data"]["id"]
     token = _pair_worker(client)
     _claim_and_upload(client, token, task_id)
     _fake_probe(monkeypatch)
@@ -419,7 +568,9 @@ def test_cancel_running_task(client, tmp_path):
 def test_cleanup_stale_preview_and_run(client, tmp_path, monkeypatch):
     """冷数据清理（§6 三件套之二）：预览与执行。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
-    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    task_id = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "portable_1080p"}
+    ).json()["data"]["id"]
     token = _pair_worker(client)
     _claim_and_upload(client, token, task_id)
     _fake_probe(monkeypatch)

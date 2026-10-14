@@ -13,10 +13,14 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.exceptions import NotFoundException
+from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services.preload import service as preload_service
-from movieclaw_api.services.preload.ffmpeg_preload import PRESETS, estimate_size_bytes
+from movieclaw_api.services.preload.ffmpeg_preload import (
+    PRESET_DEFAULT,
+    PRESETS,
+    estimate_size_bytes,
+)
 from movieclaw_db.engine import get_session
 from movieclaw_db.models import PreloadTask, PreloadTaskStatus
 
@@ -25,12 +29,12 @@ router = APIRouter(prefix="/preload", tags=["preload"])
 
 class PreloadCreatePayload(BaseModel):
     file_id: int = Field(description="源文件 id（库里的原始版本）")
-    preset_id: str = Field(default="portable_1080p", description="目标档位")
+    preset_id: str = Field(default=PRESET_DEFAULT, description="目标档位")
 
 
 class PreloadEstimatePayload(BaseModel):
     file_id: int
-    preset_id: str = "portable_1080p"
+    preset_id: str = PRESET_DEFAULT
 
 
 class StaleCleanupPayload(BaseModel):
@@ -61,7 +65,12 @@ def _task_view(task: PreloadTask, session: AsyncSession) -> dict[str, Any]:
     operation_id="preload.presets",
 )
 async def list_presets() -> ApiResponse[list[dict[str, str]]]:
-    return ok([{"id": pid, "title": p["title"]} for pid, p in PRESETS.items()])
+    return ok(
+        [
+            {"id": pid, "short": p.get("short", pid), "title": p["title"]}
+            for pid, p in PRESETS.items()
+        ]
+    )
 
 
 @router.post(
@@ -73,9 +82,12 @@ async def estimate(
     payload: PreloadEstimatePayload,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict[str, Any]]:
-    """点「转码为便携版本」时先展示预估体积与当前剩余配额（§6 价格标签）。"""
+    """点「预转码」时先展示预估体积与当前剩余配额（§6 价格标签）。"""
     file = await preload_service.get_target_file(session, payload.file_id)
-    estimated = estimate_size_bytes(duration_seconds=file.duration_seconds)
+    preset = PRESETS.get(payload.preset_id)
+    if preset is None:
+        raise BadRequestException(f"未知档位：{payload.preset_id}")
+    estimated = estimate_size_bytes(duration_seconds=file.duration_seconds, preset=preset)
     setting = await get_setting_store_dep()
     used = await preload_service.preload_usage_bytes(session)
     return ok(
