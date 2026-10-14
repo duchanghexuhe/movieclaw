@@ -147,9 +147,10 @@ _NVENC_ENCODER_BY_CODEC = {"h264": "h264_nvenc", "hevc": "hevc_nvenc"}
 
 
 def _nvenc_video_args(preset: dict, filters: list[str]) -> list[str]:
-    """NVENC 编码参数：p4 质量档 + maxrate 约束（NVENC 不认 CRF 模式下的
+    """NVENC 编码参数 + maxrate 约束（NVENC 不认 CRF 模式下的
     恒质量……实际上支持 -cq，但与 maxrate 混用的行为随驱动版本漂；用
-    纯码率模式最稳，速度是第一目标）。编码器与 profile 随档位。"""
+    纯码率模式最稳）。速度档 p2（用户盲测 p2/p4 无差别后拍板，真机实测
+    快约 35%；p1 不再更快）+ spatial AQ 保暗场。"""
     codec = preset.get("video_codec", "h264")
     args: list[str] = []
     if filters:
@@ -161,7 +162,7 @@ def _nvenc_video_args(preset: dict, filters: list[str]) -> list[str]:
     else:
         args += ["-profile:v", "high", "-level:v", "4.1"]
     args += [
-        "-preset", "p4",
+        "-preset", "p2",
         "-b:v", "0",  # 交给 -maxrate 均值码率模式
         "-maxrate", preset["maxrate"],
         "-bufsize", preset["bufsize"],
