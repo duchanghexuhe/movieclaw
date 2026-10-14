@@ -1029,6 +1029,11 @@ export function LibraryItemDetailView({
               marking={marking}
               onToggleFavorite={toggleFavorite}
               onTogglePlayed={togglePlayed}
+              // 预转码圆键与文件区标题行按钮同一落点（§8 显眼入口）：播放排
+              // 是详情页动作的主门面，比藏在底部文件区更容易被看到
+              onOpenPreloadDialog={
+                canManageLibraries ? () => setPreloadDialogOpen(true) : undefined
+              }
               onPlay={() => {
                 // 退出播放要回到用户离开的这一屏（含季集查询参数）。导航
                 // 状态不进播放页地址（§6.10 地址就是分享凭证），走
@@ -1171,9 +1176,6 @@ export function LibraryItemDetailView({
               onPreload={canManageLibraries ? handlePreloadCreate : undefined}
               onPreloadCancel={canManageLibraries ? handlePreloadCancel : undefined}
               onPreloadRetry={canManageLibraries ? handlePreloadRetry : undefined}
-              onOpenPreloadDialog={
-                canManageLibraries ? () => setPreloadDialogOpen(true) : undefined
-              }
             />
           );
         })()}
@@ -1378,6 +1380,7 @@ export function PlayAction({
   marking = false,
   onToggleFavorite,
   onTogglePlayed,
+  onOpenPreloadDialog,
 }: {
   watched: PlaybackWatchState | null;
   onPlay: () => void;
@@ -1389,6 +1392,8 @@ export function PlayAction({
   marking?: boolean;
   onToggleFavorite?: () => void;
   onTogglePlayed?: () => void;
+  /** 打开「预转码」选版本弹窗（§8 显眼入口的第二落点）；未传不渲染 */
+  onOpenPreloadDialog?: () => void;
 }) {
   const positionMs = watched?.position_ms ?? 0;
   const durationMs = watched?.duration_ms ?? null;
@@ -1484,6 +1489,23 @@ export function PlayAction({
                 <span className="text-ui font-medium md:hidden">
                   {finished ? "已看完" : "标为已看"}
                 </span>
+              </button>
+            </Tooltip>
+          )}
+          {onOpenPreloadDialog && (
+            <Tooltip
+              content="预转码：提前转好省流版本，外网播放不用等"
+              dismissOnReferencePress
+              disabled={isMobile}
+            >
+              <button
+                type="button"
+                onClick={onOpenPreloadDialog}
+                aria-label="预转码"
+                className={MARK_BUTTON_CLASS}
+              >
+                <SparklesIcon className="size-4.5" />
+                <span className="text-ui font-medium md:hidden">预转码</span>
               </button>
             </Tooltip>
           )}
@@ -2639,7 +2661,6 @@ function FileSection({
   onPreload,
   onPreloadCancel,
   onPreloadRetry,
-  onOpenPreloadDialog,
 }: {
   files: LibraryItemFile[];
   title: string;
@@ -2653,8 +2674,6 @@ function FileSection({
   /** 预转码任务（preload-transcode.md §3）：按 target_file_id 对应文件行展示状态 */
   preloadTasks?: PreloadTaskView[];
   onPreload?: (file: LibraryItemFile) => void;
-  /** 标题行「预转码」按钮：打开选版本弹窗（§8 显眼入口） */
-  onOpenPreloadDialog?: () => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
@@ -2667,20 +2686,10 @@ function FileSection({
             {files.length}
           </span>
         </span>
-        {onPreload && (
-          <button
-            type="button"
-            onClick={onOpenPreloadDialog}
-            className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-white/[0.12] px-2.5 py-0.5 text-caption font-medium text-[var(--text-muted)] transition hover:border-white/[0.2] hover:text-[var(--text)]"
-          >
-            <SparklesIcon className="size-3.5" />
-            预转码
-          </button>
-        )}
         {duplicateHref && duplicateLabel && (
           <Link
             href={duplicateHref}
-            className={onPreload ? "" : "ml-auto inline-flex items-center gap-1.5 rounded-full border border-[var(--warn)]/35 px-2.5 py-0.5 text-caption font-medium text-[var(--warn)] transition hover:bg-[var(--warn)]/10"}
+            className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-[var(--warn)]/35 px-2.5 py-0.5 text-caption font-medium text-[var(--warn)] transition hover:bg-[var(--warn)]/10"
           >
             {duplicateLabel} · 处理重复
           </Link>
