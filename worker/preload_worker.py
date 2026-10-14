@@ -30,6 +30,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# 允许直接以脚本方式运行（python worker/preload_worker.py）：realtime_worker
+# 与本文件同目录，加入 sys.path 保证 import 在任何 cwd 下都能命中。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 CONFIG_FILE = Path(__file__).with_name("preload_worker.json")
 POLL_SECONDS = 30
 PROGRESS_SECONDS = 60
@@ -335,6 +339,7 @@ def load_config(overrides: dict | None = None) -> dict:
             config[key] = value
     config.setdefault("concurrency", 1)
     config.setdefault("ac_only", False)
+    config.setdefault("realtime", False)
     return config
 
 
@@ -381,6 +386,7 @@ class WorkerRuntime:
         concurrency: int = 1,
         ac_only: bool = False,
         once: bool = False,
+        realtime: bool = False,
         on_token: Callable[[str], None] | None = None,
         status_cb: Callable[..., None] | None = None,
     ) -> None:
@@ -393,6 +399,7 @@ class WorkerRuntime:
         self.concurrency = max(1, min(int(concurrency), 8))
         self.ac_only = ac_only
         self.once = once
+        self.realtime = realtime
         self.on_token = on_token
         self.status_cb = status_cb or (lambda *a, **k: None)
         self.stop_event = threading.Event()
@@ -432,8 +439,12 @@ class WorkerRuntime:
         nvenc = "h264_nvenc" in self.caps["encoders"]
         self.log(
             f"Worker 已连接 {self.server}（并发 {self.concurrency}，"
-            f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}）"
+            f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}"
+            f"{f'，实时转码: 开' if self.realtime else ''}）"
         )
+        realtime_thread: threading.Thread | None = None
+        if self.realtime:
+            realtime_thread = self._start_realtime()
         threads = [
             threading.Thread(target=self._slot, args=(i,), daemon=True, name=f"slot-{i}")
             for i in range(self.concurrency)
@@ -448,6 +459,32 @@ class WorkerRuntime:
                 break
             time.sleep(0.5)
         self._emit("stopped")
+
+    def _start_realtime(self) -> threading.Thread:
+        """拉起实时转码 WS 客户端线程（与预转码轮询并行，互不干扰）。"""
+        from realtime_worker import RealtimeClient
+
+        client = RealtimeClient(
+            server=self.server,
+            token=self.token or "",
+            worker_id=self.name,
+            ffmpeg=self.ffmpeg,
+            caps={**self.caps, "ffmpeg_version": self.caps.get("ffmpeg_version")},
+            max_jobs=1,
+            log=lambda line: self.log(f"[实时] {line}"),
+        )
+        self._realtime_client = client
+
+        def watch() -> None:
+            while not self.stop_event.is_set():
+                client.run_forever()
+                client.stop_event.clear()  # run_forever 返回后允许下一轮重连
+                time.sleep(2.0)
+
+        thread = threading.Thread(target=watch, daemon=True, name="realtime")
+        thread.start()
+        self.log("实时转码模式已开启（GPU 空闲时也能接播放转码）")
+        return thread
 
     def _slot(self, index: int) -> None:
         assert self.api is not None
@@ -520,6 +557,7 @@ def main() -> None:
     parser.add_argument("--name", help="配对显示名；缺省读配置文件")
     parser.add_argument("--concurrency", type=int, help="并发槽位数 1-8")
     parser.add_argument("--ac-only", action="store_true", help="仅接通电源时执行")
+    parser.add_argument("--realtime", action="store_true", help="同时开启实时远程转码（WS 长连接接播放任务）")
     parser.add_argument("--once", action="store_true", help="处理完队列里现有任务后退出")
     parser.add_argument("--reset-token", action="store_true", help="丢弃已存令牌重新配对")
     args = parser.parse_args()
@@ -532,6 +570,8 @@ def main() -> None:
     })
     if args.ac_only:
         config["ac_only"] = True
+    if args.realtime:
+        config["realtime"] = True
     if args.reset_token:
         config.pop("token", None)
     save_config(config)
@@ -544,6 +584,7 @@ def main() -> None:
         concurrency=config.get("concurrency") or 1,
         ac_only=bool(config.get("ac_only")),
         once=args.once,
+        realtime=bool(config.get("realtime")),
         on_token=lambda token: save_config({**config, "token": token}),
         status_cb=lambda kind, **fields: print(fields.get("line") or f"（{kind}）"),
     )

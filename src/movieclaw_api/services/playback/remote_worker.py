@@ -42,7 +42,10 @@ WORKER_IDLE_TIMEOUT_S = 45.0
 JOB_ACCEPT_TIMEOUT_S = 8.0
 LOAD_TIMEOUT_S = 15.0
 _WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-_SUPPORTED_BACKENDS = frozenset({"videotoolbox"})
+#: 远程 Worker 允许申报的硬件后端。videotoolbox 之外加了 nvenc（Windows
+#: Worker 的 CUDA 链，命令构造器 HW_BACKENDS 里本就有它；hello 里申报
+#: 其他名字一律丢弃）。segment_types/分片器等约束与后端无关。
+_SUPPORTED_BACKENDS = frozenset({"videotoolbox", "nvenc"})
 #: HLS 分片类型，取值同 ffmpeg ``-hls_segment_type``（见 ffmpeg_args.segment_type）。
 _SUPPORTED_SEGMENT_TYPES = frozenset({"fmp4", "mpegts"})
 #: 没申报 ``hw_decoders`` 的旧版 Worker 只按这两种算能硬解：所有支持的 Apple 芯片
@@ -857,6 +860,8 @@ class RemoteWorkerRegistry:
         )
         if "videotoolbox" in backends and "h264_videotoolbox" not in encoders:
             backends = tuple(item for item in backends if item != "videotoolbox")
+        if "nvenc" in backends and "h264_nvenc" not in encoders:
+            backends = tuple(item for item in backends if item != "nvenc")
         try:
             max_jobs = max(1, min(4, int(raw.get("max_jobs", 1))))
         except (TypeError, ValueError):

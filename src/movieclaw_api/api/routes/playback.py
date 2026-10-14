@@ -1254,11 +1254,14 @@ async def start_playback_session(
         asyncio.to_thread(available_backends),
         _keyframe_index(),
     )
-    # ``backends`` 可能包含外置 Worker 的 videotoolbox；本地命令只能从真实的
-    # NAS 探测快照中选编码器。只有在执行端确认仍在线时，才把 videotoolbox
-    # 作为远程命令发给 Worker。
+    # ``backends`` 可能包含外置 Worker 的能力（videotoolbox/nvenc）；本地命令
+    # 只能从真实的 NAS 探测快照中选编码器。远程候选按在线状态确认后再交给
+    # 决策层（plan.select_execution_backend 的远程名单与此保持一致）。
     local_backends = await asyncio.to_thread(available_local_backends) if backends else ()
-    remote_video_available = remote_worker_available("videotoolbox", disc=disc is not None)
+    remote_video_available = any(
+        remote_worker_available(name, disc=disc is not None)
+        for name in ("videotoolbox", "nvenc")
+    )
     prep_ms = int((time.perf_counter() - prep_started_at) * 1000)
     if disc is None and view.video is not None and view.video.action == "copy":
         # 视频直通的会话：MP4 快路径只抽检了部分关键帧的，起播之后在后台全量核对；快路径拿不到

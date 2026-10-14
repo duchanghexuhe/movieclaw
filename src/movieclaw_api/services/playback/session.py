@@ -1183,9 +1183,11 @@ class TranscodeSessionManager:
         session.remote_job_id = job_id
         # 先占位再拼 URL：得先知道是谁接单，才能用它连上来的地址拼。
         try:
+            if not session.hw_backend:
+                raise SessionStartError("远程会话缺少执行后端（决策层未给出）")
             connection = registry.reserve(
                 job_id,
-                backend=session.hw_backend or "videotoolbox",
+                backend=session.hw_backend,
                 segment_type=segment_type(session.plan),
                 attempt_id=job_id,
                 disc=session.concat_list is not None,
@@ -2075,7 +2077,7 @@ class TranscodeSessionManager:
                 # 另一台从不同入口连进来的 Worker 接走。
                 connection = registry.reserve(
                     job_id,
-                    backend=session.hw_backend or "videotoolbox",
+                    backend=session.hw_backend,  # type: ignore[arg-type]  # 首次下发已校验非空
                     segment_type=segment_type(session.plan),
                     attempt_id=job_id,
                     disc=session.concat_list is not None,

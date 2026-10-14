@@ -253,6 +253,9 @@ class WorkerGUI:
         self.var_ac_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="仅接通电源时执行", variable=self.var_ac_only).grid(
             row=2, column=2, sticky=tk.W)
+        self.var_realtime = tk.BooleanVar(value=False)
+        ttk.Checkbutton(config, text="实时转码（边播边转）", variable=self.var_realtime).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, padx=(6, 0))
         self.var_autostart = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="开机自启", variable=self.var_autostart,
                         command=self._toggle_autostart).grid(row=3, column=2, sticky=tk.W)
@@ -278,6 +281,7 @@ class WorkerGUI:
         self.var_ffmpeg.set(self.config.get("ffmpeg") or "")
         self.var_concurrency.set(int(self.config.get("concurrency") or 1))
         self.var_ac_only.set(bool(self.config.get("ac_only")))
+        self.var_realtime.set(bool(self.config.get("realtime")))
         self.var_autostart.set((_startup_dir() / STARTUP_BAT_NAME).exists())
 
     # -- 动作 ----------------------------------------------------------------
@@ -295,6 +299,7 @@ class WorkerGUI:
             "ffmpeg": self.var_ffmpeg.get().strip(),
             "concurrency": max(1, min(int(self.var_concurrency.get() or 1), 8)),
             "ac_only": bool(self.var_ac_only.get()),
+            "realtime": bool(self.var_realtime.get()),
         }
 
     def _start(self) -> None:
@@ -313,6 +318,7 @@ class WorkerGUI:
             name=self.config.get("name") or "Preload Worker",
             concurrency=config["concurrency"],
             ac_only=config["ac_only"],
+            realtime=config["realtime"],
             on_token=lambda token: save_config({**self.config, "token": token}),
             status_cb=self._on_runtime_event,
         )

@@ -193,7 +193,10 @@ async def load_policy() -> PlaybackPolicy:
     return PlaybackPolicy(
         software_transcode_enabled=stored.software_transcode_enabled,
         hardware_available=available,
-        hardware_busy=not available and remote_worker_busy("videotoolbox"),
+        # 本机无硬件但远程有（Mac 或 Windows GPU），提示「忙」而不是「没有」；
+        # 名单要覆盖 _with_remote_backend 叠加的每个远程后端
+        hardware_busy=not available
+        and any(remote_worker_busy(name) for name in ("videotoolbox", "nvenc")),
         max_transcode_height=MAX_TRANSCODE_HEIGHT,
     )
 
@@ -223,12 +226,16 @@ def select_execution_backend(
         if effective_hw_backend(decision, backend) is not None:
             return backend, False
 
-    if (
-        remote_video_available
-        and "videotoolbox" in available
-        and effective_hw_backend(decision, "videotoolbox") is not None
-    ):
-        return "videotoolbox", True
+    # 本地执行不了才轮到远程 Worker。远程后端按优先级排：videotoolbox 在前
+    # （先接单的跑得久，速度画像更厚），nvenc（Windows GPU）兜底。谁在
+    # ``available`` 里由 hwprobe._with_remote_backend 按在线状态叠加。
+    for backend in ("videotoolbox", "nvenc"):
+        if (
+            remote_video_available
+            and backend in available
+            and effective_hw_backend(decision, backend) is not None
+        ):
+            return backend, True
     return None, False
 
 

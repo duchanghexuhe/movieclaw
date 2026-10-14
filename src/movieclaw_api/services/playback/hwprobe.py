@@ -183,28 +183,34 @@ async def probe_backends_async(*, force: bool = False) -> list[HwBackendStatus]:
 
 
 def _with_remote_backend(statuses: list[HwBackendStatus]) -> list[HwBackendStatus]:
-    """把在线远程 Worker 映射为决策层可识别的 VideoToolbox 后端。
+    """把在线远程 Worker 映射为决策层可识别的硬件后端。
 
     远程 Worker 不参与 NAS 容器内的一秒探测；它在连接 hello 中已经完成了
     ffmpeg 能力探测。动态追加而不是写入本地缓存，保证 Worker 断线后下一次
-    决策立即回到真实的本机结果。
+    决策立即回到真实的本机结果。videotoolbox（Mac）与 nvenc（Windows CUDA）
+    都认：谁在线叠加谁；Linux 探测矩阵里的同名 False 条目被在线声明覆盖，
+    而不是重复返回两个同名后端。
     """
-    if not remote_worker_available("videotoolbox"):
-        return statuses
-    remote_status = HwBackendStatus(
-        name="videotoolbox",
-        label=BACKEND_LABELS["videotoolbox"],
-        available=True,
-        detail="已连接远程 Worker，并通过其 VideoToolbox 能力声明。",
-    )
-    # Linux 探测矩阵也会包含 videotoolbox=False；在线 Worker 应覆盖这个
-    # “本机没有该后端”的诊断，而不是重复返回两个同名后端。
-    if any(status.name == "videotoolbox" for status in statuses):
-        return [
-            remote_status if status.name == "videotoolbox" else status
-            for status in statuses
-        ]
-    return [*statuses, remote_status]
+    for name in ("videotoolbox", "nvenc"):
+        if not remote_worker_available(name):
+            continue
+        remote_status = HwBackendStatus(
+            name=name,
+            label=BACKEND_LABELS.get(name, name),
+            available=True,
+            detail=(
+                "已连接远程 Worker，并通过其 VideoToolbox 能力声明。"
+                if name == "videotoolbox"
+                else "已连接远程 Windows Worker，并通过其 NVENC 能力声明。"
+            ),
+        )
+        if any(status.name == name for status in statuses):
+            statuses = [
+                remote_status if status.name == name else status for status in statuses
+            ]
+        else:
+            statuses = [*statuses, remote_status]
+    return statuses
 
 
 def _probe_one(name: str, encoders: frozenset[str]) -> HwBackendStatus:
