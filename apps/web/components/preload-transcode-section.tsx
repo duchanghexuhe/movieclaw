@@ -45,7 +45,8 @@ const STATUS_LABELS: Record<PreloadTaskView["status"], string> = {
  * 「媒体库」分区的预转码设置（preload-transcode.md §6）。
  *
  * 管理任务队列（取消/重试）与「清理冷数据」（预览 → 执行）。Worker 的
- * 配对与授权在「设备」分区（与实时转码 Worker 同一套）。
+ * 配对与授权在「设备」分区（与实时远程转码 Worker 同一套；两个 Worker
+ * 的运行状态都在「转码」页看——实时节看长连接，本节看任务队列）。
  */
 export function TranscodeSection() {
   const [overview, setOverview] = useState<PreloadOverview | null>(null);

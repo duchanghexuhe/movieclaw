@@ -254,7 +254,7 @@ export function SettingsPanel({ active, item }: SettingsPanelProps) {
         ) : section.id === "playback" ? (
           <PlaybackSection />
         ) : section.id === "transcode" ? (
-          <TranscodeSection />
+          <TranscodeSettingsPage />
         ) : section.id === "llm" ? (
           <LlmConfigSection />
         ) : section.id === "ai" ? (
@@ -674,14 +674,11 @@ function AppSection() {
 /**
  * —— 播放分区（媒体库组）——
  *
- * 住户：进度条预览、转码缓存、片段预切三颗开关（合成「播放体验」一组）、远程转码
- * （原「应用 → 远程转码」标签迁来）。
- * 按功能命名为「播放」而不是按实现叫「远程转码」：转码策略、字幕偏好等
- * 播放域设置都落在这里，分区不用再改名。Worker 的审批与吊销仍在
- * 「设备」分区，靠 onOpenDevices 一键直达。
+ * 住户：进度条预览、转码缓存、片段预切三颗开关（合成「播放体验」一组）。
+ * 远程转码已迁到「转码」页：两套转码 Worker（实时/预转码）同处一页管理，
+ * 用户不用猜"我的转码机器在哪个设置页"。
  */
 function PlaybackSection() {
-  const router = useRouter();
   return (
     <div className="space-y-10">
       {/* 进度条预览与转码缓存各只有一颗开关：同属「拿服务器资源换播放体验」，并成一组 */}
@@ -695,9 +692,25 @@ function PlaybackSection() {
           <ReelClipsToggleRow />
         </SettingsList>
       </SettingsSection>
+    </div>
+  );
+}
+
+/**
+ * —— 转码页：两套转码 Worker 的统一门面 ——
+ *
+ * 实时远程转码（播放当下派活，长连接）在前——它有开关要先开；
+ * 预转码（闲时批量转好存起来，轮询领活）在后。设备审批与吊销仍在
+ * 「设备」分区，两节各自指路。
+ */
+function TranscodeSettingsPage() {
+  const router = useRouter();
+  return (
+    <div className="space-y-10">
       <RemoteTranscodeSection
         onOpenDevices={() => router.push("/settings/devices" as Route)}
       />
+      <TranscodeSection />
     </div>
   );
 }
