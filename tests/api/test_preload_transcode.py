@@ -152,6 +152,13 @@ def _claim_and_upload(client: TestClient, token: str, task_id: int) -> dict:
         headers={"Content-Type": "application/octet-stream"},
     )
     assert put.status_code == 201, put.text
+    # 服务端落盘的段必须是合法 MKV（EBML 魔数 0x1A45DFA3）；曾经因追加模式
+    # 写坏段文件，concat 才报 EBML 解析失败——此断言防回归
+    from movieclaw_api.services.preload import service as _svc
+    from movieclaw_api.core.config import get_settings as _gs
+
+    part_file = _svc.artifact_dir_for(task_id) / "seg00000.mkv"
+    assert part_file.read_bytes()[:4] == bytes([0x1A, 0x45, 0xDF, 0xA3]), part_file.read_bytes()[:16]
     seg.unlink(missing_ok=True)
     return task
 

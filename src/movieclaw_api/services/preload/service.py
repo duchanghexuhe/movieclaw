@@ -397,6 +397,7 @@ def build_task_command(
         # complete 时 concat demuxer 拼接。video_copy（直拷）不分段
         "segment_seconds": 0 if command.video_copy else SEGMENT_SECONDS,
         "duration_seconds": file.duration_seconds,
+        "source_size_bytes": file.size_bytes,
     }
 
 

@@ -59,7 +59,9 @@ class Api:
             # 控制面路径带前导 /；claim 返回的 source_url/artifact_url 是
             # 协议相对路径（无前导 /）。两者都拼到 server 上
             url = f"{self.server}/{path.lstrip('/')}"
-        head = {"Accept": "application/json"}
+        # 每请求独立连接：段转码期间 keep-alive 会被服务端空闲超时（5s）关闭，
+        # 复用死连接 PUT 大段体 → WinError 10053（2026-10-14 本地流程实测）
+        head = {"Accept": "application/json", "Connection": "close"}
         if self.token and "token=" not in url:
             head["Authorization"] = f"Bearer {self.token}"
         if json_body is not None:
@@ -208,13 +210,17 @@ def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path, *,
         return False
     workdir.mkdir(parents=True, exist_ok=True)
     source = workdir / "source.mkv"
-    artifact_url = "/api/v1/" + task["artifact_url"]
+    artifact_url = "/" + task["artifact_url"]  # claim 已带 api/v1 前缀
     segment_seconds = task.get("segment_seconds") or 0
     duration = task.get("duration_seconds") or 0
     resume = task.get("resume_parts") or 0
     base_argv = task["argv"]  # 末两个元素是 -f matroska <output>
 
-    # 1) 取源（签名 URL；整文件下载对断线重试与 NAS 磁盘更友好；已下载过直接续用）
+    # 1) 取源（签名 URL；整文件下载对断线重试与 NAS 磁盘更友好）。
+    # 已下载且大小与台账一致才复用；中断的半截文件直接重下
+    expected = task.get("source_size_bytes") or 0
+    if source.exists() and (not expected or source.stat().st_size != expected):
+        source.unlink()
     if not source.exists():
         url = api.server + "/" + task["source_url"]
         req = urllib.request.Request(url)
@@ -252,12 +258,20 @@ def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path, *,
             seg_argv = list(base_argv)
             # argv 尾部是 [-f, matroska, output] → 输出改为本段文件
             seg_argv[-1] = str(seg_path)
-            insert_at = seg_argv.index("-i")
+            input_idx = seg_argv.index("-i")
+            url_idx = input_idx + 1  # -i 的值（源文件）所在位置
             seek = part * segment_seconds
-            if segment_seconds and seek > 0:
-                seg_argv[insert_at:insert_at] = ["-ss", str(seek)]
+            if segment_seconds:
+                # 每段都要截时长（含第 0 段！漏了会把整部片转进第一段）。
+                # -ss 插在 -i 前做快速寻址；**-t 必须插在 -i 的值之后（输出
+                # 选项）**：输入侧 -t 切不动字幕包，每段的 SRT 轨会带上整部片
+                # 的时间戳，concat 时长直接爆表（2026-10-14 真机实测 514% 偏差）。
+                # 只有末段转到 EOF
+                if seek > 0:
+                    seg_argv[input_idx:input_idx] = ["-ss", str(seek)]
+                    url_idx += 2
                 if part < total_parts - 1:
-                    seg_argv[insert_at + 2:insert_at + 2] = ["-t", str(segment_seconds)]
+                    seg_argv[url_idx + 1:url_idx + 1] = ["-t", str(segment_seconds)]
             code, stderr_tail = run_ffmpeg(ffmpeg, seg_argv, workdir)
             if code != 0:
                 api.request(
@@ -397,12 +411,17 @@ class WorkerRuntime:
         self._emit("log", line=line)
 
     def ensure_token(self) -> None:
+        if self.token:
+            self.api = Api(self.server, self.token)
+            return
+        # 无令牌：先空 Api 发起配对，拿到令牌后必须把**带令牌的 Api** 装回
+        # （否则槽位循环一直 401、无限重新配对——2026-10-14 本地流程实测）
+        self._emit("pairing")
+        api = Api(self.server, None)
+        self.token = api.pair(self.name, status_cb=self._emit)
         self.api = Api(self.server, self.token)
-        if not self.token:
-            self._emit("pairing")
-            self.token = self.api.pair(self.name, status_cb=self._emit)
-            if self.on_token is not None:
-                self.on_token(self.token)
+        if self.on_token is not None:
+            self.on_token(self.token)
 
     def start(self) -> None:
         """阻塞直到 stop_event 置位（或 --once 队列清空）。"""
@@ -480,7 +499,10 @@ class WorkerRuntime:
                     phase="done" if ok else "failed",
                 )
             except Exception as exc:  # 任何意外：上报失败，继续领下一个
+                import traceback
+
                 self.log(f"[{task_id}] 异常：{exc}")
+                self.log(traceback.format_exc()[-900:])
                 self.api.request(
                     "POST",
                     f"/api/v1/preload-worker/tasks/{task['task_id']}/fail",

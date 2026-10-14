@@ -168,33 +168,30 @@ async def put_preload_artifact(
     directory.mkdir(parents=True, exist_ok=True)
     part_path = directory / f"seg{part:05d}.mkv"
 
-    part_bytes = task.part_bytes or _PART_BYTES
-    committed = part_path.stat().st_size if part_path.exists() else 0
-    # 已收满同号段：重传幂等认下
-    if committed >= part_bytes:
-        return Response(status_code=201, headers={"Cache-Control": "no-store"})
-
+    # 段上传时代（§7 断点续转）：一段是 600s 的转码产物（约 300MB），旧的
+    # 64MiB byte-range 上限只会在中途断连（服务端断、客户端 10053）。
+    # 上限放宽到 2GB，仅作防呆
+    part_bytes = max(task.part_bytes or 0, 2 * 1024**3)
     written = 0
     try:
-        with open(part_path, "ab") as output:
+        # **整文件覆盖写**（每段是独立完整的 MKV，不是 byte-range）：
+        # 追加模式 + 上次中断的半截文件 = 段损坏、concat 时长全是垃圾
+        # （2026-10-14 本地流程实测 514% 时长偏差即此因）
+        with open(part_path, "wb") as output:
             async for chunk in request.stream():
                 if not chunk:
                     continue
                 written += len(chunk)
-                if committed + written > part_bytes:
-                    output.truncate(committed)
-                    raise BadRequestException("分段超过约定大小")
+                if written > part_bytes:
+                    output.truncate(0)
+                    raise BadRequestException("分段超过大小上限")
                 output.write(chunk)
     except ClientDisconnect:
-        # 半段不能留：截回段首，Worker 重传时从同一位置重写
-        if part_path.exists():
-            with open(part_path, "r+b") as output:
-                output.truncate(committed)
+        # 半段不能留：中断的段在重传时整段覆盖
+        part_path.unlink(missing_ok=True)
         return Response(status_code=499, headers={"Cache-Control": "no-store"})
     except BaseException:
-        if part_path.exists():
-            with open(part_path, "r+b") as output:
-                output.truncate(committed)
+        part_path.unlink(missing_ok=True)
         raise
     received = await preload_service.record_part_count(session, task_id, part=part)
     return Response(
