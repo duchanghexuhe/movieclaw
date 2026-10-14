@@ -249,11 +249,13 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
       : onlineWorkers.length > 0
         ? `已就绪，${onlineWorkers.length} 个 Worker 在线`
         : "配置已就绪，但还没有 Worker 连上来";
-  const statusClass = !config.enabled
-    ? "text-[var(--text-muted)]"
+  // 状态信号走小色点，文字保持中性——Netflix 主题下大段绿字/橙字与品牌红
+  // 同屏发土，色点既保留信号又不参与撞色（与 Banner「图标上色、正文中性」同理）。
+  const statusDotClass = !config.enabled
+    ? null
     : config.ready && onlineWorkers.length > 0
-      ? "text-emerald-300"
-      : "text-amber-200";
+      ? "bg-[var(--ok)]"
+      : "bg-[var(--warn)]";
   // 「设备」页入口：这一页只回答「现在连着吗、在干什么」；「批准新的、授权还在
   // 不在、要不要注销」是设备页的事，两页各管一段，互相指路。
   const devicesLink = onOpenDevices && (
@@ -302,13 +304,16 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
               label="当前状态"
               description={
                 config.issues.length > 0 && (
-                  <ul className="space-y-0.5 text-amber-200/90">
+                  <ul className="space-y-0.5 text-[var(--warn)]/90">
                     {config.issues.map((issue) => <li key={issue}>· {issue}</li>)}
                   </ul>
                 )
               }
             >
-              <span className={`max-w-[18rem] text-right text-sub ${statusClass}`}>{statusText}</span>
+              <span className="flex max-w-[18rem] items-center justify-end gap-1.5 text-right text-sub text-[var(--text-muted)]">
+                {statusDotClass && <span className={`size-1.5 shrink-0 rounded-full ${statusDotClass}`} />}
+                {statusText}
+              </span>
             </SettingsRow>
           </SettingsList>
         </div>
@@ -330,11 +335,17 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
               合法）挡着。做成横幅而不是替换整块内容：已授权的设备该照常列出来，
               用户需要同时看到「我配过哪几台」和「现在为什么连不上」。 */}
           {!config.ready && (
-            <Banner tone="warn">
-              {!config.enabled
-                ? "远程转码还没开启，Worker 现在连不上来。打开上面的开关即可。"
-                : "「高级」里填的覆盖地址不合法，Worker 现在连不上来。改正或清空它即可。"}
-            </Banner>
+            !config.enabled ? (
+              // 「还没开启」是关闭态不是异常——按全站规范不占状态色，用中性灰
+              //（与 cloud 分区「已断开」横幅同一档）；warn 只留给上面那种「想开但配错」。
+              <Banner tone="neutral">
+                远程转码还没开启，Worker 现在连不上来。打开上面的开关即可。
+              </Banner>
+            ) : (
+              <Banner tone="warn">
+                「高级」里填的覆盖地址不合法，Worker 现在连不上来。改正或清空它即可。
+              </Banner>
+            )
           )}
 
           {status == null ? (
@@ -347,15 +358,16 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                   label={
                     <span className="flex items-center gap-2">
                       <span className="truncate">{worker.worker_id}</span>
-                      <span
-                        className={`shrink-0 text-caption font-normal ${
-                          worker.online
-                            ? worker.draining
-                              ? "text-amber-200"
-                              : "text-emerald-300"
-                            : "text-[var(--text-faint)]"
-                        }`}
-                      >
+                      {/* 在线信号走色点不走彩字：与「当前状态」行同一形态，
+                          避免 Netflix 主题下绿字与品牌红同屏撞色 */}
+                      {worker.online && (
+                        <span
+                          className={`size-1.5 shrink-0 rounded-full ${
+                            worker.draining ? "bg-[var(--warn)]" : "bg-[var(--ok)]"
+                          }`}
+                        />
+                      )}
+                      <span className="shrink-0 text-caption font-normal text-[var(--text-faint)]">
                         {worker.online ? (worker.draining ? "暂停接单" : "在线") : "已离线"}
                       </span>
                     </span>

@@ -202,7 +202,7 @@ function UpNextCard({ item }: { item: UpNextItem }) {
                   墙 GPU 合成成本；本徽章 76% 不透明且压在海报图上，模糊贡献
                   趋近于零）；emerald 字面量保留——收口到 --ok 会让银玻璃可见
                   变化（emerald-100=#d1fae5 vs :root --ok=#4ade80），待设计决策 */}
-              <span className="tnum rounded-full border border-emerald-200/25 bg-[rgba(5,46,34,0.76)] px-2 py-0.5 text-micro font-semibold text-emerald-100 shadow-[0_5px_16px_rgba(0,0,0,0.32)]">
+              <span className="tnum rounded-full border border-emerald-200/25 bg-[rgba(5,46,34,0.76)] px-2 py-0.5 text-micro font-semibold text-[var(--ok)] shadow-[0_5px_16px_rgba(0,0,0,0.32)]">
                 {unwatchedLabel}
               </span>
             </div>

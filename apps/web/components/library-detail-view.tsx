@@ -1716,12 +1716,12 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           />
         )}
         {failed && (
-          <p className="mt-3 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3.5 py-2 text-sub text-amber-200">
+          <p className="mt-3 rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3.5 py-2 text-sub text-[var(--warn)]">
             与后端通信失败，正在自动重试；下方显示的是最近一次成功加载的数据
           </p>
         )}
         {notice && (
-          <p className="mt-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2 text-sub text-red-200">
+          <p className="mt-3 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2 text-sub text-[var(--danger)]">
             {notice}
           </p>
         )}
@@ -2822,7 +2822,10 @@ function MissingRow({
           <span className="ml-2 text-sub font-normal text-[var(--text-muted)]">{summary}</span>
         </span>
         {done ? (
-          <span className="text-sub text-[var(--ok)]">{done}</span>
+          <span className="inline-flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
+            <span className="size-1.5 shrink-0 rounded-full bg-[var(--ok)]" />
+            {done}
+          </span>
         ) : (
           <span className="flex shrink-0 items-center gap-2">
             <button
@@ -2864,7 +2867,7 @@ function MissingRow({
       {item.subscription_id && !done && (
         <p className="mt-1 text-caption text-[var(--warn)]/80">该条目有订阅在追踪</p>
       )}
-      {error && <p className="mt-1 text-caption text-red-300">{error}</p>}
+      {error && <p className="mt-1 text-caption text-[var(--danger)]">{error}</p>}
     </div>
   );
 }
@@ -3131,7 +3134,7 @@ function UnidentifiedGroupRow({
         </div>
       )}
 
-      {error && <p className="mt-1.5 text-caption text-red-300">{error}</p>}
+      {error && <p className="mt-1.5 text-caption text-[var(--danger)]">{error}</p>}
 
       {panel?.view === "search" && (
         <ClaimSearchPanel
@@ -3264,7 +3267,7 @@ function ReviewGroupRow({ group, onChanged }: { group: ReviewGroup; onChanged: (
         >
           维持现状
         </button>
-        {error && <span className="text-caption text-red-300">{error}</span>}
+        {error && <span className="text-caption text-[var(--danger)]">{error}</span>}
       </div>
     </div>
   );
@@ -3320,7 +3323,7 @@ function IgnoredGroupRow({
           </button>
         )}
       </div>
-      {error && <p className="mt-1 text-caption text-red-300">{error}</p>}
+      {error && <p className="mt-1 text-caption text-[var(--danger)]">{error}</p>}
       {expanded && (
         <ul className="mt-2 space-y-1 border-t border-white/[0.06] pt-2">
           {group.files.map((f) => (

@@ -405,7 +405,7 @@ export function TaskActionsMenu({
               disabled={item.disabled}
               className={`${itemClass} ${
                 item.tone === "danger"
-                  ? // 危险项字色消费 --danger：银玻璃 :root 同值（#ff6b6b）零变化，
+                  ? // 危险项字色消费 --danger：银玻璃 :root 同值（var(--danger)）零变化，
                     // Netflix 主题取与品牌红刻意区分的状态红 #eb3942
                     "!text-[var(--danger)] data-[highlighted]:!bg-[var(--danger)]/10"
                   : "text-white/75"
@@ -467,7 +467,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
   const compact =
     (job.status === "succeeded" || job.status === "cancelled") && !hasDomainAlert;
   const cardBorder =
-    statusStyle.border ?? (hasDomainAlert ? "border-amber-300/15" : "border-white/[0.08]");
+    statusStyle.border ?? (hasDomainAlert ? "border-[var(--warn)]/15" : "border-white/[0.08]");
   const progressAccent =
     job.status === "succeeded"
       ? "bg-[var(--ok)]"
@@ -727,7 +727,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
                 key={item.label}
                 className={`min-w-0 max-w-full rounded-md border px-2 py-1 text-caption ${
                   item.alert
-                    ? "border-amber-300/15 bg-amber-300/[0.05] text-amber-100/75"
+                    ? "border-[var(--warn)]/15 bg-[var(--warn)]/[0.05] text-[var(--warn)]/75"
                     : "border-white/[0.07] bg-white/[0.035] text-white/45"
                 }`}
               >
@@ -767,7 +767,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
                   {job.provider_ref && <span>{job.provider_ref}</span>}
                   <span>{subtitleUsage.requests} 次模型请求</span>
                   {subtitleUsage.failedRequests > 0 && (
-                    <span className="text-amber-200/70">
+                    <span className="text-[var(--warn)]/70">
                       {subtitleUsage.failedRequests} 次失败
                     </span>
                   )}
@@ -780,7 +780,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
         )}
 
         {actionError && (
-          // 错误文字保留 #ff9f9f 浅红字面量：:root --danger=#ff6b6b 与之不同值，
+          // 错误文字保留 #ff9f9f 浅红字面量：:root --danger=var(--danger) 与之不同值，
           // 收口会让银玻璃可见变化，待设计决策（与上方菜单危险项的同值收口
           // 性质不同——那是 :root 同值零变化）
           <p className="mt-2 text-caption leading-5 text-[#ff9f9f]">{actionError}</p>

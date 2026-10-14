@@ -338,7 +338,7 @@ function DirRow({
       description={
         <span className="flex items-center gap-1.5">
           {expensive && (
-            <span className="shrink-0 rounded-full bg-amber-400/10 px-1.5 py-px text-micro font-medium text-amber-300/90">
+            <span className="shrink-0 rounded-full bg-[var(--warn)]/10 px-1.5 py-px text-micro font-medium text-[var(--warn)]/90">
               重建代价高
             </span>
           )}

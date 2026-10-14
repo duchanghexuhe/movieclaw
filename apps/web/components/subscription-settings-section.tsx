@@ -287,7 +287,7 @@ function IssueCard({ issue }: { issue: PipelineIssue }) {
   return (
     <div
       className={`rounded-xl border p-4 ${
-        isError ? "border-[#ff6b6b]/30 bg-[#ff6b6b]/[0.06]" : "border-amber-400/25 bg-amber-500/[0.06]"
+        isError ? "border-[var(--danger)]/30 bg-[var(--danger)]/[0.06]" : "border-[var(--warn)]/25 bg-[var(--warn)]/[0.06]"
       }`}
     >
       <div className="flex items-start gap-2.5">
@@ -373,8 +373,8 @@ function FlowStepper({ nodes }: { nodes: FlowNode[] }) {
               node.status === "ok"
                 ? "border-white/[0.08] bg-white/[0.03]"
                 : node.status === "warn"
-                  ? "border-amber-400/30 bg-amber-500/10"
-                  : "border-[#ff6b6b]/35 bg-[#ff6b6b]/10"
+                  ? "border-[var(--warn)]/30 bg-[var(--warn)]/10"
+                  : "border-[var(--danger)]/35 bg-[var(--danger)]/10"
             }`}
           >
             <span className={`size-1.5 shrink-0 rounded-full ${STATUS_META[node.status].dot}`} />
@@ -706,7 +706,7 @@ function RuleMatchPreview({ onClose }: { onClose: () => void }) {
                     ✓ 规则与入库配置可用
                   </p>
                 ) : (
-                  <p className="rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-sub leading-relaxed text-amber-200">
+                  <p className="rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3 py-2 text-sub leading-relaxed text-[var(--warn)]">
                     {preview.warning}
                   </p>
                 )}

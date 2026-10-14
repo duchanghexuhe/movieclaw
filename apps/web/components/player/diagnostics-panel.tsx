@@ -125,7 +125,7 @@ function SourceLine({ children }: { children: React.ReactNode }) {
 /** 处理行：→ 开头，弱一档的颜色——读的顺序就是数据流的方向。 */
 function ActionLine({ children, alert }: { children: React.ReactNode; alert?: boolean }) {
   return (
-    <p className={alert ? "text-red-300" : "text-white/75"}>
+    <p className={alert ? "text-[var(--danger)]" : "text-white/75"}>
       <span className="mr-1 text-white/40">→</span>
       {children}
     </p>
@@ -409,7 +409,7 @@ export function DiagnosticsPanel({
           {videoSource ? <SourceLine>{videoSource}</SourceLine> : null}
           {videoAction ? <ActionLine>{videoAction}</ActionLine> : null}
           {decision.video?.burn_subtitle ? <ActionLine>字幕压制进画面</ActionLine> : null}
-          <div className={dropRatio > DROP_ALERT_RATIO ? "text-red-300" : "text-white/75"}>
+          <div className={dropRatio > DROP_ALERT_RATIO ? "text-[var(--danger)]" : "text-white/75"}>
             掉帧{" "}
             <span className="tnum">
               {stats?.droppedFrames != null

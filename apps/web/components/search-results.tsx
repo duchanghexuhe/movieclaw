@@ -2578,7 +2578,7 @@ function SiteStatusSummary({
   const dotCls = streaming
     ? "animate-pulse bg-[var(--accent)]"
     : failed > 0
-      ? "bg-[#ff6b6b]"
+      ? "bg-[var(--danger)]"
       : "bg-[var(--ok)]";
 
   // 逐站详情（浮层与底部弹层共用同一份内容）
@@ -2593,7 +2593,7 @@ function SiteStatusSummary({
                   s.phase === "searching"
                     ? "animate-pulse bg-[var(--accent)]"
                     : s.phase === "error"
-                      ? "bg-[#ff6b6b]"
+                      ? "bg-[var(--danger)]"
                       : "bg-[var(--ok)]"
                 }`}
               />

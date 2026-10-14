@@ -442,7 +442,7 @@ const TurnView = memo(function TurnView({
         })}
 
         {turn.status === "error" && (
-          <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-3.5 py-2.5 text-ui leading-5 break-words text-[#ff6b6b]">
+          <div className="rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/10 px-3.5 py-2.5 text-ui leading-5 break-words text-[var(--danger)]">
             {turn.error}
           </div>
         )}
@@ -838,7 +838,7 @@ const ToolCallCard = memo(function ToolCallCard({ tool }: { tool: AgentTurnToolC
             <ProgressRing />
           </span>
         ) : (
-          <span className={`shrink-0 ${tool.isError ? "text-[#ff6b6b]" : "text-[var(--text-faint)]"}`}>
+          <span className={`shrink-0 ${tool.isError ? "text-[var(--danger)]" : "text-[var(--text-faint)]"}`}>
             {tool.isError ? "✗" : "✓"}
           </span>
         )}
@@ -852,7 +852,7 @@ const ToolCallCard = memo(function ToolCallCard({ tool }: { tool: AgentTurnToolC
             <div
               // 行高用相对值：字号随语义 token 在移动端换档（11→13px），固定 16px 行高会挤死多行日志
               className={`selectable scroll-thin mt-1 max-h-44 overflow-y-auto whitespace-pre-wrap break-words font-mono text-caption leading-[1.45] ${
-                tool.isError ? "text-[#ff6b6b]" : "text-[var(--text-muted)]"
+                tool.isError ? "text-[var(--danger)]" : "text-[var(--text-muted)]"
               }`}
             >
               {tool.output}

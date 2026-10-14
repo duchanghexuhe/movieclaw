@@ -978,7 +978,7 @@ export function WatchStatsPanel({
 
   if (error) {
     return (
-      <p className="rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-6 text-amber-100">
+      <p className="rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub leading-6 text-[var(--warn)]">
         {error}
       </p>
     );

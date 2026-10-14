@@ -1125,8 +1125,14 @@ function NamingTab({
           <span className="text-micro uppercase tracking-widest text-[var(--text-faint)]">
             实时预览
           </span>
-          <span className={`text-caption ${valid ? "text-[var(--ok)]" : "text-[var(--danger)]"}`}>
-            {valid ? "✓ 模板有效" : "✕ 模板有误"}
+          <span className={`text-caption ${valid ? "text-[var(--text-muted)]" : "text-[var(--danger)]"}`}>
+            {valid ? (
+              <>
+                <span className="text-[var(--ok)]">✓</span> 模板有效
+              </>
+            ) : (
+              "✕ 模板有误"
+            )}
           </span>
         </div>
         {valid && (

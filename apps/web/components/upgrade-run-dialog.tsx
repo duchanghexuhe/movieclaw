@@ -282,13 +282,13 @@ export function UpgradeRunDialog({
 
           <div className="scroll-thin min-h-0 flex-1 overflow-y-auto p-6 max-md:p-5">
             {error && (
-              <p className="mt-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-sub leading-6 text-red-200">
+              <p className="mt-3 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--danger)]">
                 {error}
               </p>
             )}
 
             {paused && (
-              <p className="mt-3 rounded-lg border border-amber-300/25 bg-amber-400/10 px-3.5 py-2.5 text-sub leading-6 text-amber-100/90">
+              <p className="mt-3 rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--warn)]/90">
                 该订阅已暂停。触发洗版会先恢复追踪，随后开始搜索。
               </p>
             )}

@@ -260,7 +260,7 @@ export function ClaimSearchPanel({
         )}
       </div>
 
-      {error && <p className="mt-2 text-caption text-red-300">{error}</p>}
+      {error && <p className="mt-2 text-caption text-[var(--danger)]">{error}</p>}
       {results !== null && results.length === 0 && !error && (
         <p className="mt-2 text-caption leading-relaxed text-[var(--text-muted)]">
           没有找到{movie ? "电影" : "剧集"}结果，换个关键词试试（TMDB 对中文名支持有限时可试英文/原名）。

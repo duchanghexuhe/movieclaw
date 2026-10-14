@@ -462,7 +462,7 @@ function DeleteDownloadTaskDialog({
         <label
           className={`mt-4 flex cursor-pointer items-start gap-3 rounded-xl border px-3.5 py-3 transition ${
             deleteFiles
-              ? "border-[#ff6b6b]/35 bg-[#ff6b6b]/[0.08]"
+              ? "border-[var(--danger)]/35 bg-[var(--danger)]/[0.08]"
               : "border-white/[0.08] bg-white/[0.025] hover:bg-white/[0.045]"
           }`}
         >
@@ -470,7 +470,7 @@ function DeleteDownloadTaskDialog({
             type="checkbox"
             checked={deleteFiles}
             onChange={(event) => setDeleteFiles(event.target.checked)}
-            className="mt-1 size-4 shrink-0 accent-[#ff6b6b]"
+            className="mt-1 size-4 shrink-0 accent-[var(--danger)]"
           />
           <span className="min-w-0">
             <span className="block text-ui font-semibold text-white/90">同时删除数据文件</span>
@@ -480,7 +480,7 @@ function DeleteDownloadTaskDialog({
           </span>
         </label>
         {task.source === "subscription" && (
-          <p className="mt-3 text-caption leading-5 text-amber-100/65">
+          <p className="mt-3 text-caption leading-5 text-[var(--warn)]/65">
             关联订阅会保留原工单身份；巡检确认任务无进度后会按换源策略寻找替代源。
           </p>
         )}
@@ -497,7 +497,7 @@ function DeleteDownloadTaskDialog({
             type="button"
             onClick={() => onConfirm(deleteFiles)}
             disabled={busy}
-            className="rounded-lg bg-red-500/85 px-4 py-2 text-ui font-medium text-white transition hover:bg-red-500 disabled:opacity-40"
+            className="rounded-lg bg-[var(--danger-solid)] px-4 py-2 text-ui font-medium text-white transition hover:bg-[var(--danger-solid-hover)] disabled:opacity-40"
           >
             {busy ? "正在删除…" : deleteFiles ? "删除任务和文件" : "仅删除任务"}
           </button>
@@ -514,12 +514,12 @@ export function SourceWarning({ sources, error }: { sources: DownloadTaskSource[
         .map((source) => `「${source.name}」${source.message || "当前不可用"}`)
         .join("；");
   return (
-    <div className="mt-4 flex items-start gap-3 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-6 text-amber-100">
+    <div className="mt-4 flex items-start gap-3 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub leading-6 text-[var(--warn)]">
       <InfoIcon className="mt-0.5 size-4 shrink-0" />
       <p className="min-w-0 flex-1">{message}</p>
       <Link
         href={"/settings/downloaders" as Route}
-        className="shrink-0 font-semibold text-amber-50 hover:underline"
+        className="shrink-0 font-semibold text-[var(--warn)] hover:underline"
       >
         检查设置
       </Link>
@@ -1056,7 +1056,7 @@ function BoostTaskSection({ tasks, onChanged }: { tasks: DownloadTask[]; onChang
             <SpeedStat direction="up" bytesPerSecond={upSpeed} glow placeholder="↑ 0 B/s" />
             <SpeedStat direction="down" bytesPerSecond={downSpeed} glow placeholder="↓ 0 B/s" />
             <span>
-              已上传 <span className="font-semibold text-[var(--ok)]">{formatBytes(uploaded)}</span>
+              已上传 <span className="font-semibold text-[var(--text-muted)]">{formatBytes(uploaded)}</span>
             </span>
             <span>
               已下载 <span className="font-semibold text-[var(--info)]">{formatBytes(downloaded)}</span>
@@ -1912,7 +1912,7 @@ const LIFECYCLE_DOT_STYLE: Record<LifecycleTone, string> = {
 const LIFECYCLE_LABEL_STYLE: Record<LifecycleTone, string> = {
   done: "text-white/60",
   current: "text-[var(--info)]",
-  waiting: "text-amber-100/70",
+  waiting: "text-[var(--warn)]/70",
   attention: "text-[var(--danger)]",
   future: "text-white/30",
 };
@@ -1920,7 +1920,7 @@ const LIFECYCLE_LABEL_STYLE: Record<LifecycleTone, string> = {
 const LIFECYCLE_DETAIL_STYLE: Record<LifecycleTone, string> = {
   done: "text-white/30",
   current: "text-white/30",
-  waiting: "text-amber-100/40",
+  waiting: "text-[var(--warn)]/40",
   attention: "text-[var(--danger)]/70",
   future: "text-white/30",
 };
@@ -2356,7 +2356,7 @@ function EpisodeUnitsLabel({
       <span className="tnum">
         {summary.label}
         {summary.kind === "episodes" && doneCount > 0 && (
-          <span className="text-[var(--ok)]">（{doneWord}）</span>
+          <span className="text-[var(--text-muted)]">（{doneWord}）</span>
         )}
       </span>
     );
@@ -2385,7 +2385,7 @@ function EpisodeUnitsLabel({
           {summary.label}
         </OverflowText>
         {doneCount > 0 && (
-          <span className="tnum shrink-0 text-[var(--ok)]">
+          <span className="tnum shrink-0 text-[var(--text-muted)]">
             {upgrade ? `（已完成 ${doneCount} 集替换）` : `（有 ${doneCount} 集已入库）`}
           </span>
         )}

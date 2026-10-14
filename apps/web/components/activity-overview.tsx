@@ -213,7 +213,7 @@ function ActivityOverview({ media }: { media: MediaActivityState }) {
       </p>
 
       {media.error && (
-        <p className="mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-6 text-amber-100">
+        <p className="mt-4 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub leading-6 text-[var(--warn)]">
           {media.error}
         </p>
       )}
@@ -474,10 +474,13 @@ function RecentPlayRow({ entry }: { entry: PlaybackLogEntry }) {
       </span>
       <span className="tnum flex shrink-0 flex-col items-end gap-0.5 whitespace-nowrap text-sub">
         {playing ? (
-          <span className="font-medium text-[var(--ok)]">播放中</span>
+          <span className="inline-flex items-center gap-1.5 font-medium text-[var(--text-muted)]">
+            <span className="size-1.5 shrink-0 rounded-full bg-[var(--ok)]" />
+            播放中
+          </span>
         ) : entry.completed ? (
-          <span className="inline-flex items-center gap-1 font-medium text-[var(--ok)]">
-            <CheckIcon className="size-3" />
+          <span className="inline-flex items-center gap-1 font-medium text-[var(--text-muted)]">
+            <CheckIcon className="size-3 text-[var(--ok)]" />
             看完
           </span>
         ) : entry.progress_percent != null ? (

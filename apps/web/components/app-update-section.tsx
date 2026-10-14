@@ -449,7 +449,8 @@ export function AppUpdateSection() {
                   来源：{sourceLabel}
                   {/* 手动检查的即时反馈：跟在动作所在的行下方 */}
                   {check && !check.update_available && (
-                    <span className="block text-emerald-300/90">
+                    <span className="block text-[var(--text-muted)]">
+                      <span className="mr-1.5 inline-block size-1.5 rounded-full bg-[var(--ok)] align-middle" />
                       已是最新版本（v{check.current_version}）
                     </span>
                   )}
@@ -528,7 +529,7 @@ export function AppUpdateSection() {
               title={`发现新版本 v${available.version}`}
               hint={
                 available.compatible ? undefined : (
-                  <span className="text-amber-300/90">
+                  <span className="text-[var(--warn)]/90">
                     本次更新包含依赖变化，需拉取新的 Docker 镜像升级
                   </span>
                 )
@@ -542,7 +543,7 @@ export function AppUpdateSection() {
               }
             >
               {available.knownBad && (
-                <p className="mb-3 text-sub text-amber-300/90">
+                <p className="mb-3 text-sub text-[var(--warn)]/90">
                   注意：v{available.version} 此前曾在本机连续启动失败被自动回落。
                   重新更新会清除失败标记再试一次；若问题依旧，容器会再次自动回落，
                   建议等待修复版本。
@@ -583,11 +584,12 @@ export function AppUpdateSection() {
                 // 冒出一句无从触发的结论
                 modelCheck && !availableModelTag ? (
                   !modelCheck.update_available ? (
-                    <span className="text-emerald-300/90">
+                    <span className="text-[var(--text-muted)]">
+                      <span className="mr-1.5 inline-block size-1.5 rounded-full bg-[var(--ok)] align-middle" />
                       模型已是最新（{modelCheck.latest_tag}）
                     </span>
                   ) : (
-                    <span className="text-amber-300/90">
+                    <span className="text-[var(--warn)]/90">
                       发现新模型 {modelCheck.latest_tag}，但该发布未携带更新清单，暂无法应用内安装
                     </span>
                   )
@@ -821,13 +823,13 @@ function RollbackDialog({
             >
               <span className="text-ui font-semibold text-[var(--text)]">{label(t)}</span>
               {t.schema_action === "switch" ? (
-                <span className="text-caption text-emerald-300/90">可直接切换，数据保留</span>
+                <span className="text-caption text-[var(--ok)]/90">可直接切换，数据保留</span>
               ) : t.schema_action === "restore" ? (
-                <span className="text-caption text-amber-300/90">
+                <span className="text-caption text-[var(--warn)]/90">
                   需恢复 {formatDateTime(t.backup_taken_at)} 的数据备份
                 </span>
               ) : (
-                <span className="text-caption text-red-300/90">无对应数据备份</span>
+                <span className="text-caption text-[var(--danger)]/90">无对应数据备份</span>
               )}
               <span className="ml-auto text-caption text-[var(--text-faint)]">
                 {[
@@ -847,18 +849,18 @@ function RollbackDialog({
             {i === selected && (
               <div className="border-t border-white/[0.06] px-4 py-2.5">
                 {t.schema_action === "switch" ? (
-                  <p className="text-sub text-emerald-300/90">
+                  <p className="text-sub text-[var(--text-muted)]">
                     该版本与当前的数据结构一致：直接切换代码，全部数据原样保留。
                   </p>
                 ) : t.schema_action === "restore" ? (
-                  <p className="text-sub text-amber-300/90">
+                  <p className="text-sub text-[var(--warn)]/90">
                     当前数据结构比该版本新（中间经过数据库升级）。回退将恢复{" "}
                     {formatDateTime(t.backup_taken_at)} 自动备份的数据，
                     此后产生的数据（订阅活动、入库记录等）将丢失；回退前会再自动
                     备份一次当前数据，切回新版本时可完整还原。
                   </p>
                 ) : (
-                  <p className="text-sub text-red-300/90">
+                  <p className="text-sub text-[var(--danger)]/90">
                     没有可对应时点的数据备份：切换后该版本将直接使用当前数据，
                     若中间经过数据库升级可能无法正常运行（启动失败时会自动回落）。
                   </p>

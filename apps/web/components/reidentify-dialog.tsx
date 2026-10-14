@@ -122,7 +122,7 @@ export function ReidentifyDialog({
       </div>
 
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto scroll-thin px-5 py-4">
-        {error && <p className="text-sub text-red-300">{error}</p>}
+        {error && <p className="text-sub text-[var(--danger)]">{error}</p>}
 
         {!preview && !error && (
           <div className="flex items-center justify-center gap-2.5 py-10 text-ui text-[var(--text-muted)]">
@@ -136,7 +136,7 @@ export function ReidentifyDialog({
             <CurrentIdentity preview={preview} />
 
             {preview.unreachable && (
-              <p className="rounded-lg border border-[var(--warn)]/30 bg-[var(--warn)]/[0.08] px-3 py-2 text-caption leading-relaxed text-[#f5d489]">
+              <p className="rounded-lg border border-[var(--warn)]/30 bg-[var(--warn)]/[0.08] px-3 py-2 text-caption leading-relaxed text-[var(--warn)]">
                 有文件因为 TMDB 不可达没能得出结论——那是网络问题不是识别问题。
                 建议先修好网络再来，此刻的结论不足以据此拍板。
               </p>
@@ -446,7 +446,7 @@ function GroupRow({
         </button>
       </div>
 
-      {error && <p className="mt-1.5 text-caption text-red-300">{error}</p>}
+      {error && <p className="mt-1.5 text-caption text-[var(--danger)]">{error}</p>}
 
       {panel?.view === "search" && (
         <ClaimSearchPanel

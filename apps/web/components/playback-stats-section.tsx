@@ -264,10 +264,13 @@ function HistoryRow({ entry }: { entry: PlaybackLogEntry }) {
       </div>
       <div className="shrink-0 text-right text-caption leading-5">
         {live ? (
-          <span className="text-[var(--ok)]">播放中</span>
+          <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+            <span className="size-1.5 shrink-0 rounded-full bg-[var(--ok)]" />
+            播放中
+          </span>
         ) : entry.completed ? (
-          <span className="inline-flex items-center gap-1 text-[var(--ok)]">
-            <CheckIcon className="size-3" />
+          <span className="inline-flex items-center gap-1 text-[var(--text-muted)]">
+            <CheckIcon className="size-3 text-[var(--ok)]" />
             看完
           </span>
         ) : (
@@ -382,7 +385,7 @@ export function PlaybackHistoryList({
 
   if (error) {
     return (
-      <p className="rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-6 text-amber-100">
+      <p className="rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub leading-6 text-[var(--warn)]">
         {error}
       </p>
     );

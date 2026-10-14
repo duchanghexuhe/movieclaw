@@ -23,7 +23,9 @@ export interface SmartSelectionContext {
 /** 常规状态由原有分集列表表达，这里只报告智能执行的全局异常。 */
 export function SmartSubscriptionStatus({ detail }: { detail: SubscriptionDetail }) {
   if (detail.selection_mode !== "smart" || !detail.smart_status || detail.smart_status === "active") return null;
-  return <p role="status" className="rounded-xl border border-[var(--warn)]/25 p-4 text-sub">{detail.smart_status === "invalid_policy" ? "智能设置无法读取，自动选择已暂停。" : detail.smart_status === "shadow" ? "当前仅记录选择结果，尚未开启自动下载。" : "智能自动选择已关闭。已有下载和入库继续完成。"}</p>;
+  // 只有 invalid_policy 是真异常（warn）；shadow/关闭都是关闭态，不占状态色。
+  const invalid = detail.smart_status === "invalid_policy";
+  return <p role="status" className={`rounded-xl border p-4 text-sub ${invalid ? "border-[var(--warn)]/25" : "border-white/[0.08]"}`}>{detail.smart_status === "invalid_policy" ? "智能设置无法读取，自动选择已暂停。" : detail.smart_status === "shadow" ? "当前仅记录选择结果，尚未开启自动下载。" : "智能自动选择已关闭。已有下载和入库继续完成。"}</p>;
 }
 
 /** 放在原有搜索节点内；未播出、无候选、下载和洗版沿用原有里程碑。 */
@@ -47,7 +49,7 @@ export function SmartWantedSelection({ row, detail, canManage, onChanged }: Smar
     </details>}
   </div>;
   return <div role="group" className="basis-full space-y-1 text-sub" aria-label="智能选择依据">
-    {error && <p role="alert" className="text-red-400">{error}</p>}
+    {error && <p role="alert" className="text-[var(--danger)]">{error}</p>}
     {state.following && <p className="text-[var(--text-muted)]">跟随版本：{seriesLabel(state.following)}</p>}
     {state.wait_explanation && <p className="mt-1 text-[var(--text-muted)]">{state.wait_explanation}</p>}
     <p className="mt-1 text-[var(--text-muted)]">{state.anchor_source === "published_at" ? "本集最早匹配资源的站点发布时间" : "本系统首次发现合格资源"}：{localTime(state.anchor)}</p>

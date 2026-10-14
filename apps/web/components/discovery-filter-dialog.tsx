@@ -548,7 +548,7 @@ export function DiscoveryFilterControl({
           <fieldset>
             <legend className="mb-3 text-sub font-semibold text-[var(--text-muted)]">类型（可多选）</legend>
             {genreError ? (
-              <p className="text-sub text-red-300">类型加载失败，其他筛选仍可使用</p>
+              <p className="text-sub text-[var(--danger)]">类型加载失败，其他筛选仍可使用</p>
             ) : genres.length === 0 ? (
               <div className="h-16 animate-pulse rounded-xl bg-white/[0.05]" />
             ) : (

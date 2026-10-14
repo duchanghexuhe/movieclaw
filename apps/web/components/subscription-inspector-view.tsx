@@ -849,7 +849,7 @@ function SubscriptionManageMenu({
             <DropdownMenu.Item
               onSelect={onRemove}
               disabled={busy}
-              className={`${itemClass} !text-[#ff8b8b] data-[highlighted]:!bg-[#ff6b6b]/10`}
+              className={`${itemClass} !text-[var(--danger)] data-[highlighted]:!bg-[var(--danger)]/10`}
             >
               取消订阅
             </DropdownMenu.Item>
@@ -1000,7 +1000,7 @@ function SubscriptionManageSheet({
               type="button"
               disabled={busy}
               onClick={onRemove}
-              className={`${rowClass} border-t border-white/[0.07] !text-[#ff8b8b] hover:!bg-[#ff6b6b]/10`}
+              className={`${rowClass} border-t border-white/[0.07] !text-[var(--danger)] hover:!bg-[var(--danger)]/10`}
             >
               <span>取消订阅</span>
             </button>
@@ -1106,7 +1106,7 @@ function RuleSetSwitchDialog({
           需要新的组合条件可去「设置 → 订阅规则 → 规则组」新建。
         </p>
         {error && (
-          <p className="mt-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-sub leading-6 text-red-200">
+          <p className="mt-3 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--danger)]">
             {error}
           </p>
         )}
@@ -1136,8 +1136,8 @@ function RuleSetSwitchDialog({
                     )}
                   </span>
                   {current && (
-                    <span className="shrink-0 text-caption font-medium text-[var(--ok)]">
-                      当前使用 ✓
+                    <span className="shrink-0 text-caption font-medium text-[var(--text-muted)]">
+                      当前使用 <span className="text-[var(--ok)]">✓</span>
                     </span>
                   )}
                 </span>

@@ -36,7 +36,7 @@ import {
 const CANCEL_BTN_CLS =
   "rounded-lg border border-white/10 bg-white/[0.06] px-4 py-2 text-ui text-white/80 transition hover:bg-white/[0.1]";
 const DANGER_BTN_CLS =
-  "rounded-lg bg-red-500/85 px-4 py-2 text-ui font-medium text-white transition hover:bg-red-500 disabled:opacity-50";
+  "rounded-lg bg-[var(--danger-solid)] px-4 py-2 text-ui font-medium text-white transition hover:bg-[var(--danger-solid-hover)] disabled:opacity-50";
 
 export function SubscriptionCancelDialog({
   open,

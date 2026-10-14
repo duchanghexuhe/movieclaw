@@ -107,7 +107,11 @@ export function DiscoverRegionFooter({ onChanged }: { onChanged?: () => void }) 
       ) : (
         <span className="font-medium text-[var(--text-muted)]">{regionName(region)}</span>
       )}
-      {saved && <span className="text-[var(--ok)]">✓ 已保存</span>}
+      {saved && (
+        <span className="text-[var(--text-muted)]">
+          <span className="text-[var(--ok)]">✓</span> 已保存
+        </span>
+      )}
       {open && (
         <div
           role="menu"

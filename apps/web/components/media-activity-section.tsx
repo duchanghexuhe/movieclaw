@@ -443,10 +443,12 @@ export function SessionCard({
           )}
           <span
             className={`flex shrink-0 items-center gap-1 font-medium ${
-              session.paused ? "text-white/55" : "text-[var(--ok)]"
+              session.paused ? "text-white/55" : "text-[var(--text-muted)]"
             }`}
           >
-            {!session.paused && <PlayIcon className="size-2.5" />}
+            {!session.paused && (
+              <span className="size-1.5 shrink-0 rounded-full bg-[var(--ok)]" />
+            )}
             {session.paused ? "已暂停" : "播放中"}
           </span>
           {percent != null && <span className="text-white/55">· {percent}%</span>}
@@ -849,7 +851,7 @@ export function MediaActivityPanel({
       </WatchToolbar>
 
       {error && (
-        <p className="mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-6 text-amber-100">
+        <p className="mt-4 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub leading-6 text-[var(--warn)]">
           {error}
         </p>
       )}
@@ -1120,7 +1122,7 @@ function RevokeDeviceDialog({
             type="button"
             onClick={onConfirm}
             disabled={busy}
-            className="rounded-lg bg-red-500/85 px-4 py-2 text-ui font-medium text-white transition hover:bg-red-500 disabled:opacity-40"
+            className="rounded-lg bg-[var(--danger-solid)] px-4 py-2 text-ui font-medium text-white transition hover:bg-[var(--danger-solid-hover)] disabled:opacity-40"
           >
             {busy ? "正在注销…" : "注销设备"}
           </button>

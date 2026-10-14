@@ -881,7 +881,7 @@ function Badge({ children }: { children: React.ReactNode }) {
 
 function StatusBadge({ status }: { status: MemberView["status"] }) {
   return (
-    <span className={`ml-auto rounded-full border px-2.5 py-1 text-caption font-medium ${status === "active" ? "border-emerald-400/25 bg-[var(--ok)]/10 text-emerald-300" : "border-white/[0.1] bg-white/[0.04] text-[var(--text-faint)]"}`}>
+    <span className={`ml-auto rounded-full border px-2.5 py-1 text-caption font-medium ${status === "active" ? "border-[var(--ok)]/25 bg-[var(--ok)]/10 text-[var(--ok)]" : "border-white/[0.1] bg-white/[0.04] text-[var(--text-faint)]"}`}>
       {status === "active" ? "已启用" : "已停用"}
     </span>
   );
@@ -945,7 +945,7 @@ function CopySurface({
       {(copied || idleLabel) && (
         <span
           aria-live="polite"
-          className={`shrink-0 text-caption ${copied ? "text-emerald-300" : "text-[var(--text-faint)]"}`}
+          className={`shrink-0 text-caption ${copied ? "text-[var(--ok)]" : "text-[var(--text-faint)]"}`}
         >
           {copied ? "已复制" : idleLabel}
         </span>

@@ -227,7 +227,7 @@ export function SubscriptionAdjustDialog({
             `将直接下载到库内目录 ${preview.entry_dir ?? preview.path ?? ""}，完成后自动入账`}
       </p>
     ) : (
-      <p className="mt-1.5 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-caption leading-relaxed text-amber-200">
+      <p className="mt-1.5 rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3 py-2 text-caption leading-relaxed text-[var(--warn)]">
         {preview.warning}
       </p>
     ));
@@ -312,7 +312,7 @@ export function SubscriptionAdjustDialog({
 
       <div className="scroll-thin min-h-0 flex-1 overflow-y-auto p-6 max-md:p-5">
         {error && (
-          <p className="mt-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-sub leading-6 text-red-200">
+          <p className="mt-3 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--danger)]">
             {error}
           </p>
         )}
@@ -343,7 +343,7 @@ export function SubscriptionAdjustDialog({
                 </div>
               )}
               {droppedNote && (
-                <p className="mt-2 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-caption leading-relaxed text-amber-200">
+                <p className="mt-2 rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3 py-2 text-caption leading-relaxed text-[var(--warn)]">
                   {droppedNote}
                 </p>
               )}

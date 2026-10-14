@@ -135,7 +135,7 @@ export function SmartProfileCard({ kind, onSaved, compact = false }: {
       <h3 className={compact && !editing ? "text-sub text-[var(--text-muted)]" : "text-ui font-semibold"}>{compact && !editing ? "智能选择" : `${label}智能设置`}</h3>
       {profile?.preferences && !editing && isAdmin && <button type="button" onClick={() => { setEditing(true); onSaved?.(null); }} className="min-h-11 -my-2 -mr-2 px-2 text-sub text-[var(--accent)]">修改设置</button>}
     </div>
-    {error && <div className="mt-3 text-sub"><p role="alert" className="text-red-400">{error}</p><button type="button" className="mt-2 text-[var(--accent)]" onClick={() => setReload((value) => value + 1)}>重新读取设置</button></div>}
+    {error && <div className="mt-3 text-sub"><p role="alert" className="text-[var(--danger)]">{error}</p><button type="button" className="mt-2 text-[var(--accent)]" onClick={() => setReload((value) => value + 1)}>重新读取设置</button></div>}
     {!profile && !error && <p className="mt-3 text-sub text-[var(--text-muted)]">正在读取设置…</p>}
     {profile && !profile.preferences && !isAdmin && <p className="mt-3 text-sub text-[var(--text-muted)]">请管理员先完成{label}智能设置，或选择规则模式。</p>}
     {preferences && !editing && compact && <div className="mt-2 space-y-2">
