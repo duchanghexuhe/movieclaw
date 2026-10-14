@@ -48,13 +48,8 @@ PRELOAD_PART_BYTES = 64 * 1024 * 1024
 #: 图形字幕编码名集合（第一版跳过，不进产物）
 GRAPHIC_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvdsub", "pgssub"})
 
-#: 上游 ffmpeg 的软件 HDR→SDR 色调映射（无 tonemapx 时的链）。
-#: hable 是可选算法里高光滚降最平缓的；bt709 三件套钉死输出色彩。
-_SW_TONEMAP_UPSTREAM = (
-    "tonemap=hable:desat=0,zscale=t=bt709:m=bt709:p=bt709,format=nv12"
-)
-
-#: jellyfin-ffmpeg 的 tonemapx（能力探测命中时优先，观感与实时链一致）
+#: jellyfin-ffmpeg 的 tonemapx（HDR 色调映射的唯一软件路径；上游 ffmpeg
+#: 的 zimg 缺 PQ→linear 路径，tonemap 滤镜到不了——见 build_preload_command）
 _SW_TONEMAP_JELLYFIN = (
     "tonemapx=tonemap=bt2390:desat=0:p=bt709:t=bt709:m=bt709:format=yuv420p"
 )
@@ -71,6 +66,8 @@ class PreloadCommand:
     hw_backend: str | None  # nvenc | None（软编）
     skipped_subtitle_indexes: list[int]  # 跳过的图形字幕轨（0 基，ffmpeg 流序）
     has_chapters: bool
+    #: 非空 = 这条命令装不出来（HDR 源 + Worker 无 tonemapx），领取方据此拒做并说明
+    unusable_reason: str | None = None
 
 
 def _source_needs_tone_map(hdr: str | None, dv_profile: int | None) -> bool:
@@ -100,8 +97,7 @@ def _gpu_filters(
     色调映射留在 CPU 但输出直接对齐（少一次 zscale）。
     """
     if needs_tone_map:
-        tonemap = _SW_TONEMAP_JELLYFIN if has_tonemapx else _SW_TONEMAP_UPSTREAM
-        parts = [f"hwdownload,format=p010le,{tonemap}"]
+        parts = [f"hwdownload,format=p010le,{_SW_TONEMAP_JELLYFIN}"]
         if needs_scale:
             parts.append(f"hwupload_cuda,scale_cuda=-2:{height_cap}:format=nv12")
         return parts
@@ -202,10 +198,29 @@ def build_preload_command(
         and "h264_nvenc" in encoders
         and "scale_cuda" in filters_available
     )
+    has_tonemapx = "tonemapx" in filters_available
+    # HDR 色调映射的最低门槛是 tonemapx（jellyfin-ffmpeg）：上游 ffmpeg 的
+    # zimg 没有编进 PQ(HDR10/杜比视界)→linear 的转换路径（zscale 报
+    # "no path between colorspaces"，2026-10-14 真机实测），上游 tonemap
+    # 滤镜又只吃 linear 输入——没有 tonemapx 时 HDR 源装不出任何正确的链。
+    # 拒绝比转出一部偏色的片子好：错误信息直接告诉用户换 build。
+    unusable_reason: str | None = None
+    if needs_tone_map and not has_tonemapx:
+        unusable_reason = (
+            "HDR 源需要 jellyfin-ffmpeg（tonemapx 滤镜）做色调映射，"
+            "当前 Worker 的 ffmpeg 不含它；请给 Worker 换 jellyfin-ffmpeg "
+            "的 Windows build 后重试"
+        )
     # 硬解可用性：解码器在 Worker 上报的 hw_decoders 里（缺省视为可硬解——
     # ffmpeg 自己会回退软解，不作为整条链的开关）
     hw_decodable = bool(caps.get("hw_decoders")) and src_codec in caps["hw_decoders"]
-    has_tonemapx = "tonemapx" in filters_available
+
+    if unusable_reason:
+        return PreloadCommand(
+            argv=[], preset_id=preset_id, tone_map=needs_tone_map, video_copy=False,
+            hw_backend=None, skipped_subtitle_indexes=[], has_chapters=False,
+            unusable_reason=unusable_reason,
+        )
 
     input_args: list[str] = []
     if not video_copy:
@@ -231,9 +246,9 @@ def build_preload_command(
             hw_backend_used: str | None = "nvenc"
         else:
             filters: list[str] = []
-            color_pre = _SW_TONEMAP_JELLYFIN if has_tonemapx else None
             if needs_tone_map:
-                filters.append(color_pre or _SW_TONEMAP_UPSTREAM.replace(",format=nv12", ""))
+                # 到这里必然 has_tonemapx（无 tonemapx 已在上面拒掉）
+                filters.append(_SW_TONEMAP_JELLYFIN)
             else:
                 convert = _source_color_convert(source.get("color_space"))
                 if convert:

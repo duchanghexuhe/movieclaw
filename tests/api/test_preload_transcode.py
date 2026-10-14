@@ -201,17 +201,32 @@ def test_claim_selects_nvenc_when_worker_reports_caps(client, tmp_path):
     task = client.post(
         f"{_WORKER}/claim", json={"caps": caps}, headers=_worker_headers(token)
     ).json()["data"]["task"]
-    argv = " ".join(task["argv"])
+    # caps 无 tonemapx：HDR 源拒发（见上）
+    assert task["argv"] == [] and task["unusable_reason"], task
+    # Worker 对不可执行任务上报失败（process_task 的行为），然后取消重下
+    client.post(
+        f"{_WORKER}/tasks/{task['task_id']}/fail",
+        json={"error": task["unusable_reason"]},
+        headers=_worker_headers(token),
+    )
+    client.post(f"{_PRELOAD}/tasks/{task['task_id']}/cancel")
+    client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
+
+    # 补 tonemapx 能力再领：HDR → 硬解下载回内存 tonemapx + NVENC 编码
+    caps_tx = {**caps, "filters": [*caps["filters"], "tonemapx"]}
+    task_tx = client.post(
+        f"{_WORKER}/claim", json={"caps": caps_tx}, headers=_worker_headers(token)
+    ).json()["data"]["task"]
+    argv = " ".join(task_tx["argv"])
     assert "h264_nvenc" in argv, argv
-    # HDR 源没有 tonemap_cuda 能力 → 下载回内存软件 tonemap（hable）
-    assert "hwdownload" in argv and "tonemap=hable" in argv, argv
-    assert task["hw_backend"] == "nvenc"
+    assert "hwdownload" in argv and "tonemapx=tonemap=bt2390" in argv, argv
+    assert task_tx["hw_backend"] == "nvenc"
 
     # 换 SDR 4K 源再领：全 GPU 链（硬解 + scale_cuda，无 hwdownload）
     file2 = _seed_file(client, tmp_path)
     client.post(f"{_PRELOAD}/tasks", json={"file_id": file2})
     task2 = client.post(
-        f"{_WORKER}/claim", json={"caps": caps}, headers=_worker_headers(token)
+        f"{_WORKER}/claim", json={"caps": caps_tx}, headers=_worker_headers(token)
     ).json()["data"]["task"]
     argv2 = " ".join(task2["argv"])
     assert "scale_cuda" in argv2 and "hwdownload" not in argv2, argv2
@@ -252,10 +267,10 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
     assert claim.status_code == 200, claim.text
     task = claim.json()["data"]["task"]
     assert task is not None and task["task_id"] == task_id
-    argv = " ".join(task["argv"])
-    # HDR 源 → 色调映射链（§4）；无能力上报时软编（上游 tonemap + libx264）
-    assert "tonemap=" in argv, argv
-    assert "libx264" in argv, argv
+    # HDR 源 + Worker 未上报 tonemapx 能力 → 服务端拒发命令（上游 ffmpeg 的
+    # zimg 没有 PQ→linear 路径，装不出正确的色调映射链），错误原文透传
+    assert task["argv"] == [], task
+    assert "jellyfin-ffmpeg" in task["unusable_reason"], task
 
     # 领取后队列空
     empty = client.post(f"{_WORKER}/claim", headers=_worker_headers(token))

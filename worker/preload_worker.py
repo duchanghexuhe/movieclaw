@@ -165,6 +165,16 @@ def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path) -> bool:
     task_id = task["task_id"]
     display = task.get("display_name", f"#{task_id}")
     print(f"[{task_id}] 领到任务：{display}")
+    if task.get("unusable_reason"):
+        # 服务端装不出可执行的命令（如 HDR 源但本机 ffmpeg 缺 tonemapx）：
+        # 不下载不转码，原文透传给服务端，网页端直接可见原因
+        api.request(
+            "POST",
+            f"/api/v1/preload-worker/tasks/{task_id}/fail",
+            json_body={"error": task["unusable_reason"]},
+        )
+        print(f"[{task_id}] 任务不可执行：{task['unusable_reason']}")
+        return False
     workdir.mkdir(parents=True, exist_ok=True)
     source = workdir / "source.mkv"
     artifact = workdir / task["artifact_name"]

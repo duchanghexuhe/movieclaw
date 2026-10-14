@@ -379,6 +379,9 @@ def build_task_command(
         "tone_map": command.tone_map,
         "video_copy": command.video_copy,
         "hw_backend": command.hw_backend,
+        # 非空 = 服务端装不出可执行的命令（HDR 源 + Worker 缺 tonemapx），
+        # Worker 收到后直接按失败上报，原文透传给用户
+        "unusable_reason": command.unusable_reason,
         "skipped_subtitle_indexes": command.skipped_subtitle_indexes,
         "resume_parts": task.resume_parts,
         "part_bytes": task.part_bytes,
