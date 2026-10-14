@@ -141,7 +141,7 @@ export function TranscodeSection() {
       {tasks === null ? (
         <SettingsEmpty title="加载中…" />
       ) : (
-        <>
+        <div className="space-y-10">
           <SettingsList>
             {tasks.length === 0 ? (
               <SettingsEmpty title="还没有预转码任务" description="在影片详情页的文件区或「预转码」弹窗里下单。" />
@@ -252,7 +252,7 @@ export function TranscodeSection() {
               </Banner>
             )}
           </SettingsSection>
-        </>
+        </div>
       )}
     </SettingsSection>
   );
