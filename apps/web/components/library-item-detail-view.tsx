@@ -214,9 +214,9 @@ export function LibraryItemDetailView({
   // 与 Hero 的「已看完」必须同步，但不能重置当前选中的集
   const [episodesVersion, setEpisodesVersion] = useState(0);
   // 预转码（preload-transcode.md §3）：本条目相关的任务（按源文件 id 索引）。
-  // 文件区的「优化版本」按钮据此显示状态；进入页面拉一次，动作后局部刷新
+  // 文件区的「预转码」按钮据此显示状态；进入页面拉一次，动作后局部刷新
   const [preloadTasks, setPreloadTasks] = useState<PreloadTaskView[]>([]);
-  // 「优化版本」选版本弹窗（§8 标题行显眼入口）
+  // 「预转码」选版本弹窗（§8 标题行显眼入口）
   const [preloadDialogOpen, setPreloadDialogOpen] = useState(false);
 
   /**
@@ -505,7 +505,7 @@ export function LibraryItemDetailView({
       try {
         const est = await estimatePreload(file.id);
         const ok = await confirm({
-          title: `把「${file.file_name}」转成优化版本？`,
+          title: `把「${file.file_name}」预转码？`,
           description: `约多占 ${(est.estimated_bytes / 1024 ** 3).toFixed(1)} GB（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后文件区会出现一个 1080p H.264 的可选版本。`,
           confirmLabel: "加入转码队列",
           cancelLabel: "先不",
@@ -1176,7 +1176,7 @@ export function LibraryItemDetailView({
           );
         })()}
 
-        {/* 「优化版本」选版本弹窗（§8）：列条目全部在位文件，逐个看预估与任务状态 */}
+        {/* 「预转码」选版本弹窗（§8）：列条目全部在位文件，逐个看预估与任务状态 */}
         {(() => {
           const files = isMovie ? detail.files : (selectedSeriesEpisode?.files ?? []);
           return (
@@ -2463,7 +2463,7 @@ function fileDirectory(filePath: string): string {
 }
 
 /**
- * 「优化版本」选版本弹窗（preload-transcode.md §8 显眼入口）：把条目全部在位
+ * 「预转码」选版本弹窗（preload-transcode.md §8 显眼入口）：把条目全部在位
  * 原生版本列出来，逐个展示转码任务状态与下单入口——文件区行内按钮之外的
  * 正门，多版本条目（4K + 1080p 并存）在这里一次看清。
  */
@@ -2488,15 +2488,15 @@ function PreloadDialog({
   onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
   return (
-    <Modal open={open} onClose={onClose} label="优化版本" width="lg">
+    <Modal open={open} onClose={onClose} label="预转码" width="lg">
       <div className="p-6">
         <h3 className="flex items-center gap-2 text-title-sm font-semibold text-[var(--text)]">
           <SparklesIcon className="size-4.5 text-[var(--accent-2)]" />
-          「{title}」的优化版本
+          「{title}」的预转码
         </h3>
         <p className="mt-2 text-sub leading-6 text-[var(--text-muted)]">
-          转出 1080p H.264 低码率版本，<span className="text-white/80">外网播放直接发小文件</span>
-          。由预转码 Worker 在后台完成（设置 → 转码），完成后文件区多出一个可选版本。
+          提前转好的 <span className="text-white/80">1080p 低码率版本</span>：外网播放直接发小文件，
+          NAS 不用实时转码。由预转码 Worker 在后台完成（设置 → 转码），完成后文件区多出一个可选版本。
         </p>
         <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
           {files.length === 0 && (
@@ -2606,7 +2606,7 @@ function FileSection({
   /** 预转码任务（preload-transcode.md §3）：按 target_file_id 对应文件行展示状态 */
   preloadTasks?: PreloadTaskView[];
   onPreload?: (file: LibraryItemFile) => void;
-  /** 标题行「优化版本」按钮：打开选版本弹窗（§8 显眼入口） */
+  /** 标题行「预转码」按钮：打开选版本弹窗（§8 显眼入口） */
   onOpenPreloadDialog?: () => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
@@ -2627,7 +2627,7 @@ function FileSection({
             className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-white/[0.12] px-2.5 py-0.5 text-caption font-medium text-[var(--text-muted)] transition hover:border-white/[0.2] hover:text-[var(--text)]"
           >
             <SparklesIcon className="size-3.5" />
-            优化版本
+            预转码
           </button>
         )}
         {duplicateHref && duplicateLabel && (
@@ -2750,7 +2750,7 @@ function FileRow({
         )}
         {file.derivation?.kind === "preload" && (
           <span className="shrink-0 rounded border border-[var(--text-faint)]/25 px-1.5 py-px text-micro text-[var(--text-muted)]">
-            优化版本
+            预转码
           </span>
         )}
         {/* 预转码：本行是源文件且该行有活跃/失败任务时展示状态；没下过单给「转便携版」入口 */}
@@ -2792,10 +2792,10 @@ function FileRow({
           <button
             type="button"
             onClick={onPreload}
-            title="转码为优化版本（1080p H.264 低码率，外网播放更省带宽）"
+            title="预转码（提前转好 1080p 低码率版本，外网播放更省带宽）"
             className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
           >
-            优化版本
+            预转码
           </button>
         )}
         {file.state === "trashed" && onRestore && (

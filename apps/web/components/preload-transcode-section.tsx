@@ -100,7 +100,7 @@ export function TranscodeSection() {
 
   return (
     <SettingsSection
-      title="预转码（便携版本）"
+      title="预转码"
       description="预转码 Worker 闲时把指定影片转成 1080p H.264 的低码率版本，外网播放时直接发小文件。Worker 在「设备」分区配对。"
     >
       {overview && (
