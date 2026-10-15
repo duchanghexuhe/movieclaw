@@ -1,9 +1,9 @@
 """Windows 单实例防呆锁：同机第二个 Worker 进程直接退出。
 
-三入口（remote_worker / preload_worker / preload_worker_gui）共用一个命名
-互斥体 ``Global\\MovieClawWorker``：跨登录会话生效，随进程句柄存活——进程
-被杀也由内核回收，不存在死锁。同机双开的真实代价是两份 ffmpeg 抢同一块
-GPU、两个 WS 连接互相顶掉（同 worker_id 重连会判旧任务失败）。
+两入口（worker / worker_gui）共用一个命名互斥体 ``Global\\MovieClawWorker``：
+跨登录会话生效，随进程句柄存活——进程被杀也由内核回收，不存在死锁。
+同机双开的真实代价是两份 ffmpeg 抢同一块 GPU、两个 WS 连接互相顶掉
+（同 worker_id 重连会判旧任务失败）。
 """
 
 from __future__ import annotations

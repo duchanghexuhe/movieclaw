@@ -1,6 +1,6 @@
-"""MovieClaw 预转码 Worker 的图形界面（tkinter + ctypes 托盘，零第三方依赖）。
+"""MovieClaw Worker 的图形界面（tkinter + ctypes 托盘，零第三方依赖）。
 
-用法：``pythonw worker/preload_worker_gui.pyw``（或 python worker/preload_worker_gui.py）。
+用法：``pythonw worker/worker_gui.pyw``（或 python worker/worker_gui.py）。
 
 - 主窗口：连接状态、各槽位当前任务、滚动日志、配置（服务器 / ffmpeg / 并发 /
   仅接电 / 开机自启），启动与停止；
@@ -24,15 +24,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from preload_worker import (  # noqa: E402
+from worker import (  # noqa: E402
     WorkerRuntime,
     load_config,
     on_battery,
     save_config,
 )
 
-APP_TITLE = "MovieClaw 预转码 Worker"
-STARTUP_BAT_NAME = "MovieClaw 预转码 Worker.bat"
+APP_TITLE = "MovieClaw Worker"
+STARTUP_BAT_NAME = "MovieClaw Worker.bat"
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +350,10 @@ class WorkerGUI:
             bat.write_text(
                 f'@echo off\r\nstart "" "{python}" "{script}" --autostart\r\n', encoding="utf-8"
             )
+            # 旧版自启 bat 指向 preload_worker_gui.py：一并清掉，避免双开
+            legacy = _startup_dir() / "MovieClaw 预转码 Worker.bat"
+            if legacy.exists():
+                legacy.unlink(missing_ok=True)
         elif bat.exists():
             bat.unlink()
 

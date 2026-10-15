@@ -1,17 +1,19 @@
-"""MovieClaw 预转码 Windows Worker（docs/design/preload-transcode.md §7）。
+"""MovieClaw Windows Worker——NAS 的转码执行器（预转码 + 实时，统一调度 v2）。
 
-独立后台程序：连 NAS 领任务 → 跑 ffmpeg → 分段上传产物。**不在客户端里**：
-「把 Windows 从架构里拿掉，功能仍完整存在，只是暂时无人执行」。
+独立后台程序，一个进程两种活：连 NAS 的 WS 控制面，预转码任务由服务端
+推送进来（本地/远程自动调度的远程臂），播放转码任务实时接单。**不在
+客户端里**：MovieClaw 客户端不含任何转码执行逻辑。
 
 用法::
 
-    python preload_worker.py --server http://nas:3000 [--ffmpeg ffmpeg.exe] [--once]
+    python worker.py --server http://nas:3000 [--ffmpeg ffmpeg.exe] [--once]
 
 - 首次运行走设备配对（浏览器开 NAS 的 /activate 页，批准 Worker 的请求）；
-- 配对令牌存本地 preload_worker.json（与配置同文件）；
-- 主循环：领任务 → 下载源 → ffmpeg 转码（定时上报进度续约）→ 分段上传 →
-  complete → 领下一个；队列空时睡 POLL_SECONDS。
-- 断点续转：上传按段对齐服务端台账 resume_parts；中断重跑自动续。
+- 配对令牌存本地 worker.json（与配置同文件）；
+- 实时任务：WS job.start → 本机 ffmpeg → 分片回传 NAS（engine.py）；
+- 预转码任务：WS 推送 job.start(class=preload) → 分段转码 + REST 数据面
+  （断点续转：按段对齐服务端台账 resume_parts，中断重跑自动续）；
+- 图形界面用 worker_gui.py（托盘常驻，同一份配置）。
 
 依赖：仅 Python 3.11+ 标准库（urllib），零第三方包——可直接拷到任何
 Windows 机器跑，不要求装 MovieClaw 客户端。
@@ -30,11 +32,16 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# 允许直接以脚本方式运行（python worker/preload_worker.py）：realtime_worker
+# 允许直接以脚本方式运行（python worker/worker.py）：engine
 # 与本文件同目录，加入 sys.path 保证 import 在任何 cwd 下都能命中。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-CONFIG_FILE = Path(__file__).with_name("preload_worker.json")
+#: 配置文件：新名 worker.json；旧部署的 preload_worker.json 自动沿用
+#: （改名迁移不做——两份并存时以旧名为准，那台机器还在用旧令牌）
+_LEGACY_CONFIG_FILE = Path(__file__).with_name("preload_worker.json")
+CONFIG_FILE = (
+    _LEGACY_CONFIG_FILE if _LEGACY_CONFIG_FILE.exists() else Path(__file__).with_name("worker.json")
+)
 #: 失败上报的退避间隔（推送派单后 REST 调用失败时用）
 POLL_SECONDS = 30
 PROGRESS_SECONDS = 60
@@ -464,7 +471,7 @@ class WorkerRuntime:
 
     def _start_realtime(self):
         """拉起统一 WS 客户端（实时任务 + 预转码推送派单同一条连接）。"""
-        from realtime_worker import RealtimeClient
+        from engine import RealtimeClient
 
         client = RealtimeClient(
             server=self.server,
@@ -558,7 +565,7 @@ class WorkerRuntime:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MovieClaw 预转码 Worker")
+    parser = argparse.ArgumentParser(description="MovieClaw Windows Worker（预转码+实时统一调度）")
     parser.add_argument("--server", help="NAS 地址；缺省读配置文件")
     parser.add_argument("--ffmpeg", help="ffmpeg 可执行文件路径；缺省读配置文件")
     parser.add_argument("--name", help="配对显示名；缺省读配置文件")

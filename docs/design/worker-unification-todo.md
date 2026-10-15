@@ -2,6 +2,9 @@
 
 > 依据：2026-10-15 六场讨论，过程细节不在此文，可向当次会话索要；实现时的代码事实
 > 入口在文末「实现锚点」。状态：T1-T4 已全部实现（2026-10-15，分支 feat/preload-transcode）。
+> 2026-10-16 追加：Worker 端收敛为单一程序（旧 preload_worker.py → worker.py、
+> realtime_worker.py → engine.py、preload_worker_gui.py → worker_gui.py），
+> 预转码自动调度本地优先 + prefer_remote 开关移除；下文旧文件名以改名注记保留。
 
 ## TODO 看板（按依赖排序）
 

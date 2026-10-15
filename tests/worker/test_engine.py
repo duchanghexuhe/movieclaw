@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from realtime_worker import (
+from engine import (
     ArtifactUploadProxy,
     FragmentOutput,
     FragmentSegmenter,
@@ -71,7 +71,7 @@ def test_source_proxy_prefetch_does_not_cascade(monkeypatch):
         block = int(range_header.split("=")[1].split("-")[0]) // (8 * 1024 * 1024)
         return _FakeResponse(calls, block)
 
-    import realtime_worker as rw
+    import engine as rw
 
     monkeypatch.setattr(rw, "_NO_PROXY_OPENER", _FakeOpener(fake_urlopen))
     proxy = SourceReadProxy("job-x", "http://upstream/api/v1/transcode-worker/sessions/s/source?token=t")
@@ -235,7 +235,7 @@ def test_job_releases_concurrency_slot_on_failure():
 
 def test_hello_declares_roles_by_preload_presence():
     """v2 统一调度：带 preload 执行器的客户端报 realtime+preload，纯实时只报 realtime。"""
-    from realtime_worker import RealtimeClient
+    from engine import RealtimeClient
 
     pure = RealtimeClient(
         server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={}
@@ -255,7 +255,7 @@ def test_roles_respect_realtime_toggle():
     服务端 select_execution_backend 只按角色选 realtime 执行者，角色
     申报错了 --no-realtime 机器照样被派播放任务（v2 实现次日复查发现）。
     """
-    from realtime_worker import RealtimeClient
+    from engine import RealtimeClient
 
     preload_only = RealtimeClient(
         server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},
@@ -268,7 +268,7 @@ def test_roles_respect_realtime_toggle():
 
 def test_preload_job_start_without_executor_is_rejected():
     """没报 preload 角色却收到 class=preload 的任务：明确上报失败，而不是误执行。"""
-    from realtime_worker import RealtimeClient
+    from engine import RealtimeClient
 
     client = RealtimeClient(
         server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={}
@@ -281,7 +281,7 @@ def test_preload_job_start_without_executor_is_rejected():
 
 def test_preload_job_start_runs_executor():
     """带执行器时 class=preload 任务被交给执行器并回传结果。"""
-    from realtime_worker import RealtimeClient
+    from engine import RealtimeClient
 
     ran: list[dict] = []
     client = RealtimeClient(
@@ -294,7 +294,7 @@ def test_preload_job_start_runs_executor():
 
 def test_preload_stop_routes_to_registered_stopper():
     """job.stop(class=preload) 只停对应 task_id 的预转码，不碰实时任务表。"""
-    from realtime_worker import RealtimeClient
+    from engine import RealtimeClient
 
     client = RealtimeClient(
         server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},

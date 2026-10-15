@@ -16,7 +16,7 @@ ffmpeg 用分片化 MP4（frag_keyframe+delay_moov+...）PUT 到本机回环代�
 代理按 MP4 盒子切段归到 HLS 分片栅格，逐块 PUT 给 NAS；一块传不动就整段
 攒内存重传。取源代理则把 NAS 的取源请求按 8MiB 块缓存、顺序预取。
 
-纯标准库实现（与 preload_worker.py 同一约束）：WebSocket 握手/帧协议手写，
+纯标准库实现（与 worker.py 同一约束）：WebSocket 握手/帧协议手写，
 HTTP 代理用 http.server + urllib。
 """
 
@@ -1416,7 +1416,7 @@ class RealtimeClient:
         self.caps = caps
         self.max_jobs = max_jobs
         self.log = log or (lambda _msg: None)
-        # 预转码执行器（preload_worker.process_task 的包装）：None=本客户端
+        # 预转码执行器（worker.process_task 的包装）：None=本客户端
         # 只报 realtime 角色，收到 class=preload 的 job.start 直接拒掉
         self.preload = preload
         # realtime 开关只影响角色申报（--no-realtime 的机器不该被派播放任务，
