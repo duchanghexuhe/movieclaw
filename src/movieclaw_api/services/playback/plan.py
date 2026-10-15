@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Select, select
@@ -22,7 +23,10 @@ from movieclaw_api.services.playback.ffmpeg_args import effective_hw_backend
 from movieclaw_api.services.playback.hwprobe import hardware_available
 from movieclaw_api.services.playback.iso_source import iso_disc_source
 from movieclaw_api.services.playback.limits import MAX_TRANSCODE_HEIGHT
-from movieclaw_api.services.playback.remote_worker import remote_worker_busy
+from movieclaw_api.services.playback.remote_worker import (
+    remote_worker_available,
+    remote_worker_busy,
+)
 from movieclaw_api.services.playback.strm_probe import ensure_strm_spec
 from movieclaw_api.services.playback.track_context import track_contexts
 from movieclaw_api.settings import PlaybackPolicySetting
@@ -106,6 +110,20 @@ async def decide_for_files(
     policy = await load_policy()
     decisions = []
     for file in files:
+        # T3 高度上限随执行者：片属性命中远程分流（HDR/4K）且 nvenc Worker
+        # 在线时，这一部的转码上限放到 2160——只有远程才装得出 4K 的速度
+        # （NAS 核显 4K 只有 1.8×）。执行后端随后在 select_execution_backend
+        # 按同一分流规则把这类片优先交给远程；远程中途掉线走既有「硬件落空
+        # →重决策」路径，按 1080 本地重判，不会卡住播放。
+        file_policy = policy
+        if (
+            policy.max_transcode_height < REMOTE_TRANSCODE_HEIGHT
+            and prefers_remote_execution(file)
+            and remote_worker_available("nvenc")
+        ):
+            file_policy = replace(
+                policy, max_transcode_height=REMOTE_TRANSCODE_HEIGHT
+            )
         # 网盘（strm）条目扫库时不探规格，第一次播放在这里现探并落库（strm_probe）：
         # 有了真实编码，才能和本地文件一样选直出 / 换封装 / 转码
         await ensure_strm_spec(file)
@@ -141,7 +159,7 @@ async def decide_for_files(
         elif not is_iso and needs_keyframe_probe(
             profile,
             capability,
-            policy,
+            file_policy,
             failed_tiers=failed_tiers,
             preferred_audio=preferred_audio,
             preferred_subtitle=preferred_subtitle,
@@ -169,7 +187,7 @@ async def decide_for_files(
                 decide_playback(
                     profile,
                     capability,
-                    policy,
+                    file_policy,
                     can_self_enable=can_self_enable,
                     failed_tiers=failed_tiers,
                     preferred_audio=preferred_audio,
@@ -202,6 +220,23 @@ async def load_policy() -> PlaybackPolicy:
     )
 
 
+#: 远程执行者的高度上限（T3）：NAS 虚拟核显编 4K 只有 1.8×（真片实测），
+#: 2070S 的全 GPU 链有 4.7×——4K 输出只对远程放开。
+REMOTE_TRANSCODE_HEIGHT = 2160
+
+
+def prefers_remote_execution(file: LibraryFile) -> bool:
+    """T3 分流规则：这部片该不该由远程 Worker 执行转码（按片属性，不按负载）。
+
+    HDR 或 ≥4K 源走远程——核显的 tone-map/CUDA 链在这种片上与本地差一个
+    数量级（2070S 省流档 12.7× vs NAS 4K HDR 1.8×）；普通 SDR ≤1080p 本地
+    跑得又快又省（远程供片天生 +4 秒延迟，见 git log 5ef5f5c3/0d55051b）。
+    """
+    if file.hdr:
+        return True
+    return (file.resolution or "") == "2160p"
+
+
 def select_execution_backend(
     decision: PlaybackPlan,
     *,
@@ -219,6 +254,10 @@ def select_execution_backend(
     翻转这个顺序：Worker 在线、有空闲槽位且兼容当前计划时优先由它执行，
     本地退作兜底（用户显式偏好「让 Windows GPU 干活、NAS 减负」）。
     返回值的第二项明确标出是否需要远程会话。
+
+    T3 分流：HDR 或高分辨率（>1080，即高度上限已随执行者放开）的计划，
+    即使没开 prefer_remote 也优先由远程执行——这两类片远程快一个数量级
+    （2070S 12.7×/4.7× vs NAS 核显 1.8×），本地优先反而选了个跑不动的。
 
     网页播放器与 Jellyfin 兼容层的转码入口共用这一个函数——两条链路起的是
     同一种会话，执行后端的选法不能有两套。
@@ -239,6 +278,9 @@ def select_execution_backend(
             and not remote_worker_busy(backend)
             and effective_hw_backend(decision, backend) is not None
         )
+    )
+    prefer_remote = prefer_remote or (
+        decision.video.tone_map or (decision.video.height or 0) > MAX_TRANSCODE_HEIGHT
     )
     if prefer_remote and remote_candidates:
         return remote_candidates[0], True

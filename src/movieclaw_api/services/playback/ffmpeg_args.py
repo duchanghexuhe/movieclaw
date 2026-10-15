@@ -935,7 +935,17 @@ def _filter_chain(
         if backend is not None and backend.scale_filter and not software_filters:
             # format 必须写在硬件 scale 上：10-bit 源的硬件帧不会自己变成
             # 8-bit，而 H.264 的硬件编码器只吃 8-bit（见 scale_format）。
-            opts = f"w=-2:h={height}"
+            # 宽度不写 -2（等比放大）：NVENC 的 H.264 编码上限是 4096 宽，
+            # 宽银幕 4K 源（如 3840x1604）按 2160 高度放大后宽约 5172，
+            # h264_nvenc 直接打不开（2026-10-15 2070S 实测）。表达式让
+            # 宽度越界时改按 4096 收、高度随比例同收；16:9 4K（3840 宽）
+            # 不触发。VAPI/QSV 的 scale 上限远高于此，但统一走同一表达式
+            # 无害（现代编码器都认 min/trunc）。逗号要用反斜杠转义——
+            # 滤镜选项里的逗号是选项分隔符。
+            opts = (
+                f"w=min(4096\\,trunc(iw*{height}/ih/2)*2)"
+                f":h=min({height}\\,trunc(ih*4096/iw/2)*2)"
+            )
             if backend.scale_format:
                 opts = f"format={backend.scale_format}:{opts}"
             parts.append(f"{backend.scale_filter}={opts}")

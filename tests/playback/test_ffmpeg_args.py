@@ -511,15 +511,16 @@ def test_nvenc_with_probed_tonemap_stays_on_gpu(probed_nvenc_tonemap):
     assert vf.count("bt709") >= 3  # 三件套一项都不能少（issue #331）
     assert pair(argv, "-hwaccel") == "cuda"
     assert pair(argv, "-hwaccel_output_format") == "cuda"  # 全程硬件帧
-    assert "scale_cuda=format=yuv420p:w=-2:h=1080" in vf
+    assert "scale_cuda=format=yuv420p" in vf
+    assert "h=min(1080" in vf  # T3 后宽度走 min(4096,…) 表达式（NVENC 宽上限）
 
 
 @pytest.mark.parametrize(
     "backend, expected",
     [
-        ("vaapi", "scale_vaapi=format=nv12:w=-2:h=1080"),
-        ("qsv", "scale_qsv=format=nv12:w=-2:h=1080"),
-        ("nvenc", "scale_cuda=format=yuv420p:w=-2:h=1080"),
+        ("vaapi", "scale_vaapi=format=nv12:w=min(4096"),
+        ("qsv", "scale_qsv=format=nv12:w=min(4096"),
+        ("nvenc", "scale_cuda=format=yuv420p:w=min(4096"),
     ],
 )
 def test_hardware_scale_pins_eight_bit_output(backend, expected):
@@ -1030,7 +1031,8 @@ def test_no_burn_keeps_plain_vf_path():
     )
     assert "-filter_complex" not in argv
     assert "0:v:0" in [argv[i + 1] for i, a in enumerate(argv) if a == "-map"]
-    assert "scale_vaapi=format=nv12:w=-2:h=720" in " ".join(argv)
+    assert "scale_vaapi=format=nv12:w=min(4096" in " ".join(argv)
+    assert "h=min(720" in " ".join(argv)
 
 
 # ---------------------------------------------------------------------------

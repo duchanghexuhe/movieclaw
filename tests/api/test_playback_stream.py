@@ -2555,3 +2555,66 @@ def test_diagnostic_encoder_marks_vaapi_low_power():
         assert routes_playback._diagnostic_encoder(session) == "h264_vaapi（低功耗）"
     finally:
         register_encoder_options("vaapi", ())
+
+
+def test_execution_backend_routes_hdr_to_remote_even_without_preference():
+    """T3 分流：HDR 片即使没开「远程优先」也交给远程 Worker——核显的
+    tone-map 与远程 GPU 差一个数量级，本地优先反而选了个跑不动的。"""
+    from movieclaw_playback.decide import VideoPlan
+
+    hdr = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True),
+        audio=AudioPlan(action="copy"),
+    )
+    assert routes_playback.playback_plan.select_execution_backend(
+        hdr,
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+    ) == ("nvenc", True)
+
+
+def test_execution_backend_routes_4k_plan_to_remote():
+    """T3 分流：高分辨率计划（>1080，即高度上限已随执行者放开）走远程。"""
+    from movieclaw_playback.decide import VideoPlan
+
+    uhd = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=2160),
+        audio=AudioPlan(action="copy"),
+    )
+    assert routes_playback.playback_plan.select_execution_backend(
+        uhd,
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+    ) == ("nvenc", True)
+
+
+def test_execution_backend_keeps_sdr_1080p_local_without_preference():
+    """T3 分流不越界：普通 SDR ≤1080p 计划维持本地优先（省掉远程供片的
+    天生 1~4 秒延迟）。"""
+    assert routes_playback.playback_plan.select_execution_backend(
+        _hw_decision(),
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+    ) == ("vaapi", False)
+
+
+def test_prefers_remote_execution_by_media_attributes():
+    """分流规则本身：HDR 或 2160p 源命中，其余不命中。"""
+    from movieclaw_api.services.playback.plan import prefers_remote_execution
+
+    def file(**kw):
+        return SimpleNamespace(hdr=kw.get("hdr"), resolution=kw.get("resolution"))
+
+    assert prefers_remote_execution(file(hdr="HDR10", resolution="1080p"))
+    assert prefers_remote_execution(file(hdr=None, resolution="2160p"))
+    assert not prefers_remote_execution(file(hdr=None, resolution="1080p"))
+    assert not prefers_remote_execution(file(hdr=None, resolution=None))
