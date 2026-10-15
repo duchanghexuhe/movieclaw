@@ -1067,6 +1067,13 @@ class RealtimeJob:
                         "error": str(exc)[:2000],
                     }
                 )
+        finally:
+            # 任务线程退出即释放并发槽位：条目原本只在 NAS 显式 job.stop 或同
+            # job 换轮次重派时移除，ffmpeg 自然结束（无论成败）条目留在表里，
+            # 之后每个 job.start 都被"Worker 并发已满"挡住，直到 Worker 重连
+            #（2026-10-15 真机：两个失败任务把并发占死约 5 分钟）。
+            with self.client.jobs_lock:
+                self.client.jobs.pop(self.job_id, None)
 
     def _run_inner(self, message: dict) -> None:
         arguments = list(message.get("ffmpeg_args") or [])

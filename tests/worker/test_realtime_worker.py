@@ -9,7 +9,9 @@ from __future__ import annotations
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -121,3 +123,46 @@ def test_out_time_parsing():
     assert RealtimeJob._out_time_ms({"out_time_ms": "1234567"}) == 1234
     assert RealtimeJob._out_time_ms({"out_time": "1.5"}) == 1500
     assert RealtimeJob._out_time_ms({}) is None
+
+
+class _StubClient:
+    """_start_job 注册表的最小客户端替身：捕捉上行消息与槽位表。"""
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, RealtimeJob] = {}
+        self.jobs_lock = threading.Lock()
+        self._outbox: list[dict] = []
+        self._outbox_lock = threading.Lock()
+        self.sent: list[dict] = []
+
+    def _send_safe(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+
+def _run_job_and_release(job_id: str, exit_code: int) -> _StubClient:
+    """跑一轮立刻退出的"ffmpeg"（用 python 进程顶替），返回捕获到的客户端。"""
+    client = _StubClient()
+    message = {"ffmpeg_args": ["-c", f"import sys; sys.exit({exit_code})"]}
+    job = RealtimeJob(job_id, message, sys.executable, client)
+    with client.jobs_lock:
+        client.jobs[job_id] = job  # 模拟 _start_job 的注册
+    job.run(message)
+    return client
+
+
+def test_job_releases_concurrency_slot_on_finish():
+    """ffmpeg 正常结束必须释放并发槽位：条目原本只在 NAS 显式 job.stop 或同
+    job 重派时移除，自然结束的条目一直占着表，之后所有接单都被
+    "Worker 并发已满"挡住（2026-10-15 真机：两个失败任务占死并发 5 分钟）。"""
+    client = _run_job_and_release("job-ok", 0)
+    assert "job-ok" not in client.jobs
+    assert any(m["type"] == "job.finished" for m in client.sent)
+
+
+def test_job_releases_concurrency_slot_on_failure():
+    """失败同样释放：失败是最常见的槽位泄漏现场（ffmpeg 起不来→任务失败→
+    槽位占死→用户重试全被拒）。"""
+    client = _run_job_and_release("job-bad", 3)
+    assert "job-bad" not in client.jobs
+    failed = [m for m in client.sent if m["type"] == "job.failed"]
+    assert failed and "退出码 3" in failed[0]["error"]
