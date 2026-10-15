@@ -288,6 +288,12 @@ def _children(box: bytes) -> list[tuple[str, bytes]]:
 # ---------------------------------------------------------------------------
 
 
+#: 产物回传与取源都走内网 NAS 地址：显式绕过进程环境里的 http_proxy
+#（Clash 常驻机器上 urllib 会把内网流量交给代理，吞吐掉到 1.7MB/s——
+# 2026-10-15 真机：PUT 8MB 恒定 4.6s，是播放供片追不上转码的直接原因）。
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 class ArtifactUploadProxy:
     """为一个实时任务提供仅监听回环地址的 HLS 产物代理。
 
@@ -311,6 +317,7 @@ class ArtifactUploadProxy:
         on_abandoned: Callable[[str, int, str], None] | None = None,
         on_rejected: Callable[[str], None] | None = None,
         on_first_segment: Callable[[], None] | None = None,
+        debug: Callable[[str], None] | None = None,
     ) -> None:
         self.job_id = job_id
         self.remote_base_url = remote_base_url.rstrip("/")
@@ -320,6 +327,7 @@ class ArtifactUploadProxy:
         self.on_abandoned = on_abandoned
         self.on_rejected = on_rejected
         self.on_first_segment = on_first_segment
+        self._debug = debug or (lambda msg: None)
         self._lock = threading.Lock()
         self._stopped = False
         self._first_segment_reported = False
@@ -489,7 +497,9 @@ class ArtifactUploadProxy:
             if self._stopped:
                 return
             if output.kind == "init":
+                self._debug(f"upload init.mp4 begin ({len(output.data)}B)")
                 self._upload_whole("init.mp4", output.data, self.query)
+                self._debug("upload init.mp4 done")
                 continue
             name = f"seg{output.segment:05d}.m4s"
             with self._upload_lock:
@@ -518,7 +528,9 @@ class ArtifactUploadProxy:
                         done_key = done["name"]
                         data = done["buffer"]
                         done["uploaded"] = True
+                        self._debug(f"upload {done_key} begin ({len(data)}B)")
                         self._upload_whole(done_key, data, self.query)
+                        self._debug(f"upload {done_key} done")
                         # 从待收尾表移除（保留当前段）
                         for k in [k for k, s in self._segments.items()
                                   if s.get("uploaded") and k != output.segment]:
@@ -548,13 +560,23 @@ class ArtifactUploadProxy:
             url, data=body, method="PUT",
             headers={"Content-Type": "application/octet-stream", "Cache-Control": "no-store"},
         )
+        # **显式直连**：urllib 默认会读进程环境里的 http_proxy——挂机的机器带着
+        # Clash 等代理环境变量时，内网 PUT 被绕去代理（实测稳定 4.6s/8MB =
+        # 1.7MB/s，供片永远追不上播放）。NAS 内网地址直连永远是对的。
+        began = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=30) as resp:
-                return resp.status
+            with _NO_PROXY_OPENER.open(request, timeout=30) as resp:
+                resp.read()
+                status = resp.status
         except urllib.error.HTTPError as exc:
-            return exc.code
+            status = exc.code
         except OSError:
             return 502
+        self._debug(
+            f"put {url.rsplit('/', 1)[-1].split('?')[0]}: {len(body)}B status={status}"
+            f" in {time.monotonic() - began:.2f}s"
+        )
+        return status
 
     def _upload_whole(self, name: str, body: bytes, query: str | None) -> bool:
         url = self._remote_url(name, query)
@@ -719,7 +741,7 @@ class SourceReadProxy:
                 split = urllib.parse.urlsplit(self.path)
                 url = proxy.origin + split.path + (("?" + split.query) if split.query else "")
                 try:
-                    resp = urllib.request.urlopen(url, timeout=30)
+                    resp = _NO_PROXY_OPENER.open(url, timeout=30)
                 except urllib.error.HTTPError as exc:
                     self.send_response(exc.code)
                     self.send_header("Content-Length", "0")
@@ -761,7 +783,7 @@ class SourceReadProxy:
         url = self.origin + self._path + "?" + self._query
         request = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
         try:
-            with urllib.request.urlopen(request, timeout=30) as resp:
+            with _NO_PROXY_OPENER.open(request, timeout=30) as resp:
                 content_range = resp.headers.get("Content-Range", "")
                 resp.read()
         except (urllib.error.HTTPError, OSError):
@@ -792,7 +814,7 @@ class SourceReadProxy:
         )
         began = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=60) as resp:
+            with _NO_PROXY_OPENER.open(request, timeout=60) as resp:
                 data = resp.read()
         except (urllib.error.HTTPError, OSError):
             if self._debug:
@@ -967,11 +989,12 @@ class TailFeeder:
     注释）。轮询 0.2 秒读新增字节；文件比上次读更短 = seek 换了新轮次，重置。
     """
 
-    def __init__(self, path, on_bytes, on_error=None) -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, path, on_bytes, on_error=None, debug=None) -> None:  # type: ignore[no-untyped-def]
         from pathlib import Path as _P
 
         self.path = _P(path)
         self.on_bytes = on_bytes
+        self._debug = debug or (lambda msg: None)
         self.on_error = on_error
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -994,10 +1017,12 @@ class TailFeeder:
             return True
 
     def _loop(self) -> None:
+        self._debug("tail loop started")
         while not self._stop.is_set():
             try:
                 size = self.path.stat().st_size
             except OSError:
+                self._debug("tail stat failed")
                 self._stop.wait(0.2)
                 continue
             if size < self._offset:
@@ -1010,10 +1035,13 @@ class TailFeeder:
                 except OSError as exc:
                     if self.on_error is not None:
                         self.on_error(f"读中转文件失败：{exc}")
+                    self._debug(f"tail read failed: {exc}")
                     self._stop.wait(0.5)
                     continue
                 self._offset += len(data)
                 if data:
+                    if self._offset < 2 * 1024 * 1024 or self._offset % (8 * 1024 * 1024) < 65536:
+                        self._debug(f"tail fed {len(data)}B (offset={self._offset})")
                     self.on_bytes(data)
             self._stop.wait(0.2)
 
@@ -1133,6 +1161,11 @@ class RealtimeJob:
         arguments = list(message.get("ffmpeg_args") or [])
         if not arguments:
             raise RuntimeError("任务缺少 ffmpeg_args")
+        self._debug_log("argv: " + " ".join(arguments)[:1500])
+        self._debug_log(
+            f"start_segment={message.get('start_segment')} "
+            f"segment_seconds={message.get('segment_seconds')}"
+        )
         # 1) 上传代理：从参数里找产物基址。**ffmpeg 不直接 PUT 代理**——
         # Windows 上 SMB 源 + 回环 PUT 组合会死锁（ffmpeg 发完 header 即 RST，
         # 实测 lavfi/本地源都正常，与服务器行为无关，2026-10-14 二分钟：
@@ -1153,6 +1186,7 @@ class RealtimeJob:
                 start_segment=int(start_segment) if start_segment is not None else None,
                 on_abandoned=self._on_artifact_abandoned,
                 on_rejected=self._on_artifact_rejected,
+                debug=self._debug_log,
             )
             self.upload_proxy.start()
             stream_index = arguments.index("stream.mp4") if "stream.mp4" in arguments else -1
@@ -1169,6 +1203,7 @@ class RealtimeJob:
                 self._temp_stream,
                 on_bytes=self.upload_proxy.feed_bytes,
                 on_error=lambda msg: self._on_artifact_abandoned("stream.mp4", 500, msg),
+                debug=self._debug_log,
             )
         # 2) 取源代理：**默认关闭**，ffmpeg 直连 NAS 的 /source 端点。
         #

@@ -48,6 +48,16 @@ class _FakeResponse:
         return False
 
 
+class _FakeOpener:
+    """_NO_PROXY_OPENER 的替身：把 open() 转给 fake_urlopen。"""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def open(self, request, timeout=0):  # noqa: ARG002
+        return self._fn(request)
+
+
 def test_source_proxy_prefetch_does_not_cascade(monkeypatch):
     """预取绝不级联：按需取一块 → 只预取后两块，预取自身不再派生。
 
@@ -61,9 +71,9 @@ def test_source_proxy_prefetch_does_not_cascade(monkeypatch):
         block = int(range_header.split("=")[1].split("-")[0]) // (8 * 1024 * 1024)
         return _FakeResponse(calls, block)
 
-    import urllib.request
+    import realtime_worker as rw
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(rw, "_NO_PROXY_OPENER", _FakeOpener(fake_urlopen))
     proxy = SourceReadProxy("job-x", "http://upstream/api/v1/transcode-worker/sessions/s/source?token=t")
     assert proxy._block(0) is not None
     # 等预取线程跑完：块 0 按需 + 块 1/2 预取，且数字稳定（不继续增长）
