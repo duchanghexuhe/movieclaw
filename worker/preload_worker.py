@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 CONFIG_FILE = Path(__file__).with_name("preload_worker.json")
+#: 失败上报的退避间隔（推送派单后 REST 调用失败时用）
 POLL_SECONDS = 30
 PROGRESS_SECONDS = 60
 PART_BYTES_DEFAULT = 64 * 1024 * 1024
@@ -339,7 +340,7 @@ def load_config(overrides: dict | None = None) -> dict:
             config[key] = value
     config.setdefault("concurrency", 1)
     config.setdefault("ac_only", False)
-    config.setdefault("realtime", False)
+    config.setdefault("realtime", True)
     return config
 
 
@@ -370,7 +371,11 @@ def on_battery() -> bool:
 
 
 class WorkerRuntime:
-    """预转码运行时：N 个领取槽位线程 + 电源策略 + 状态回调。
+    """预转码运行时：WS 推送派单 + 电源策略 + 状态回调（v2 统一调度）。
+
+    任务不再轮询 claim，而是随 realtime 客户端的 WS 连接推送过来
+    （``class=preload`` 的 job.start），由 ``_run_preload`` 在独立线程里执行
+    ``process_task``；数据面（分段上传/续约/complete/fail）照旧走 REST。
 
     ``status_cb(kind, **fields)`` 是 GUI/CLI 的唯一状态出口（线程安全：回调
     里只入队，不碰 Tk）。kind ∈ log/task/pairing/stopped。
@@ -387,11 +392,9 @@ class WorkerRuntime:
         ac_only: bool = False,
         once: bool = False,
         realtime: bool = False,
-        on_token: Callable[[str], None] | None = None,
-        status_cb: Callable[..., None] | None = None,
+        on_token=None,  # Callable[[str], None] | None
+        status_cb=None,  # Callable[..., None] | None
     ) -> None:
-        from typing import Callable
-
         self.server = server
         self.token = token
         self.ffmpeg = ffmpeg
@@ -407,6 +410,12 @@ class WorkerRuntime:
         self.caps: dict = {}
         self.tasks: dict[int, str] = {}  # slot -> display（GUI 显示当前任务）
         self._tasks_lock = threading.Lock()
+        # 预转码并发闸：同时在跑的分段转码数。注意这是**本机**闸（电源/停止
+        # 之外的唯一本地限制）——服务端按 max_concurrency−1 派单，这里再拦
+        # 一道防派单与断线重连交错时短暂超发
+        self._preload_slots = threading.Semaphore(max(1, self.concurrency - 1) or 1)
+        self._preload_stop: dict[int, threading.Event] = {}
+        self._realtime_client = None
 
     def _emit(self, kind: str, **fields: object) -> None:
         try:
@@ -432,36 +441,29 @@ class WorkerRuntime:
 
     def start(self) -> None:
         """阻塞直到 stop_event 置位（或 --once 队列清空）。"""
-        from typing import Callable
-
         self.ensure_token()
         self.caps = probe_caps(self.ffmpeg)
         nvenc = "h264_nvenc" in self.caps["encoders"]
         self.log(
             f"Worker 已连接 {self.server}（并发 {self.concurrency}，"
             f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}"
-            f"{f'，实时转码: 开' if self.realtime else ''}）"
+            f"{'，实时转码: 开' if self.realtime else ''}）"
         )
-        realtime_thread: threading.Thread | None = None
-        if self.realtime:
-            realtime_thread = self._start_realtime()
-        threads = [
-            threading.Thread(target=self._slot, args=(i,), daemon=True, name=f"slot-{i}")
-            for i in range(self.concurrency)
-        ]
-        for t in threads:
-            t.start()
-        while any(t.is_alive() for t in threads):
-            if self.stop_event.is_set():
+        # v2 统一调度：一条 WS 连接同时报 realtime+preload 角色（GUI 勾了实时
+        # 才报 realtime；预转码永远是本程序的主职）。REST 轮询 claim 已删除，
+        # 任务由服务端推送。
+        client = self._start_realtime()
+        try:
+            while not self.stop_event.is_set():
                 # stop_event 只拦"还没进 ffmpeg 的下一单"；进行中的 ffmpeg
-                # 由 GUI 层 terminate，这里等它自然收尾
-                self.stop_event.set()
-                break
-            time.sleep(0.5)
-        self._emit("stopped")
+                # 由 stop()/preload 停止钩子收尾
+                self.stop_event.wait(0.5)
+        finally:
+            client.stop()
+            self._emit("stopped")
 
-    def _start_realtime(self) -> threading.Thread:
-        """拉起实时转码 WS 客户端线程（与预转码轮询并行，互不干扰）。"""
+    def _start_realtime(self):
+        """拉起统一 WS 客户端（实时任务 + 预转码推送派单同一条连接）。"""
         from realtime_worker import RealtimeClient
 
         client = RealtimeClient(
@@ -469,10 +471,12 @@ class WorkerRuntime:
             token=self.token or "",
             worker_id=self.name,
             ffmpeg=self.ffmpeg,
-            caps={**self.caps, "ffmpeg_version": self.caps.get("ffmpeg_version")},
-            max_jobs=1,
-            log=lambda line: self.log(f"[实时] {line}"),
+            caps=self.caps,
+            max_jobs=self.concurrency,
+            log=lambda line: self.log(f"[WS] {line}"),
+            preload=self._run_preload,
         )
+        client.preload_stop = self._stop_preload_task
         self._realtime_client = client
 
         def watch() -> None:
@@ -483,71 +487,70 @@ class WorkerRuntime:
 
         thread = threading.Thread(target=watch, daemon=True, name="realtime")
         thread.start()
-        self.log("实时转码模式已开启（GPU 空闲时也能接播放转码）")
-        return thread
+        self.log("统一调度已连接：预转码任务由服务端推送（并发位 = 本机并发 − 1）")
+        return client
 
-    def _slot(self, index: int) -> None:
+    def _run_preload(self, message: dict) -> bool:
+        """RealtimeClient 的 class=preload 执行器：跑 process_task。
+
+        返回是否成功（失败已通过 REST fail 上报，主循环只记日志）。
+        """
         assert self.api is not None
-        while not self.stop_event.is_set():
-            if self.ac_only and on_battery():
-                time.sleep(POLL_SECONDS)  # 未接电源：静默等待，不打日志刷屏
-                continue
-            try:
-                status, view = self.api.request(
-                    "POST", "/api/v1/preload-worker/claim", json_body={"caps": self.caps}
-                )
-            except Exception as exc:  # 网络抖动：退避重试
-                self.log(f"[槽 {index}] 连接失败，{POLL_SECONDS}s 后重试：{exc}")
-                time.sleep(POLL_SECONDS)
-                continue
-            if status == 401:
-                self.log("令牌失效，重新配对…")
-                self._emit("pairing")
-                self.api = Api(self.server, None)
-                self.token = self.api.pair(self.name, status_cb=self._emit)
-                if self.on_token is not None:
-                    self.on_token(self.token)
-                continue
-            task = (view or {}).get("data", {}).get("task") if status == 200 else None
-            if task is None:
-                # 服务端 claim 是长轮询（最多等 20s 才回空），拿到空后立即再问：
-                # 下单到被领取的延迟由服务端 0.5s 的查询间隔决定，与这里无关
-                if self.once:
-                    self.log("队列已空，退出。")
-                    self.stop_event.set()
-                    return
-                continue
-            task_id = task["task_id"]
+        task = message  # 派单载荷与 claim 响应同构（dispatcher._payload_for）
+        task_id = task["task_id"]
+        if self.ac_only and on_battery():
+            # 电源策略不满足：不上报失败（不是任务的错），服务端租约 10 分钟
+            # 后自动回队。本地记一条，GUI 能看到为什么没在转
+            self.log(f"[{task_id}] 使用电池中，跳过执行（任务将回队）")
+            return False
+        with self._preload_slots:
+            if self.stop_event.is_set():
+                return False
+            stop = threading.Event()
             with self._tasks_lock:
-                self.tasks[index] = task.get("display_name", f"#{task_id}")
+                self._preload_stop[task_id] = stop
+                self.tasks[task_id] = task.get("display_name", f"#{task_id}")
             self._emit(
-                "task", slot=index, task_id=task_id,
+                "task", slot=task_id, task_id=task_id,
                 name=task.get("display_name", f"#{task_id}"), phase="claimed",
             )
             try:
+                # 服务端抢占（job.stop class=preload）置位 stop：process_task
+                # 在段间检查，断点台账在服务端，重派自动续转
+                stop.wait(0)  # 占位让 stop 变量在闭包里可见
                 ok = process_task(
                     self.api, self.ffmpeg, task,
                     Path(__file__).parent / "work" / str(task_id),
-                    stop=self.stop_event,
+                    stop=stop,
                 )
                 self._emit(
-                    "task", slot=index, task_id=task_id,
+                    "task", slot=task_id, task_id=task_id,
                     name=task.get("display_name", f"#{task_id}"),
                     phase="done" if ok else "failed",
                 )
-            except Exception as exc:  # 任何意外：上报失败，继续领下一个
+                return ok
+            except Exception as exc:  # 任何意外：上报失败，继续接下一单
                 import traceback
 
                 self.log(f"[{task_id}] 异常：{exc}")
                 self.log(traceback.format_exc()[-900:])
                 self.api.request(
                     "POST",
-                    f"/api/v1/preload-worker/tasks/{task['task_id']}/fail",
+                    f"/api/v1/preload-worker/tasks/{task_id}/fail",
                     json_body={"error": str(exc)[:2000]},
                 )
+                return False
             finally:
                 with self._tasks_lock:
-                    self.tasks.pop(index, None)
+                    self.tasks.pop(task_id, None)
+                    self._preload_stop.pop(task_id, None)
+
+    def _stop_preload_task(self, task_id) -> None:
+        """服务端抢占时停掉对应任务的 ffmpeg（断点保留在服务端台账）。"""
+        with self._tasks_lock:
+            stop = self._preload_stop.get(task_id)
+        if stop is not None:
+            stop.set()
 
 
 def main() -> None:
@@ -557,7 +560,12 @@ def main() -> None:
     parser.add_argument("--name", help="配对显示名；缺省读配置文件")
     parser.add_argument("--concurrency", type=int, help="并发槽位数 1-8")
     parser.add_argument("--ac-only", action="store_true", help="仅接通电源时执行")
-    parser.add_argument("--realtime", action="store_true", help="同时开启实时远程转码（WS 长连接接播放任务）")
+    parser.add_argument(
+        "--realtime",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否接实时转码（默认开；--no-realtime 只跑预转码）",
+    )
     parser.add_argument("--once", action="store_true", help="处理完队列里现有任务后退出")
     parser.add_argument("--reset-token", action="store_true", help="丢弃已存令牌重新配对")
     parser.add_argument("--autostart", action="store_true", help="开机自启调用；已有实例时静默退出")
@@ -579,8 +587,8 @@ def main() -> None:
     })
     if args.ac_only:
         config["ac_only"] = True
-    if args.realtime:
-        config["realtime"] = True
+    if args.realtime is not None:
+        config["realtime"] = args.realtime
     if args.reset_token:
         config.pop("token", None)
     save_config(config)

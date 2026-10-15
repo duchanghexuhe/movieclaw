@@ -20,7 +20,6 @@ import {
   getRemoteTranscodeConfig,
   getRemoteTranscodeStatus,
   saveRemoteTranscodeConfig,
-  saveWorkerLimit,
 } from "@/lib/api/transcode-worker";
 
 const BYTES_PER_MIB = 1024 * 1024;
@@ -48,8 +47,9 @@ export interface RemoteTranscodeSectionProps {
  * 「播放」分区的远程转码设置（原「应用 → 远程转码」标签，设置页按功能重组后
  * 迁入「媒体库」组）。
  *
- * 在这里启用远程转码，并调整每台设备的并发上限。开关、并发上限改完即存；
- * 覆盖地址是单个文本值，失焦或回车提交。
+ * 在这里启用远程转码；覆盖地址是单个文本值，失焦或回车提交。并发上限在
+ * Worker 本机配置（v2 起服务端不再保存或下发它），这一页只展示 Worker
+ * 申报的值。
  *
  * Worker 用哪个地址连过来，是在 Mac 那侧填的；服务端下发任务时用的取源地址和
  * 产物回传地址，默认直接取用那条控制连接自报的地址（remote_worker.py 的
@@ -72,7 +72,6 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
   const discardRef = useRef(false);
   const toast = useToast();
   const [status, setStatus] = useState<RemoteTranscodeStatus | null>(null);
-  const [savingLimit, setSavingLimit] = useState<number | null>(null);
   // 已授权的 Worker：「设备」里 scope=transcode 的那些（配对出来的转码器，以及
   // 给命令行模式转码器用的「仅限转码」手工令牌）。运行时注册表在断线时会把
   // Worker 整个摘掉（remote_worker.py 的 unregister），所以只看 status.workers
@@ -82,36 +81,6 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
   // 待批准的请求这里看不到了：服务端不再列出待批准请求（只能按配对码查），
   // 转码器发起配对时会直接打开带码的批准页（docs/design/login-devices.md §4）。
   const [authorizedWorkers, setAuthorizedWorkers] = useState<LoginDeviceView[]>([]);
-
-  async function updateLimit(deviceID: number, value: number) {
-    setSavingLimit(deviceID);
-    setError(null);
-    try {
-      await saveWorkerLimit(deviceID, value);
-      setStatus(await getRemoteTranscodeStatus());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "并发上限保存失败");
-    } finally {
-      setSavingLimit(null);
-    }
-  }
-
-  function limitControl(name: string, deviceID: number, value: number, supported = true) {
-    return (
-      <label className="flex items-center gap-2 text-caption text-[var(--text-muted)]">
-        {savingLimit === deviceID ? "正在保存…" : "同时转码"}
-        <select
-          aria-label={`${name} 最大并发任务数`}
-          className={SETTINGS_INPUT_CLASS}
-          value={value}
-          disabled={savingLimit !== null || !supported}
-          onChange={(event) => void updateLimit(deviceID, Number(event.target.value))}
-        >
-          {[1, 2, 3, 4].map((limit) => <option key={limit} value={limit}>{limit} 路</option>)}
-        </select>
-      </label>
-    );
-  }
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -372,7 +341,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
         footnote={
           hasAnyWorker && (
             <>
-              同时转码的路数改完即存，并同步到转码器。{devicesLink}
+              同时转码的路数在 Worker 本机配置，这里只展示它申报的值。{devicesLink}
             </>
           )
         }
@@ -429,6 +398,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                         worker.hardware.memory_bytes ? `${Math.round(worker.hardware.memory_bytes / 1024 ** 3)} GB` : null,
                         worker.ffmpeg_version ? `ffmpeg ${worker.ffmpeg_version}` : null,
                         worker.backends.length > 0 ? worker.backends.join("/") : null,
+                        worker.roles.length > 0 ? worker.roles.join("/") : null,
                         `任务 ${worker.active_jobs}/${worker.max_jobs}`,
                         `${Math.round(worker.last_seen_seconds)} 秒前活跃`,
                       ]
@@ -440,15 +410,9 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                           {worker.load.thermal_state >= 2 ? " · 正在降温" : ""}
                         </span>
                       )}
-                      {!worker.server_config && (
-                        <span className="block">更新转码器后可同步设置并发上限</span>
-                      )}
                     </>
                   }
-                >
-                  {worker.device_id != null && limitControl(worker.worker_id, worker.device_id,
-                    status.device_limits[`ld-${worker.device_id}`] ?? worker.max_jobs, worker.server_config)}
-                </SettingsRow>
+                />
               ))}
               {/* 已授权但没连上来的。它们在运行时注册表里不存在，但授权还在，
                   用户也确实配过——不显示的话，Mac 一关机这台就凭空消失，
@@ -467,9 +431,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                   description={`已授权 · 最近活跃 ${relativeTime(device.last_seen_at)}${
                     config.ready ? " · Mac 没开机或没联网时属正常" : ""
                   }`}
-                >
-                  {limitControl(device.name, Number(device.id.replace("ld-", "")), status.device_limits[device.id] ?? 1)}
-                </SettingsRow>
+                />
               ))}
             </SettingsList>
           ) : config.ready ? (

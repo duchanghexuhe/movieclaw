@@ -40,8 +40,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-#: 与服务端 REMOTE_WORKER_PROTOCOL_VERSION 对齐（remote_worker.py:40）
-PROTOCOL_VERSION = 1
+#: 与服务端 REMOTE_WORKER_PROTOCOL_VERSION 对齐（remote_worker.py）
+#: v2：hello 报 roles+max_concurrency；job.start 带 class（realtime/preload）
+PROTOCOL_VERSION = 2
 #: 心跳间隔与服务端静默判离线窗口（对齐 Mac 客户端的 45 秒）
 HEARTBEAT_SECONDS = 15.0
 SERVER_SILENCE_SECONDS = 45.0
@@ -1405,6 +1406,7 @@ class RealtimeClient:
         caps: dict,
         max_jobs: int = 1,
         log: Callable[[str], None] | None = None,
+        preload: Callable[[dict], bool] | None = None,
     ) -> None:
         self.server = server.rstrip("/")
         self.token = token
@@ -1413,6 +1415,9 @@ class RealtimeClient:
         self.caps = caps
         self.max_jobs = max_jobs
         self.log = log or (lambda _msg: None)
+        # 预转码执行器（preload_worker.process_task 的包装）：None=本客户端
+        # 只报 realtime 角色，收到 class=preload 的 job.start 直接拒掉
+        self.preload = preload
         self.jobs: dict[str, RealtimeJob] = {}
         self.jobs_lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -1458,7 +1463,7 @@ class RealtimeClient:
             hello = {
                 "type": "worker.hello",
                 "protocol_version": PROTOCOL_VERSION,
-                "worker_version": "win-worker-1",
+                "worker_version": "win-worker-2",
                 "worker_id": self.worker_id,
                 "draining": False,
                 "capabilities": {
@@ -1468,6 +1473,7 @@ class RealtimeClient:
                     "encoders": self.caps.get("encoders", []),
                     "backends": ["nvenc"],
                     "max_jobs": self.max_jobs,
+                    "roles": ["realtime", "preload"] if self.preload else ["realtime"],
                     "server_config": True,
                     "hardware": self.caps.get("hardware", {}),
                     "segment_types": ["fmp4"],
@@ -1523,12 +1529,21 @@ class RealtimeClient:
                 self.max_jobs = limit
                 self.log(f"并发上限同步为 {limit}")
         elif message_type == "job.start":
-            threading.Thread(
-                target=self._start_job, args=(ws, message), name="job-start", daemon=True
-            ).start()
+            # v2 统一调度：同一连接里实时与预转码任务按 class 分流
+            if message.get("class") == "preload":
+                threading.Thread(
+                    target=self._start_preload, args=(message,), name="preload-start", daemon=True
+                ).start()
+            else:
+                threading.Thread(
+                    target=self._start_job, args=(ws, message), name="job-start", daemon=True
+                ).start()
         elif message_type == "job.stop":
             job_id = str(message.get("job_id", ""))
             force = message.get("force") is True
+            if message.get("class") == "preload":
+                self._stop_preload(message)
+                return
             with self.jobs_lock:
                 job = self.jobs.pop(job_id, None)
             if job is not None:
@@ -1548,6 +1563,9 @@ class RealtimeClient:
             # job.playback 是观众播放位置（服务端只发给声明了 playback_progress
             # 的 Worker，原本是给 Mac 面板显示用的）；本 Worker 无面板，静默即可
             pass
+        elif message_type == "worker.config":
+            # v2 起服务端不再下发并发上限；收到说明对端还是旧版，忽略即可
+            self.log("服务端仍按 v1 下发并发上限，已忽略（并发以本机配置为准）")
         else:
             self.log(f"忽略未知消息：{message_type}")
 
@@ -1602,3 +1620,37 @@ class RealtimeClient:
         """任务线程投递状态消息；由主循环发到当前连接。"""
         with self._outbox_lock:
             self._outbox.append(payload)
+
+    # -- 预转码任务（v2 统一调度的 class=preload 分支）-----------------------
+
+    def _start_preload(self, message: dict) -> None:
+        """执行一个推送来的预转码任务（分段转码 + REST 数据面）。"""
+        task_id = message.get("task_id")
+        display = message.get("display_name") or f"#{task_id}"
+        if self.preload is None:
+            # 没报 preload 角色却被派了单（服务端bug 或旧版服务端）：明确拒绝
+            self._send_safe(
+                {
+                    "type": "job.failed",
+                    "job_id": f"preload-{task_id}",
+                    "class": "preload",
+                    "task_id": task_id,
+                    "error": "本 Worker 未开启预转码角色",
+                }
+            )
+            return
+        self.log(f"接预转码单 {task_id}：{display}")
+        try:
+            ok = self.preload(message)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[{task_id}] 预转码异常：{exc}")
+            ok = False
+        self.log(f"预转码单 {task_id} {'完成' if ok else '失败/中断'}：{display}")
+
+    def _stop_preload(self, message: dict) -> None:
+        """服务端抢占预转码任务（实时优先）：停掉对应任务的分段 ffmpeg。"""
+        task_id = message.get("task_id")
+        stopper = getattr(self, "preload_stop", None)
+        if stopper is not None and task_id is not None:
+            self.log(f"NAS 抢占预转码任务 {task_id}（实时任务优先），停止转码")
+            stopper(task_id)

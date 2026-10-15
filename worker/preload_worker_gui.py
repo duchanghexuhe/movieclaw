@@ -250,11 +250,16 @@ class WorkerGUI:
         self.var_concurrency = tk.IntVar(value=1)
         ttk.Spinbox(config, from_=1, to=8, width=5, textvariable=self.var_concurrency).grid(
             row=2, column=1, sticky=tk.W)
+        ttk.Label(
+            config, text="（播放转码优先，预转码占并发−1）",
+            foreground="#666",
+        ).grid(row=2, column=1, sticky=tk.W, padx=(52, 0))
         self.var_ac_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="仅接通电源时执行", variable=self.var_ac_only).grid(
             row=2, column=2, sticky=tk.W)
-        self.var_realtime = tk.BooleanVar(value=False)
-        ttk.Checkbutton(config, text="实时转码（边播边转）", variable=self.var_realtime).grid(
+        self.var_realtime = tk.BooleanVar(value=True)
+        ttk.Checkbutton(config, text="接实时转码（边播边转；取消则只跑预转码）",
+                        variable=self.var_realtime).grid(
             row=3, column=0, columnspan=2, sticky=tk.W, padx=(6, 0))
         self.var_autostart = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="开机自启", variable=self.var_autostart,
@@ -281,7 +286,10 @@ class WorkerGUI:
         self.var_ffmpeg.set(self.config.get("ffmpeg") or "")
         self.var_concurrency.set(int(self.config.get("concurrency") or 1))
         self.var_ac_only.set(bool(self.config.get("ac_only")))
-        self.var_realtime.set(bool(self.config.get("realtime")))
+        # v2 默认开实时（统一调度主推形态）；老配置里明确存过 false 的尊重原值
+        self.var_realtime.set(
+            bool(self.config.get("realtime", True)) if "realtime" in self.config else True
+        )
         self.var_autostart.set((_startup_dir() / STARTUP_BAT_NAME).exists())
 
     # -- 动作 ----------------------------------------------------------------

@@ -26,7 +26,7 @@ from movieclaw_api.services.preload.ffmpeg_preload import (
     estimate_size_bytes,
 )
 from movieclaw_db.engine import get_session
-from movieclaw_db.models import LibraryFile, MediaItem, PreloadTask, PreloadTaskStatus
+from movieclaw_db.models import LibraryFile, MediaItem, PreloadTask
 
 router = APIRouter(prefix="/preload", tags=["preload"])
 
@@ -155,8 +155,8 @@ async def estimate(
 
 
 async def get_setting_store_dep():
-    from movieclaw_api.settings.store import get_setting_store
     from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
 
     return await get_setting_store().get(PreloadSetting)
 
@@ -185,6 +185,10 @@ async def create_task(
         session, file_id=payload.file_id, preset_id=payload.preset_id
     )
     view = (await enriched_task_views(session, [task]))[0]
+    # v2 推送派单：下单即触发，不再等 Worker 轮询
+    from movieclaw_api.services.preload.dispatcher import dispatch_queued_tasks
+
+    await dispatch_queued_tasks()
     return ok(view, message="已加入预转码队列，等 Worker 领取")
 
 

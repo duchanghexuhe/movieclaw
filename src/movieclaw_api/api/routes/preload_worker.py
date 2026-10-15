@@ -16,10 +16,8 @@ remote_signing 的签名 URL 域（kind 扩展 ``preload.source`` / ``preload.ar
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import subprocess
-import time
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -34,12 +32,10 @@ from movieclaw_api.exceptions import (
     NotFoundException,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
-from movieclaw_api.services import login_devices
 from movieclaw_api.services.media_probe import probe_media
 from movieclaw_api.services.preload import service as preload_service
 from movieclaw_api.services.preload.service import (
     ARTIFACT_UPLOAD_NAME,
-    PRELOAD_PART_BYTES as _PART_BYTES,
 )
 from movieclaw_api.services.preload.signing import (
     issue_preload_grant,
@@ -144,7 +140,9 @@ async def put_preload_artifact(
     task_id: Annotated[int, PathParam()],
     name: Annotated[str, PathParam()],
     request: Request,
-    part: Annotated[int | None, Query(description="分段号，从 0 开始；缺省按服务端断点台账")] = None,
+    part: Annotated[
+        int | None, Query(description="分段号，从 0 开始；缺省按服务端断点台账")
+    ] = None,
     token: Annotated[str | None, Query()] = None,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
@@ -271,6 +269,10 @@ async def complete_preload_task(
         # 整件作废：产物与分片一并清掉，任务置失败
         final_path.unlink(missing_ok=True)
         raise
+    # 一个任务结束，空闲出来的并发位立刻可以派下一个
+    from movieclaw_api.services.preload.dispatcher import dispatch_queued_tasks
+
+    await dispatch_queued_tasks()
     return ok({"file_id": derived.id, "size_bytes": size})
 
 
@@ -290,6 +292,10 @@ async def fail_preload_task(
     _assert_claimer(task, principal)
     error = str((payload or {}).get("error") or "Worker 上报失败")
     await preload_service.fail_task(session, task, error)
+    # 失败也释放并发位：下一个排队任务立刻可以派
+    from movieclaw_api.services.preload.dispatcher import dispatch_queued_tasks
+
+    await dispatch_queued_tasks()
     return ok(None)
 
 
@@ -306,8 +312,8 @@ async def preload_source(
     session: AsyncSession = Depends(get_session),
 ):
     """给 Worker 提供支持 Range 的源文件读取（与实时转码取源同形态）。"""
-    from movieclaw_playback.streaming import DisconnectAwareFileResponse
     from movieclaw_db.models import LibraryFile
+    from movieclaw_playback.streaming import DisconnectAwareFileResponse
 
     grant = await verify_preload_grant(token, task_id=task_id, kind="preload.source")
     if grant is None:

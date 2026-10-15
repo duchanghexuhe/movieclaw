@@ -42,7 +42,11 @@ from movieclaw_playback.decide import PlaybackPlan
 
 logger = logging.getLogger("movieclaw_api.playback.remote_worker")
 
-REMOTE_WORKER_PROTOCOL_VERSION = 1
+#: v2（2026-10-15 Worker 统一调度）：hello 增报 ``roles``（realtime/preload）
+#: 与 ``max_concurrency``（本机最大同时转码，替代 max_jobs），job.start 增
+#: ``class``（realtime/preload）。v2 起并发只在 Worker 本机配置，服务端不再
+#: 保存或下发任何并发上限。旧版 Worker 被握手版本检查挡掉（提示更新）。
+REMOTE_WORKER_PROTOCOL_VERSION = 2
 WORKER_IDLE_TIMEOUT_S = 45.0
 JOB_ACCEPT_TIMEOUT_S = 8.0
 LOAD_TIMEOUT_S = 15.0
@@ -85,6 +89,9 @@ class WorkerCapabilities:
     ffmpeg_version: str | None = None
     platform: str | None = None
     max_jobs: int = 1
+    #: v2 hello 申报的执行角色。带 preload 的 Worker 才会被推送预转码任务；
+    #: 只报 realtime 的（如纯实时 CLI）保持原有只接播放任务的形态。
+    roles: frozenset[str] = frozenset({"realtime"})
     #: 能回传的 HLS 分片类型。没声明的是旧版 Worker，只当它会 fMP4：它的上传
     #: 代理白名单只放行 ``.m4s``，TS 分片在它本机就被拒收，而 ffmpeg 不看上传
     #: 响应码、照样退出码 0 转完整部片——播放器等满 30 秒只拿到 404（issue #444）。
@@ -180,7 +187,6 @@ class RemoteWorkerRegistry:
         *,
         observed_base_url: str = "",
         login_device_id: int | None = None,
-        max_jobs: int | None = None,
     ) -> WorkerConnection:
         """校验 hello 并登记 Worker；同 ID 的旧连接会被替换。"""
         raw_worker_id = hello.get("worker_id")
@@ -194,11 +200,9 @@ class RemoteWorkerRegistry:
             worker_id=worker_id,
             websocket=websocket,
             capabilities=capabilities,
-            max_jobs=(
-                max_jobs
-                if max_jobs is not None and capabilities.server_config
-                else min(max_jobs or capabilities.max_jobs, capabilities.max_jobs)
-            ),
+            # v2：并发只在 Worker 本机配置（max_concurrency），服务端不再保存
+            # 或下发任何上限；这里照单全收它申报的值
+            max_jobs=capabilities.max_jobs,
             observed_base_url=observed_base_url,
             login_device_id=login_device_id,
             worker_version=str(hello.get("worker_version"))
@@ -367,6 +371,7 @@ class RemoteWorkerRegistry:
                     "ffmpeg_version": connection.capabilities.ffmpeg_version,
                     "backends": list(connection.capabilities.backends),
                     "max_jobs": connection.max_jobs,
+                    "roles": sorted(connection.capabilities.roles),
                     "disc_sources": connection.capabilities.disc_sources,
                     "hw_decoders": list(connection.capabilities.hw_decoders),
                     "filters": list(connection.capabilities.filters),
@@ -481,6 +486,82 @@ class RemoteWorkerRegistry:
     def release_job(self, job_id: str) -> None:
         """占位之后拼装失败时归还槽位。"""
         self._release_job(job_id)
+
+    # -- 预转码推送派单（v2 统一调度）-------------------------------------
+
+    def preload_capacity(self, connection: WorkerConnection) -> int:
+        """这台 Worker 现在还能接几个预转码任务（realtime 永远优先）。
+
+        预算 = max_concurrency − 1 − 在跑的实时任务数，最小 0：并发=1 的机器
+        只服务实时；空闲出来的并发位才允许预转码占用。实时任务在连接断开时
+        全部判失败释放，预转码按数据库任务状态独立记账（掉线不影响在跑的
+        预转码），所以实时占用只看 ``connection.jobs``。
+        """
+        with self._lock:
+            busy = len(connection.jobs)
+        return max(0, connection.max_jobs - 1 - busy)
+
+    def preload_workers(self) -> list[WorkerConnection]:
+        """带 preload 角色、不在排空、心跳新鲜的在线连接（按余量排序）。"""
+        with self._lock:
+            candidates = [
+                c
+                for c in self._workers.values()
+                if "preload" in c.capabilities.roles
+                and not c.draining
+                and self._is_fresh(c)
+            ]
+        candidates.sort(key=lambda c: (len(c.jobs) / max(1, c.max_jobs), -c.connected_at))
+        return candidates
+
+    async def send_preload_job(
+        self, connection: WorkerConnection, payload: dict[str, Any]
+    ) -> bool:
+        """向一台 Worker 推送预转码 job.start；发送失败返回 False（调用方退回任务）。
+
+        由正在事件循环里的调用方直接 await（不内嵌 create_task——抢占式
+        claim 的原子性要求发送结果当场可知，异步丢弃会把失败留成无人认领
+        的 CLAIMED 任务等 10 分钟租约）。
+        """
+        try:
+            await connection.send({"type": "job.start", "class": "preload", **payload})
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "预转码任务下发失败：worker=%s task=%s",
+                connection.worker_id,
+                payload.get("task_id"),
+            )
+            return False
+        return True
+
+    async def send_preload_stop(self, device_id: int, task_id: int) -> None:
+        """实时任务抢占并发位时，通知该设备在跑的预转码任务停止。
+
+        与实时 job.stop 的区别：只按 login_device_id 找连接、消息带
+        ``class=preload`` 与 ``task_id``（Worker 用它停对应的分段 ffmpeg）。
+        发送失败不打紧——租约到 10 分钟自然回收，断点台账保留。
+        """
+        with self._lock:
+            connection = next(
+                (
+                    c
+                    for c in self._workers.values()
+                    if c.login_device_id == device_id and self._is_fresh(c)
+                ),
+                None,
+            )
+        if connection is None:
+            return
+        try:
+            await connection.send(
+                {"type": "job.stop", "class": "preload", "task_id": task_id}
+            )
+        except Exception:  # noqa: BLE001
+            logger.info(
+                "预转码抢占停止消息发送失败（租约会兜底）：device=%s task=%s",
+                device_id,
+                task_id,
+            )
 
     async def start_job(
         self,
@@ -724,24 +805,9 @@ class RemoteWorkerRegistry:
             return min(candidates, key=rank)
 
     async def configure_device(self, device_id: int, max_jobs: int) -> None:
-        with self._lock:
-            workers = [c for c in self._workers.values() if c.login_device_id == device_id]
-            for c in workers:
-                c.max_jobs = (
-                    max_jobs
-                    if c.capabilities.server_config
-                    else min(max_jobs, c.capabilities.max_jobs)
-                )
-        for c in workers:
-            if c.capabilities.server_config:
-                try:
-                    await asyncio.wait_for(
-                        c.send({"type": "worker.config", "max_jobs": max_jobs}), 3
-                    )
-                except Exception:  # noqa: BLE001
-                    # 服务器设置已保存；断开后握手会重新同步，不保留半同步的连接。
-                    await self.unregister(c)
-                    await self._close_quietly(c.websocket, code=1012, reason="配置同步失败")
+        """v2 起废弃：并发只在 Worker 本机配置。保留方法以兼容旧测试签名，
+        实际不动任何状态。"""
+        return None
 
     @staticmethod
     def _profile(plan: PlaybackPlan, source_id: int) -> tuple[Any, ...]:
@@ -879,9 +945,16 @@ class RemoteWorkerRegistry:
         if "nvenc" in backends and "h264_nvenc" not in encoders:
             backends = tuple(item for item in backends if item != "nvenc")
         try:
-            max_jobs = max(1, min(4, int(raw.get("max_jobs", 1))))
+            max_jobs = max(1, min(8, int(raw.get("max_jobs", 1))))
         except (TypeError, ValueError):
             max_jobs = 1
+        # v2：hello 直接报 roles；没报的按旧语义只有 realtime
+        raw_roles = raw.get("roles")
+        roles = frozenset(
+            item
+            for item in (raw_roles if isinstance(raw_roles, list) else [])
+            if isinstance(item, str) and item in {"realtime", "preload"}
+        ) or frozenset({"realtime"})
         segment_types = raw.get("segment_types")
         segment_types = tuple(
             item
@@ -902,6 +975,7 @@ class RemoteWorkerRegistry:
             else None,
             platform=str(raw.get("platform")) if raw.get("platform") else None,
             max_jobs=max_jobs,
+            roles=roles,
             playback_progress=raw.get("playback_progress") is True,
             # 没声明（旧版 Worker）按只会 fMP4 处理，见字段注释
             segment_types=segment_types or ("fmp4",),

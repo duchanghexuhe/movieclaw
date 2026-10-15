@@ -33,7 +33,6 @@ from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.transcode_worker import (
     RemoteTranscodeConfigPayload,
     RemoteTranscodeConfigView,
-    WorkerConfigPayload,
 )
 from movieclaw_api.services import login_devices, media_scrape
 from movieclaw_api.services.image_variants import (
@@ -62,11 +61,6 @@ from movieclaw_api.services.playback.session import (
     PartialSegment,
     TranscodeSession,
     get_session_manager,
-)
-from movieclaw_api.services.playback.worker_config import (
-    ensure_worker_limit,
-    save_worker_limit,
-    worker_limits,
 )
 from movieclaw_api.services.tmdb_images import remote_image_url
 from movieclaw_db.engine import get_database, get_session
@@ -323,17 +317,12 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
             return
         try:
             device_id = principal.device.id if principal.device is not None else None
-            max_jobs = None
-            if device_id is not None:
-                initial = registry._parse_capabilities(hello.get("capabilities")).max_jobs
-                max_jobs = await ensure_worker_limit(device_id, initial)
             connection = await registry.register(
                 websocket,
                 hello,
                 observed_base_url=_observed_base_url(websocket),
                 # 注销这台转码器时据此当场断开连接（login_devices._after_revoke）
-                login_device_id=principal.device.id if principal.device is not None else None,
-                max_jobs=max_jobs,
+                login_device_id=device_id,
             )
         except ValueError as exc:
             _warn_throttled(
@@ -355,6 +344,11 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
                 "max_jobs": connection.max_jobs,
             }
         )
+        # v2：带 preload 角色的 Worker 一上线就可能有活干（此前在排队等它的任务）
+        if "preload" in connection.capabilities.roles:
+            from movieclaw_api.services.preload.dispatcher import dispatch_queued_tasks
+
+            await dispatch_queued_tasks()
         worker_ip = client_address(websocket) or None  # type: ignore[arg-type]
         worker_ua = websocket.headers.get("user-agent")
         while True:
@@ -365,19 +359,6 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
                     connection.login_device_id, ip=worker_ip, user_agent=worker_ua
                 )
             if isinstance(message, dict):
-                if message.get("type") == "worker.configure":
-                    if connection.login_device_id is not None:
-                        try:
-                            payload = WorkerConfigPayload.model_validate(
-                                {"max_jobs": message.get("max_jobs")}
-                            )
-                        except ValueError:
-                            await connection.send(
-                                {"type": "worker.config.error", "error": "并发上限必须为 1～4"}
-                            )
-                        else:
-                            await save_worker_limit(connection.login_device_id, payload.max_jobs)
-                    continue
                 forwarded = await registry.handle_message(connection, message)
                 if forwarded is None:
                     pass
@@ -422,28 +403,8 @@ async def transcode_worker_status() -> ApiResponse[dict]:
             "base_url_configured": bool(config.base_url),
             "ready": config.ready,
             "workers": get_remote_worker_registry().snapshot(),
-            "device_limits": {f"ld-{k}": v for k, v in (await worker_limits()).items()},
         }
     )
-
-
-@router.put(
-    "/devices/{device_id}/config",
-    response_model=ApiResponse[WorkerConfigPayload],
-    summary="修改转码器并发上限",
-    operation_id="transcode.worker.config",
-    dependencies=[Depends(require_admin)],
-)
-async def configure_transcode_worker(
-    device_id: int,
-    payload: WorkerConfigPayload,
-    session: AsyncSession = Depends(get_session),
-) -> ApiResponse[WorkerConfigPayload]:
-    device = await login_devices.get_device(session, device_id)
-    if device is None or device.scope != "transcode":
-        raise NotFoundException("转码器不存在")
-    await save_worker_limit(device_id, payload.max_jobs)
-    return ok(payload)
 
 
 async def _remote_source_file(

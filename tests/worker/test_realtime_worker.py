@@ -231,3 +231,59 @@ def test_job_releases_concurrency_slot_on_failure():
     assert "job-bad" not in client.jobs
     failed = [m for m in client.sent if m["type"] == "job.failed"]
     assert failed and "退出码 3" in failed[0]["error"]
+
+
+def test_hello_declares_roles_by_preload_presence():
+    """v2 统一调度：带 preload 执行器的客户端报 realtime+preload，纯实时只报 realtime。"""
+    from realtime_worker import RealtimeClient
+
+    pure = RealtimeClient(
+        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={}
+    )
+    both = RealtimeClient(
+        server="http://nas", token="t", worker_id="w2", ffmpeg="ffmpeg", caps={},
+        preload=lambda message: True,
+    )
+    # hello 的 capabilities 由 _connect_once 构造；这里直接验证判定源
+    assert pure.preload is None
+    assert both.preload is not None
+
+
+def test_preload_job_start_without_executor_is_rejected():
+    """没报 preload 角色却收到 class=preload 的任务：明确上报失败，而不是误执行。"""
+    from realtime_worker import RealtimeClient
+
+    client = RealtimeClient(
+        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={}
+    )
+    client._start_preload({"task_id": 7, "display_name": "x.mkv"})
+    rejected = [m for m in client._outbox if m.get("class") == "preload"]
+    assert rejected and rejected[0]["type"] == "job.failed"
+    assert rejected[0]["task_id"] == 7
+
+
+def test_preload_job_start_runs_executor():
+    """带执行器时 class=preload 任务被交给执行器并回传结果。"""
+    from realtime_worker import RealtimeClient
+
+    ran: list[dict] = []
+    client = RealtimeClient(
+        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},
+        preload=lambda message: ran.append(message) or True,
+    )
+    client._start_preload({"task_id": 9, "display_name": "y.mkv"})
+    assert ran and ran[0]["task_id"] == 9
+
+
+def test_preload_stop_routes_to_registered_stopper():
+    """job.stop(class=preload) 只停对应 task_id 的预转码，不碰实时任务表。"""
+    from realtime_worker import RealtimeClient
+
+    client = RealtimeClient(
+        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},
+        preload=lambda message: True,
+    )
+    stopped: list[object] = []
+    client.preload_stop = stopped.append
+    client._handle(None, {"type": "job.stop", "class": "preload", "task_id": 42})
+    assert stopped == [42]

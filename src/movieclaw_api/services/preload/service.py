@@ -396,6 +396,14 @@ async def reclaim_expired_leases(session: AsyncSession) -> int:
         logger.info("预转码任务租约到期回队：task=%s", task.id)
     if rows:
         await session.commit()
+        # 回队的任务可能立刻有 Worker 能接：触发一次推送派单（在事件循环里
+        # 才触发，定时任务/测试的同步上下文由下一个触发点兜底）
+        try:
+            from movieclaw_api.services.preload.dispatcher import trigger_dispatch
+
+            trigger_dispatch()
+        except Exception:  # noqa: BLE001 - 派单失败不影响回收本身
+            logger.warning("租约回队后的派单触发失败", exc_info=True)
     return len(rows)
 
 
