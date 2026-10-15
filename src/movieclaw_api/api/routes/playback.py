@@ -2079,6 +2079,9 @@ def _metered_file_response(
     """按 Range 出一个磁盘文件，并登记到设备流与活动页（原文件直出与原盘目录直推共用）。"""
     # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计
     probe = qoe.serve_probe(grant.attempt_id)
+    probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
+        grant.session_id
+    )
     stream = _register_play_stream(
         request,
         grant,
@@ -2105,6 +2108,9 @@ def _metered_file_response(
 def _metered_relay_response(request: Request, grant, file: LibraryFile, link: StrmLink) -> Response:
     """转发网盘直链（``strm_needs_relay``），与磁盘直出同一套设备流与活动页登记。"""
     probe = qoe.serve_probe(grant.attempt_id)
+    probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
+        grant.session_id
+    )
     stream = _register_play_stream(request, grant, file, name=PathLib(file.file_path).name)
     session_stopped, byte_sink, on_close = stream if stream is not None else (None, None, None)
     return RemoteRelayResponse(
