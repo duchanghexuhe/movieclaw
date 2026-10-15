@@ -771,11 +771,15 @@ def _video_args(
     if backend is not None:
         args += ["-c:v", backend.encoder, *encoder_options(backend)]
         # iOS 原生 HLS 对 10-bit/High 10 的硬件编码结果兼容性很差，统一锁
-        # 到 High profile + 8-bit yuv420p。VideoToolbox 不能在 4K 输出时强制
-        # 使用 High@4.1（会以 kVTParameterErr=-12902 拒绝创建编码器），因此
-        # 交给它按实际分辨率选择合法 level（2160p 通常为 5.1）。
+        # 到 High profile + 8-bit yuv420p。level 4.1 与**实际编码尺寸**是硬校验
+        #（H.264 level 4.1 上限 8192 宏块）：宽银幕缩到 1080p 高后宽出界——
+        # 坠落2 3828×2058 → 2010×1080 = 8568 宏块——VideoToolbox 以
+        # kVTParameterErr=-12902、NVENC 以 "Invalid Level" 在 InitializeEncoder
+        # 拒绝创建编码器，整部片起不了播（libx264 只是告警并自动抬高 level，
+        # Intel 驱动静默钳制，所以软编与 VAAPI/QSV 可以继续钉）。这两家交给
+        # 编码器按实际分辨率选合法 level（2160p 通常 5.1、宽银幕 1080p 4.2）。
         args += ["-profile:v", "high"]
-        if backend.name != "videotoolbox":
+        if backend.name not in ("videotoolbox", "nvenc"):
             args += ["-level:v", "4.1"]
         if backend.name == "videotoolbox" and vt_mode != VT_GPU:
             # GPU 链路的帧是硬件帧、已是 8-bit NV12；再要 yuv420p 会逼 ffmpeg 插一个

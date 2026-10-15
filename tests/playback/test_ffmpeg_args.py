@@ -878,6 +878,27 @@ def test_videotoolbox_transcode_lets_encoder_choose_level_for_4k():
     assert pair(argv, "-pix_fmt") == "yuv420p"
 
 
+def test_nvenc_transcode_lets_encoder_choose_level():
+    """NVENC 与 VideoToolbox 同罪：level 4.1 对宽银幕是硬校验。
+
+    level 4.1 上限 8192 宏块；宽银幕缩到 1080p 高后宽出界（坠落2 3828×2058
+    → 2010×1080 = 8568 宏块），NVENC 在 InitializeEncoder 直接以
+    "Invalid Level" 拒绝创建编码器，整部片起不了播（2026-10-15 真机）。
+    level 交给编码器按实际分辨率选（1080p 宽银幕 4.2、4K 5.1），profile 仍钉死。
+    """
+    argv = argv_of(
+        plan(
+            PlaybackTier.HARDWARE_TRANSCODE,
+            video=VideoPlan(action="transcode", codec="h264", height=1080),
+        ),
+        hw_backend="nvenc",
+    )
+
+    assert pair(argv, "-profile:v") == "high"
+    assert "-level:v" not in argv
+    assert pair(argv, "-c:v") == "h264_nvenc"
+
+
 def test_software_h264_transcode_keeps_level_4_1():
     argv = argv_of(
         plan(
