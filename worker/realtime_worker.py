@@ -639,6 +639,15 @@ class SourceReadProxy:
                 return candidate
         return None
 
+    @staticmethod
+    def strip_proxy_target(arguments: list[str]) -> list[str]:
+        """代理关闭时原样返回参数：-i 本就指向 NAS 的 /source，ffmpeg 直连即可。
+
+        留这个函数是为了让调用点表达「这里刻意不经过代理」而不只是"删掉那段
+        代码"；将来若代理修好了，把这里换回 remote_source_url 分支即可。
+        """
+        return arguments
+
     def _make_handler(self):  # type: ignore[no-untyped-def]
         proxy = self
 
@@ -1161,17 +1170,17 @@ class RealtimeJob:
                 on_bytes=self.upload_proxy.feed_bytes,
                 on_error=lambda msg: self._on_artifact_abandoned("stream.mp4", 500, msg),
             )
-        # 2) 取源代理：可选优化，起不来不影响转码
-        source_url = SourceReadProxy.remote_source_url(arguments)
-        if source_url is not None:
-            try:
-                self.source_proxy = SourceReadProxy(
-                    self.job_id, source_url, debug=self._debug_log
-                )
-                src_base = self.source_proxy.start()
-                arguments = self.source_proxy.rewrite(arguments, src_base)
-            except OSError:
-                self.source_proxy = None
+        # 2) 取源代理：**默认关闭**，ffmpeg 直连 NAS 的 /source 端点。
+        #
+        # 曾经默认开启（"seek 频繁时复用连接与块缓存"），但真机实测它是毒药：
+        # 代理经 NAS:8096 逐块拉 8MiB，实测读速只有 ~1.7MB/s（块耗时恒定
+        # 4.6s，与服务端 6ms 的响应时间、磁盘 38MB/s、同链路 SMB 30MB/s 全对
+        # 不上——瓶颈在 dockerd 用户态端口代理对单连接大响应的转发），ffmpeg
+        # 转码速度被压到 0.9× 实时，追不上播放器，首帧 40 秒起、供片 0.35×，
+        # 播放器等不到分片降档。禁用代理直连后同一会话 speed p50=10.3×。
+        # MOVIECLAW_WORKER_SOURCE_PROXY=1 可显式打开（排查用）。
+        if not os.environ.get("MOVIECLAW_WORKER_SOURCE_PROXY"):
+            arguments = SourceReadProxy.strip_proxy_target(arguments)
         # 3) 起 ffmpeg：-progress pipe:1 由服务端拼好；stdout 解析进度
         with self._stderr_lock:
             self.stderr_tail.clear()
