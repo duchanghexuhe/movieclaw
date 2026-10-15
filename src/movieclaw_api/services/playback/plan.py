@@ -243,21 +243,19 @@ def select_execution_backend(
     available: tuple[str, ...],
     local_backends: tuple[str, ...],
     remote_video_available: bool,
-    prefer_remote: bool = False,
 ) -> tuple[str | None, bool]:
-    """为当前播放计划选择真正能执行的后端。
+    """为当前播放计划选择真正能执行的后端（自动调度，无人工偏好开关）。
 
     ``available`` 是给决策层用的合并能力快照，``local_backends`` 则只包含
     NAS 本机实际探测通过的后端。两者不能按列表首项直接使用：列表顺序是
-    全局优先级，不代表该计划（尤其是 PGS 烧录）的滤镜链兼容性。默认本地
-    优先——只有本地都不兼容时，才把在线 Worker 作为候选。``prefer_remote``
-    翻转这个顺序：Worker 在线、有空闲槽位且兼容当前计划时优先由它执行，
-    本地退作兜底（用户显式偏好「让 Windows GPU 干活、NAS 减负」）。
-    返回值的第二项明确标出是否需要远程会话。
+    全局优先级，不代表该计划（尤其是 PGS 烧录）的滤镜链兼容性。
 
-    T3 分流：HDR 或高分辨率（>1080，即高度上限已随执行者放开）的计划，
-    即使没开 prefer_remote 也优先由远程执行——这两类片远程快一个数量级
-    （2070S 12.7×/4.7× vs NAS 核显 1.8×），本地优先反而选了个跑不动的。
+    调度规则（T3 定案，替代原「远程优先」偏好开关）：
+    - SDR ≤1080p 的普通转码本地优先——远程供片天生多 1~4 秒延迟；
+    - HDR 或高分辨率（>1080，即高度上限已随执行者放开）的计划优先远程
+      ——这两类片远程快一个数量级（2070S 12.7×/4.7× vs NAS 核显 1.8×），
+      本地优先反而选了个跑不动的；
+    - 选择的远程不可用（离线/满员/不兼容）自动落回本地。
 
     网页播放器与 Jellyfin 兼容层的转码入口共用这一个函数——两条链路起的是
     同一种会话，执行后端的选法不能有两套。
@@ -279,7 +277,7 @@ def select_execution_backend(
             and effective_hw_backend(decision, backend) is not None
         )
     )
-    prefer_remote = prefer_remote or (
+    prefer_remote = (
         decision.video.tone_map or (decision.video.height or 0) > MAX_TRANSCODE_HEIGHT
     )
     if prefer_remote and remote_candidates:

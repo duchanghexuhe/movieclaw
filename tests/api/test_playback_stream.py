@@ -335,39 +335,44 @@ def _hw_decision() -> PlaybackPlan:
     )
 
 
-def test_execution_backend_prefers_remote_when_configured():
-    """远程优先：Worker 在线且兼容当前计划时压过本地候选。"""
-    assert routes_playback.playback_plan.select_execution_backend(
-        _hw_decision(),
-        available=("vaapi", "nvenc"),
-        local_backends=("vaapi",),
-        remote_video_available=True,
-        prefer_remote=True,
-    ) == ("nvenc", True)
+def test_execution_backend_hdr_remote_route_falls_back_to_local_when_offline():
+    """HDR 分流但 Worker 离线：照常走本地，不因规则放不了片。"""
+    from movieclaw_playback.decide import VideoPlan
 
-
-def test_execution_backend_remote_preference_falls_back_to_local_when_offline():
-    """远程优先但 Worker 离线：照常走本地，不因偏好放不了片。"""
+    hdr = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True),
+        audio=AudioPlan(action="copy"),
+    )
     assert routes_playback.playback_plan.select_execution_backend(
-        _hw_decision(),
+        hdr,
         available=("vaapi",),
         local_backends=("vaapi",),
         remote_video_available=False,
-        prefer_remote=True,
     ) == ("vaapi", False)
 
 
-def test_execution_backend_skips_busy_remote_when_preferring_remote(monkeypatch):
-    """远程优先但唯一 Worker 名额全满：跳过它用本地，而不是 reserve 时 503。"""
+def test_execution_backend_skips_busy_remote_on_routed_plans(monkeypatch):
+    """HDR 分流但唯一 Worker 名额全满：跳过它用本地，而不是 reserve 时 503。"""
+    from movieclaw_playback.decide import VideoPlan
+
     monkeypatch.setattr(
         routes_playback.playback_plan, "remote_worker_busy", lambda backend: True
     )
+    hdr = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True),
+        audio=AudioPlan(action="copy"),
+    )
     assert routes_playback.playback_plan.select_execution_backend(
-        _hw_decision(),
+        hdr,
         available=("vaapi", "nvenc"),
         local_backends=("vaapi",),
         remote_video_available=True,
-        prefer_remote=True,
     ) == ("vaapi", False)
 
 
@@ -1997,30 +2002,23 @@ def test_remote_artifact_upload_maps_disk_quota_to_507(
     assert session.remote_uploads[-1].status == 500
 
 
-def test_remote_transcode_config_prefer_remote_roundtrip(client):
-    """prefer_remote 三态：显式写入生效；不带字段=保持。"""
+def test_remote_transcode_config_ignores_removed_prefer_remote(client):
+    """prefer_remote 已随自动调度定案移除：视图里没有这个字段，旧客户端带它
+    保存也不炸（pydantic 默认忽略未知字段）。"""
     url = "/api/v1/transcode-worker/config"
     view = client.get(url).json()["data"]
-    assert view["prefer_remote"] is False
+    assert "prefer_remote" not in view
 
     saved = client.put(
         url,
-        json={"enabled": False, "prefer_remote": True, "max_artifact_bytes": 512 * 1024 * 1024},
+        json={
+            "enabled": False,
+            "prefer_remote": True,  # 旧前端残留字段
+            "max_artifact_bytes": 512 * 1024 * 1024,
+        },
     ).json()["data"]
-    assert saved["prefer_remote"] is True
-
-    # 不带 prefer_remote 字段（null）= 保持，不回弹默认值
-    kept = client.put(
-        url,
-        json={"enabled": False, "max_artifact_bytes": 512 * 1024 * 1024},
-    ).json()["data"]
-    assert kept["prefer_remote"] is True
-
-    turned_off = client.put(
-        url,
-        json={"enabled": False, "prefer_remote": False, "max_artifact_bytes": 512 * 1024 * 1024},
-    ).json()["data"]
-    assert turned_off["prefer_remote"] is False
+    assert saved["enabled"] is False
+    assert "prefer_remote" not in saved
 
 
 def test_remote_artifact_upload_rejects_oversized_body(client, tmp_path):

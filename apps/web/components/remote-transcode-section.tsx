@@ -59,13 +59,11 @@ export interface RemoteTranscodeSectionProps {
 export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSectionProps) {
   const [config, setConfig] = useState<RemoteTranscodeConfigView | null>(null);
   const [enabled, setEnabled] = useState(false);
-  const [preferRemote, setPreferRemote] = useState(false);
   const [baseURLDraft, setBaseURLDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [toggling, setToggling] = useState(false);
   const [toggleError, setToggleError] = useState<string | null>(null);
-  const [preferRemoteError, setPreferRemoteError] = useState<string | null>(null);
   const [savingURL, setSavingURL] = useState(false);
   const [urlError, setURLError] = useState<string | null>(null);
   // Esc 放弃：随后的失焦不再提交（失焦回调读到的还是改过的草稿）
@@ -89,7 +87,6 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
       const next = await getRemoteTranscodeConfig();
       setConfig(next);
       setEnabled(next.enabled);
-      setPreferRemote(next.prefer_remote);
       setBaseURLDraft(next.base_url_override);
     } catch (e) {
       setError((e as Error).message);
@@ -152,32 +149,6 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
     } catch (e) {
       setEnabled(!next);
       setToggleError((e as Error).message);
-    } finally {
-      setToggling(false);
-    }
-  }
-
-  /**
-   * 远程优先：改完即存。只提交 prefer_remote，其余字段保持不动
-   * （base_url 传 null 表示保持，见 RemoteTranscodeConfigPayload）。
-   */
-  async function togglePreferRemote(next: boolean) {
-    if (config == null) return;
-    setPreferRemote(next); // 乐观更新：失败回滚
-    setToggling(true);
-    setPreferRemoteError(null);
-    try {
-      const saved = await saveRemoteTranscodeConfig({
-        enabled: config.enabled,
-        prefer_remote: next,
-        base_url: null,
-        max_artifact_bytes: config.max_artifact_bytes,
-      });
-      setConfig(saved);
-      setPreferRemote(saved.prefer_remote);
-    } catch (e) {
-      setPreferRemote(!next);
-      setPreferRemoteError((e as Error).message);
     } finally {
       setToggling(false);
     }
@@ -298,24 +269,9 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                 onChange={(next) => void toggleEnabled(next)}
               />
             </SettingsRow>
-            <SettingsRow
-              label="远程 Worker 优先"
-              description={
-                !enabled
-                  ? "先启用远程硬件转码；开启后 Worker 在线且能跑当前影片时优先由它转码"
-                  : preferRemote
-                    ? "Worker 在线且兼容当前影片时优先由它转码，起播略慢但给 NAS 减负；Worker 离线或忙时自动回落 NAS 本地"
-                    : "默认本地优先：NAS 能跑的由 NAS 跑，Worker 只接本地干不了的活（如 PGS 烧录）"
-              }
-              error={preferRemoteError}
-            >
-              <Toggle
-                checked={preferRemote}
-                label="远程 Worker 优先"
-                disabled={toggling || !enabled}
-                onChange={(next) => void togglePreferRemote(next)}
-              />
-            </SettingsRow>
+            {/* 「远程优先」开关已随自动调度定案移除：HDR / 4K 片由远程 Worker
+                执行、普通 SDR ≤1080p 由 NAS 本地执行（plan.select_execution_backend），
+                不再需要人工偏好。 */}
             <SettingsRow
               label="当前状态"
               description={

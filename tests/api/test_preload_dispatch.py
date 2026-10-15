@@ -209,3 +209,103 @@ def test_preempt_for_realtime_returns_task_and_sends_stop(client, tmp_path):
             return row.resume_parts
 
     assert client.portal.call(_resume_parts) == 0
+
+
+# ---------------------------------------------------------------------------
+# Q3 自动调度：本地优先 / 避让 / HDR 兜底
+# ---------------------------------------------------------------------------
+
+
+def test_local_execution_takes_task_before_remote(client, tmp_path, monkeypatch):
+    """本地有硬件且空闲：任务由本地执行器跑（不推给 Worker）。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+
+    monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
+    ran: list[tuple] = []
+
+    def fake_run(task, file, command):  # 与真 _run_local 同为同步签名
+        ran.append((task.id, tuple(command["argv"]) != ()))
+
+    monkeypatch.setattr(dispatcher, "_run_local", fake_run)
+    token = _pair_worker(client)
+    # hevc 源：本地软编真转码（h264 1080p SDR 源会被判定直拷形态转远程）
+    file_id = _seed_file(client, tmp_path, hdr=None, codec="hevc", resolution="1080p")
+    created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    # 有一个在线 preload Worker 也不该抢走：本地优先
+    with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
+        ws.send_json(_hello("win-local", max_jobs=2, roles=["realtime", "preload"]))
+        assert ws.receive_json()["type"] == "worker.accepted"
+        assert ran and ran[0][0] == created["id"]
+        # Worker 不该收到 job.start：心跳后只有 ack
+        ws.send_json({"type": "worker.heartbeat", "load": {}})
+        assert ws.receive_json()["type"] == "worker.heartbeat.ack"
+
+
+def test_local_video_copy_never_reaches_queue(client, tmp_path, monkeypatch):
+    """直拷形态（h264 1080p SDR 源 + 高清档）在下单时就被拒，进不了队列——
+    调度器的直拷防御分支正常情况下到不了。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+
+    monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
+    ran: list[int] = []
+
+    def fake_run(task, file, command):  # 同步签名对齐真 _run_local
+        ran.append(task.id)
+
+    monkeypatch.setattr(dispatcher, "_run_local", fake_run)
+    file_id = _seed_file(client, tmp_path, hdr=None, codec="h264", resolution="1080p")
+    response = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "portable_1080p"}
+    )
+    assert response.status_code == 400  # 「已经是便携档」直接拒绝
+    assert not ran
+
+
+def test_local_avoids_running_playback_sessions(client, tmp_path, monkeypatch):
+    """有播放转码会话在跑：本地让路，任务推给远程 Worker。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+
+    monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 0)  # 避让=容量 0
+    token = _pair_worker(client)
+    file_id = _seed_file(client, tmp_path, hdr=None, codec="h264", resolution="1080p")
+    created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
+        ws.send_json(_hello("win-yield", max_jobs=2, roles=["realtime", "preload"]))
+        assert ws.receive_json()["type"] == "worker.accepted"
+        message = ws.receive_json()
+        assert message["type"] == "job.start" and message["task_id"] == created["id"]
+
+
+def test_local_capacity_is_zero_without_hardware(monkeypatch):
+    """NAS 无硬件（available_local_backends 空）：本地容量恒 0，不接预转码。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+    from movieclaw_api.services.playback import hwprobe
+
+    monkeypatch.setattr(hwprobe, "available_local_backends", lambda: ())
+    monkeypatch.setattr(
+        dispatcher, "_LOCAL_RUNNING", {}
+    )
+    assert dispatcher._local_capacity() == 0
+
+
+def test_local_capacity_is_zero_while_playback_transcodes(monkeypatch):
+    """播放转码会话在跑：本地预转码让路。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+    from movieclaw_api.services.playback import hwprobe
+    from movieclaw_api.services.playback.session import get_session_manager
+
+    monkeypatch.setattr(hwprobe, "available_local_backends", lambda: ("vaapi",))
+    sessions = get_session_manager()
+    original = sessions.active
+
+    def fake_active():
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(tier=3)]  # tier 3 = 硬件转码
+
+    monkeypatch.setattr(sessions, "active", fake_active)
+    try:
+        assert dispatcher._local_capacity() == 0
+    finally:
+        monkeypatch.setattr(sessions, "active", original)
+

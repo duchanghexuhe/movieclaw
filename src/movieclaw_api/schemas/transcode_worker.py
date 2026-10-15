@@ -28,10 +28,6 @@ class RemoteTranscodeConfigPayload(BaseModel):
     """
 
     enabled: bool = Field(default=False, description="是否启用远程硬件转码")
-    prefer_remote: bool | None = Field(
-        default=None,
-        description="远程 Worker 在线时是否优先由它转码；null=保持当前值",
-    )
     base_url: str | None = Field(
         default=None,
         max_length=4096,
@@ -49,10 +45,6 @@ class RemoteTranscodeConfigView(BaseModel):
     """网页展示的远程转码配置。"""
 
     enabled: bool
-    prefer_remote: bool = Field(
-        default=False,
-        description="远程 Worker 在线且兼容当前计划时，优先由它执行转码（NAS 本地作兜底）",
-    )
     base_url: str = Field(
         default="", description="静态配置出的根地址；空表示自动使用 Worker 连上来的地址"
     )

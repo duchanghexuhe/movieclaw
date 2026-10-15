@@ -33,8 +33,16 @@ from movieclaw_api.exceptions import (
     BadRequestException,
     NotFoundException,
 )
+from movieclaw_api.services.preload.ffmpeg_preload import (
+    PRELOAD_PART_BYTES,
+    PRESET_DEFAULT,
+    PRESETS,
+    build_preload_command,
+    estimate_size_bytes,
+)
 from movieclaw_api.settings import PreloadSetting
 from movieclaw_api.settings.store import get_setting_store
+from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
     FileState,
     LibraryFile,
@@ -42,13 +50,6 @@ from movieclaw_db.models import (
     PreloadTask,
     PreloadTaskStatus,
     utcnow,
-)
-from movieclaw_api.services.preload.ffmpeg_preload import (
-    PRESET_DEFAULT,
-    PRESETS,
-    PRELOAD_PART_BYTES,
-    build_preload_command,
-    estimate_size_bytes,
 )
 
 logger = logging.getLogger("movieclaw_api.preload")
@@ -408,12 +409,18 @@ async def reclaim_expired_leases(session: AsyncSession) -> int:
 
 
 async def claim_next_task(
-    session: AsyncSession, *, device_id: int, max_parts_bytes: int | None = None
+    session: AsyncSession,
+    *,
+    device_id: int | None = None,
+    max_parts_bytes: int | None = None,
 ) -> tuple[PreloadTask, LibraryFile] | None:
     """领取下一个排队任务（§7：在线时领、离线无碍）。
 
-    原子性：UPDATE ... WHERE status=queued 抢占式改状态，两台 Worker 并发领取
-    不会拿到同一个任务（SQLite 写锁串行化保证）。
+    ``device_id=None`` 是本地执行器抢占（worker_device_id 写 NULL——
+    它不走 Worker 的 REST 数据面，台账里 NULL 表达「不归任何一台 Worker」；
+    服务重启后由租约回收兜底）。原子性：UPDATE ... WHERE status=queued
+    抢占式改状态，两台 Worker 并发领取不会拿到同一个任务（SQLite 写锁
+    串行化保证）。
     """
     await reclaim_expired_leases(session)
     row = (
@@ -759,7 +766,6 @@ async def overview(session: AsyncSession) -> dict[str, Any]:
         ).all()
     )
     oldest_days = 0
-    from movieclaw_db.models import PlaybackLog
 
     for _size, created_at in rows:
         anchor = created_at
@@ -867,8 +873,8 @@ def register_task_safe():
     """把维护任务注册进调度器；注册失败（测试环境无调度器）不炸导入。"""
     def decorator(fn):
         try:
-            from movieclaw_scheduler.registry import register_task
             from movieclaw_db.models.scheduled_task import TriggerType
+            from movieclaw_scheduler.registry import register_task
 
             return register_task(
                 "preload_maintenance",
