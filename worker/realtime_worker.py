@@ -1544,7 +1544,9 @@ class RealtimeClient:
                 job = self.jobs.get(str(message.get("job_id", "")))
             if job is not None:
                 job.resume()
-        elif message_type in ("worker.heartbeat.ack",):
+        elif message_type in ("worker.heartbeat.ack", "job.playback"):
+            # job.playback 是观众播放位置（服务端只发给声明了 playback_progress
+            # 的 Worker，原本是给 Mac 面板显示用的）；本 Worker 无面板，静默即可
             pass
         else:
             self.log(f"忽略未知消息：{message_type}")

@@ -340,7 +340,7 @@ class WorkerGUI:
             python = Path(sys.executable).with_name("pythonw.exe")
             python = python if python.exists() else Path(sys.executable)
             bat.write_text(
-                f'@echo off\r\nstart "" "{python}" "{script}"\r\n', encoding="utf-8"
+                f'@echo off\r\nstart "" "{python}" "{script}" --autostart\r\n', encoding="utf-8"
             )
         elif bat.exists():
             bat.unlink()
@@ -415,6 +415,23 @@ class WorkerGUI:
 
 
 def main() -> None:
+    # 单实例防呆锁要在 Tk 起来之前拿（避免窗口一闪）；撞锁时自启静默退、
+    # 手动启动弹窗说明。弹窗用 Win32 MessageBox 而不是 messagebox：后者
+    # 需要先初始化一个 Tk 实例，为一个提示不值当
+    from single_instance import acquire_singleton_lock
+
+    if acquire_singleton_lock() is None:
+        if "--autostart" in sys.argv:
+            sys.exit(0)
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "已有 MovieClaw Worker 在运行。\n同机只需一个 Worker，本程序退出。",
+            APP_TITLE,
+            0x40,
+        )
+        sys.exit(0)
     root = tk.Tk()
     try:
         ttk.Style(root).theme_use("vista")

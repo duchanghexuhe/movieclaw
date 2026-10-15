@@ -560,7 +560,16 @@ def main() -> None:
     parser.add_argument("--realtime", action="store_true", help="同时开启实时远程转码（WS 长连接接播放任务）")
     parser.add_argument("--once", action="store_true", help="处理完队列里现有任务后退出")
     parser.add_argument("--reset-token", action="store_true", help="丢弃已存令牌重新配对")
+    parser.add_argument("--autostart", action="store_true", help="开机自启调用；已有实例时静默退出")
     args = parser.parse_args()
+
+    # 单实例防呆锁：同机第二个 Worker 只会互顶 WS 连接、抢同一块 GPU
+    from single_instance import acquire_singleton_lock
+
+    if acquire_singleton_lock() is None:
+        if not args.autostart:
+            print("已有 MovieClaw Worker 在运行，本进程退出（同机只需一个 Worker）。")
+        sys.exit(0)
 
     config = load_config({
         "server": args.server,
