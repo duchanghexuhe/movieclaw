@@ -824,8 +824,8 @@ async def test_worker_disconnect_does_not_delete_foreign_registration():
     本机探测刚重跑过），就原样保留。"""
     from movieclaw_api.services.playback.ffmpeg_args import (
         NVENC_TONEMAP,
-        registered_native_tonemap,
         register_native_tonemap,
+        registered_native_tonemap,
     )
 
     registry = RemoteWorkerRegistry()
