@@ -21,8 +21,63 @@ from realtime_worker import (
     FragmentOutput,
     FragmentSegmenter,
     RealtimeJob,
+    SourceReadProxy,
     _allowed_artifact_name,
 )
+
+
+class _FakeResponse:
+    """urlopen 的替身：按 Range 头返回 8MiB，并记录每次请求的块号。"""
+
+    def __init__(self, calls: list[int], block: int) -> None:
+        self._calls = calls
+        self._block = block
+        self.headers = {
+            "Content-Range": f"bytes 0-0/{8 * 1024 * 1024 * 64}",
+            "Content-Length": str(8 * 1024 * 1024),
+        }
+
+    def read(self) -> bytes:
+        self._calls.append(self._block)
+        return b"\0" * (8 * 1024 * 1024)
+
+    def __enter__(self):  # noqa: D105
+        return self
+
+    def __exit__(self, *args):  # noqa: D105
+        return False
+
+
+def test_source_proxy_prefetch_does_not_cascade(monkeypatch):
+    """预取绝不级联：按需取一块 → 只预取后两块，预取自身不再派生。
+
+    曾经预取成功也再派生两块，链式翻倍往前冲 + FIFO 缓存被冲垮，深 seek
+    首帧被拖到 40 秒开外，播放器等不到分片直接降档（2026-10-15 真机）。
+    """
+    calls: list[int] = []
+
+    def fake_urlopen(request, timeout=0):  # noqa: ARG001
+        range_header = request.headers.get("Range", "")
+        block = int(range_header.split("=")[1].split("-")[0]) // (8 * 1024 * 1024)
+        return _FakeResponse(calls, block)
+
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    proxy = SourceReadProxy("job-x", "http://upstream/api/v1/transcode-worker/sessions/s/source?token=t")
+    assert proxy._block(0) is not None
+    # 等预取线程跑完：块 0 按需 + 块 1/2 预取，且数字稳定（不继续增长）
+    import time
+
+    for _ in range(20):
+        time.sleep(0.1)
+        if len(calls) >= 3:
+            break
+    time.sleep(0.5)
+    assert sorted(set(calls)) == [0, 1, 2]
+    stable = len(calls)
+    time.sleep(0.5)
+    assert len(calls) == stable, "预取还在继续派生——级联没堵住"
 
 
 def _make_fragmented_mp4(tmp_path: Path, seconds: int = 10) -> bytes:

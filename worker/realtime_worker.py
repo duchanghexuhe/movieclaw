@@ -584,8 +584,14 @@ class SourceReadProxy:
     代理起不来不影响转码（ffmpeg 直连 NAS），与 Mac 端同一取舍。
     """
 
-    def __init__(self, job_id: str, origin_url: str) -> None:
+    def __init__(
+        self,
+        job_id: str,
+        origin_url: str,
+        debug=None,  # Callable[[str], None] | None：调试回调（MOVIECLAW_WORKER_DEBUG）
+    ) -> None:
         self.job_id = job_id
+        self._debug = debug
         parsed = urllib.parse.urlsplit(origin_url)
         self.origin = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, "", "", "")
@@ -759,11 +765,15 @@ class SourceReadProxy:
         self._size = int(match.group(1))
         return self._size
 
-    def _block(self, index: int) -> bytes | None:
+    def _block(self, index: int, *, allow_prefetch: bool = True) -> bytes | None:
         with self._lock:
             cached = self._cache.get(index)
         if cached is not None:
             return cached
+        # 越过文件尾的块（预取越界）直接放弃：上游 416，白费一趟
+        total = self._total_size()
+        if total is not None and index * BLOCK_BYTES >= total:
+            return None
         start = index * BLOCK_BYTES
         # 上游是标准 Range 端点：Range 头指明块区间（offset/bytes 参数是
         # 早期设计的残留，真实上游并不认识）
@@ -771,28 +781,41 @@ class SourceReadProxy:
         request = urllib.request.Request(
             url, headers={"Range": f"bytes={start}-{start + BLOCK_BYTES - 1}"}
         )
+        began = time.monotonic()
         try:
             with urllib.request.urlopen(request, timeout=60) as resp:
                 data = resp.read()
         except (urllib.error.HTTPError, OSError):
+            if self._debug:
+                self._debug(f"src block {index}: FETCH FAILED ({time.monotonic() - began:.2f}s)")
             return None
+        if self._debug:
+            self._debug(
+                f"src block {index}: {len(data)}B in {time.monotonic() - began:.2f}s"
+                f" (cache={len(self._cache)})"
+            )
         with self._lock:
             self._cache[index] = data
             # 缓存上限 32 块（256MiB）：seek 走过的块不必永久留
             while len(self._cache) > 32:
                 self._cache.pop(next(iter(self._cache)))
-        # 顺序读预取后两块
-        for ahead in (index + 1, index + 2):
-            threading.Thread(
-                target=self._prefetch, args=(ahead,), name="prefetch", daemon=True
-            ).start()
+        # 顺序读预取后两块。**只有按需取（ffmpeg 真在等的那块）允许派生预取**，
+        # 预取自身不级联——曾经预取成功也再派生两块，链式翻倍往前冲（ffmpeg
+        # 还在读开头，预取已经冲到几十块之外），8MiB 块的 FIFO 缓存被预取洪水
+        # 冲垮，工作集反复被挤掉重取，深 seek 首帧被拖到 40 秒开外，播放器
+        # 等不到分片直接降档（2026-10-15 真机 debug 日志：block 6 被重取 6 次）。
+        if allow_prefetch:
+            for ahead in (index + 1, index + 2):
+                threading.Thread(
+                    target=self._prefetch, args=(ahead,), name="prefetch", daemon=True
+                ).start()
         return data
 
     def _prefetch(self, index: int) -> None:
         with self._lock:
             if index in self._cache:
                 return
-        self._block(index)
+        self._block(index, allow_prefetch=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1038,13 @@ class RealtimeJob:
         self._stderr_lock = threading.Lock()
         self._last_progress_sent = 0.0
         self._temp_stream: Path | None = None
+        self._debug_lock = threading.Lock()
+        self._debug_t0 = time.monotonic()
+        self._debug_file = (
+            self._work_dir() / "ffmpeg-debug.log"
+            if os.environ.get("MOVIECLAW_WORKER_DEBUG")
+            else ""
+        )
 
     def _work_dir(self) -> Path:
         directory = Path(os.environ.get("TEMP", ".")) / f"mc-realtime-{self.job_id[-8:]}"
@@ -1047,6 +1077,21 @@ class RealtimeJob:
             self.stderr_tail.append(line)
             if len(self.stderr_tail) > 40:
                 self.stderr_tail.pop(0)
+        self._debug_log(line)
+
+    def _debug_log(self, message: str) -> None:
+        """调试文件：MOVIECLAW_WORKER_DEBUG=1 时把 ffmpeg stderr 与代理耗时
+        逐行带时间戳落盘（远程排障用——stderr_tail 只留 40 行且仅在失败时
+        上报，播放器主动停掉的会话什么都查不到）。文件随任务临时目录清理。"""
+        if not self._debug_file:
+            return
+        try:
+            stamp = time.monotonic() - self._debug_t0
+            with self._debug_lock:
+                with open(self._debug_file, "a", encoding="utf-8", errors="replace") as fh:
+                    fh.write(f"[+{stamp:7.2f}s] {message}\n")
+        except OSError:
+            pass
 
     def _gate_on_pause(self) -> None:
         # 暂停用「停止喂数据」近似：ffmpeg 读源阻塞在取源代理上即等于暂停。
@@ -1120,7 +1165,9 @@ class RealtimeJob:
         source_url = SourceReadProxy.remote_source_url(arguments)
         if source_url is not None:
             try:
-                self.source_proxy = SourceReadProxy(self.job_id, source_url)
+                self.source_proxy = SourceReadProxy(
+                    self.job_id, source_url, debug=self._debug_log
+                )
                 src_base = self.source_proxy.start()
                 arguments = self.source_proxy.rewrite(arguments, src_base)
             except OSError:
