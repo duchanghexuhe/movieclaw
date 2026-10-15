@@ -565,6 +565,39 @@ def test_cancel_running_task(client, tmp_path):
     assert cancel.json()["data"]["status"] == PreloadTaskStatus.CANCELLED.value
 
 
+def test_task_view_carries_media_identity(client, tmp_path):
+    """任务视图带片名与源规格：设置页与活动页不用再对着「源文件 #id」猜。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    task = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    assert task["media_title"] == "示例"
+    assert task["season_number"] == 0 and task["episode_number"] == 0  # 电影哨兵
+    assert task["source_quality"] == "2160p HDR10"
+    assert task["updated_at"]
+
+    listed = client.get(f"{_PRELOAD}/tasks").json()["data"]
+    view = next(t for t in listed if t["id"] == task["id"])
+    assert view["media_title"] == "示例"
+
+
+def test_cancel_failed_task(client, tmp_path):
+    """失败任务可以放弃重试：取消后落到已取消，再次取消明确拒绝。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    token = _pair_worker(client)
+    client.post(f"{_WORKER}/claim", headers=_worker_headers(token))
+    fail = client.post(
+        f"{_WORKER}/tasks/{task_id}/fail",
+        json={"error": "boom"},
+        headers=_worker_headers(token),
+    )
+    assert fail.status_code == 200
+
+    cancel = client.post(f"{_PRELOAD}/tasks/{task_id}/cancel")
+    assert cancel.status_code == 200
+    assert cancel.json()["data"]["status"] == PreloadTaskStatus.CANCELLED.value
+    assert client.post(f"{_PRELOAD}/tasks/{task_id}/cancel").status_code == 400
+
+
 def test_cleanup_stale_preview_and_run(client, tmp_path, monkeypatch):
     """冷数据清理（§6 三件套之二）：预览与执行。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")

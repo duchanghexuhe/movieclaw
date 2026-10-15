@@ -25,7 +25,8 @@ class PreloadTaskStatus(StrEnum):
 
     状态迁移只允许经 ``services/preload/service.py`` 的写函数：
     queued → claimed → (running) → completed / failed；
-    queued/claimed/running → cancelled；failed → queued（重试=新排队）。
+    queued/claimed/running → cancelled；failed → queued（重试=新排队）
+    或 cancelled（放弃重试）。
     """
 
     QUEUED = "queued"  # 已排队，等 Worker 领取

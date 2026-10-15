@@ -25,15 +25,20 @@ import { PosterImage } from "@/components/poster-image";
 import {
   ActiveDownloadRow,
   ActiveJobRow,
+  ActivePreloadRow,
   FinishedJobRow,
+  FinishedPreloadRow,
+  historyEntryTimestamp,
   SourceWarning,
   TaskAttentionCards,
   TaskCenterView,
   useTaskCenterActions,
+  type HistoryEntry,
 } from "@/components/task-center-view";
 import { WatchStatsPanel } from "@/components/watch-stats-panel";
 import { activitySummaryParts, weekdayLabel, weeklyDelta } from "@/lib/activity-overview";
 import { isSystemCancelled, type JobView } from "@/lib/api/jobs";
+import type { PreloadTaskView } from "@/lib/api/preload";
 import { listMembers, type MemberView } from "@/lib/api/members";
 import {
   fetchPlaybackHistory,
@@ -172,10 +177,23 @@ function ActivityOverview({ media }: { media: MediaActivityState }) {
   const extras = useWatchExtras(media.enabled, scope, watching);
   const failedSources = sources.filter((source) => source.status !== "active");
   const canDismissAll = activity.standaloneAttentionJobs.some((job) => job.status === "failed");
-  const activeItems: ({ kind: "group"; group: DownloadTaskGroup } | { kind: "job"; job: JobView })[] = [
+  const activeItems: (
+    | { kind: "group"; group: DownloadTaskGroup }
+    | { kind: "job"; job: JobView }
+    | { kind: "preload"; task: PreloadTaskView }
+  )[] = [
     ...activity.activeDownloadGroups.map((group) => ({ kind: "group" as const, group })),
     ...activity.standaloneActiveJobs.map((job) => ({ kind: "job" as const, job })),
+    ...activity.preloadActive.map((task) => ({ kind: "preload" as const, task })),
   ];
+  // 「最近完成」把预转码的终态任务并进同一条时间线（两源各自倒序，合并重排）
+  const finishedEntries: HistoryEntry[] = [
+    ...activity.standaloneHistoricalJobs.map((job): HistoryEntry => ({ kind: "job", job })),
+    ...activity.preloadHistorical.map((task): HistoryEntry => ({ kind: "preload", task })),
+  ].toSorted(
+    (left, right) =>
+      Date.parse(historyEntryTimestamp(right)) - Date.parse(historyEntryTimestamp(left)),
+  );
 
   /** 浏览范围脚注：有被隐藏的内容才出现，就地切到「全部」；已是「全部」时给回退出口 */
   const scopeFooter = (hidden: number, noun: string) =>
@@ -298,7 +316,7 @@ function ActivityOverview({ media }: { media: MediaActivityState }) {
               >
                 <ActiveDownloadRow group={item.group} ingestJobsByHash={activity.ingestJobsByHash} />
               </GroupLinkRow>
-            ) : (
+            ) : item.kind === "job" ? (
               <GroupLinkRow
                 key={`job:${item.job.id}`}
                 href={"/activity?view=active" as Route}
@@ -319,6 +337,26 @@ function ActivityOverview({ media }: { media: MediaActivityState }) {
                 }
               >
                 <ActiveJobRow job={item.job} />
+              </GroupLinkRow>
+            ) : (
+              <GroupLinkRow
+                key={`preload:${item.task.id}`}
+                href={"/activity?view=active" as Route}
+                menu={
+                  <TaskActionsMenu
+                    ariaLabel="预转码任务操作"
+                    disabled={actions.cancellingPreloadId != null}
+                    items={[
+                      {
+                        id: "cancel",
+                        label: actions.cancellingPreloadId === item.task.id ? "正在取消…" : "取消任务",
+                        onSelect: () => actions.cancelPreload(item.task),
+                      },
+                    ]}
+                  />
+                }
+              >
+                <ActivePreloadRow task={item.task} />
               </GroupLinkRow>
             ),
           )}
@@ -350,7 +388,7 @@ function ActivityOverview({ media }: { media: MediaActivityState }) {
         </ActivityGroup>
       )}
 
-      {activity.standaloneHistoricalJobs.length > 0 && (
+      {finishedEntries.length > 0 && (
         <ActivityGroup
           title="最近完成"
           trailing={{
@@ -358,15 +396,21 @@ function ActivityOverview({ media }: { media: MediaActivityState }) {
             href: "/activity?view=history" as Route,
           }}
         >
-          {activity.standaloneHistoricalJobs.slice(0, RECENT_LIMIT).map((job) => (
-            <GroupLinkRow
-              key={job.id}
-              href={"/activity?view=history" as Route}
-              menu={finishedJobMenu(job, actions)}
-            >
-              <FinishedJobRow job={job} />
-            </GroupLinkRow>
-          ))}
+          {finishedEntries.slice(0, RECENT_LIMIT).map((entry) =>
+            entry.kind === "job" ? (
+              <GroupLinkRow
+                key={entry.job.id}
+                href={"/activity?view=history" as Route}
+                menu={finishedJobMenu(entry.job, actions)}
+              >
+                <FinishedJobRow job={entry.job} />
+              </GroupLinkRow>
+            ) : (
+              <GroupLinkRow key={entry.task.id} href={"/activity?view=history" as Route}>
+                <FinishedPreloadRow task={entry.task} />
+              </GroupLinkRow>
+            ),
+          )}
         </ActivityGroup>
       )}
 

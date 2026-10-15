@@ -25,6 +25,40 @@ export interface PreloadTaskView {
   result_file_id: number | null;
   created_at: string | null;
   completed_at: string | null;
+  updated_at: string | null;
+  /** 这单转的是哪部片子；未识别/源已删为 null，展示落回「源文件 #id」 */
+  media_title: string | null;
+  season_number: number | null;
+  episode_number: number | null;
+  /** 源文件规格签名（「2160p WEB-DL DV」） */
+  source_quality: string | null;
+}
+
+/** 任务状态中文标签（设置页任务行与活动页任务卡共用一套口径）。 */
+export const PRELOAD_STATUS_LABELS: Record<PreloadTaskView["status"], string> = {
+  queued: "排队中",
+  claimed: "已领取",
+  running: "转码中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+  invalidated: "已失效（可重新转码）",
+};
+
+/** 任务卡的标识：《片名》[ SxxEyy]，没有身份时落回「源文件 #id」。 */
+export function preloadTaskTitle(task: PreloadTaskView): string {
+  if (!task.media_title) return `源文件 #${task.target_file_id}`;
+  const unit =
+    (task.season_number ?? 0) > 0
+      ? ` S${String(task.season_number).padStart(2, "0")}E${String(task.episode_number ?? 0).padStart(2, "0")}`
+      : "";
+  return `《${task.media_title}》${unit}`;
+}
+
+/** 任务卡的副标识：档位短名（省流/高清）+ 源规格，没有档位表时落回档位 id。 */
+export function preloadTaskSubtitle(task: PreloadTaskView, presets: { id: string; short: string }[]): string {
+  const preset = presets.find((p) => p.id === task.preset_id)?.short ?? task.preset_id;
+  return [preset, task.source_quality].filter(Boolean).join(" · ");
 }
 
 export interface PreloadEstimate {

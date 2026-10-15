@@ -3,6 +3,7 @@ import { AuthGate } from "@/components/auth-gate";
 import { LlmCapabilityProvider } from "@/components/llm-gate";
 import { DownloadTasksProvider } from "@/lib/download-tasks";
 import { JobsProvider } from "@/lib/jobs";
+import { PreloadTasksProvider } from "@/lib/preload-tasks";
 
 /**
  * (app) 路由组：工作台全部页面共用的外壳布局。
@@ -16,7 +17,9 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       <LlmCapabilityProvider>
         <JobsProvider>
           <DownloadTasksProvider>
-            <AppShell>{children}</AppShell>
+            <PreloadTasksProvider>
+              <AppShell>{children}</AppShell>
+            </PreloadTasksProvider>
           </DownloadTasksProvider>
         </JobsProvider>
       </LlmCapabilityProvider>

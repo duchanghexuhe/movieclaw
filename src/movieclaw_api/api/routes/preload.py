@@ -7,14 +7,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
+from movieclaw_api.schemas.base import utc_isoformat
 from movieclaw_api.schemas.response import ApiResponse, ok
+from movieclaw_api.services.library.duplicates import quality_label_of
 from movieclaw_api.services.preload import service as preload_service
 from movieclaw_api.services.preload.ffmpeg_preload import (
     PRESET_DEFAULT,
@@ -22,7 +26,7 @@ from movieclaw_api.services.preload.ffmpeg_preload import (
     estimate_size_bytes,
 )
 from movieclaw_db.engine import get_session
-from movieclaw_db.models import PreloadTask, PreloadTaskStatus
+from movieclaw_db.models import LibraryFile, MediaItem, PreloadTask, PreloadTaskStatus
 
 router = APIRouter(prefix="/preload", tags=["preload"])
 
@@ -42,7 +46,14 @@ class StaleCleanupPayload(BaseModel):
     confirm: bool = Field(default=False, description="false=预览；true=执行删除")
 
 
-def _task_view(task: PreloadTask, session: AsyncSession) -> dict[str, Any]:
+def _task_view(
+    task: PreloadTask,
+    *,
+    media_title: str | None = None,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+    source_quality: str | None = None,
+) -> dict[str, Any]:
     return {
         "id": task.id,
         "target_file_id": task.target_file_id,
@@ -54,9 +65,52 @@ def _task_view(task: PreloadTask, session: AsyncSession) -> dict[str, Any]:
         "attempts": task.attempts,
         "error": task.error,
         "result_file_id": task.result_file_id,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "created_at": utc_isoformat(task.created_at) if task.created_at else None,
+        "completed_at": utc_isoformat(task.completed_at) if task.completed_at else None,
+        "updated_at": utc_isoformat(task.updated_at) if task.updated_at else None,
+        # 这单转的是哪部片子（未识别/源已删为 None，前端落回「源文件 #id」）
+        "media_title": media_title,
+        "season_number": season_number,
+        "episode_number": episode_number,
+        # 源文件的规格签名（「2160p WEB-DL DV」），帮人认出转的是哪个版本
+        "source_quality": source_quality,
     }
+
+
+async def enriched_task_views(
+    session: AsyncSession, tasks: Sequence[PreloadTask]
+) -> list[dict[str, Any]]:
+    """任务视图批量补片名与源规格：两查询取齐，列表页不做 N+1。"""
+    if not tasks:
+        return []
+    file_ids = {task.target_file_id for task in tasks}
+    files = {
+        file.id: file
+        for file in (
+            await session.execute(select(LibraryFile).where(LibraryFile.id.in_(file_ids)))
+        ).scalars()
+    }
+    item_ids = {file.media_item_id for file in files.values() if file.media_item_id}
+    items = {
+        item.id: item
+        for item in (
+            await session.execute(select(MediaItem).where(MediaItem.id.in_(item_ids)))
+        ).scalars()
+    }
+    views = []
+    for task in tasks:
+        file = files.get(task.target_file_id)
+        item = items.get(file.media_item_id) if file and file.media_item_id else None
+        views.append(
+            _task_view(
+                task,
+                media_title=item.title if item else None,
+                season_number=file.season_number if file else None,
+                episode_number=file.episode_number if file else None,
+                source_quality=quality_label_of(file) if file else None,
+            )
+        )
+    return views
 
 
 @router.get(
@@ -130,7 +184,8 @@ async def create_task(
     task = await preload_service.create_preload_task(
         session, file_id=payload.file_id, preset_id=payload.preset_id
     )
-    return ok(_task_view(task, session), message="已加入预转码队列，等 Worker 领取")
+    view = (await enriched_task_views(session, [task]))[0]
+    return ok(view, message="已加入预转码队列，等 Worker 领取")
 
 
 @router.get(
@@ -142,7 +197,7 @@ async def list_tasks(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[dict[str, Any]]]:
     tasks = await preload_service.list_tasks(session)
-    return ok([_task_view(t, session) for t in tasks])
+    return ok(await enriched_task_views(session, tasks))
 
 
 @router.get(
@@ -157,7 +212,7 @@ async def get_task(
     task = await session.get(PreloadTask, task_id)
     if task is None:
         raise NotFoundException("任务不存在")
-    return ok(_task_view(task, session))
+    return ok((await enriched_task_views(session, [task]))[0])
 
 
 @router.post(
@@ -170,7 +225,7 @@ async def cancel_task(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict[str, Any]]:
     task = await preload_service.cancel_task(session, task_id)
-    return ok(_task_view(task, session), message="任务已取消")
+    return ok((await enriched_task_views(session, [task]))[0], message="任务已取消")
 
 
 @router.post(
@@ -183,7 +238,7 @@ async def retry_task(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict[str, Any]]:
     task = await preload_service.retry_task(session, task_id)
-    return ok(_task_view(task, session), message="已重新排队")
+    return ok((await enriched_task_views(session, [task]))[0], message="已重新排队")
 
 
 @router.delete(

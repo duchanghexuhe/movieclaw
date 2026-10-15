@@ -61,8 +61,17 @@ import {
   type JobStatus,
   type JobView,
 } from "@/lib/api/jobs";
+import {
+  PRELOAD_STATUS_LABELS,
+  preloadTaskSubtitle,
+  preloadTaskTitle,
+  cancelPreloadTask as cancelPreloadTaskApi,
+  retryPreloadTask as retryPreloadTaskApi,
+  type PreloadTaskView,
+} from "@/lib/api/preload";
 import { isDismissed, ACTIVE_FEED_JOB_STATUSES, jobNeedsAttention } from "@/lib/job-attention";
 import { useJobs } from "@/lib/jobs";
+import { usePreloadTasks } from "@/lib/preload-tasks";
 import type { TaskCenterViewName } from "@/lib/task-center";
 import {
   contentMissingLabel,
@@ -98,9 +107,12 @@ export function useTaskCenterActions() {
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [bulkDismissing, setBulkDismissing] = useState(false);
   const [undismissingJobId, setUndismissingJobId] = useState<string | null>(null);
+  const [cancellingPreloadId, setCancellingPreloadId] = useState<number | null>(null);
+  const [retryingPreloadId, setRetryingPreloadId] = useState<number | null>(null);
   const [pendingDeleteTask, setPendingDeleteTask] = useState<DownloadTask | null>(null);
   const toast = useToast();
   const { upsert } = useJobs();
+  const { upsert: upsertPreload } = usePreloadTasks();
   const { refresh } = useDownloadTasks();
 
   async function removeDownloadTask(task: DownloadTask, deleteFiles: boolean) {
@@ -192,6 +204,32 @@ export function useTaskCenterActions() {
     }
   }
 
+  async function cancelPreload(task: PreloadTaskView) {
+    if (cancellingPreloadId != null) return;
+    setCancellingPreloadId(task.id);
+    try {
+      upsertPreload(await cancelPreloadTaskApi(task.id));
+      toast.success("任务已取消");
+    } catch (caught) {
+      toast.error((caught as Error).message || "取消任务失败");
+    } finally {
+      setCancellingPreloadId(null);
+    }
+  }
+
+  async function retryPreload(task: PreloadTaskView) {
+    if (retryingPreloadId != null) return;
+    setRetryingPreloadId(task.id);
+    try {
+      upsertPreload(await retryPreloadTaskApi(task.id));
+      toast.success("已重新排队");
+    } catch (caught) {
+      toast.error((caught as Error).message || "重新排队失败");
+    } finally {
+      setRetryingPreloadId(null);
+    }
+  }
+
   const deleteDialog = pendingDeleteTask && (
     <DeleteDownloadTaskDialog
       task={pendingDeleteTask}
@@ -210,6 +248,8 @@ export function useTaskCenterActions() {
     retryingJobId,
     bulkDismissing,
     undismissingJobId,
+    cancellingPreloadId,
+    retryingPreloadId,
     /** 删种先弹确认（是否连数据一起删），确认框见 deleteDialog */
     requestDelete: setPendingDeleteTask,
     replaceStalledTask: (task: DownloadTask) => void replaceStalledTask(task),
@@ -217,6 +257,8 @@ export function useTaskCenterActions() {
     dismissAllFailed: () => void dismissAllFailed(),
     restoreDismissedJob: (job: JobView) => void restoreDismissedJob(job),
     retryHistoricalJob: (job: JobView) => void retryHistoricalJob(job),
+    cancelPreload: (task: PreloadTaskView) => void cancelPreload(task),
+    retryPreload: (task: PreloadTaskView) => void retryPreload(task),
     deleteDialog,
   };
 }
@@ -224,11 +266,13 @@ export function useTaskCenterActions() {
 export type TaskCenterActions = ReturnType<typeof useTaskCenterActions>;
 
 /**
- * 「需要处理」的完整卡片（下载组卡片 + 作业卡片）：每种故障的补救动作不同（换种、重试、
- * 交给 AI、删除、忽略），压成一行反而要多点一层，所以任务视角与活动总览都用完整卡片。
+ * 「需要处理」的完整卡片（下载组卡片 + 作业卡片 + 预转码卡片）：每种故障的补救动作
+ * 不同（换种、重试、交给 AI、删除、忽略），压成一行反而要多点一层，所以任务视角与
+ * 活动总览都用完整卡片。
  */
 export function TaskAttentionCards({ actions }: { actions: TaskCenterActions }) {
-  const { ingestJobsByHash, attentionDownloadGroups, standaloneAttentionJobs } = useTaskActivity();
+  const { ingestJobsByHash, attentionDownloadGroups, standaloneAttentionJobs, preloadAttention } =
+    useTaskActivity();
   return (
     <>
       {attentionDownloadGroups.map((group) => (
@@ -245,7 +289,88 @@ export function TaskAttentionCards({ actions }: { actions: TaskCenterActions }) 
       {standaloneAttentionJobs.map((job) => (
         <JobCard key={job.id} job={job} onNavigate={() => undefined} />
       ))}
+      {preloadAttention.map((task) => (
+        <PreloadAttentionCard
+          key={task.id}
+          task={task}
+          cancelling={actions.cancellingPreloadId === task.id}
+          retrying={actions.retryingPreloadId === task.id}
+          onCancel={() => actions.cancelPreload(task)}
+          onRetry={() => actions.retryPreload(task)}
+        />
+      ))}
     </>
+  );
+}
+
+/**
+ * 预转码失败卡：卡面三件套与 JobCard 同构（状态点 + 类型小签 + 标题，错误文本在
+ * danger 面板里），补救动作「重试 / 取消」直接平铺——预转码的失败原因十有八九是
+ * Worker 侧 ffmpeg 起不来，动作就这两个，不必收进 ⋯ 菜单。
+ */
+function PreloadAttentionCard({
+  task,
+  cancelling,
+  retrying,
+  onCancel,
+  onRetry,
+}: {
+  task: PreloadTaskView;
+  cancelling: boolean;
+  retrying: boolean;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  const { presets } = usePreloadTasks();
+  return (
+    <article className="solid-card overflow-hidden rounded-2xl border bg-[rgba(14,16,22,0.52)] p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <span className="size-2 shrink-0 rounded-full bg-[var(--danger)]" aria-hidden="true" />
+          <span className="shrink-0 rounded-md border border-[var(--line)] bg-white/[0.045] px-1.5 py-0.5 text-micro font-medium text-white/55">
+            预转码
+          </span>
+          <h3 className="min-w-0 text-ui font-semibold leading-5 text-white/90">
+            <OverflowText>{preloadTaskTitle(task)}</OverflowText>
+          </h3>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={retrying || cancelling}
+            className="shrink-0 rounded-lg px-2.5 py-1.5 text-caption font-medium text-white/45 transition hover:bg-white/[0.06] hover:text-white/75 disabled:cursor-wait disabled:opacity-45"
+          >
+            {retrying ? "排队中…" : "重试"}
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={retrying || cancelling}
+            className="shrink-0 rounded-lg px-2.5 py-1.5 text-caption font-medium text-white/45 transition hover:bg-white/[0.06] hover:text-white/75 disabled:cursor-wait disabled:opacity-45"
+          >
+            {cancelling ? "正在取消…" : "取消"}
+          </button>
+        </div>
+      </div>
+      <div className="mt-2 rounded-xl border border-[var(--danger)]/15 bg-[var(--danger)]/[0.06] px-3 py-2.5 text-sub leading-5 text-[var(--danger)]">
+        <OverflowText
+          lines={2}
+          className="min-h-10 break-words"
+          tooltipContent={
+            <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+              {task.error}
+            </span>
+          }
+        >
+          {task.error}
+        </OverflowText>
+      </div>
+      <p className="mt-2 text-caption text-white/40">
+        {preloadTaskSubtitle(task, presets)} · 预估 {formatBytes(task.estimated_bytes)}
+        {task.attempts > 1 && ` · 已尝试 ${task.attempts} 次`}
+      </p>
+    </article>
   );
 }
 
@@ -294,6 +419,8 @@ export function TaskCenterView({
     standaloneAttentionJobs,
     standaloneActiveJobs,
     standaloneHistoricalJobs,
+    preloadActive,
+    preloadHistorical,
     attentionTotal,
     activeTotal,
   } = useTaskActivity();
@@ -301,18 +428,25 @@ export function TaskCenterView({
   const showActive = view === "all" || view === "active";
   const showBoost = showActive && !subPage && boostTasks.length > 0;
   const showHistory = view === "all" || view === "history";
+  const historyEntries = useMemo(
+    () => [
+      ...standaloneHistoricalJobs.map((job): HistoryEntry => ({ kind: "job", job })),
+      ...preloadHistorical.map((task): HistoryEntry => ({ kind: "preload", task })),
+    ],
+    [standaloneHistoricalJobs, preloadHistorical],
+  );
   const hasContentBeforeHistory =
     (showAttention && attentionTotal > 0) || (showActive && activeTotal > 0);
   const visibleCount =
     (showAttention ? attentionTotal : 0) +
     (showActive ? activeTotal : 0) +
     (showBoost ? 1 : 0) +
-    (showHistory ? standaloneHistoricalJobs.length : 0);
+    (showHistory ? historyEntries.length : 0);
   const failedSources = sources.filter((source) => source.status !== "active");
   const viewCounts: Partial<Record<TaskCenterViewName, number>> = {
     attention: attentionTotal,
     active: activeTotal,
-    history: standaloneHistoricalJobs.length,
+    history: historyEntries.length,
   };
 
   return (
@@ -399,6 +533,18 @@ export function TaskCenterView({
                 />
               </TaskTimelineItem>
             ))}
+            {preloadActive.map((task) => (
+              <TaskTimelineItem
+                key={task.id}
+                tone={task.status === "running" ? "active" : "waiting"}
+              >
+                <PreloadActiveFeedItem
+                  task={task}
+                  cancelling={actions.cancellingPreloadId === task.id}
+                  onCancel={() => actions.cancelPreload(task)}
+                />
+              </TaskTimelineItem>
+            ))}
           </TaskTimelineSection>
         )}
 
@@ -408,9 +554,9 @@ export function TaskCenterView({
           <BoostTaskSection tasks={boostTasks} onChanged={refresh} />
         )}
 
-        {showHistory && standaloneHistoricalJobs.length > 0 && (
+        {showHistory && historyEntries.length > 0 && (
           <TaskHistorySection
-            jobs={standaloneHistoricalJobs}
+            entries={historyEntries}
             initiallyOpen={view === "history"}
             separated={hasContentBeforeHistory}
             retryingJobId={actions.retryingJobId}
@@ -864,22 +1010,109 @@ function ActiveJobFeedItem({
   );
 }
 
+// ---------------------------------------------------------------------------
+// 预转码任务（docs/design/preload-transcode.md）：独立小状态机，Worker 只报
+// 分段台账、没有百分比，卡片只到「状态 + 预估」粒度。
+// ---------------------------------------------------------------------------
+
+function historicalPreloadTitle(task: PreloadTaskView): string {
+  const result =
+    task.status === "completed"
+      ? "完成"
+      : task.status === "cancelled"
+        ? "已取消"
+        : task.status === "invalidated"
+          ? "已失效"
+          : "未完成";
+  return `${preloadTaskTitle(task)}预转码${result}`;
+}
+
+function historicalPreloadSummary(task: PreloadTaskView): string {
+  if (task.status === "invalidated") return "源文件已被回收或换源，产物已清理";
+  if (task.error) return task.error;
+  const parts = [`预估 ${formatBytes(task.estimated_bytes)}`];
+  if (task.actual_bytes > 0) parts.push(`实际 ${formatBytes(task.actual_bytes)}`);
+  return parts.join(" · ");
+}
+
+/** 进行中的预转码任务（Netflix 任务视角的「现在」时间线）。 */
+function PreloadActiveFeedItem({
+  task,
+  cancelling,
+  onCancel,
+}: {
+  task: PreloadTaskView;
+  cancelling: boolean;
+  onCancel: () => void;
+}) {
+  const { presets } = usePreloadTasks();
+  return (
+    <article className="min-w-0 py-1.5">
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <h3 className="text-ui font-semibold leading-5 text-white/90">
+            <OverflowText>{preloadTaskTitle(task)}</OverflowText>
+          </h3>
+          <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-sub text-white/60">
+            <span className="font-medium text-white/70">{PRELOAD_STATUS_LABELS[task.status]}</span>
+            <span aria-hidden="true" className="text-white/25">·</span>
+            <span className="tnum">预估 {formatBytes(task.estimated_bytes)}</span>
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={cancelling}
+          className="shrink-0 rounded-lg px-2.5 py-1.5 text-caption font-medium text-white/45 transition hover:bg-white/[0.06] hover:text-white/75 disabled:cursor-wait disabled:opacity-45"
+        >
+          {cancelling ? "正在取消…" : "取消任务"}
+        </button>
+      </div>
+      <p className="mt-2 text-caption text-white/30">
+        预转码 · {preloadTaskSubtitle(task, presets)}
+        {task.created_at && (
+          <>
+            <span aria-hidden="true"> · </span>
+            {formatClockTime(task.created_at)} 下单
+          </>
+        )}
+      </p>
+    </article>
+  );
+}
+
 interface HistoryDayGroup {
   key: string;
   label: string;
-  jobs: JobView[];
+  entries: HistoryEntry[];
 }
 
-function groupHistoricalJobs(jobs: JobView[]): HistoryDayGroup[] {
+/** 历史时间线的一个条目：后台 Job 或预转码任务（各自有自己的终态与摘要）。 */
+export type HistoryEntry =
+  | { kind: "job"; job: JobView }
+  | { kind: "preload"; task: PreloadTaskView };
+
+export function historyEntryTimestamp(entry: HistoryEntry): string {
+  if (entry.kind === "job") return entry.job.finished_at || entry.job.created_at;
+  return entry.task.completed_at || entry.task.updated_at || entry.task.created_at || "";
+}
+
+function groupHistoricalEntries(entries: HistoryEntry[]): HistoryDayGroup[] {
+  // Job 与预转码来自两个 Provider、各自按更新时间倒序，合并后须重排才能混进
+  // 同一条"按天"的时间线
+  const sorted = [...entries].toSorted(
+    (left, right) =>
+      Date.parse(historyEntryTimestamp(right)) - Date.parse(historyEntryTimestamp(left)),
+  );
   const groups = new Map<string, HistoryDayGroup>();
-  for (const job of jobs) {
-    const timestamp = job.finished_at || job.created_at;
+  for (const entry of sorted) {
+    const timestamp = historyEntryTimestamp(entry);
     const key = timelineDayKey(timestamp);
     const existing = groups.get(key);
     if (existing) {
-      existing.jobs.push(job);
+      existing.entries.push(entry);
     } else {
-      groups.set(key, { key, label: formatTimelineDayLabel(timestamp), jobs: [job] });
+      groups.set(key, { key, label: formatTimelineDayLabel(timestamp), entries: [entry] });
     }
   }
   return [...groups.values()];
@@ -940,6 +1173,27 @@ function HistoricalJobFeedItem({
             {retrying ? "重新执行中…" : "重新执行"}
           </button>
         )}
+      </div>
+    </article>
+  );
+}
+
+/** 已结束的预转码任务：完成/取消/失效都属终态，没有可补救的动作。 */
+function HistoricalPreloadFeedItem({ task, time }: { task: PreloadTaskView; time: string }) {
+  return (
+    <article className="group/history min-w-0 py-1.5">
+      <div className="flex min-w-0 items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <h3 className="text-ui font-medium leading-5 text-white/78">
+            <OverflowText>{historicalPreloadTitle(task)}</OverflowText>
+          </h3>
+          <div className="mt-1 flex min-w-0 items-baseline gap-2 text-caption leading-5 text-white/40">
+            <span className="tnum shrink-0 text-white/32">{time}</span>
+            <OverflowText lines={2} className="min-w-0 flex-1">
+              {historicalPreloadSummary(task)}
+            </OverflowText>
+          </div>
+        </div>
       </div>
     </article>
   );
@@ -1171,7 +1425,7 @@ function BoostTaskRow({ task, cleanupNote }: { task: DownloadTask; cleanupNote?:
 }
 
 function TaskHistorySection({
-  jobs,
+  entries,
   initiallyOpen,
   separated,
   retryingJobId,
@@ -1179,7 +1433,7 @@ function TaskHistorySection({
   undismissingJobId,
   onUndismiss,
 }: {
-  jobs: JobView[];
+  entries: HistoryEntry[];
   initiallyOpen: boolean;
   separated: boolean;
   retryingJobId: string | null;
@@ -1187,7 +1441,7 @@ function TaskHistorySection({
   undismissingJobId: string | null;
   onUndismiss: (job: JobView) => void;
 }) {
-  const groups = groupHistoricalJobs(jobs);
+  const groups = groupHistoricalEntries(entries);
   return (
     <section
       className={separated ? "mt-6 border-t border-white/[0.1]" : "mt-3"}
@@ -1201,33 +1455,45 @@ function TaskHistorySection({
         >
           <summary className="flex cursor-pointer list-none items-center gap-2 rounded-lg py-1 text-ui text-white/55 transition hover:text-white/80 [&::-webkit-details-marker]:hidden">
             <span className="font-semibold">{group.label}</span>
-            <span className="tnum text-caption text-white/30">{group.jobs.length} 项</span>
+            <span className="tnum text-caption text-white/30">{group.entries.length} 项</span>
             <span className="ml-auto text-caption text-white/30 group-open:hidden">展开</span>
             <span className="ml-auto hidden text-caption text-white/30 group-open:inline">收起</span>
             <ChevronRightIcon className="size-4 transition-transform group-open:rotate-90" />
           </summary>
           <div className="mt-3">
-            {group.jobs.map((job) => (
-              <TaskTimelineItem
-                key={job.id}
-                tone={
-                  job.status !== "succeeded"
-                    ? "cancelled"
-                    : jobDetailItems(job).some((item) => item.alert)
-                      ? "partial"
-                      : "success"
-                }
-              >
-                <HistoricalJobFeedItem
-                  job={job}
-                  time={formatClockTime(job.finished_at || job.created_at)}
-                  retrying={retryingJobId === job.id}
-                  onRetry={() => onRetry(job)}
-                  undismissing={undismissingJobId === job.id}
-                  onUndismiss={() => onUndismiss(job)}
-                />
-              </TaskTimelineItem>
-            ))}
+            {group.entries.map((entry) =>
+              entry.kind === "job" ? (
+                <TaskTimelineItem
+                  key={entry.job.id}
+                  tone={
+                    entry.job.status !== "succeeded"
+                      ? "cancelled"
+                      : jobDetailItems(entry.job).some((item) => item.alert)
+                        ? "partial"
+                        : "success"
+                  }
+                >
+                  <HistoricalJobFeedItem
+                    job={entry.job}
+                    time={formatClockTime(entry.job.finished_at || entry.job.created_at)}
+                    retrying={retryingJobId === entry.job.id}
+                    onRetry={() => onRetry(entry.job)}
+                    undismissing={undismissingJobId === entry.job.id}
+                    onUndismiss={() => onUndismiss(entry.job)}
+                  />
+                </TaskTimelineItem>
+              ) : (
+                <TaskTimelineItem
+                  key={entry.task.id}
+                  tone={entry.task.status === "completed" ? "success" : "cancelled"}
+                >
+                  <HistoricalPreloadFeedItem
+                    task={entry.task}
+                    time={formatClockTime(historyEntryTimestamp(entry))}
+                  />
+                </TaskTimelineItem>
+              ),
+            )}
           </div>
         </details>
       ))}
@@ -2547,6 +2813,50 @@ export function FinishedJobRow({ job }: { job: JobView }) {
       </span>
       <span className="shrink-0 text-sub text-[var(--text-faint)]">
         {formatRelativeTime(job.finished_at || job.created_at)}
+      </span>
+    </>
+  );
+}
+
+/** 进行中的预转码任务（银玻璃总览的「进行中」行）。 */
+export function ActivePreloadRow({ task }: { task: PreloadTaskView }) {
+  return (
+    <>
+      <span className="grid w-6 shrink-0 place-items-center text-[var(--info)]">
+        <GearIcon className="size-[18px]" />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-ui font-semibold text-[var(--text)]">
+          {preloadTaskTitle(task)}
+        </span>
+        <span className="mt-0.5 block truncate text-sub text-[var(--text-muted)]">
+          预转码 · {PRELOAD_STATUS_LABELS[task.status]} · 预估 {formatBytes(task.estimated_bytes)}
+        </span>
+      </span>
+    </>
+  );
+}
+
+/** 最近完成的预转码任务行：结果图标 · 标题 / 摘要 · 右侧相对时间 */
+export function FinishedPreloadRow({ task }: { task: PreloadTaskView }) {
+  const completed = task.status === "completed";
+  return (
+    <>
+      <span
+        className={`grid w-6 shrink-0 place-items-center ${completed ? "text-[var(--ok)]" : "text-[var(--text-faint)]"}`}
+      >
+        {completed ? <CheckIcon className="size-[18px]" /> : <XIcon className="size-[18px]" />}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-ui font-semibold text-[var(--text)]">
+          {historicalPreloadTitle(task)}
+        </span>
+        <span className="mt-0.5 block truncate text-sub text-[var(--text-muted)]">
+          {historicalPreloadSummary(task)}
+        </span>
+      </span>
+      <span className="shrink-0 text-sub text-[var(--text-faint)]">
+        {formatRelativeTime(task.completed_at || task.updated_at || task.created_at)}
       </span>
     </>
   );

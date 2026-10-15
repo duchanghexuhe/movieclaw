@@ -13,6 +13,7 @@ import {
   SettingsSection,
 } from "@/components/settings-ui";
 import {
+  PRELOAD_STATUS_LABELS,
   type PreloadOverview,
   type PreloadPreset,
   type PreloadTaskView,
@@ -22,6 +23,7 @@ import {
   getPreloadOverview,
   getPreloadPresets,
   listPreloadTasks,
+  preloadTaskTitle,
   retryPreloadTask,
 } from "@/lib/api/preload";
 
@@ -30,16 +32,6 @@ const GB = 1024 ** 3;
 function formatGB(bytes: number): string {
   return `${(bytes / GB).toFixed(1)} GB`;
 }
-
-const STATUS_LABELS: Record<PreloadTaskView["status"], string> = {
-  queued: "排队中",
-  claimed: "已领取",
-  running: "转码中",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-  invalidated: "已失效（可重新转码）",
-};
 
 /**
  * 「媒体库」分区的预转码设置（preload-transcode.md §6）。
@@ -153,15 +145,20 @@ export function TranscodeSection() {
                     <>
                       任务 #{task.id}
                       <span className="ml-2 text-caption font-normal text-[var(--text-faint)]">
-                        {presets.find((p) => p.id === task.preset_id)?.short ?? task.preset_id}
-                        {" · 源文件 #"}
-                        {task.target_file_id}
+                        {[
+                          presets.find((p) => p.id === task.preset_id)?.short ?? task.preset_id,
+                          // 这单转的是哪部片子——没有身份（未识别/源已删）才落回文件号
+                          preloadTaskTitle(task),
+                          task.source_quality,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
                       </span>
                     </>
                   }
                   description={
                     <>
-                      {STATUS_LABELS[task.status]} · 预估 {formatGB(task.estimated_bytes)}
+                      {PRELOAD_STATUS_LABELS[task.status]} · 预估 {formatGB(task.estimated_bytes)}
                       {task.actual_bytes > 0 && ` · 实际 ${formatGB(task.actual_bytes)}`}
                       {task.error && (
                         <span className="mt-1 block text-[var(--warn)]">{task.error}</span>
@@ -187,21 +184,38 @@ export function TranscodeSection() {
                     </button>
                   )}
                   {task.status === "failed" && (
-                    <button
-                      type="button"
-                      className={SETTINGS_BUTTON_CLASS}
-                      onClick={async () => {
-                        try {
-                          await retryPreloadTask(task.id);
-                          toast.success("已重新排队");
-                          reload();
-                        } catch (e) {
-                          toast.error(e instanceof Error ? e.message : "重试失败");
-                        }
-                      }}
-                    >
-                      重试
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        className={SETTINGS_BUTTON_CLASS}
+                        onClick={async () => {
+                          try {
+                            await retryPreloadTask(task.id);
+                            toast.success("已重新排队");
+                            reload();
+                          } catch (e) {
+                            toast.error(e instanceof Error ? e.message : "重试失败");
+                          }
+                        }}
+                      >
+                        重试
+                      </button>
+                      <button
+                        type="button"
+                        className={SETTINGS_BUTTON_CLASS}
+                        onClick={async () => {
+                          try {
+                            await cancelPreloadTask(task.id);
+                            toast.success("任务已取消");
+                            reload();
+                          } catch (e) {
+                            toast.error(e instanceof Error ? e.message : "取消失败");
+                          }
+                        }}
+                      >
+                        取消
+                      </button>
+                    </>
                   )}
                 </SettingsRow>
               ))
