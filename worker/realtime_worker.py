@@ -1309,6 +1309,10 @@ class RealtimeJob:
                 now = time.time()
                 if phase == "end" or now - self._last_progress_sent >= 0.8:
                     self._last_progress_sent = now
+                    if out_time_ms is not None:
+                        self._debug_log(
+                            f"progress out_time_ms={out_time_ms} speed={speed or '?'}"
+                        )
                     payload: dict[str, Any] = {
                         "type": "job.progress",
                         "job_id": self.job_id,

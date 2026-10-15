@@ -390,6 +390,14 @@ def native_tonemap_filter(backend: HwBackend) -> str | None:
     return _PROBED_TONEMAP.get(backend.name, backend.tonemap_filter)
 
 
+def registered_native_tonemap(backend: str) -> str | None:
+    """某个后端当前已注册的原生 tone-map 滤镜；None=没注册。
+
+    给远程 Worker 的注册/撤销配对用：断开时只有当注册值仍是自己写入的那份
+    才撤销，避免盖掉本机探测的结论。"""
+    return _PROBED_TONEMAP.get(backend)
+
+
 #: VAAPI 的低功耗编码（Intel VDEnc 定长电路）。Intel 自 11/12 代起主推这条路；issue #763 的
 #: SR-IOV 虚拟核显（12 代，黑群晖跑在虚拟机里）上，默认的普通编码一跑真实片子就让 GPU 挂死
 #: 重置，换低功耗整条链（硬解 → tonemap_vaapi → scale_vaapi → 编码）正常。老核显不支持它，

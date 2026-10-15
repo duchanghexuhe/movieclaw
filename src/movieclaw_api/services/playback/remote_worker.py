@@ -25,7 +25,12 @@ from typing import Any
 
 from starlette.websockets import WebSocket
 
-from movieclaw_api.services.playback.ffmpeg_args import WorkerVideoCaps
+from movieclaw_api.services.playback.ffmpeg_args import (
+    NVENC_TONEMAP,
+    WorkerVideoCaps,
+    registered_native_tonemap,
+    register_native_tonemap,
+)
 from movieclaw_api.services.playback.remote_config import (
     RemoteTranscodeRuntimeConfig,
     remote_transcode_issues,
@@ -223,6 +228,13 @@ class RemoteWorkerRegistry:
             ",".join(capabilities.backends) or "无",
             ",".join(capabilities.segment_types),
         )
+        if "nvenc" in capabilities.backends and "tonemap_cuda" in capabilities.filters:
+            # NAS 本地探不到 NVENC（远程会话跑在这台 Worker 的 ffmpeg 上），原生
+            # tone-map 只能信 Worker 申报：HDR 片的全 GPU 链（tonemap_cuda +
+            # scale_cuda）靠这里点亮。不点亮的话远程会话一直走 Worker CPU 的
+            # tonemapx 软链——实测吞吐只有 GPU 链的 1/4，GPU 大部分时间在等
+            # CPU（利用率呈正弦波）。
+            register_native_tonemap("nvenc", NVENC_TONEMAP)
         return connection
 
     async def unregister(self, connection: WorkerConnection) -> None:
@@ -233,6 +245,10 @@ class RemoteWorkerRegistry:
                 return
             self._workers.pop(connection.worker_id, None)
             lost_jobs = self._mark_jobs_lost(connection, "远程 Worker 已断开连接")
+        # Worker 申报的原生 tone-map 注册一并撤销（hello 时登记的那份）；
+        # 注册值已不是它写入的（本机探测的结论）就不动，避免盖掉别人。
+        if registered_native_tonemap("nvenc") == NVENC_TONEMAP:
+            register_native_tonemap("nvenc", None)
         # 带上被判失败的任务 ID：Worker 崩在半路时，用户先看到的是「播放失败」，
         # 而这一行是把那次失败和这台 Worker 的掉线对上号的唯一凭据。
         logger.warning(
