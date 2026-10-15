@@ -447,7 +447,7 @@ class WorkerRuntime:
         self.log(
             f"Worker 已连接 {self.server}（并发 {self.concurrency}，"
             f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}"
-            f"{'，实时转码: 开' if self.realtime else ''}）"
+            f"{'，实时转码: 开' if self.realtime else '，实时转码: 关（只跑预转码）'}）"
         )
         # v2 统一调度：一条 WS 连接同时报 realtime+preload 角色（GUI 勾了实时
         # 才报 realtime；预转码永远是本程序的主职）。REST 轮询 claim 已删除，
@@ -475,6 +475,7 @@ class WorkerRuntime:
             max_jobs=self.concurrency,
             log=lambda line: self.log(f"[WS] {line}"),
             preload=self._run_preload,
+            realtime=self.realtime,
         )
         client.preload_stop = self._stop_preload_task
         self._realtime_client = client
@@ -487,7 +488,10 @@ class WorkerRuntime:
 
         thread = threading.Thread(target=watch, daemon=True, name="realtime")
         thread.start()
-        self.log("统一调度已连接：预转码任务由服务端推送（并发位 = 本机并发 − 1）")
+        self.log(
+            "统一调度已连接：预转码任务由服务端推送"
+            + ("（同时接实时播放任务）" if self.realtime else "（实时转码未开，只跑预转码）")
+        )
         return client
 
     def _run_preload(self, message: dict) -> bool:

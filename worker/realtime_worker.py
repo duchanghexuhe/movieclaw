@@ -1407,6 +1407,7 @@ class RealtimeClient:
         max_jobs: int = 1,
         log: Callable[[str], None] | None = None,
         preload: Callable[[dict], bool] | None = None,
+        realtime: bool = True,
     ) -> None:
         self.server = server.rstrip("/")
         self.token = token
@@ -1418,6 +1419,9 @@ class RealtimeClient:
         # 预转码执行器（preload_worker.process_task 的包装）：None=本客户端
         # 只报 realtime 角色，收到 class=preload 的 job.start 直接拒掉
         self.preload = preload
+        # realtime 开关只影响角色申报（--no-realtime 的机器不该被派播放任务，
+        # 但连接本身要维持——预转码派单走同一条 WS）
+        self.realtime = realtime
         self.jobs: dict[str, RealtimeJob] = {}
         self.jobs_lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -1473,7 +1477,11 @@ class RealtimeClient:
                     "encoders": self.caps.get("encoders", []),
                     "backends": ["nvenc"],
                     "max_jobs": self.max_jobs,
-                    "roles": ["realtime", "preload"] if self.preload else ["realtime"],
+                    "roles": (
+                        (["realtime"] if self.realtime else []) + ["preload"]
+                        if self.preload
+                        else ["realtime"]
+                    ),
                     "server_config": True,
                     "hardware": self.caps.get("hardware", {}),
                     "segment_types": ["fmp4"],
