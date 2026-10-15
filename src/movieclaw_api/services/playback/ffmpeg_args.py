@@ -819,7 +819,20 @@ def _video_args(
     args += ["-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})"]
     # 输出侧的色彩标签放在最后、且不依赖滤镜链的属性传递：滤镜漏设（VAAPI 与
     # QSV 都漏过）或不同 ffmpeg 版本的协商差异，都会在这里被兜住。
-    if _outputs_bt709(plan):
+    #
+    # 例外：帧不落回软件的 VAAPI/QSV 链不能写 colorspace/primaries/trc——
+    # ffmpeg 7.1 在首帧到达、发现源色彩属性（BT.2020/PQ）与声明输出不符时会
+    # 重建滤镜图，重建插入的软件 auto_scale 接不上硬件帧，整链以
+    # 「Impossible to convert between the formats … / Function not implemented」
+    # 即刻崩掉（4K HDR10 + VAAPI 低功耗真机复现，2026-10-15，二分到这组标签）。
+    # 这两家的原生 tone-map 滤镜本来就在滤镜内声明了全套输出色彩
+    # （tonemap_vaapi 的 format/t/m/p、vpp_qsv 的 out_color_*），流标签不受影响。
+    hw_frames = (
+        backend is not None
+        and not software_filters
+        and backend.name in ("vaapi", "qsv")
+    )
+    if _outputs_bt709(plan) and not hw_frames:
         args += _BT709_OUTPUT_TAGS
     return args
 

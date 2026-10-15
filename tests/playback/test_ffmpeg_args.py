@@ -717,6 +717,29 @@ def test_output_color_tags_only_when_certain(name, video_kw, tagged):
     assert (pair(argv, "-color_range") == "tv") is tagged, name
 
 
+@pytest.mark.parametrize("backend", ["vaapi", "qsv"])
+def test_hw_frame_tonemap_chain_gets_no_output_color_tags(backend):
+    """VAAPI/QSV 硬件帧链不写输出侧色彩三件套。
+
+    ffmpeg 7.1 在首帧发现源色彩属性（BT.2020/PQ）与声明输出不符时重建滤镜
+    图，重建插入的软件 auto_scale 接不上硬件帧，整链以
+    「Impossible to convert between the formats …」即刻崩掉（4K HDR10 + VAAPI
+    低功耗真机复现，2026-10-15）。输出色彩由滤镜内的原生 tone-map 声明
+    （tonemap_vaapi 的 format/t/m/p、vpp_qsv 的 out_color_*），不靠输出标签。
+    """
+    video = VideoPlan(
+        action="transcode", codec="hevc", height=2160,
+        tone_map=True, source_color="BT.2020", source_bit_depth=10,
+    )
+    argv = argv_of(plan(PlaybackTier.HARDWARE_TRANSCODE, video=video), hw_backend=backend)
+    for flag in ("-colorspace", "-color_primaries", "-color_trc", "-color_range"):
+        assert flag not in argv
+    # 软件档同一计划不受影响：帧在系统内存里，标签照写
+    soft_argv = argv_of(plan(PlaybackTier.SOFTWARE_TRANSCODE, video=video))
+    assert pair(soft_argv, "-colorspace") == "bt709"
+    assert pair(soft_argv, "-color_range") == "tv"
+
+
 def test_copy_path_gets_no_color_tags():
     """直通/重封装不解码画面，写色彩标签既没依据也可能覆盖源的正确标签。"""
     argv = argv_of(plan(PlaybackTier.REMUX))
