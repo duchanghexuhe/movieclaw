@@ -9,14 +9,17 @@ dispatcher：预转码任务由**外部 Worker** 执行（在线时领、离线�
 机器半夜领走任务转 2 小时"的形态。排队去重、台账、失败重试的**思想**与
 jobs.py 一致，实现是独立的小状态机。
 
-产物（``LibraryFile`` 派生行）落在 data/preload/<task_id>/portable.mkv：
-登记后 file_path 指向它，播放/详情页把它当普通版本对待（探测、字幕轨、
-播放决策全部复用既有链路）；派生身份靠 derives_from_file_id / derivation。
+产物（``LibraryFile`` 派生行）落在 data/preload/<task_id>/，文件名带片名与
+码率（``artifact_file_name``，例「坠落2：死点 (2026) - 省流 1080p HEVC
+1.5Mbps.mkv」）：登记后 file_path 指向它，播放/详情页把它当普通版本对待
+（探测、字幕轨、播放决策全部复用既有链路）；派生身份靠
+derives_from_file_id / derivation。
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from datetime import timedelta
 from pathlib import Path
@@ -35,6 +38,7 @@ from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.models import (
     FileState,
     LibraryFile,
+    MediaItem,
     PreloadTask,
     PreloadTaskStatus,
     utcnow,
@@ -52,8 +56,10 @@ logger = logging.getLogger("movieclaw_api.preload")
 #: 领取租约：Worker 领走任务后必须按时上报进度续约；到期未续自动回队。
 LEASE_SECONDS = 10 * 60
 
-#: 一任务一产物，固定名
-ARTIFACT_NAME = "portable.mkv"
+#: 分段上传 URL 里的产物名：纯协议标识（Worker 把分段 PUT 到
+#: /artifacts/<名>，complete 时才由服务端拼装成最终名）。固定名避开中文
+#: 文件名的 URL 编码问题；产物最终名见 artifact_file_name
+ARTIFACT_UPLOAD_NAME = "artifact.mkv"
 
 #: 转码分段时长（§7 断点续转）：每段独立 ffmpeg 进程转（-ss/-t 切），完成时
 #: 服务端 concat demuxer 拼接。被打断时只重转未完成的段（上传台账 resume_parts
@@ -120,6 +126,80 @@ def preload_root() -> Path:
 def artifact_dir_for(task_id: int) -> Path:
     """一个任务一个子目录：临时分片、最终产物、失败清理都以它为单位。"""
     return preload_root() / str(task_id)
+
+
+_WIN_ILLEGAL_CHARS = re.compile(r'[\\/:*?"<>|]')
+
+#: 产物文件名的编码展示写法（video_codec 值 → 人话）
+_CODEC_LABELS = {"h264": "H.264", "hevc": "HEVC"}
+
+
+def sanitize_filename(text: str) -> str:
+    """Windows 文件名净化：非法字符折成空格，压缩空白并去首尾的点/空格。"""
+    cleaned = re.sub(r"\s+", " ", _WIN_ILLEGAL_CHARS.sub(" ", text)).strip(" .")
+    return cleaned or "未命名"
+
+
+def _bitrate_label(spec: str) -> str:
+    """ffmpeg 码率字面量 → 展示写法（"1.5M" → "1.5Mbps"）。"""
+    text = spec.strip().lower()
+    if text.endswith("m"):
+        return f"{text[:-1]}Mbps"
+    if text.endswith("k"):
+        return f"{text[:-1]}Kbps"
+    return f"{text}bps"
+
+
+def artifact_file_name(
+    *,
+    media_title: str,
+    year: int | None,
+    kind: str | None,
+    season_number: int | None,
+    episode_number: int | None,
+    preset: dict,
+) -> str:
+    """产物文件名：片名(+年份/剧集号) - 档位 分辨率 编码 码率.mkv。
+
+    版本列表与下载直接显示这个文件名，所以要自带片名与码率，而不是一个
+    通用占位（例：「坠落2：死点 (2026) - 省流 1080p HEVC 1.5Mbps.mkv」）。
+    """
+    title = sanitize_filename(media_title)[:80]
+    if year:
+        title = f"{title} ({year})"
+    if kind == "tv" and season_number and episode_number:
+        title = f"{title} S{season_number:02d}E{episode_number:02d}"
+    codec = _CODEC_LABELS.get(preset.get("video_codec", "h264"), "H.264")
+    spec = (
+        f"{preset.get('short', '预转码')} {preset['height']}p"
+        f" {codec} {_bitrate_label(preset['maxrate'])}"
+    )
+    return f"{title} - {spec}.mkv"
+
+
+async def artifact_path_for(session: AsyncSession, task: PreloadTask) -> Path:
+    """产物最终落盘路径（complete 时按源条目的片名定名）。
+
+    片名拿不到（源行/条目已删）退回协议名——这条路径随后就会被时长/源存在
+    性校验拦下，不影响作废流程。
+    """
+    directory = artifact_dir_for(task.id or 0)
+    source = await session.get(LibraryFile, task.target_file_id)
+    item = (
+        await session.get(MediaItem, source.media_item_id)
+        if source is not None and source.media_item_id
+        else None
+    )
+    if source is None or item is None:
+        return directory / ARTIFACT_UPLOAD_NAME
+    return directory / artifact_file_name(
+        media_title=item.title,
+        year=item.year,
+        kind=item.kind,
+        season_number=source.season_number,
+        episode_number=source.episode_number,
+        preset=_preset_of(task),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +459,7 @@ def build_task_command(
     hw_backend = "nvenc" if _caps_have_nvenc(worker_caps) else None
     command = build_preload_command(
         source_path="source.mkv",
-        output_path=ARTIFACT_NAME,
+        output_path=ARTIFACT_UPLOAD_NAME,
         preset_id=task.preset_id,
         source=_source_spec(file),
         hw_backend=hw_backend,
@@ -397,7 +477,6 @@ def build_task_command(
         "skipped_subtitle_indexes": command.skipped_subtitle_indexes,
         "resume_parts": task.resume_parts,
         "part_bytes": task.part_bytes,
-        "artifact_name": ARTIFACT_NAME,
         # 断点续转（§7）：转码按固定时长分段，Worker 对第 i 段在 -i 前插
         # "-ss <i*SEGMENT_SECONDS>"（末段省 -t 让 ffmpeg 到 EOF），产物命名为
         # 段文件 partNNNN.mkv 逐段上传；服务端按 resume_parts 跳过已收段，
@@ -457,18 +536,28 @@ async def complete_task(
             return file
         raise BadRequestException("任务已完成但产物缺失，请删除后重转")
     # 重转场景：同任务目录下可能还挂着上一轮的派生行（file_path 唯一约束
-    # 会炸登记）。产物可再生的语义下，新产物直接顶掉旧版本行
-    stale = (
-        await session.execute(
-            select(LibraryFile).where(LibraryFile.file_path == str(artifact_dir_for(task.id or 0) / ARTIFACT_NAME))
-        )
-    ).scalar_one_or_none()
-    if stale is not None:
+    # 会炸登记）。产物可再生的语义下，新产物直接顶掉旧版本行；按任务目录圈
+    # 定范围——产物名是动态的，旧命名（portable.mkv）的历史行也在内
+    directory = artifact_dir_for(task.id or 0)
+    path = await artifact_path_for(session, task)
+    stale_rows = list(
+        (
+            await session.execute(
+                select(LibraryFile).where(
+                    LibraryFile.derives_from_file_id == task.target_file_id
+                )
+            )
+        ).scalars()
+    )
+    for stale in stale_rows:
+        if Path(stale.file_path).parent != directory:
+            continue
+        old_path = Path(stale.file_path)
+        if old_path != path and old_path.is_file():
+            old_path.unlink(missing_ok=True)  # 改名后的旧文件；同名的是本轮新鲜产物
         await session.delete(stale)
         await session.flush()
         logger.info("重转顶掉旧产物行：file=%s（task=%s）", stale.id, task.id)
-    directory = artifact_dir_for(task.id or 0)
-    path = directory / ARTIFACT_NAME
     if not path.is_file():
         raise BadRequestException("产物文件不存在，无法登记")
     size = path.stat().st_size
@@ -745,17 +834,21 @@ async def invalidate_orphans(session: AsyncSession) -> int:
             await session.execute(select(_PT.id))
         ).scalars()
     )
+    # 已登记产物行所在的目录（产物名动态，按目录归属判定而不是文件名）
+    registered_dirs = {
+        Path(row.file_path).parent
+        for row in (
+            await session.execute(
+                select(LibraryFile).where(LibraryFile.derivation.is_not(None))  # type: ignore[union-attr]
+            )
+        ).scalars()
+    }
     removed = 0
     for entry in root.iterdir():
         if not entry.name.isdigit() or int(entry.name) in live_task_ids:
             continue
         # 目录里还有已登记产物行的不清（产物行还在库上）
-        file_row = (
-            await session.execute(
-                select(LibraryFile).where(LibraryFile.file_path == str(entry / ARTIFACT_NAME))
-            )
-        ).scalar_one_or_none()
-        if file_row is not None:
+        if entry in registered_dirs:
             continue
         shutil.rmtree(entry, ignore_errors=True)
         removed += 1
@@ -815,10 +908,12 @@ async def preload_maintenance() -> None:
 
 
 __all__ = [
-    "ARTIFACT_NAME",
+    "ARTIFACT_UPLOAD_NAME",
     "LEASE_SECONDS",
     "PreloadQuotaExceeded",
     "artifact_dir_for",
+    "artifact_file_name",
+    "artifact_path_for",
     "build_task_command",
     "cancel_task",
     "check_quota",

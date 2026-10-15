@@ -37,7 +37,10 @@ from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import login_devices
 from movieclaw_api.services.media_probe import probe_media
 from movieclaw_api.services.preload import service as preload_service
-from movieclaw_api.services.preload.service import ARTIFACT_NAME, PRELOAD_PART_BYTES as _PART_BYTES
+from movieclaw_api.services.preload.service import (
+    ARTIFACT_UPLOAD_NAME,
+    PRELOAD_PART_BYTES as _PART_BYTES,
+)
 from movieclaw_api.services.preload.signing import (
     issue_preload_grant,
     verify_preload_grant,
@@ -97,7 +100,7 @@ async def claim_preload_task(
     # 相对路径带 API 前缀：Worker 直接 server + "/" + path 拼接
     command["source_url"] = f"api/v1/preload-worker/preload-source/{task_id}?token={grant}"
     command["artifact_url"] = (
-        f"api/v1/preload-worker/tasks/{task_id}/artifacts/{ARTIFACT_NAME}?token={grant}"
+        f"api/v1/preload-worker/tasks/{task_id}/artifacts/{ARTIFACT_UPLOAD_NAME}?token={grant}"
     )
     command["task_id"] = task_id
     command["display_name"] = Path(file.file_path).name
@@ -151,7 +154,7 @@ async def put_preload_artifact(
     - 半段连接断开截回段首，Worker 重传不写重；
     - 收到的完整段数推进台账（``resume_parts``），Worker 失败重试时按它续传。
     """
-    if name != ARTIFACT_NAME:
+    if name != ARTIFACT_UPLOAD_NAME:
         raise NotFoundException("产物名称无效")
     grant = await verify_preload_grant(token, task_id=task_id, kind="preload.artifact")
     if grant is None:
@@ -221,7 +224,8 @@ async def complete_preload_task(
     if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
         raise BadRequestException("任务不在执行态")
     directory = preload_service.artifact_dir_for(task_id)
-    final_path = directory / ARTIFACT_NAME
+    # 最终名带片名与码率（complete 时按源条目定名），分段拼装到它
+    final_path = await preload_service.artifact_path_for(session, task)
     if final_path.exists():
         final_path.unlink()  # 重跑 complete 的兜底
     # 按段号拼接：转码分段（§7 断点续转）每段是独立编码的 MKV，用 concat

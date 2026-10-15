@@ -402,6 +402,8 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
     assert derived is not None and derives_from == file_id
     assert derived.media_item_id is not None  # 播放枚举能找到它
     assert derived.derivation["preset_id"] == "portable_1080p"
+    # 产物文件名带片名与码率（版本列表/下载直接显示）
+    assert Path(derived.file_path).name == "示例 - 高清 1080p H.264 4Mbps.mkv"
 
 
 def test_saver_preset_roundtrip_hevc(client, tmp_path, monkeypatch):
@@ -436,16 +438,18 @@ def test_saver_preset_roundtrip_hevc(client, tmp_path, monkeypatch):
     assert done.status_code == 200, done.text
     derived_id = done.json()["data"]["file_id"]
 
-    async def _check() -> tuple[str | None, str]:
+    async def _check() -> tuple[str | None, str, str]:
         async with get_database().session() as session:
             row = await session.get(LibraryFile, derived_id)
             return (
                 row.video_codec if row else None,  # type: ignore[union-attr]
                 row.derivation["preset_id"],  # type: ignore[union-attr]
+                Path(row.file_path).name,  # type: ignore[union-attr]
             )
 
-    codec, preset_id = client.portal.call(partial(_check))  # type: ignore[attr-defined]
+    codec, preset_id, artifact_name = client.portal.call(partial(_check))  # type: ignore[attr-defined]
     assert codec == "hevc" and preset_id == "saver_1080p"
+    assert artifact_name == "示例 - 省流 1080p HEVC 1.5Mbps.mkv"
 
 
 def test_complete_rejects_wrong_codec_for_preset(client, tmp_path, monkeypatch):
@@ -644,4 +648,86 @@ def test_cleanup_stale_preview_and_run(client, tmp_path, monkeypatch):
             return await session.get(LibraryFile, derived_id) is None
 
     assert client.portal.call(partial(_gone))  # type: ignore[attr-defined]
-    assert not (tmp_path / "preload" / str(task_id) / "portable.mkv").exists()
+    assert not (
+        tmp_path / "preload" / str(task_id) / "示例 - 高清 1080p H.264 4Mbps.mkv"
+    ).exists()
+
+
+def test_artifact_file_name_composition():
+    """产物名 = 片名(+年份/剧集号) - 档位 分辨率 编码 码率；Windows 非法字符净化。"""
+    from movieclaw_api.services.preload.ffmpeg_preload import PRESETS
+    from movieclaw_api.services.preload.service import (
+        artifact_file_name,
+        sanitize_filename,
+    )
+
+    # 电影 + 年份；省流档 = HEVC 1.5Mbps
+    movie = artifact_file_name(
+        media_title="坠落2：死点", year=2026, kind="movie",
+        season_number=0, episode_number=0,  # 电影哨兵不进名字
+        preset=PRESETS["saver_1080p"],
+    )
+    assert movie == "坠落2：死点 (2026) - 省流 1080p HEVC 1.5Mbps.mkv"
+
+    # 剧集：剧名 + SxxEyy；高清档 = H.264 4Mbps
+    episode = artifact_file_name(
+        media_title="三体", year=2023, kind="tv",
+        season_number=1, episode_number=3,
+        preset=PRESETS["portable_1080p"],
+    )
+    assert episode == "三体 (2023) S01E03 - 高清 1080p H.264 4Mbps.mkv"
+
+    # 无年份；半角冒号等 Windows 非法字符折成空格
+    plain = artifact_file_name(
+        media_title="Movie: The Sequel", year=None, kind="movie",
+        season_number=None, episode_number=None,
+        preset=PRESETS["saver_1080p"],
+    )
+    assert plain == "Movie The Sequel - 省流 1080p HEVC 1.5Mbps.mkv"
+
+    assert sanitize_filename("Atlas: Earth <4K>") == "Atlas Earth 4K"
+    assert sanitize_filename("   ") == "未命名"
+
+
+def test_invalidate_orphans_respects_registered_dirs(client, tmp_path):
+    """孤儿目录清理按目录归属判定（产物名是动态的）：已登记产物（含旧命名行）
+    所在目录不动，无主残留目录清掉。"""
+    from movieclaw_api.services.preload import service as _svc
+
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+
+    async def _scenario() -> None:
+        async with get_database().session() as session:
+            source = await session.get(LibraryFile, file_id)
+            # 有已登记产物的目录（动态文件名，任务行不存在=任务行已被清理的形态）
+            keep_dir = _svc.preload_root() / "777"
+            keep_dir.mkdir(parents=True, exist_ok=True)
+            keep_file = keep_dir / "示例 - 省流 1080p HEVC 1.5Mbps.mkv"
+            keep_file.write_bytes(b"x")
+            session.add(
+                LibraryFile(
+                    library_id=source.library_id,  # type: ignore[union-attr]
+                    media_item_id=source.media_item_id,  # type: ignore[union-attr]
+                    file_path=str(keep_file),
+                    size_bytes=1,
+                    source="imported",
+                    state=FileState.IN_PLACE,
+                    container="mkv",
+                    resolution="1080p",
+                    derives_from_file_id=file_id,
+                    derivation={"kind": "preload", "preset_id": "saver_1080p"},
+                )
+            )
+            # 无主孤儿目录：任务行已消失，里面只有残留文件
+            orphan = _svc.preload_root() / "999"
+            orphan.mkdir(parents=True, exist_ok=True)
+            (orphan / "artifact.mkv").write_bytes(b"x")
+            await session.commit()
+
+            removed = await _svc.invalidate_orphans(session)
+            await session.commit()
+            assert removed == 1
+
+    client.portal.call(partial(_scenario))  # type: ignore[attr-defined]
+    assert not (_svc.preload_root() / "999").exists()
+    assert (_svc.preload_root() / "777" / "示例 - 省流 1080p HEVC 1.5Mbps.mkv").exists()
