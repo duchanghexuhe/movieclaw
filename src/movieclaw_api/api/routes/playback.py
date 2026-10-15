@@ -155,7 +155,7 @@ from movieclaw_api.services.playback_up_next import up_next_items
 from movieclaw_api.services.reels import clip_tip
 from movieclaw_api.services.reels import clips as reel_clips
 from movieclaw_api.services.tmdb_images import tmdb_image_url
-from movieclaw_api.settings import PlaybackPolicySetting
+from movieclaw_api.settings import PlaybackPolicySetting, RemoteTranscodeSetting
 from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.engine import get_database, get_session
 from movieclaw_db.models import LibraryFile, MediaItem, PlaybackMetric, PlaybackState
@@ -1249,10 +1249,11 @@ async def start_playback_session(
     # 会话无关）、硬件后端探测、关键帧索引。旧会话已在上面的最终决策前串行
     # 释放，不能重新放回这里，否则远程 Worker 的槽位又会产生竞态。
     prep_started_at = time.perf_counter()
-    policy, backends, keyframe_index = await asyncio.gather(
+    policy, backends, keyframe_index, remote_setting = await asyncio.gather(
         get_setting_store().get(PlaybackPolicySetting),
         asyncio.to_thread(available_backends),
         _keyframe_index(),
+        get_setting_store().get(RemoteTranscodeSetting),
     )
     # ``backends`` 可能包含外置 Worker 的能力（videotoolbox/nvenc）；本地命令
     # 只能从真实的 NAS 探测快照中选编码器。远程候选按在线状态确认后再交给
@@ -1276,6 +1277,9 @@ async def start_playback_session(
         available=backends,
         local_backends=local_backends,
         remote_video_available=remote_video_available,
+        # 远程 Worker 在线时优先由它转码（用户偏好）；Worker 离线/满员/不
+        # 兼容当前计划时决策层自动落回本地，不需要这里再判断
+        prefer_remote=remote_setting.enabled and remote_setting.prefer_remote,
     )
     if view.tier == int(Tier.HARDWARE_TRANSCODE) and execution_backend is None:
         # 决策阶段看到的硬件能力可能在准备阶段断线，或本地后端与当前滤镜链

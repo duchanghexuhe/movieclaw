@@ -21,6 +21,8 @@ export type RemoteTranscodeBaseUrlSource =
 
 export interface RemoteTranscodeConfigView {
   enabled: boolean;
+  /** 远程 Worker 在线且兼容当前计划时，优先由它执行转码（NAS 本地作兜底）。 */
+  prefer_remote: boolean;
   /** 静态配置出的远程转码根地址；为空表示自动跟随 Worker 连上来的地址。 */
   base_url: string;
   /** 网页配置的远程转码专用地址覆盖项；为空表示不覆盖。 */
@@ -33,6 +35,8 @@ export interface RemoteTranscodeConfigView {
 
 export interface RemoteTranscodeConfigPayload {
   enabled: boolean;
+  /** null=保持当前偏好。 */
+  prefer_remote?: boolean | null;
   /** null=保持当前专用地址，空字符串=清除覆盖、回到自动。 */
   base_url?: string | null;
   max_artifact_bytes: number;

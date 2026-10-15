@@ -29,6 +29,11 @@ class RemoteTranscodeSetting(SettingSchema):
     """
 
     enabled: bool = Field(default=False, description="是否启用远程硬件转码")
+    prefer_remote: bool = Field(
+        default=False,
+        description="远程 Worker 在线且兼容当前计划时，优先由它执行转码（NAS 本地作兜底）；"
+        "默认本地优先——NAS 能跑就不麻烦 Worker",
+    )
     base_url: str = Field(
         default="",
         description="远程转码专用根地址；为空时使用系统外部访问地址",

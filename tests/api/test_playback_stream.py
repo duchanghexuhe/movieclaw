@@ -324,6 +324,85 @@ def test_execution_backend_uses_remote_when_local_backend_is_incompatible():
     ) == ("videotoolbox", True)
 
 
+def _hw_decision() -> PlaybackPlan:
+    """本地与远程都兼容的普通硬件转码计划（无烧录、无 tone-map）。"""
+    return PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, source_bit_depth=8),
+        audio=AudioPlan(action="copy"),
+    )
+
+
+def test_execution_backend_prefers_remote_when_configured():
+    """远程优先：Worker 在线且兼容当前计划时压过本地候选。"""
+    assert routes_playback.playback_plan.select_execution_backend(
+        _hw_decision(),
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+        prefer_remote=True,
+    ) == ("nvenc", True)
+
+
+def test_execution_backend_remote_preference_falls_back_to_local_when_offline():
+    """远程优先但 Worker 离线：照常走本地，不因偏好放不了片。"""
+    assert routes_playback.playback_plan.select_execution_backend(
+        _hw_decision(),
+        available=("vaapi",),
+        local_backends=("vaapi",),
+        remote_video_available=False,
+        prefer_remote=True,
+    ) == ("vaapi", False)
+
+
+def test_execution_backend_skips_busy_remote_when_preferring_remote(monkeypatch):
+    """远程优先但唯一 Worker 名额全满：跳过它用本地，而不是 reserve 时 503。"""
+    monkeypatch.setattr(
+        routes_playback.playback_plan, "remote_worker_busy", lambda backend: True
+    )
+    assert routes_playback.playback_plan.select_execution_backend(
+        _hw_decision(),
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+        prefer_remote=True,
+    ) == ("vaapi", False)
+
+
+def test_execution_backend_skips_demoted_local_backend():
+    """本地后端起步即死被熔断后，让位给在线远程 Worker。"""
+    from movieclaw_api.services.playback import backend_health
+
+    backend_health.demote("vaapi")
+    try:
+        assert routes_playback.playback_plan.select_execution_backend(
+            _hw_decision(),
+            available=("vaapi", "nvenc"),
+            local_backends=("vaapi",),
+            remote_video_available=True,
+        ) == ("nvenc", True)
+    finally:
+        backend_health.reset()
+
+
+def test_execution_backend_still_uses_demoted_backend_without_alternative():
+    """熔断是降级不是拉黑：没有替代者时仍用被熔的后端，片子不能因此判死。"""
+    from movieclaw_api.services.playback import backend_health
+
+    backend_health.demote("vaapi")
+    try:
+        assert routes_playback.playback_plan.select_execution_backend(
+            _hw_decision(),
+            available=("vaapi",),
+            local_backends=("vaapi",),
+            remote_video_available=False,
+        ) == ("vaapi", False)
+    finally:
+        backend_health.reset()
+
+
 # ---------------------------------------------------------------------------
 # 档 0：原文件直出
 # ---------------------------------------------------------------------------
@@ -1916,6 +1995,32 @@ def test_remote_artifact_upload_maps_disk_quota_to_507(
     session = get_session_manager().get(grants["session_id"])
     assert session is not None
     assert session.remote_uploads[-1].status == 500
+
+
+def test_remote_transcode_config_prefer_remote_roundtrip(client):
+    """prefer_remote 三态：显式写入生效；不带字段=保持。"""
+    url = "/api/v1/transcode-worker/config"
+    view = client.get(url).json()["data"]
+    assert view["prefer_remote"] is False
+
+    saved = client.put(
+        url,
+        json={"enabled": False, "prefer_remote": True, "max_artifact_bytes": 512 * 1024 * 1024},
+    ).json()["data"]
+    assert saved["prefer_remote"] is True
+
+    # 不带 prefer_remote 字段（null）= 保持，不回弹默认值
+    kept = client.put(
+        url,
+        json={"enabled": False, "max_artifact_bytes": 512 * 1024 * 1024},
+    ).json()["data"]
+    assert kept["prefer_remote"] is True
+
+    turned_off = client.put(
+        url,
+        json={"enabled": False, "prefer_remote": False, "max_artifact_bytes": 512 * 1024 * 1024},
+    ).json()["data"]
+    assert turned_off["prefer_remote"] is False
 
 
 def test_remote_artifact_upload_rejects_oversized_body(client, tmp_path):

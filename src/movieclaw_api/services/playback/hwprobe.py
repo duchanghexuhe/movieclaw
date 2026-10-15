@@ -28,6 +28,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from movieclaw_api.services.playback import backend_health
 from movieclaw_api.services.playback.ffmpeg_args import (
     HW_BACKENDS,
     NVENC_TONEMAP,
@@ -133,6 +134,9 @@ def probe_backends(*, force: bool = False) -> list[HwBackendStatus]:
     _cache = [_probe_one(name, encoders) for name in HW_BACKENDS]
     for status in _cache:
         _probe_native_tonemap(status.name, available=status.available)
+    # 真跑过一轮探测 = 拿到了新证据，起步失败留下的熔断记录一并作废；
+    # 用户在设置页点「重新检测」通常正是修好了东西想让它被重新选中
+    backend_health.reset()
     usable = [s.name for s in _cache if s.available]
     if usable:
         logger.info("硬件加速自检通过：%s", "、".join(usable))

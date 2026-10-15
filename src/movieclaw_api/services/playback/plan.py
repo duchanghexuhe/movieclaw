@@ -16,6 +16,7 @@ from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.services.media_probe import probe_keyframe_interval
+from movieclaw_api.services.playback import backend_health
 from movieclaw_api.services.playback.disc_source import disc_source_for_file
 from movieclaw_api.services.playback.ffmpeg_args import effective_hw_backend
 from movieclaw_api.services.playback.hwprobe import hardware_available
@@ -207,14 +208,17 @@ def select_execution_backend(
     available: tuple[str, ...],
     local_backends: tuple[str, ...],
     remote_video_available: bool,
+    prefer_remote: bool = False,
 ) -> tuple[str | None, bool]:
     """为当前播放计划选择真正能执行的后端。
 
     ``available`` 是给决策层用的合并能力快照，``local_backends`` 则只包含
     NAS 本机实际探测通过的后端。两者不能按列表首项直接使用：列表顺序是
-    全局优先级，不代表该计划（尤其是 PGS 烧录）的滤镜链兼容性。先选能在
-    NAS 执行当前计划的后端；只有本地都不兼容时，才把在线 VideoToolbox
-    Worker 作为候选。返回值的第二项明确标出是否需要远程会话。
+    全局优先级，不代表该计划（尤其是 PGS 烧录）的滤镜链兼容性。默认本地
+    优先——只有本地都不兼容时，才把在线 Worker 作为候选。``prefer_remote``
+    翻转这个顺序：Worker 在线、有空闲槽位且兼容当前计划时优先由它执行，
+    本地退作兜底（用户显式偏好「让 Windows GPU 干活、NAS 减负」）。
+    返回值的第二项明确标出是否需要远程会话。
 
     网页播放器与 Jellyfin 兼容层的转码入口共用这一个函数——两条链路起的是
     同一种会话，执行后端的选法不能有两套。
@@ -222,20 +226,37 @@ def select_execution_backend(
     if decision.tier is not Tier.HARDWARE_TRANSCODE or decision.video.action != "transcode":
         return None, False
 
-    for backend in local_backends:
-        if effective_hw_backend(decision, backend) is not None:
-            return backend, False
-
-    # 本地执行不了才轮到远程 Worker。远程后端按优先级排：videotoolbox 在前
-    # （先接单的跑得久，速度画像更厚），nvenc（Windows GPU）兜底。谁在
-    # ``available`` 里由 hwprobe._with_remote_backend 按在线状态叠加。
-    for backend in ("videotoolbox", "nvenc"):
+    # 远程候选在进入顺序比较前先过两道闸：兼容性（滤镜链）与忙闲（名额
+    # 全满的 Worker 选了也会在 reserve 时 503，而明明还有本机能放——忙者
+    # 跳过，让本地兜底接住）。谁在 ``available`` 里由 hwprobe._with_remote_backend
+    # 按在线状态叠加。
+    remote_candidates = tuple(
+        backend
+        for backend in ("videotoolbox", "nvenc")
         if (
             remote_video_available
             and backend in available
+            and not remote_worker_busy(backend)
             and effective_hw_backend(decision, backend) is not None
-        ):
-            return backend, True
+        )
+    )
+    if prefer_remote and remote_candidates:
+        return remote_candidates[0], True
+
+    # 本地执行不了才轮到远程 Worker。远程后端按优先级排：videotoolbox 在前
+    # （先接单的跑得久，速度画像更厚），nvenc（Windows GPU）兜底。
+    # 熔过的本地后端先跳过（起步即死刚发生过，证据见 backend_health）；
+    # 若全都被熔且远程也没有，末位兜底仍按原顺序试——熔断表达的是优先级
+    # 降低，不是绝对禁用，没有替代者时把片子判死比再试一次坏后端更糟。
+    demoted = backend_health.demoted_backends()
+    for backend in local_backends:
+        if backend not in demoted and effective_hw_backend(decision, backend) is not None:
+            return backend, False
+    for backend in remote_candidates:
+        return backend, True
+    for backend in local_backends:
+        if effective_hw_backend(decision, backend) is not None:
+            return backend, False
     return None, False
 
 

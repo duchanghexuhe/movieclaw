@@ -147,6 +147,7 @@ async def build_remote_transcode_config_view() -> RemoteTranscodeConfigView:
     runtime = effective_remote_transcode_config()
     return RemoteTranscodeConfigView(
         enabled=setting.enabled,
+        prefer_remote=setting.prefer_remote,
         base_url=runtime.base_url,
         base_url_override=_normalize_base_url(setting.base_url),
         base_url_source=runtime.base_url_source,
@@ -170,6 +171,11 @@ async def save_remote_transcode_config(
     )
     next_setting = RemoteTranscodeSetting(
         enabled=payload.enabled,
+        prefer_remote=(
+            current.prefer_remote
+            if payload.prefer_remote is None
+            else payload.prefer_remote
+        ),
         base_url=base_url,
         max_artifact_bytes=payload.max_artifact_bytes,
     )
