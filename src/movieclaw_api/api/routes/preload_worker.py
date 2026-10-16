@@ -158,6 +158,24 @@ async def report_preload_progress(
         raise BadRequestException("任务已不在执行态，停止上报")
     if task.status == PreloadTaskStatus.CLAIMED:
         task.status = PreloadTaskStatus.RUNNING
+    # 进度载荷落台账（活动页进行中卡片据此显示下载量/第几段/剩余时间）：
+    # 只收认识且类型对得上的键——Worker 版本参差，多余字段不进库；
+    # 坏载荷不影响续约
+    raw = payload if isinstance(payload, dict) else {}
+    progress: dict[str, Any] = {}
+    if isinstance(raw.get("phase"), str):
+        progress["phase"] = raw["phase"]
+    for key in (
+        "downloaded_bytes",
+        "total_bytes",
+        "segment_index",
+        "segment_total",
+        "eta_seconds",
+    ):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            progress[key] = int(value)
+    task.progress = progress or None
     await renew_lease(session, task_id)
     await session.commit()
     return ok(None)
@@ -323,6 +341,7 @@ async def complete_preload_task(
             actual_bytes=size,
             duration_seconds=duration,
             video_codec=video_codec,
+            spec=spec,
         )
     except BadRequestException:
         # 整件作废：产物与分片一并清掉，任务置失败

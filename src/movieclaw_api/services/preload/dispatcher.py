@@ -86,12 +86,6 @@ async def dispatch_queued_tasks() -> None:
 
 async def _dispatch_round() -> None:
     """一轮派发（调用方保证持有派发锁）。"""
-    from movieclaw_api.settings import PreloadSetting
-    from movieclaw_api.settings.store import get_setting_store
-
-    setting = await get_setting_store().get(PreloadSetting)
-    if not setting.enabled:
-        return  # 预转码队列已停用：任务留在队列里，重新打开开关后继续派
     dispatched = 0
     # 本地能吃几个就先吃几个（每轮重读容量：占用是动态的）
     while _local_capacity() > 0:
@@ -358,6 +352,7 @@ async def _execute_local_task(
                 actual_bytes=(final_path or tmp_path).stat().st_size,
                 duration_seconds=spec.duration_seconds if spec else None,
                 video_codec=spec.video_codec if spec else None,
+                spec=spec,
             )
         final_path = None  # 已登记为版本（file_path 指向它），finally 不再清理
         logger.info("本地预转码完成：task=%s → file=%s", task_id, derived.id)

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Banner } from "@/components/cloud-push-ui";
 import { useConfirm, useToast } from "@/components/feedback";
 import { InfoIcon, RefreshIcon } from "@/components/icons";
+import { PreloadStatsGrid } from "@/components/preload-transcode-section";
 import {
   SETTINGS_BUTTON_CLASS,
   SettingsList,
@@ -13,6 +14,10 @@ import {
   SettingsSection,
 } from "@/components/settings-ui";
 import { Tooltip } from "@/components/tooltip";
+import {
+  getPreloadOverview,
+  type PreloadOverview,
+} from "@/lib/api/preload";
 import {
   cleanStorage,
   getStorageState,
@@ -49,6 +54,9 @@ import { formatRelativeTime } from "@/lib/time";
  *      （重建代价高的目录在确认弹窗里标红警示）；
  *   3. 应用数据：只展示占用（用户资产或回退恢复源）。
  *   「未登记目录」块只在后端发现登记表之外的条目时出现。
+ *   「预转码产物」块是唯一的功能定制区块（preload-transcode.md §6 入口展示）：
+ *   库层的产物统计（共占/共 N 部/最老未播）是目录行给不了的，与转码缓存并列；
+ *   没有产物时不出现。
  */
 
 /** 后台统计期间的轮询间隔 */
@@ -59,6 +67,7 @@ export function AppStorageSection() {
   const [computing, setComputing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [preloadOverview, setPreloadOverview] = useState<PreloadOverview | null>(null);
   const confirm = useConfirm();
   const toast = useToast();
 
@@ -78,6 +87,14 @@ export function AppStorageSection() {
   useEffect(() => {
     void load(false);
   }, [load]);
+
+  // 预转码产物的总量统计（§6 入口展示）：与转码缓存并列的专属区块；
+  // 是轻量聚合查询，进页取一次即可
+  useEffect(() => {
+    getPreloadOverview()
+      .then(setPreloadOverview)
+      .catch(() => {});
+  }, []);
 
   // 后台正在统计时轮询，等新数据落地后自动替换页面上的旧数据
   useEffect(() => {
@@ -177,6 +194,15 @@ export function AppStorageSection() {
               ))}
             </ul>
           </Banner>
+        </SettingsSection>
+      )}
+
+      {preloadOverview && preloadOverview.count > 0 && (
+        <SettingsSection
+          title="预转码产物"
+          description="预转码 Worker 转出的便携版本（库文件的可选版本）；清理与任务管理在「设置 → 转码」"
+        >
+          <PreloadStatsGrid overview={preloadOverview} />
         </SettingsSection>
       )}
 

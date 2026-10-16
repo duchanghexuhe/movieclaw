@@ -33,6 +33,7 @@ from movieclaw_api.exceptions import (
     BadRequestException,
     NotFoundException,
 )
+from movieclaw_api.services.media_probe import PROBE_SCHEMA_VERSION, MediaSpec
 from movieclaw_api.services.preload.ffmpeg_preload import (
     PRELOAD_PART_BYTES,
     PRESET_DEFAULT,
@@ -413,6 +414,7 @@ async def reclaim_expired_leases(session: AsyncSession) -> int:
         task.lease_expires_at = None
         task.claimed_at = None
         task.worker_device_id = None
+        task.progress = None  # 上一次执行的进度不属于回队后的执行
         task.updated_at = now
         logger.info("预转码任务租约到期回队：task=%s", task.id)
     if rows:
@@ -471,6 +473,7 @@ async def claim_next_task(
                 claimed_at=now,
                 lease_expires_at=now + timedelta(seconds=LEASE_SECONDS),
                 attempts=PreloadTask.attempts + 1,
+                progress=None,  # 旧执行的最后进度不属于新执行
             )
         )
     ).rowcount
@@ -565,11 +568,16 @@ async def complete_task(
     actual_bytes: int,
     duration_seconds: int | None,
     video_codec: str | None,
+    spec: MediaSpec | None = None,
     container: str = "mkv",
 ) -> LibraryFile:
     """产物校验 + 登记为版本（§7 扩展点 2：整件采纳，不做部分采纳）。
 
     校验：文件在盘、大小与最后分段对齐、时长与源相近（±5%，浮点探针精度）。
+    ``spec`` 是调用方 ffprobe 产物的结果（REST/本地两条完成路径都已探测），
+    登记行的音轨/字幕轨从这里来——不填的话决策引擎按「无音轨」装配转码
+    计划、字幕轨列表为空，播放就是没声音没字幕（NAS 实测惊天魔盗团产物
+    即此坑）；没传时退回旧行为（流字段留空，由扫描补探兜底）。
     登记成 ``LibraryFile`` 派生行后，播放决策/字幕轨/详情页零改动地认它。
     """
     if task.status == PreloadTaskStatus.COMPLETED:
@@ -625,6 +633,11 @@ async def complete_task(
             f"产物视频编码不是档位要求的 {_preset_of(task).get('video_codec', 'h264').upper()}"
         )
 
+    # 产物没有音轨（源有音轨）= 转码链丢了音频，整件作废而不是登记出
+    # 一部无声片
+    if spec is not None and not spec.audio_streams and (source.audio_streams or []):
+        raise BadRequestException("产物没有音轨（源有音轨），整件作废")
+
     # 登记为派生行：规格用产物自己的探测结果，来源快照标派生身份
     target = await session.get(LibraryFile, task.target_file_id)
     if target is None:
@@ -638,9 +651,18 @@ async def complete_task(
         file_path=str(path),
         size_bytes=size,
         container=container,
-        resolution="1080p",
-        video_codec=video_codec or preset.get("video_codec", "h264"),
+        resolution=spec.resolution if spec else "1080p",
+        video_codec=spec.video_codec if spec else (video_codec or preset.get("video_codec", "h264")),
+        hdr=spec.hdr if spec else None,
+        bit_depth=spec.bit_depth if spec else None,
         duration_seconds=duration_seconds,
+        bit_rate=spec.bit_rate if spec else None,
+        frame_rate=spec.frame_rate if spec else None,
+        color_space=spec.color_space if spec else None,
+        probe_version=PROBE_SCHEMA_VERSION if spec else None,
+        audio_streams=list(spec.audio_streams) if spec else None,
+        subtitle_streams=list(spec.subtitle_streams) if spec else None,
+        chapters=list(spec.chapters) if spec else None,
         source="imported",
         origin={
             **_PRELOAD_ORIGIN,

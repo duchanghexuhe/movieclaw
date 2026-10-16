@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { Banner, Toggle } from "@/components/cloud-push-ui";
+import { Banner } from "@/components/cloud-push-ui";
 import { useConfirm, useToast } from "@/components/feedback";
 import {
   SETTINGS_BUTTON_CLASS,
@@ -31,6 +31,40 @@ const GB = 1024 ** 3;
 
 function formatGB(bytes: number): string {
   return `${(bytes / GB).toFixed(1)} GB`;
+}
+
+/**
+ * 预转码总量三格（preload-transcode.md §6）：共占/共 N 部 · 配额 | 最老未播 |
+ * 未播阈值（自动清理开）。设置页预转码分区与缓存管理页的「预转码产物」
+ * 区块共用这一套规格（§6 入口展示）。
+ */
+export function PreloadStatsGrid({ overview }: { overview: PreloadOverview }) {
+  return (
+    <div className="grid grid-cols-3 gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sub">
+      <div>
+        <div className="tnum text-body font-semibold text-[var(--text)]">
+          {(overview.total_bytes / GB).toFixed(1)} GB
+        </div>
+        <div className="mt-0.5 text-caption text-[var(--text-faint)]">
+          共 {overview.count} 部 · 配额 {(overview.quota_bytes / GB).toFixed(0)} GB
+        </div>
+      </div>
+      <div>
+        <div className="tnum text-body font-semibold text-[var(--text)]">
+          {overview.oldest_days > 0 ? `${overview.oldest_days} 天` : "—"}
+        </div>
+        <div className="mt-0.5 text-caption text-[var(--text-faint)]">最老未播</div>
+      </div>
+      <div>
+        <div className="tnum text-body font-semibold text-[var(--text)]">
+          {overview.stale_days} 天
+        </div>
+        <div className="mt-0.5 text-caption text-[var(--text-faint)]">
+          未播阈值{overview.auto_cleanup ? " · 自动清理开" : ""}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -115,34 +149,13 @@ export function TranscodeSection() {
   }, [cleanupPreview, confirm, previewDays, toast]);
 
   return (
-    <SettingsSection
-      title="预转码"
-      description="预转码 Worker 闲时把指定影片提前转成小体积版本（默认省流档 1080p HEVC，约 0.8GB/小时；可选高清档 1080p H.264），外网播放时直接发小文件。Worker 在「设备」分区配对。"
-    >
+      <SettingsSection
+        title="预转码"
+        description="预转码 Worker 闲时把指定影片提前转成小体积版本（默认省流档 1080p HEVC，约 0.8GB/小时；可选高清档 1080p H.264），外网播放时直接发小文件。Worker 在「设备」分区配对；任务进行中的实时进度（下载量/第几段/剩余时间）看「活动」页。"
+      >
       {overview && (
-        <div className="mb-4 grid grid-cols-3 gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sub">
-          <div>
-            <div className="tnum text-body font-semibold text-[var(--text)]">
-              {(overview.total_bytes / GB).toFixed(1)} GB
-            </div>
-            <div className="mt-0.5 text-caption text-[var(--text-faint)]">
-              共 {overview.count} 部 · 配额 {(overview.quota_bytes / GB).toFixed(0)} GB
-            </div>
-          </div>
-          <div>
-            <div className="tnum text-body font-semibold text-[var(--text)]">
-              {overview.oldest_days > 0 ? `${overview.oldest_days} 天` : "—"}
-            </div>
-            <div className="mt-0.5 text-caption text-[var(--text-faint)]">最老未播</div>
-          </div>
-          <div>
-            <div className="tnum text-body font-semibold text-[var(--text)]">
-              {overview.stale_days} 天
-            </div>
-            <div className="mt-0.5 text-caption text-[var(--text-faint)]">
-              未播阈值{overview.auto_cleanup ? " · 自动清理开" : ""}
-            </div>
-          </div>
+        <div className="mb-4">
+          <PreloadStatsGrid overview={overview} />
         </div>
       )}
       {tasksError ? (
@@ -158,7 +171,7 @@ export function TranscodeSection() {
         <div className="space-y-10">
           <SettingsList>
             {tasks.length === 0 ? (
-              <SettingsEmpty title="还没有预转码任务" description="在影片详情页的文件区或「预转码」弹窗里下单。" />
+              <SettingsEmpty title="还没有预转码任务" description="在影片详情页顶部的「预转码」里下单。" />
             ) : (
               tasks.map((task) => (
                 <SettingsRow

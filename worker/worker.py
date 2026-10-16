@@ -310,65 +310,79 @@ def process_task(
     resume = task.get("resume_parts") or 0
     base_argv = task["argv"]  # 末两个元素是 -f matroska <output>
 
-    # 1) 取源（签名 URL；整文件下载对断线重试与 NAS 磁盘更友好）。
-    # 已下载且大小与台账一致才复用；中断的半截文件直接重下。
-    # 下载带重试：17GB 源一次网络抖动就整任务 FAILED、断点归零，太脆
-    expected = task.get("source_size_bytes") or 0
-    if source.exists() and (not expected or source.stat().st_size != expected):
-        source.unlink()
-    if not source.exists():
-        url = api.server + "/" + task["source_url"]
-        last_error: Exception | None = None
-        for attempt in range(3):
-            if stop is not None and stop.is_set():
-                print(f"[{task_id}] 停止中断于下载（断点保留）")
-                return False
-            try:
-                req = urllib.request.Request(url)
-                with _NO_PROXY_OPENER.open(req, timeout=600) as resp, open(source, "wb") as out:
-                    while chunk := resp.read(4 * 1024 * 1024):
-                        out.write(chunk)
-                last_error = None
-                break
-            except (urllib.error.URLError, OSError) as exc:
-                last_error = exc
-                source.unlink(missing_ok=True)
-                print(f"[{task_id}] 源下载失败（第 {attempt + 1}/3 次）：{exc}")
-                time.sleep(2 * (attempt + 1))
-        if last_error is not None:
-            api.request(
-                "POST",
-                f"/api/v1/preload-worker/tasks/{task_id}/fail",
-                json_body={"error": f"源文件下载失败（重试 3 次）：{last_error}"},
-            )
-            return False
-    print(f"[{task_id}] 源已就绪（{source.stat().st_size / 1024**2:.0f} MB）")
-
-    # 2) 计算段数并跳过已收段
-    if segment_seconds and duration:
-        total_parts = -(-duration // segment_seconds)  # ceil
-    else:
-        total_parts = 1  # 直拷/单段
-    print(f"[{task_id}] 共 {total_parts} 段，断点在第 {resume} 段后")
-
-    # 3) 进度上报线程（续约）
+    # 1) 进度上报线程（续约 + 活动页实时进度）：共享 dict 主线程更新、
+    #    上报线程快照发送（CPython dict 读写在 GIL 下原子，不需要锁）。
+    #    先于下载启动——慢网络下大源下载也要续约，下载进度活动页才看得到
+    progress: dict = {}
+    seg_times: list[float] = []
     progress_stop = threading.Event()
 
     def reporter() -> None:
         while not progress_stop.wait(PROGRESS_SECONDS):
             api.request(
-                "POST", f"/api/v1/preload-worker/tasks/{task_id}/progress", json_body={}
+                "POST",
+                f"/api/v1/preload-worker/tasks/{task_id}/progress",
+                json_body=dict(progress),
             )
 
     thread = threading.Thread(target=reporter, daemon=True)
     thread.start()
     try:
+        # 2) 取源（签名 URL；整文件下载对断线重试与 NAS 磁盘更友好）。
+        # 已下载且大小与台账一致才复用；中断的半截文件直接重下。
+        # 下载带重试：17GB 源一次网络抖动就整任务 FAILED、断点归零，太脆
+        expected = task.get("source_size_bytes") or 0
+        if source.exists() and (not expected or source.stat().st_size != expected):
+            source.unlink()
+        if not source.exists():
+            url = api.server + "/" + task["source_url"]
+            progress.update(phase="downloading", downloaded_bytes=0, total_bytes=expected)
+            last_error: Exception | None = None
+            for attempt in range(3):
+                if stop is not None and stop.is_set():
+                    print(f"[{task_id}] 停止中断于下载（断点保留）")
+                    return False
+                try:
+                    req = urllib.request.Request(url)
+                    with _NO_PROXY_OPENER.open(req, timeout=600) as resp, open(source, "wb") as out:
+                        received = 0
+                        while chunk := resp.read(4 * 1024 * 1024):
+                            out.write(chunk)
+                            received += len(chunk)
+                            progress["downloaded_bytes"] = received
+                    last_error = None
+                    break
+                except (urllib.error.URLError, OSError) as exc:
+                    last_error = exc
+                    source.unlink(missing_ok=True)
+                    progress["downloaded_bytes"] = 0
+                    print(f"[{task_id}] 源下载失败（第 {attempt + 1}/3 次）：{exc}")
+                    time.sleep(2 * (attempt + 1))
+            if last_error is not None:
+                api.request(
+                    "POST",
+                    f"/api/v1/preload-worker/tasks/{task_id}/fail",
+                    json_body={"error": f"源文件下载失败（重试 3 次）：{last_error}"},
+                )
+                return False
+        progress.update(phase="transcoding", downloaded_bytes=expected, total_bytes=expected)
+
+        # 3) 计算段数并跳过已收段
+        if segment_seconds and duration:
+            total_parts = -(-duration // segment_seconds)  # ceil
+        else:
+            total_parts = 1  # 直拷/单段
+        progress["segment_total"] = total_parts
+        print(f"[{task_id}] 共 {total_parts} 段，断点在第 {resume} 段后")
+
         for part in range(total_parts):
             if stop is not None and stop.is_set():
                 print(f"[{task_id}] 收到停止信号，中断（断点保留在第 {part} 段）")
                 return False
             if part < resume:
                 continue  # 已在服务端，跳过
+            progress["segment_index"] = part + 1  # 正在转的第几段（1 起）
+            seg_started = time.monotonic()
             seg_path = workdir / f"seg{part:05d}.mkv"
             seg_argv = list(base_argv)
             # argv 尾部是 [-f, matroska, output] → 输出改为本段文件
@@ -427,7 +441,15 @@ def process_task(
                 print(f"[{task_id}] 第 {part + 1}/{total_parts} 段上传失败：{status}")
                 return False
             seg_path.unlink(missing_ok=True)
+            seg_times.append(time.monotonic() - seg_started)
+            remaining = total_parts - (part + 1)
+            if remaining > 0:
+                # 预计剩余：已完成段的平均耗时 × 剩余段数
+                progress["eta_seconds"] = int(sum(seg_times) / len(seg_times) * remaining)
             print(f"[{task_id}] 第 {part + 1}/{total_parts} 段完成")
+        # 段全部传完：拼接+校验+登记由服务端做（约 1 分钟），UI 标收尾
+        progress["phase"] = "finalizing"
+        progress["eta_seconds"] = 0
     finally:
         progress_stop.set()
         thread.join()

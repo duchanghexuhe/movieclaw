@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Column, ForeignKey, Index, Integer, Text
+from sqlalchemy import JSON, BigInteger, Column, ForeignKey, Index, Integer, Text
 from sqlmodel import Field
 
 from movieclaw_db.models.base import TimestampMixin
@@ -112,6 +112,16 @@ class PreloadTask(TimestampMixin, table=True):
         default=0,
         sa_column=Column(BigInteger, default=0),
         description="单段大小（字节）；领取时与 Worker 约定，续转按它对齐",
+    )
+
+    # -- 实时进度（Worker 进度上报落台账）--------------------------------------
+    # {phase, downloaded_bytes, total_bytes, segment_index, segment_total,
+    #  eta_seconds}：活动页进行中卡片据此显示下载量/第几段/剩余时间。
+    # 领取与租约回队时清零——旧执行的最后进度不属于新执行
+    progress: dict | None = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+        description="最近一次进度上报（Worker 写、服务端转发）；执行态之外为 NULL",
     )
 
     # -- 结果与诊断 ----------------------------------------------------------

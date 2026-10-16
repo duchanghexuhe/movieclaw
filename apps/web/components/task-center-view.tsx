@@ -1011,8 +1011,9 @@ function ActiveJobFeedItem({
 }
 
 // ---------------------------------------------------------------------------
-// 预转码任务（docs/design/preload-transcode.md）：独立小状态机，Worker 只报
-// 分段台账、没有百分比，卡片只到「状态 + 预估」粒度。
+// 预转码任务（docs/design/preload-transcode.md）：独立小状态机。Worker 每分钟
+// 上报实时进度（下载量/第几段/预计剩余，60 秒 = 租约续约节奏），进行中卡片
+// 据此画进度条与进度行；旧版 Worker 不发，退回「状态 + 预估」粒度。
 // ---------------------------------------------------------------------------
 
 function historicalPreloadTitle(task: PreloadTaskView): string {
@@ -1035,6 +1036,26 @@ function historicalPreloadSummary(task: PreloadTaskView): string {
   return parts.join(" · ");
 }
 
+/** 进行中卡片的进度行：取源多少/第几段/预计剩余；旧版 Worker 无进度为 null。 */
+function preloadProgressText(task: PreloadTaskView): string | null {
+  const p = task.progress;
+  if (!p) return null;
+  const parts: string[] = [];
+  if (p.phase === "downloading") {
+    parts.push(
+      (p.total_bytes ?? 0) > 0
+        ? `取源中 ${formatBytes(p.downloaded_bytes ?? 0)} / ${formatBytes(p.total_bytes ?? 0)}`
+        : "取源中",
+    );
+  } else if (p.phase === "finalizing") {
+    parts.push("拼接登记中");
+  } else if (p.segment_index != null && (p.segment_total ?? 0) > 0) {
+    parts.push(`转码第 ${p.segment_index}/${p.segment_total} 段`);
+  }
+  if ((p.eta_seconds ?? 0) > 0) parts.push(`剩余约 ${Math.ceil((p.eta_seconds ?? 0) / 60)} 分钟`);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 /** 进行中的预转码任务（Netflix 任务视角的「现在」时间线）。 */
 function PreloadActiveFeedItem({
   task,
@@ -1046,6 +1067,17 @@ function PreloadActiveFeedItem({
   onCancel: () => void;
 }) {
   const { presets } = usePreloadTasks();
+  const p = task.progress;
+  const segTotal = p?.segment_total ?? 0;
+  // 进度百分比：取源按字节、转码按段；收尾（拼接登记）时长未知走不定态条。
+  // 与后台 Job 的进度条同一形态（h-1.5、var(--info) 填充、无百分比时不定态脉冲）
+  const percent =
+    p?.phase === "downloading" && (p.total_bytes ?? 0) > 0
+      ? Math.min(99, Math.round(((p.downloaded_bytes ?? 0) / (p.total_bytes ?? 1)) * 100))
+      : p?.phase === "transcoding" && segTotal > 0 && p.segment_index != null
+        ? Math.min(99, Math.round((p.segment_index / segTotal) * 100))
+        : null;
+  const progressText = preloadProgressText(task);
   return (
     <article className="min-w-0 py-1.5">
       <div className="flex min-w-0 items-start justify-between gap-3">
@@ -1068,6 +1100,17 @@ function PreloadActiveFeedItem({
           {cancelling ? "正在取消…" : "取消任务"}
         </button>
       </div>
+      {progressText && <p className="tnum mt-1.5 text-caption text-white/50">{progressText}</p>}
+      {p && (
+        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/[0.07]">
+          <div
+            className={`h-full rounded-full bg-[var(--info)] transition-[width] duration-700 ${
+              percent == null ? "w-1/3 animate-pulse opacity-65" : ""
+            }`}
+            style={percent == null ? undefined : { width: `${Math.max(1, percent)}%` }}
+          />
+        </div>
+      )}
       <p className="mt-2 text-caption text-white/30">
         预转码 · {preloadTaskSubtitle(task, presets)}
         {task.created_at && (
@@ -2818,8 +2861,25 @@ export function FinishedJobRow({ job }: { job: JobView }) {
   );
 }
 
+/** 「进行中」行的短进度尾缀：完整进度与进度条在详情视图的卡片上。 */
+function preloadProgressShort(task: PreloadTaskView): string | null {
+  const p = task.progress;
+  if (!p) return null;
+  if (p.phase === "downloading") {
+    return (p.total_bytes ?? 0) > 0
+      ? `取源中 ${Math.min(99, Math.round(((p.downloaded_bytes ?? 0) / (p.total_bytes ?? 1)) * 100))}%`
+      : "取源中";
+  }
+  if (p.phase === "finalizing") return "拼接登记中";
+  if (p.segment_index != null && (p.segment_total ?? 0) > 0) {
+    return `第 ${p.segment_index}/${p.segment_total} 段`;
+  }
+  return null;
+}
+
 /** 进行中的预转码任务（银玻璃总览的「进行中」行）。 */
 export function ActivePreloadRow({ task }: { task: PreloadTaskView }) {
+  const short = preloadProgressShort(task);
   return (
     <>
       <span className="grid w-6 shrink-0 place-items-center text-[var(--info)]">
@@ -2831,6 +2891,7 @@ export function ActivePreloadRow({ task }: { task: PreloadTaskView }) {
         </span>
         <span className="mt-0.5 block truncate text-sub text-[var(--text-muted)]">
           预转码 · {PRELOAD_STATUS_LABELS[task.status]} · 预估 {formatBytes(task.estimated_bytes)}
+          {short && <span className="tnum"> · {short}</span>}
         </span>
       </span>
     </>

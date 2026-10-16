@@ -12,6 +12,19 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
   return (await promise).data;
 }
 
+/** Worker 实时进度上报（活动页进行中卡片渲染；旧版 Worker 不发为 null）。 */
+export interface PreloadProgress {
+  /** downloading=取源中 / transcoding=转码中 / finalizing=拼接登记 */
+  phase?: string;
+  downloaded_bytes?: number;
+  total_bytes?: number;
+  /** 正在转的第几段（1 起） */
+  segment_index?: number;
+  segment_total?: number;
+  /** 预计剩余秒数（已完成段平均耗时 × 剩余段数） */
+  eta_seconds?: number;
+}
+
 export interface PreloadTaskView {
   id: number;
   target_file_id: number;
@@ -23,6 +36,7 @@ export interface PreloadTaskView {
   attempts: number;
   error: string | null;
   result_file_id: number | null;
+  progress: PreloadProgress | null;
   created_at: string | null;
   completed_at: string | null;
   updated_at: string | null;

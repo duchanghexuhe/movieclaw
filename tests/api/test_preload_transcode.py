@@ -157,7 +157,9 @@ def _upload_segment(client: TestClient, task: dict) -> None:
     subprocess.run(
         [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
          "-f", "lavfi", "-i", "testsrc2=duration=1:size=320x180:rate=10",
-         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(seg)],
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest", str(seg)],
         check=True, timeout=60,
     )
     put = client.put(
@@ -181,6 +183,8 @@ def _fake_probe(monkeypatch) -> None:
         lambda path: MediaSpec(
             resolution="1080p", video_codec="h264", hdr=None, bit_depth=8,
             duration_seconds=7200, bit_rate=3_900_000,
+            # 登记闸：产物没有音轨（源有）整件作废——探测结果必须带音轨
+            audio_streams=[{"codec": "aac"}], subtitle_streams=[{"codec": "subrip"}],
         ),
     )
 
@@ -401,6 +405,11 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
     assert derived is not None and derives_from == file_id
     assert derived.media_item_id is not None  # 播放枚举能找到它
     assert derived.derivation["preset_id"] == "portable_1080p"
+    # 登记行带产物流探测结果：决策引擎按它装配音轨/字幕轨——不填就是
+    # 「无音轨」转码计划，播放没声音没字幕
+    assert derived.audio_streams == [{"codec": "aac"}]
+    assert derived.subtitle_streams == [{"codec": "subrip"}]
+    assert derived.bit_rate == 3_900_000
     # 产物文件名带片名与码率（版本列表/下载直接显示）
     assert Path(derived.file_path).name == "示例 - 高清 1080p H.264 4Mbps.mkv"
 
@@ -429,6 +438,8 @@ def test_saver_preset_roundtrip_hevc(client, tmp_path, monkeypatch):
         lambda path: MediaSpec(
             resolution="1080p", video_codec="hevc", hdr=None, bit_depth=8,
             duration_seconds=7200, bit_rate=1_400_000,
+            audio_streams=[{"codec": "aac", "channels": 2}],
+            subtitle_streams=[{"codec": "subrip"}],
         ),
     )
     done = client.post(
@@ -437,18 +448,21 @@ def test_saver_preset_roundtrip_hevc(client, tmp_path, monkeypatch):
     assert done.status_code == 200, done.text
     derived_id = done.json()["data"]["file_id"]
 
-    async def _check() -> tuple[str | None, str, str]:
+    async def _check() -> tuple[str | None, str, str, list | None]:
         async with get_database().session() as session:
             row = await session.get(LibraryFile, derived_id)
             return (
                 row.video_codec if row else None,  # type: ignore[union-attr]
                 row.derivation["preset_id"],  # type: ignore[union-attr]
                 Path(row.file_path).name,  # type: ignore[union-attr]
+                row.audio_streams,  # type: ignore[union-attr]
             )
 
-    codec, preset_id, artifact_name = client.portal.call(partial(_check))  # type: ignore[attr-defined]
+    codec, preset_id, artifact_name, audio_streams = client.portal.call(partial(_check))  # type: ignore[attr-defined]
     assert codec == "hevc" and preset_id == "saver_1080p"
     assert artifact_name == "示例 - 省流 1080p HEVC 1.5Mbps.mkv"
+    # 登记行带音轨：决策引擎按它装配音频计划，播放才有声音
+    assert audio_streams == [{"codec": "aac", "channels": 2}]
 
 
 def test_complete_rejects_wrong_codec_for_preset(client, tmp_path, monkeypatch):
@@ -478,6 +492,92 @@ def test_complete_rejects_wrong_codec_for_preset(client, tmp_path, monkeypatch):
     )
     assert done.status_code == 400, done.text
     assert "HEVC" in done.json()["message"], done.text
+
+
+def test_complete_rejects_artifact_without_audio(client, tmp_path, monkeypatch):
+    """产物没有音轨（源有音轨）→ 整件作废：登记出无声片的代价是播放
+    没声音（决策引擎按「无音轨」装配），宁可整件重转。"""
+    file_id = _seed_file(client, tmp_path)  # 源行带 eac3 音轨
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    token = _pair_worker(client)
+    caps = {
+        "encoders": ["h264_nvenc", "hevc_nvenc"],
+        "filters": ["scale_cuda"],
+        "hw_decoders": ["h264", "hevc"],
+    }
+    claim = client.post(f"{_WORKER}/claim", json={"caps": caps}, headers=_worker_headers(token))
+    task = claim.json()["data"]["task"]
+    assert task is not None
+
+    _upload_segment(client, task)
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.preload_worker.probe_media",
+        lambda path: MediaSpec(
+            resolution="1080p", video_codec="hevc", hdr=None, bit_depth=8,
+            duration_seconds=7200, bit_rate=1_400_000,
+            audio_streams=[],  # 转码链丢了音频
+        ),
+    )
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
+    assert done.status_code == 400, done.text
+    assert "音轨" in done.json()["message"], done.text
+
+
+def test_progress_report_persists_payload(client, tmp_path, monkeypatch):
+    """进度上报落台账（活动页进行中卡片的数据源）：载荷净化入库、CLAIMED
+    翻 RUNNING、租约续约；认不出的字段不进库。"""
+    from functools import partial
+
+    file_id = _seed_file(client, tmp_path)
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    token = _pair_worker(client)
+    claim = client.post(f"{_WORKER}/claim", headers=_worker_headers(token))
+    assert claim.status_code == 200
+
+    resp = client.post(
+        f"{_WORKER}/tasks/{task_id}/progress",
+        json={
+            "phase": "transcoding",
+            "segment_index": 3,
+            "segment_total": 14,
+            "eta_seconds": 600,
+            "downloaded_bytes": 1_000,
+            "total_bytes": 2_000,
+            "junk": "不该进库",
+        },
+        headers=_worker_headers(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async def _check() -> PreloadTask:
+        async with get_database().session() as session:
+            from sqlmodel import select
+
+            from movieclaw_db.models import PreloadTask
+
+            return (
+                await session.execute(select(PreloadTask).where(PreloadTask.id == task_id))
+            ).scalar_one()
+
+    row = client.portal.call(partial(_check))  # type: ignore[attr-defined]
+    assert row.status == PreloadTaskStatus.RUNNING.value
+    assert row.progress == {
+        "phase": "transcoding",
+        "segment_index": 3,
+        "segment_total": 14,
+        "eta_seconds": 600,
+        "downloaded_bytes": 1000,
+        "total_bytes": 2000,
+    }
+    # 任务视图带出进度
+    view = client.get(f"{_PRELOAD}/tasks/{task_id}").json()["data"]
+    assert view["progress"]["segment_index"] == 3
+
+    # 领取与租约回队清进度：新执行不吃旧执行的最后进度
+    resp = client.post(f"{_PRELOAD}/tasks/{task_id}/cancel")
+    assert resp.status_code == 200, resp.text
 
 
 def test_hdr_tonemap_cuda_stays_full_gpu(client, tmp_path):
@@ -847,6 +947,8 @@ def test_local_executor_lands_artifact_under_dynamic_name(client, tmp_path, monk
         lambda path: MediaSpec(
             resolution="1080p", video_codec="hevc", hdr=None, bit_depth=8,
             duration_seconds=7200, bit_rate=1_500_000,
+            # 登记闸：产物没有音轨（源有）整件作废
+            audio_streams=[{"codec": "aac"}],
         ),
     )
 

@@ -18,13 +18,11 @@ class PreloadSetting(SettingSchema):
     """预转码的网页配置。
 
     Worker 凭证同样是逐台设备配对签发（device-auth.md），这里没有令牌字段。
+    服务端不设「启用」开关：配对 Worker 与下单都是用户的显式动作，配额又
+    逐单兜底——没有订单时队列什么都不做，一个拦派发的开关只会制造
+    「任务永远排队中却无人派发」的死状态（没有 UI 出口可打开它）。
     """
 
-    enabled: bool = Field(
-        default=False,
-        description="是否启用预转码任务队列（关闭后暂停派发，排队任务保留）；"
-        "存量部署升级后需在设置页手动打开",
-    )
     quota_bytes: int = Field(
         default=DEFAULT_PRELOAD_QUOTA_BYTES,
         gt=0,

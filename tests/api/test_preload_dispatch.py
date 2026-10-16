@@ -38,14 +38,6 @@ def client(tmp_path, monkeypatch):
         c.post(f"{_AUTH}/bootstrap", json=_ADMIN)
         c.post(f"{_AUTH}/login", json=_ADMIN)
         c.put("/api/v1/transcode-worker/config", json={"enabled": True})
-
-        async def _enable_preload() -> None:
-            from movieclaw_api.settings import PreloadSetting
-            from movieclaw_api.settings.store import get_setting_store
-
-            await get_setting_store().set(PreloadSetting(enabled=True))
-
-        c.portal.call(_enable_preload)  # type: ignore[attr-defined]
         yield c
 
     reset_remote_worker_registry()

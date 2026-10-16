@@ -262,7 +262,7 @@ class WorkerGUI:
         ttk.Checkbutton(config, text="仅接通电源时执行", variable=self.var_ac_only).grid(
             row=2, column=2, sticky=tk.W)
         self.var_realtime = tk.BooleanVar(value=True)
-        ttk.Checkbutton(config, text="接实时转码（边播边转；取消则只跑预转码）",
+        ttk.Checkbutton(config, text="接实时转码（播放优先，转码让位；关闭则只跑预转码）",
                         variable=self.var_realtime).grid(
             row=3, column=0, columnspan=2, sticky=tk.W, padx=(6, 0))
         self.var_autostart = tk.BooleanVar(value=False)

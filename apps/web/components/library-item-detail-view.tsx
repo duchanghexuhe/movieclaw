@@ -503,6 +503,9 @@ export function LibraryItemDetailView({
   useEffect(() => {
     refreshPreloadTasks();
   }, [refreshPreloadTasks]);
+  // 任务在 Worker 侧推进，设置页/任务中心各自轮询；本页是下单主路径，
+  // 同节奏跟随（转码是分钟级任务，15 秒足够），页面隐藏时自动暂停
+  useVisiblePolling(refreshPreloadTasks, 15_000);
   const handlePreloadCreate = useCallback(
     async (file: LibraryItemFile, presetId?: string) => {
       try {
@@ -520,6 +523,48 @@ export function LibraryItemDetailView({
         if (!ok) return;
         const task = await createPreloadTask(file.id, presetId);
         toast.success(`已加入转码队列（任务 #${task.id}），等 Worker 领取`);
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "下单失败，请稍后重试");
+      }
+    },
+    [confirm, refreshPreloadTasks, toast],
+  );
+  // 整季批量下单：合并预估一次确认，逐单串行排队（配额预检在服务端逐单做，
+  // 并行会互相抢份额）；部分失败时报成功数与首条原因——原盘/已是便携档的
+  // 文件由服务端拒绝，不阻塞其余下单
+  const handlePreloadCreateMany = useCallback(
+    async (files: LibraryItemFile[], presetId?: string) => {
+      if (files.length === 0) return;
+      try {
+        const estimates = await Promise.all(
+          files.map((f) => estimatePreload(f.id, presetId)),
+        );
+        const totalBytes = estimates.reduce((sum, e) => sum + e.estimated_bytes, 0);
+        const freeBytes = estimates[0]?.free_bytes ?? 0;
+        const sizeNote =
+          totalBytes > 0
+            ? `约多占 ${(totalBytes / 1024 ** 3).toFixed(1)} GB`
+            : "占用体积未知（源缺少时长信息）";
+        const ok = await confirm({
+          title: `把这一季的 ${files.length} 个文件预转码？`,
+          description: `${sizeNote}（当前剩余 ${(freeBytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后各集文件区会出现 1080p 低码率的可选版本。`,
+          confirmLabel: "加入转码队列",
+          cancelLabel: "先不",
+        });
+        if (!ok) return;
+        let done = 0;
+        let firstError: string | null = null;
+        for (const f of files) {
+          try {
+            await createPreloadTask(f.id, presetId);
+            done += 1;
+          } catch (e) {
+            firstError = firstError ?? (e instanceof Error ? e.message : "下单失败");
+          }
+        }
+        if (done > 0) toast.success(`已加入转码队列 ${done} 个，等 Worker 领取`);
+        if (firstError) toast.error(`${files.length - done} 个未能下单：${firstError}`);
         refreshPreloadTasks();
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "下单失败，请稍后重试");
@@ -1181,29 +1226,25 @@ export function LibraryItemDetailView({
               onRestoreFile={canManageLibraries ? restoreTrashedFile : undefined}
               onPurgeFile={canManageLibraries ? purgeTrashedFile : undefined}
               preloadTasks={preloadTasks}
-              onPreload={canManageLibraries ? handlePreloadCreate : undefined}
               onPreloadCancel={canManageLibraries ? handlePreloadCancel : undefined}
               onPreloadRetry={canManageLibraries ? handlePreloadRetry : undefined}
             />
           );
         })()}
 
-        {/* 「预转码」选版本弹窗（§8）：列条目全部在位文件，逐个看预估与任务状态 */}
-        {(() => {
-          const files = isMovie ? detail.files : (selectedSeriesEpisode?.files ?? []);
-          return (
-            <PreloadDialog
-              open={preloadDialogOpen}
-              onClose={() => setPreloadDialogOpen(false)}
-              title={detail.title}
-              files={files.filter((f) => f.state === "in_place" && !f.derivation)}
-              tasks={preloadTasks}
-              onPreload={canManageLibraries ? handlePreloadCreate : undefined}
-              onPreloadCancel={canManageLibraries ? handlePreloadCancel : undefined}
-              onPreloadRetry={canManageLibraries ? handlePreloadRetry : undefined}
-            />
-          );
-        })()}
+        {/* 「预转码」选版本弹窗（§8，下单唯一门面）：电影列全部版本；剧集列全季
+            分集——按季分组、整季一键下单、逐集可单转（§3 逐部/逐季/逐集） */}
+        <PreloadDialog
+          open={preloadDialogOpen}
+          onClose={() => setPreloadDialogOpen(false)}
+          title={detail.title}
+          files={detail.files.filter((f) => f.state === "in_place" && !f.derivation)}
+          tasks={preloadTasks}
+          onPreload={canManageLibraries ? handlePreloadCreate : undefined}
+          onPreloadMany={canManageLibraries ? handlePreloadCreateMany : undefined}
+          onPreloadCancel={canManageLibraries ? handlePreloadCancel : undefined}
+          onPreloadRetry={canManageLibraries ? handlePreloadRetry : undefined}
+        />
 
         {/* 外部词条像友情链接一样固定在文件区之后，继续使用原有的新窗口跳转；
             豆瓣在移动端沿用 App 唤起逻辑。 */}
@@ -2495,10 +2536,11 @@ function fileDirectory(filePath: string): string {
 }
 
 /**
- * 「预转码」选版本弹窗（preload-transcode.md §8 显眼入口）：把条目全部在位
- * 原生版本列出来，逐个展示转码任务状态与下单入口——文件区行内按钮之外的
- * 正门，多版本条目（4K + 1080p 并存）在这里一次看清。档位切换在弹窗顶部
- * （省流=默认，手机外网；高清=局域网大屏），行内按钮不带弹窗、走默认档。
+ * 「预转码」选版本弹窗（preload-transcode.md §8 显眼入口）：下单的唯一门面。
+ * 电影列全部版本；剧集列全季分集，按季分组——每季一个「整季下单」批量入口，
+ * 逐集仍可单转（§3 逐部/逐季/逐集）。档位切换在弹窗顶部（省流=默认，手机外网；
+ * 高清=局域网大屏），任务状态与预估逐行可见，多版本条目（4K + 1080p 并存）
+ * 在这里一次看清。
  */
 function PreloadDialog({
   open,
@@ -2507,16 +2549,19 @@ function PreloadDialog({
   files,
   tasks,
   onPreload,
+  onPreloadMany,
   onPreloadCancel,
   onPreloadRetry,
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
-  /** 只收在位且非派生的原生文件（弹窗是下单入口，产物行不进来） */
+  /** 只收在位且非派生的原生文件（弹窗是下单入口，产物行不进来）；剧集是全季分集 */
   files: LibraryItemFile[];
   tasks: PreloadTaskView[];
   onPreload?: (file: LibraryItemFile, presetId?: string) => void;
+  /** 整季批量下单：按季分组时每季一个入口；只收没有活跃任务的可转文件 */
+  onPreloadMany?: (files: LibraryItemFile[], presetId?: string) => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
@@ -2539,6 +2584,38 @@ function PreloadDialog({
   }, [open]);
 
   const selectedPreset = presetId ?? presets?.[0]?.id;
+  // 任务状态跟所选档位走：高清档已有任务不挡省流档下单（反之亦然）
+  const taskFor = (file: LibraryItemFile) =>
+    tasks.find(
+      (t) => t.target_file_id === file.id && t.preset_id === selectedPreset,
+    ) ?? null;
+  // 整季下单只收这季里还没有活跃任务的文件；一个都不剩时按钮不可点
+  const ACTIVE_STATUSES = ["queued", "claimed", "running"];
+  const activeFor = (file: LibraryItemFile) =>
+    tasks.find(
+      (t) =>
+        t.target_file_id === file.id &&
+        t.preset_id === selectedPreset &&
+        ACTIVE_STATUSES.includes(t.status),
+    ) ?? null;
+  // 剧集按季分组（电影无季号走平铺）：每季一个「整季下单」，逐集仍可单转
+  const hasSeasons = files.some((f) => f.season_number > 0);
+  const seasonGroups: [number, LibraryItemFile[]][] = [];
+  if (hasSeasons) {
+    const bySeason = new Map<number, LibraryItemFile[]>();
+    for (const f of files) {
+      const list = bySeason.get(f.season_number) ?? [];
+      list.push(f);
+      bySeason.set(f.season_number, list);
+    }
+    seasonGroups.push(...[...bySeason.entries()].sort(([a], [b]) => a - b));
+  }
+  const rowProps = {
+    presetId: selectedPreset,
+    onPreload,
+    onPreloadCancel,
+    onPreloadRetry,
+  };
   return (
     <Modal open={open} onClose={onClose} label="预转码" width="lg">
       <div className="p-6">
@@ -2571,83 +2648,135 @@ function PreloadDialog({
             ))}
           </div>
         )}
-        <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
-          {files.length === 0 && (
+        {files.length === 0 ? (
+          <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
             <p className="px-4 py-6 text-center text-sub text-[var(--text-faint)]">
               这个条目没有可转的原始版本。
             </p>
-          )}
-          {files.map((file) => {
-            // 任务状态跟所选档位走：高清档已有任务不挡省流档下单（反之亦然）
-            const task =
-              tasks.find(
-                (t) => t.target_file_id === file.id && t.preset_id === selectedPreset,
-              ) ?? null;
-            return (
-              <div
-                key={file.id}
-                className="flex items-center gap-3 bg-white/[0.015] px-4 py-3"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sub text-[var(--text)]">{file.file_name}</div>
-                  <div className="mt-0.5 text-caption text-[var(--text-faint)]">
-                    {[
-                      file.resolution ? formatVideoResolution(file.resolution) : null,
-                      file.hdr,
-                      formatBytes(file.size_bytes),
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
+          </div>
+        ) : hasSeasons ? (
+          <div className="mt-4 overflow-hidden rounded-xl border border-white/[0.06]">
+            {seasonGroups.map(([season, seasonFiles]) => {
+              const eligible = seasonFiles.filter((f) => !activeFor(f));
+              return (
+                <div key={season} className="border-b border-white/[0.05] last:border-b-0">
+                  <div className="flex items-center justify-between gap-3 bg-white/[0.03] px-4 py-2">
+                    <span className="text-caption font-medium text-[var(--text-muted)]">
+                      {seasonLabel(season, true)} · {seasonFiles.length} 集
+                    </span>
+                    {onPreloadMany && (
+                      <button
+                        type="button"
+                        disabled={eligible.length === 0}
+                        onClick={() => onPreloadMany(eligible, selectedPreset)}
+                        className={`shrink-0 rounded-full border px-3 py-1 text-caption font-medium transition ${
+                          eligible.length > 0
+                            ? "border-white/[0.14] text-[var(--text)] hover:border-white/[0.25]"
+                            : "border-white/[0.06] text-[var(--text-faint)]"
+                        }`}
+                      >
+                        {eligible.length > 0
+                          ? `整季下单 · ${eligible.length} 集`
+                          : "整季已在队列"}
+                      </button>
+                    )}
+                  </div>
+                  <div className="divide-y divide-white/[0.05]">
+                    {seasonFiles.map((file) => (
+                      <PreloadFileRow
+                        key={file.id}
+                        file={file}
+                        task={taskFor(file)}
+                        {...rowProps}
+                      />
+                    ))}
                   </div>
                 </div>
-                {task && (
-                  <span
-                    className={`shrink-0 rounded border px-1.5 py-px text-micro ${
-                      task.status === "failed"
-                        ? "border-[var(--warn)]/40 text-[var(--warn)]"
-                        : "border-white/15 text-[var(--text-muted)]"
-                    }`}
-                  >
-                    {PRELOAD_STATUS_LABELS[task.status]}
-                  </span>
-                )}
-                {task &&
-                  ["queued", "claimed", "running"].includes(task.status) &&
-                  onPreloadCancel && (
-                    <button
-                      type="button"
-                      onClick={() => onPreloadCancel(task)}
-                      className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
-                    >
-                      取消
-                    </button>
-                  )}
-                {task?.status === "failed" && onPreloadRetry && (
-                  <button
-                    type="button"
-                    onClick={() => onPreloadRetry(task)}
-                    className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
-                  >
-                    重试
-                  </button>
-                )}
-                {/* 终态（完成/取消/失败/失效）允许再下单：后端幂等只拦活跃态 */}
-                {(!task || !["queued", "claimed", "running"].includes(task.status)) &&
-                  onPreload && (
-                    <button
-                      type="button"
-                      onClick={() => onPreload(file, selectedPreset)}
-                      className="shrink-0 rounded-full border border-white/[0.14] px-3 py-1 text-caption font-medium text-[var(--text)] transition hover:border-white/[0.25]"
-                    >
-                      转码
-                    </button>
-                  )}
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
+            {files.map((file) => (
+              <PreloadFileRow key={file.id} file={file} task={taskFor(file)} {...rowProps} />
+            ))}
+          </div>
+        )}
       </div>
     </Modal>
+  );
+}
+
+/** 弹窗里的一行文件：规格摘要、任务状态徽章、取消/重试/下单。 */
+function PreloadFileRow({
+  file,
+  task,
+  presetId,
+  onPreload,
+  onPreloadCancel,
+  onPreloadRetry,
+}: {
+  file: LibraryItemFile;
+  task: PreloadTaskView | null;
+  presetId?: string;
+  onPreload?: (file: LibraryItemFile, presetId?: string) => void;
+  onPreloadCancel?: (task: PreloadTaskView) => void;
+  onPreloadRetry?: (task: PreloadTaskView) => void;
+}) {
+  return (
+    <div className="flex items-center gap-3 bg-white/[0.015] px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sub text-[var(--text)]">{file.file_name}</div>
+        <div className="mt-0.5 text-caption text-[var(--text-faint)]">
+          {[
+            file.resolution ? formatVideoResolution(file.resolution) : null,
+            file.hdr,
+            formatBytes(file.size_bytes),
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </div>
+      </div>
+      {task && (
+        <span
+          className={`shrink-0 rounded border px-1.5 py-px text-micro ${
+            task.status === "failed"
+              ? "border-[var(--warn)]/40 text-[var(--warn)]"
+              : "border-white/15 text-[var(--text-muted)]"
+          }`}
+        >
+          {PRELOAD_STATUS_LABELS[task.status]}
+        </span>
+      )}
+      {task && ["queued", "claimed", "running"].includes(task.status) && onPreloadCancel && (
+        <button
+          type="button"
+          onClick={() => onPreloadCancel(task)}
+          className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+        >
+          取消
+        </button>
+      )}
+      {task?.status === "failed" && onPreloadRetry && (
+        <button
+          type="button"
+          onClick={() => onPreloadRetry(task)}
+          className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+        >
+          重试
+        </button>
+      )}
+      {/* 终态（完成/取消/失败/失效）允许再下单：后端幂等只拦活跃态 */}
+      {(!task || !["queued", "claimed", "running"].includes(task.status)) && onPreload && (
+        <button
+          type="button"
+          onClick={() => onPreload(file, presetId)}
+          className="shrink-0 rounded-full border border-white/[0.14] px-3 py-1 text-caption font-medium text-[var(--text)] transition hover:border-white/[0.25]"
+        >
+          转码
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -2664,7 +2793,6 @@ function FileSection({
   onRestoreFile,
   onPurgeFile,
   preloadTasks,
-  onPreload,
   onPreloadCancel,
   onPreloadRetry,
 }: {
@@ -2679,7 +2807,6 @@ function FileSection({
   onPurgeFile?: (file: LibraryItemFile) => void;
   /** 预转码任务（preload-transcode.md §3）：按 target_file_id 对应文件行展示状态 */
   preloadTasks?: PreloadTaskView[];
-  onPreload?: (file: LibraryItemFile) => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
@@ -2704,7 +2831,7 @@ function FileSection({
       <div className="overflow-hidden rounded-xl border border-white/[0.04] bg-white/[0.015]">
         {files.map((file) => {
           // 一个源文件可能同时有多个档位的任务：活跃态优先展示，否则取最近一单
-          //（只按 target_file_id 匹配会让任意档位的任务挡住这行的预转码入口）
+          //——状态徽章永远跟最相关的一单走，而不是被任意一单顶掉
           const fileTasks =
             preloadTasks?.filter((t) => t.target_file_id === file.id) ?? [];
           const task =
@@ -2721,7 +2848,6 @@ function FileSection({
               onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
               onRestore={onRestoreFile ? () => onRestoreFile(file) : undefined}
               onPurge={onPurgeFile ? () => onPurgeFile(file) : undefined}
-              onPreload={onPreload ? () => onPreload(file) : undefined}
               onPreloadCancel={onPreloadCancel}
               onPreloadRetry={onPreloadRetry}
             />
@@ -2750,7 +2876,6 @@ function FileRow({
   onDelete,
   onRestore,
   onPurge,
-  onPreload,
   onPreloadCancel,
   onPreloadRetry,
 }: {
@@ -2760,7 +2885,6 @@ function FileRow({
   onDelete?: () => void;
   onRestore?: () => void;
   onPurge?: () => void;
-  onPreload?: () => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
@@ -2824,7 +2948,7 @@ function FileRow({
             预转码
           </span>
         )}
-        {/* 预转码：本行是源文件且该行有活跃/失败任务时展示状态；没下过单给「预转码」入口 */}
+        {/* 预转码：本行下过单时展示状态；下单入口只保留顶部操作排（§8 显眼入口） */}
         {preloadTask && file.state !== "trashed" && (
           <span
             className={`shrink-0 rounded border px-1.5 py-px text-micro ${
@@ -2860,21 +2984,6 @@ function FileRow({
               className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
             >
               取消
-            </button>
-          )}
-        {/* 终态（完成/取消/失败/失效）允许再下单；无任务时给默认入口 */}
-        {(!preloadTask ||
-          !["queued", "claimed", "running"].includes(preloadTask.status)) &&
-          onPreload &&
-          file.state === "in_place" &&
-          !file.derivation && (
-            <button
-              type="button"
-              onClick={onPreload}
-              title="预转码（提前转好 1080p 低码率版本，外网播放更省带宽）"
-              className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
-            >
-              预转码
             </button>
           )}
         {file.state === "trashed" && onRestore && (
