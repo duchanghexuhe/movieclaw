@@ -304,3 +304,39 @@ def test_preload_stop_routes_to_registered_stopper():
     client.preload_stop = stopped.append
     client._handle(None, {"type": "job.stop", "class": "preload", "task_id": 42})
     assert stopped == [42]
+
+
+def test_recv_json_timeout_is_not_disconnect():
+    """帧边界读超时=没消息：返回 None 让主循环继续等，不当断线重连。
+
+    回归锚点：服务端安静 5 秒（心跳间隔 15 秒必出现）Worker 自断重连，
+    NAS 侧表现为每隔几秒「上线→离线」循环、断开码 1005。
+    """
+    import json
+    import socket as _socket
+
+    import engine as rw
+
+    a, b = _socket.socketpair()
+    try:
+        ws = rw._WebSocket.__new__(rw._WebSocket)
+        ws._sock = a
+        ws._closed = False
+        ws._lock = threading.Lock()
+
+        # 空转超时：不抛异常，返回 None
+        assert ws.recv_json(timeout=0.2) is None
+        assert ws.recv_json(timeout=0.2) is None
+
+        # 对端发来文本帧（服务端→客户端不掩码）：正常解析成 dict
+        payload = json.dumps({"type": "x"}).encode()
+        b.sendall(bytes([0x81, len(payload)]) + payload)
+        assert ws.recv_json(timeout=1.0) == {"type": "x"}
+
+        # 对端发关闭帧：必须抛 OSError——这才是真断线
+        b.sendall(bytes([0x88, 0x00]))
+        with pytest.raises(OSError):
+            ws.recv_json(timeout=1.0)
+    finally:
+        a.close()
+        b.close()

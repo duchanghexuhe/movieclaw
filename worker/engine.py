@@ -854,6 +854,16 @@ class SourceReadProxy:
 # ---------------------------------------------------------------------------
 
 
+class _SocketIdle(Exception):
+    """recv 在帧边界处超时：连接没坏，只是暂时没消息。
+
+    不能做成 OSError 子类——上层 run_forever 把 OSError 一律当断线处理；
+    曾经帧边界超时与对端关闭都走 ``return None`` 同一条路，服务端安静
+    5 秒（心跳间隔 15 秒，必然出现）Worker 就自断重连，实测每隔几秒
+    「上线→离线」循环一整天。
+    """
+
+
 class _WebSocket:
     """RFC6455 客户端的最小实现（文本帧收发 + 心跳），够本协议使用。"""
 
@@ -909,7 +919,10 @@ class _WebSocket:
     def recv_json(self, timeout: float) -> dict | None:
         """收一条文本消息；超时返回 None，连接断开抛 OSError。"""
         self._sock.settimeout(timeout)
-        return self._read_message()
+        try:
+            return self._read_message()
+        except _SocketIdle:
+            return None
 
     def _read_message(self) -> dict | None:
         while True:
@@ -954,7 +967,9 @@ class _WebSocket:
                 chunk = self._sock.recv(count - len(chunks))
             except (socket.timeout, TimeoutError):
                 if not chunks:
-                    return None
+                    # 帧边界超时≠断线：让 recv_json 转成 None 继续等；
+                    # 半截数据卡住才算连接有问题，维持抛超时由上层断线
+                    raise _SocketIdle
                 raise
             if not chunk:
                 return None if not chunks else chunks
