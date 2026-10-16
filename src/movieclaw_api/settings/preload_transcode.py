@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from movieclaw_api.settings.base import SettingSchema, register_setting
@@ -35,6 +37,14 @@ class PreloadSetting(SettingSchema):
     )
     auto_cleanup: bool = Field(
         default=False, description="自动清理：开启后定期删除超过 N 天未播的预转码产物"
+    )
+    video_format: Literal["h264", "hevc"] = Field(
+        default="h264",
+        description=(
+            "预转码编码格式：h264 全设备兼容（省流 480p / 高清 720p，与播放页"
+            "清晰度同值）；hevc 同流量下清晰度更高（省流 1080p / 高清 1080p·4M），"
+            "但不支持的设备会回退服务器实时转码"
+        ),
     )
 
 

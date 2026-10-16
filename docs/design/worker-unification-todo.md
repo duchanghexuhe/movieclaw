@@ -5,6 +5,9 @@
 > 2026-10-16 追加：Worker 端收敛为单一程序（旧 preload_worker.py → worker.py、
 > realtime_worker.py → engine.py、preload_worker_gui.py → worker_gui.py），
 > 预转码自动调度本地优先 + prefer_remote 开关移除；下文旧文件名以改名注记保留。
+> 2026-10-16 再追加：预转码调度翻为 **Worker 优先**（在线 Worker 预算吃满后
+> 本地才兜底）——GPU Worker 比 NAS 核显快好几倍，单任务不该被本地慢槽抢走；
+> 本地执行器保留为 Worker 离线/满员时的兜底。
 
 ## TODO 看板（按依赖排序）
 

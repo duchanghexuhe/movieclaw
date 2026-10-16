@@ -15,7 +15,8 @@ NAS 的转码执行器——**一个程序两种活**，统一调度 v2 协议�
 | 文件 | 角色 |
 |------|------|
 | `worker.py` | CLI 主程序（`python worker.py --server …`） |
-| `worker_gui.py` | 图形界面（托盘常驻；`pythonw worker_gui.pyw`） |
+| `worker_gui.py` | 图形界面（托盘常驻；实现本体） |
+| `worker_gui.pyw` | 双击启动入口（pythonw 打开，无命令行窗口） |
 | `engine.py` | 内部引擎：WS 客户端 / 分片器 / 回环代理（实现细节，不单独运行） |
 | `single_instance.py` | 同机单实例防呆锁 |
 
@@ -30,14 +31,15 @@ NAS 的转码执行器——**一个程序两种活**，统一调度 v2 协议�
    python worker.py --server http://<NAS地址>:3000 --ffmpeg C:\tools\ffmpeg.exe
    ```
 
-   或图形界面：`python worker_gui.py`（配置：服务器 / ffmpeg / 本机并发
-   / 仅接电 / 实时开关 / 开机自启，全部即改即存）。
+   或图形界面：双击 `worker_gui.pyw`（pythonw 打开，无命令行窗口；从
+   终端 `python worker_gui.py` 运行可看输出调试。配置：服务器 / ffmpeg
+   / 本机并发 / 仅接电 / 开机自启，全部即改即存）。
 3. 首次运行打印配对码，浏览器打开打印的地址（NAS 的激活页）批准——
    批准后拿到 `scope=transcode` 的设备凭证，存进同目录 `worker.json`
    （旧部署的 `preload_worker.json` 自动沿用）。
 4. 挂机即可。**本机并发是全机唯一并发旋钮**：实时任务永远优先，预转码
-   占「并发−1」；并发=1 的机器只接实时任务。NAS 侧还有本地优先的自动
-   调度：NAS 空闲时预转码任务优先由 NAS 自己跑，忙时才推给 Worker。
+   占「并发−1」；并发=1 的机器只接实时任务。NAS 侧的自动调度以 Worker
+   优先：在线 Worker 的预算吃满后，剩余任务才由 NAS 本地兜底执行。
 
 ## 断点续转
 

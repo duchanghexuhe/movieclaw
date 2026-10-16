@@ -222,12 +222,12 @@ def test_push_accounting_bounds_queue_dispatch(client, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Q3 自动调度：本地优先 / 避让 / HDR 兜底
+# Q3 自动调度：Worker 优先 / 本地兜底 / 避让
 # ---------------------------------------------------------------------------
 
 
-def test_local_execution_takes_task_before_remote(client, tmp_path, monkeypatch):
-    """本地有硬件且空闲：任务由本地执行器跑（不推给 Worker）。"""
+def test_online_worker_takes_task_before_local(client, tmp_path, monkeypatch):
+    """Worker 优先：有在线 Worker 时任务推给 Worker，本地槽不动。"""
     import movieclaw_api.services.preload.dispatcher as dispatcher
 
     monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
@@ -238,21 +238,64 @@ def test_local_execution_takes_task_before_remote(client, tmp_path, monkeypatch)
 
     monkeypatch.setattr(dispatcher, "_run_local", fake_run)
     token = _pair_worker(client)
-    # hevc 源：本地软编真转码（h264 1080p SDR 源会被判定直拷形态转远程）
+    # hevc 源：本地软编可执行（h264 1080p SDR 源会被判定直拷形态在下单时拒掉）
+    file_id = _seed_file(client, tmp_path, hdr=None, codec="hevc", resolution="1080p")
+    with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
+        ws.send_json(_hello("win-first", max_jobs=2, roles=["realtime", "preload"]))
+        assert ws.receive_json()["type"] == "worker.accepted"
+        # 下单发生在 Worker 已注册之后：派单只会走远程
+        created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+        message = ws.receive_json()
+        assert message["type"] == "job.start" and message["task_id"] == created["id"]
+        assert not ran  # 本地槽没抢活
+
+
+def test_local_executor_picks_up_when_no_worker_online(client, tmp_path, monkeypatch):
+    """本地兜底：没有任何 Worker 在线时，任务由本地槽执行。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+
+    monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
+    ran: list[int] = []
+
+    def fake_run(task, file, command):  # 同步签名对齐真 _run_local
+        ran.append(task.id)
+
+    monkeypatch.setattr(dispatcher, "_run_local", fake_run)
     file_id = _seed_file(client, tmp_path, hdr=None, codec="hevc", resolution="1080p")
     created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
-    # 有一个在线 preload Worker 也不该抢走：本地优先
+    # create 的触发点是丢进事件循环的后台任务；在 portal 里同步补一轮，
+    # 保证断言时派单已确定跑完（不依赖后台任务的调度时机）
+    client.portal.call(dispatcher.dispatch_queued_tasks)
+    assert ran == [created["id"]]
+
+
+def test_full_worker_leaves_task_to_local(client, tmp_path, monkeypatch):
+    """Worker 在线但满员（预算 0）：任务落回本地槽，Worker 不收到 job.start。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+
+    monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
+    ran: list[int] = []
+
+    def fake_run(task, file, command):  # 同步签名对齐真 _run_local
+        ran.append(task.id)
+
+    monkeypatch.setattr(dispatcher, "_run_local", fake_run)
+    token = _pair_worker(client)
+    file_id = _seed_file(client, tmp_path, hdr=None, codec="hevc", resolution="1080p")
     with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
-        ws.send_json(_hello("win-local", max_jobs=2, roles=["realtime", "preload"]))
+        ws.send_json(_hello("win-full", max_jobs=1, roles=["realtime", "preload"]))
         assert ws.receive_json()["type"] == "worker.accepted"
-        assert ran and ran[0][0] == created["id"]
-        # Worker 不该收到 job.start：心跳后只有 ack
+        created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+        # 预算 = max_jobs−1 = 0：不会有 job.start；心跳确认连接正常
         ws.send_json({"type": "worker.heartbeat", "load": {}})
         assert ws.receive_json()["type"] == "worker.heartbeat.ack"
+        # create 触发的派单是后台任务，这里同步补一轮再断言
+        client.portal.call(dispatcher.dispatch_queued_tasks)
+        assert ran == [created["id"]]
 
 
 def test_local_video_copy_never_reaches_queue(client, tmp_path, monkeypatch):
-    """直拷形态（h264 1080p SDR 源 + 高清档）在下单时就被拒，进不了队列——
+    """直拷形态（h264 720p SDR 源 + 高清档）在下单时就被拒，进不了队列——
     调度器的直拷防御分支正常情况下到不了。"""
     import movieclaw_api.services.preload.dispatcher as dispatcher
 
@@ -263,9 +306,9 @@ def test_local_video_copy_never_reaches_queue(client, tmp_path, monkeypatch):
         ran.append(task.id)
 
     monkeypatch.setattr(dispatcher, "_run_local", fake_run)
-    file_id = _seed_file(client, tmp_path, hdr=None, codec="h264", resolution="1080p")
+    file_id = _seed_file(client, tmp_path, hdr=None, codec="h264", resolution="720p")
     response = client.post(
-        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "portable_1080p"}
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "premium"}
     )
     assert response.status_code == 400  # 「已经是便携档」直接拒绝
     assert not ran

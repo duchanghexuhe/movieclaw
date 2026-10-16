@@ -9,8 +9,8 @@
 
 硬件优先（用户拍板：全功率越快越好）：
 - Worker 上报本机能力（``claim`` 携带 ``encoders``/``gpu_filters``）；
-- SDR 源 + NVENC：硬解 → ``scale_cuda`` → NVENC 整链留 GPU（编码器随档位：
-  省流= ``hevc_nvenc``，高清= ``h264_nvenc``）；
+- SDR 源 + NVENC：硬解 → ``scale_cuda`` → NVENC 整链留 GPU（编码器随格式：
+  HEVC= ``hevc_nvenc``，H.264= ``h264_nvenc``）；
 - HDR 源 + NVENC：硬解 → 下载回内存 → 软件 ``tonemap``（上游 ffmpeg 没有
   jellyfin 的 ``tonemapx``/``tonemap_cuda``，色调映射只能 CPU；用 hable
   算法——上游 ``tonemap`` 的可选算法里高光滚降最接近 BT.2390 的观感）→
@@ -30,33 +30,75 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     _COLOR_CONVERT_INPUT,
 )
 
-#: 档位注册表（§2「档位是接口」）：加档只是新增枚举。省流档是用户拍板的
-#: 默认（预转码产物只给手机外网看，家里电视看原画）——HEVC 同画质省一半
-#: 流量，一部 2 小时电影约 1.5 GB；高清档留给局域网大屏。
-PRESET_SAVER_1080P = "saver_1080p"
-PRESET_PORTABLE_1080P = "portable_1080p"
-PRESET_DEFAULT = PRESET_SAVER_1080P
+#: 预转码编码格式（全局设置，下单时快照到任务行）：h264 全设备兼容；
+#: hevc 同流量下清晰度更高，但不支持的设备回退服务器实时转码。
+FORMAT_H264 = "h264"
+FORMAT_HEVC = "hevc"
+VIDEO_FORMATS = (FORMAT_H264, FORMAT_HEVC)
+FORMAT_DEFAULT = FORMAT_H264
 
-PRESETS: dict[str, dict] = {
-    PRESET_SAVER_1080P: {
+#: 档位注册表（§2「档位是接口」）：**只有「省流/高清」两个名字**——用户
+#: 不接触参数，规格由格式各自定义。分辨率档位与播放页清晰度对应（产物
+#: 高度 ≤ 播放页所选上限时直通/重封装命中，零转码）：
+#: - 省流 = 各编码下最省流量的点：H.264 480p·1.5M（= 播放页 480p 档），
+#:   HEVC 1080p·1.5M（原省流档原样——效率红利在这：同流量清晰度更高）；
+#: - 高清 = 各编码下更清晰的点：H.264 720p·3M（= 播放页 720p 档），
+#:   HEVC 1080p·4M（原高清档换编码，码率不动）。
+PRESET_SAVER = "saver"
+PRESET_PREMIUM = "premium"
+PRESET_IDS = (PRESET_SAVER, PRESET_PREMIUM)
+PRESET_DEFAULT = PRESET_SAVER
+
+_PRESET_SPECS: dict[str, dict] = {
+    PRESET_SAVER: {
         "short": "省流",
-        "title": "省流 1080p（HEVC · 视频上限 1.5 Mbps · 手机/外网）",
-        "height": 1080,
-        "maxrate": "1.5M",
-        "bufsize": "3M",
-        "audio_bitrate": "192k",
-        "video_codec": "hevc",
+        "variants": {
+            FORMAT_H264: {
+                "height": 480, "maxrate": "1.5M", "bufsize": "3M",
+                "audio_bitrate": "192k", "video_codec": "h264",
+            },
+            FORMAT_HEVC: {
+                "height": 1080, "maxrate": "1.5M", "bufsize": "3M",
+                "audio_bitrate": "192k", "video_codec": "hevc",
+            },
+        },
     },
-    PRESET_PORTABLE_1080P: {
+    PRESET_PREMIUM: {
         "short": "高清",
-        "title": "高清 1080p（H.264 · 视频上限 4 Mbps · 局域网/大屏）",
-        "height": 1080,
-        "maxrate": "4M",
-        "bufsize": "8M",
-        "audio_bitrate": "256k",
-        "video_codec": "h264",
+        "variants": {
+            FORMAT_H264: {
+                "height": 720, "maxrate": "3M", "bufsize": "6M",
+                "audio_bitrate": "256k", "video_codec": "h264",
+            },
+            FORMAT_HEVC: {
+                "height": 1080, "maxrate": "4M", "bufsize": "8M",
+                "audio_bitrate": "256k", "video_codec": "hevc",
+            },
+        },
     },
 }
+
+
+def effective_preset(preset_id: str, video_format: str | None) -> dict:
+    """档位 × 格式 → 与旧版同形的扁平档位 dict（下游零改动消费）。
+
+    未知格式（历史行 NULL）回退 H.264；未知档位回退默认档——登录验收/
+    显示路径的兜底，下单路径用 ``preset_available`` 做严格校验。
+    """
+    spec = _PRESET_SPECS.get(preset_id) or _PRESET_SPECS[PRESET_DEFAULT]
+    fmt = video_format if video_format in VIDEO_FORMATS else FORMAT_DEFAULT
+    variant = spec["variants"][fmt]
+    return {"id": preset_id, "short": spec["short"], **variant}
+
+
+def preset_available(preset_id: str, video_format: str) -> bool:
+    """下单/预估的严格校验：档位存在（格式 × 档位当前恒有组合）。"""
+    return preset_id in _PRESET_SPECS and video_format in VIDEO_FORMATS
+
+
+def presets_for_format(video_format: str) -> list[dict]:
+    """某格式下的全部档位（presets 接口/标题动态化的数据源）。"""
+    return [effective_preset(pid, video_format) for pid in PRESET_IDS]
 
 #: 断点续转的产物分段大小（§7）：64 MiB 一段，上传失败只重传一段。
 PRELOAD_PART_BYTES = 64 * 1024 * 1024
@@ -140,7 +182,7 @@ def _gpu_filters(
     return parts
 
 
-#: NVENC 编码器随档位：省流= HEVC（同画质省一半流量），高清= H.264。
+#: NVENC 编码器随格式：HEVC 同流量清晰度更高，H.264 全设备兼容。
 #: HEVC 的编码器名是 hevc_nvenc（2026-10-14 jf-ffmpeg 8.1.3 实测 -encoders
 #: 只此一名，无 h265_nvenc 别名），必须与 Worker 上报的 caps 名一致
 _NVENC_ENCODER_BY_CODEC = {"h264": "h264_nvenc", "hevc": "hevc_nvenc"}
@@ -195,7 +237,7 @@ def build_preload_command(
     *,
     source_path: str,
     output_path: str,
-    preset_id: str = PRESET_DEFAULT,
+    preset: dict,
     source: dict,
     hw_backend: str | None = None,
     worker_caps: dict | None = None,
@@ -210,9 +252,9 @@ def build_preload_command(
     ``worker_caps``：Worker 的能力集（``encoders``/``gpu_filters``/``filters``），
     用于判断 scale_cuda 与 tonemapx 可用性。
 
-    档位是**直拷判定的产品语义**（§2）：源 ≤1080p 且已是 H.264/SDR 时直拷。
+    档位是**直拷判定的产品语义**（§2）：源 ≤ 档位高度且已是 H.264/SDR 时
+    直拷（只属于 H.264 格式的档位）。
     """
-    preset = PRESETS[preset_id]
     height_cap = preset["height"]
     caps = worker_caps or {}
     encoders = {str(e).lower() for e in (caps.get("encoders") or [])}
@@ -263,7 +305,7 @@ def build_preload_command(
 
     if unusable_reason:
         return PreloadCommand(
-            argv=[], preset_id=preset_id, tone_map=needs_tone_map, video_copy=False,
+            argv=[], preset_id=preset["id"], tone_map=needs_tone_map, video_copy=False,
             hw_backend=None, skipped_subtitle_indexes=[], has_chapters=False,
             unusable_reason=unusable_reason,
         )
@@ -380,7 +422,7 @@ def build_preload_command(
 
     return PreloadCommand(
         argv=argv,
-        preset_id=preset_id,
+        preset_id=preset["id"],
         tone_map=needs_tone_map,
         video_copy=video_copy,
         hw_backend=hw_backend_used,

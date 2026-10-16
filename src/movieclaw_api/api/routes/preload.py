@@ -10,14 +10,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.api.deps import require_login
+from movieclaw_api.api.deps import require_admin, require_login
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.base import utc_isoformat
 from movieclaw_api.schemas.response import ApiResponse, ok
@@ -30,8 +30,10 @@ from movieclaw_api.services.library.duplicates import quality_label_of
 from movieclaw_api.services.preload import service as preload_service
 from movieclaw_api.services.preload.ffmpeg_preload import (
     PRESET_DEFAULT,
-    PRESETS,
+    effective_preset,
     estimate_size_bytes,
+    preset_available,
+    presets_for_format,
 )
 from movieclaw_db.engine import get_session
 from movieclaw_db.models import LibraryFile, MediaItem, PreloadTask
@@ -47,6 +49,10 @@ class PreloadCreatePayload(BaseModel):
 class PreloadEstimatePayload(BaseModel):
     file_id: int
     preset_id: str = PRESET_DEFAULT
+
+
+class PreloadSettingsPayload(BaseModel):
+    video_format: Literal["h264", "hevc"] = Field(description="预转码编码格式")
 
 
 class StaleCleanupPayload(BaseModel):
@@ -128,18 +134,62 @@ async def enriched_task_views(
     return views
 
 
+async def get_setting_store_dep():
+    from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    return await get_setting_store().get(PreloadSetting)
+
+
 @router.get(
     "/presets",
-    summary="可用档位",
+    summary="可用档位（标题随全局格式动态生成）",
     operation_id="preload.presets",
 )
-async def list_presets() -> ApiResponse[list[dict[str, str]]]:
+async def list_presets(
+    setting: Any = Depends(get_setting_store_dep),
+) -> ApiResponse[list[dict[str, str]]]:
     return ok(
         [
-            {"id": pid, "short": p.get("short", pid), "title": p["title"]}
-            for pid, p in PRESETS.items()
+            {
+                "id": preset["id"],
+                "short": preset["short"],
+                "title": preload_service.preset_title(preset),
+            }
+            for preset in presets_for_format(setting.video_format)
         ]
     )
+
+
+@router.get(
+    "/settings",
+    summary="预转码设置（编码格式）",
+    operation_id="preload.settings.show",
+)
+async def show_settings(
+    setting: Any = Depends(get_setting_store_dep),
+    _: Principal = Depends(require_admin),
+) -> ApiResponse[dict[str, str]]:
+    return ok({"video_format": setting.video_format})
+
+
+@router.put(
+    "/settings",
+    summary="保存预转码设置（编码格式）",
+    operation_id="preload.settings.set",
+)
+async def save_settings(
+    payload: PreloadSettingsPayload,
+    _: Principal = Depends(require_admin),
+) -> ApiResponse[dict[str, str]]:
+    """改格式只影响之后的下单：在途任务按下单时的格式快照继续跑。"""
+    from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    store = get_setting_store()
+    current = await store.get(PreloadSetting)
+    await store.set(current.model_copy(update={"video_format": payload.video_format}))
+    return ok({"video_format": payload.video_format}, message="预转码格式已保存")
 
 
 @router.post(
@@ -151,15 +201,17 @@ async def estimate(
     payload: PreloadEstimatePayload,
     session: AsyncSession = Depends(get_session),
     principal: Principal = Depends(require_login),
+    setting: Any = Depends(get_setting_store_dep),
 ) -> ApiResponse[dict[str, Any]]:
     """点「预转码」时先展示预估体积与当前剩余配额（§6 价格标签）。"""
     file = await preload_service.get_target_file(session, payload.file_id)
     await assert_library_visible(session, principal, file.library_id)  # type: ignore[arg-type]
-    preset = PRESETS.get(payload.preset_id)
-    if preset is None:
+    if not preset_available(payload.preset_id, setting.video_format):
         raise BadRequestException(f"未知档位：{payload.preset_id}")
-    estimated = estimate_size_bytes(duration_seconds=file.duration_seconds, preset=preset)
-    setting = await get_setting_store_dep()
+    estimated = estimate_size_bytes(
+        duration_seconds=file.duration_seconds,
+        preset=effective_preset(payload.preset_id, setting.video_format),
+    )
     used = await preload_service.preload_usage_bytes(session)
     return ok(
         {
@@ -169,13 +221,6 @@ async def estimate(
             "free_bytes": max(setting.quota_bytes - used, 0),
         }
     )
-
-
-async def get_setting_store_dep():
-    from movieclaw_api.settings import PreloadSetting
-    from movieclaw_api.settings.store import get_setting_store
-
-    return await get_setting_store().get(PreloadSetting)
 
 
 @router.get(
@@ -203,11 +248,15 @@ async def create_task(
     payload: PreloadCreatePayload,
     session: AsyncSession = Depends(get_session),
     principal: Principal = Depends(require_login),
+    setting: Any = Depends(get_setting_store_dep),
 ) -> ApiResponse[dict[str, Any]]:
     file = await preload_service.get_target_file(session, payload.file_id)
     await assert_library_visible(session, principal, file.library_id)  # type: ignore[arg-type]
     task = await preload_service.create_preload_task(
-        session, file_id=payload.file_id, preset_id=payload.preset_id
+        session,
+        file_id=payload.file_id,
+        preset_id=payload.preset_id,
+        video_format=setting.video_format,
     )
     view = (await enriched_task_views(session, [task]))[0]
     # v2 推送派单：下单即触发，不再等 Worker 轮询

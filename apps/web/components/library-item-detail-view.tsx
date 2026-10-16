@@ -516,7 +516,7 @@ export function LibraryItemDetailView({
             : "占用体积未知（源缺少时长信息）";
         const ok = await confirm({
           title: `把「${file.file_name}」预转码？`,
-          description: `${sizeNote}（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后文件区会出现一个 1080p 低码率的可选版本。`,
+          description: `${sizeNote}（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由 Worker 在后台闲时完成，完成后文件区会出现一个低码率的可选版本。`,
           confirmLabel: "加入转码队列",
           cancelLabel: "先不",
         });
@@ -548,7 +548,7 @@ export function LibraryItemDetailView({
             : "占用体积未知（源缺少时长信息）";
         const ok = await confirm({
           title: `把这一季的 ${files.length} 个文件预转码？`,
-          description: `${sizeNote}（当前剩余 ${(freeBytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后各集文件区会出现 1080p 低码率的可选版本。`,
+          description: `${sizeNote}（当前剩余 ${(freeBytes / 1024 ** 3).toFixed(1)} GB）。转码由 Worker 在后台闲时完成，完成后各集文件区会出现低码率的可选版本。`,
           confirmLabel: "加入转码队列",
           cancelLabel: "先不",
         });
@@ -2624,8 +2624,8 @@ function PreloadDialog({
           「{title}」的预转码
         </h3>
         <p className="mt-2 text-sub leading-6 text-[var(--text-muted)]">
-          提前转好的 <span className="text-white/80">1080p 低码率版本</span>：外网播放直接发小文件，
-          NAS 不用实时转码。由预转码 Worker 在后台完成（设置 → 转码），完成后文件区多出一个可选版本。
+          提前转好的 <span className="text-white/80">低码率版本</span>：外网播放直接发小文件，
+          NAS 不用实时转码。由转码 Worker 在后台闲时完成（设置 → 转码），完成后文件区多出一个可选版本。
         </p>
         {presets && presets.length > 1 && (
           // 胶囊底材与发现页 SourceSwitcher 逐类一致；选中态白系语言原样

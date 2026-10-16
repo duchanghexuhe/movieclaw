@@ -3,10 +3,12 @@
 队列、原子抢占、断点台账、租约回收全部沿用 ``service.py`` 的数据库状态
 机；这里负责**选执行者并把任务交给它**：
 
-- **本地优先**（Q3 自动调度）：NAS 有可用硬件且播放不吃紧时，任务由本机
-  后台执行器跑掉——产物直接落盘（不经 Worker 的下载/上传回路，快得多）；
-- **远程兜底**：本地没硬件/避让中/HDR 源装不出正确命令时，按 v2 推送
-  派单交给带 preload 角色的 Worker（数据面照旧走 REST）。
+- **Worker 优先**（Q3 自动调度，2026-10-16 由「本地优先」翻转）：在线
+  Worker 按预算把排队任务清到满员——GPU Worker 比 NAS 核显快好几倍，
+  单任务也不该被本地慢槽抢走；
+- **本地兜底**：Worker 离线/满员/避让中，且 NAS 有可用硬件、播放不吃紧
+  时，任务由本机后台执行器跑掉——产物直接落盘（不经 Worker 的下载/
+  上传回路）；HDR 源本机装不出正确命令的只能远程。
 
 不与播放抢资源的口径（占用制避让）：本机在跑的**播放**转码会话数 ≥1 时
 本地预转码不再起新任务（已起的继续跑完——省流档本来就是要占机器的活，
@@ -66,7 +68,7 @@ def _get_dispatch_lock() -> asyncio.Lock:
 
 
 async def dispatch_queued_tasks() -> None:
-    """调度排队任务：本地优先，远程 Worker 兜底。
+    """调度排队任务：Worker 优先，本地兜底。
 
     单飞：一轮进行中时再触发只记「要重跑」标记，本轮结束后自动补一轮——
     队列不会因为并发触发而漏派，也不会两个循环同时读容量互相超发。
@@ -87,7 +89,13 @@ async def dispatch_queued_tasks() -> None:
 async def _dispatch_round() -> None:
     """一轮派发（调用方保证持有派发锁）。"""
     dispatched = 0
-    # 本地能吃几个就先吃几个（每轮重读容量：占用是动态的）
+    # Worker 先吃（每轮实时记账：占用是动态的），队列空或全员满员为止
+    async with get_database().session() as session:
+        while True:
+            if await _dispatch_one_remote(session) is None:
+                break
+            dispatched += 1
+    # 本地兜底：Worker 没吃掉的（离线/满员）由本地槽消化（每轮重读容量）
     while _local_capacity() > 0:
         async with get_database().session() as session:
             claimed = await _claim_for(session, device_id=None)
@@ -96,7 +104,7 @@ async def _dispatch_round() -> None:
             task, file = claimed
             command = preload_service.build_task_command(task, file, worker_caps=None)
             if command["unusable_reason"] or command["video_copy"]:
-                # 本地装不出正确命令（HDR 无 tonemapx）或直拷形态：回队交给
+                # 本地装不出正确命令（HDR 无 tonemapx）或直拷形态：回队等
                 # 远程 Worker（jellyfin-ffmpeg 有 tonemapx；直拷的远程路径
                 # 已有）。**必须跳出本地循环**——队列头就是这个任务，留在
                 # 循环里会原样再抢一次
@@ -104,14 +112,8 @@ async def _dispatch_round() -> None:
                 break
             _run_local(task, file, command)
             dispatched += 1
-    # 远程派单：余量按 Worker 记账，队列空或全员满员为止
-    async with get_database().session() as session:
-        while True:
-            if await _dispatch_one_remote(session) is None:
-                break
-            dispatched += 1
     if dispatched:
-        logger.info("预转码调度：%d 个任务已分发（本地/远程）", dispatched)
+        logger.info("预转码调度：%d 个任务已分发（远程/本地）", dispatched)
 
 
 async def _dispatch_one_remote(session: AsyncSession) -> int | None:
@@ -236,7 +238,7 @@ def trigger_dispatch() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 本地执行器：NAS 后台跑软编预转码（本地优先路径）
+# 本地执行器：NAS 后台跑预转码（Worker 离线/满员时的兜底路径）
 # ---------------------------------------------------------------------------
 
 #: 进程内本地任务记账（task_id → 协程句柄）。服务重启后这里的内存丢了

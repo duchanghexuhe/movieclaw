@@ -116,9 +116,31 @@ export interface PreloadPreset {
   title: string;
 }
 
-/** 可用档位（省流在前=默认档）。 */
+/** 可用档位（省流在前=默认档；标题随全局格式动态生成）。 */
 export function getPreloadPresets(): Promise<PreloadPreset[]> {
   return unwrap(request<ApiEnvelope<PreloadPreset[]>>("/preload/presets"));
+}
+
+export type PreloadVideoFormat = "h264" | "hevc";
+
+export interface PreloadSettings {
+  /** 预转码编码格式：h264 全设备兼容；hevc 同流量清晰度更高 */
+  video_format: PreloadVideoFormat;
+}
+
+/** 预转码设置（管理员）。 */
+export function getPreloadSettings(): Promise<PreloadSettings> {
+  return unwrap(request<ApiEnvelope<PreloadSettings>>("/preload/settings"));
+}
+
+/** 保存预转码设置；改格式只影响之后的下单（在途任务按下单时快照跑）。 */
+export function savePreloadSettings(videoFormat: PreloadVideoFormat): Promise<PreloadSettings> {
+  return unwrap(
+    request<ApiEnvelope<PreloadSettings>>("/preload/settings", {
+      method: "PUT",
+      body: JSON.stringify({ video_format: videoFormat }),
+    }),
+  );
 }
 
 /** 体积预估（价格标签）。缺省档位由后端默认（省流）。 */

@@ -11,26 +11,62 @@ import {
   SettingsList,
   SettingsRow,
   SettingsSection,
+  SettingsTabs,
 } from "@/components/settings-ui";
 import {
   PRELOAD_STATUS_LABELS,
   type PreloadOverview,
   type PreloadPreset,
   type PreloadTaskView,
+  type PreloadVideoFormat,
   type StaleCleanupResult,
   cancelPreloadTask,
   cleanupStalePreload,
   getPreloadOverview,
   getPreloadPresets,
+  getPreloadSettings,
   listPreloadTasks,
   preloadTaskTitle,
   retryPreloadTask,
+  savePreloadSettings,
 } from "@/lib/api/preload";
 
 const GB = 1024 ** 3;
 
 function formatGB(bytes: number): string {
   return `${(bytes / GB).toFixed(1)} GB`;
+}
+
+/**
+ * 失败原因：长报错（ffmpeg stderr 尾巴服务端截到 2000 字符）折叠成一行 +
+ * 「查看详情」展开，短消息直接平铺。展开状态行内自管——每行任务独立。
+ */
+function TaskErrorText({ error }: { error: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const collapsible = error.includes("\n") || error.length > 100;
+  if (!collapsible) {
+    return <span className="mt-1 block text-[var(--warn)]">{error}</span>;
+  }
+  return (
+    <span className="mt-1 block text-[var(--warn)]">
+      <span
+        className={
+          expanded
+            ? "block whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+            : "block truncate"
+        }
+      >
+        {error}
+      </span>
+      <button
+        type="button"
+        className="mt-0.5 block text-caption underline underline-offset-2"
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {expanded ? "收起" : "查看详情"}
+      </button>
+    </span>
+  );
 }
 
 /**
@@ -71,7 +107,7 @@ export function PreloadStatsGrid({ overview }: { overview: PreloadOverview }) {
  * 「媒体库」分区的预转码设置（preload-transcode.md §6）。
  *
  * 管理任务队列（取消/重试）与「清理冷数据」（预览 → 执行）。Worker 的
- * 配对与授权在「设备」分区（与实时远程转码 Worker 同一套；两个 Worker
+ * 配对与授权在「设备」分区（与实时转码是同一个 Worker；两种活
  * 的运行状态都在「转码」页看——实时节看长连接，本节看任务队列）。
  */
 export function TranscodeSection() {
@@ -79,6 +115,9 @@ export function TranscodeSection() {
   const [tasks, setTasks] = useState<PreloadTaskView[] | null>(null);
   const [tasksError, setTasksError] = useState(false);
   const [presets, setPresets] = useState<PreloadPreset[]>([]);
+  // 编码格式：本地值即时切换（乐观更新），失败回滚到已保存值
+  const [videoFormat, setVideoFormat] = useState<PreloadVideoFormat>("h264");
+  const [savedFormat, setSavedFormat] = useState<PreloadVideoFormat>("h264");
   const [cleanupPreview, setCleanupPreview] = useState<StaleCleanupResult | null>(null);
   const [staleDays, setStaleDays] = useState("90");
   // 预览时的天数快照：确认执行用的是它，不是输入框的当前值——预览与确认
@@ -109,7 +148,31 @@ export function TranscodeSection() {
     getPreloadPresets()
       .then(setPresets)
       .catch(() => {});
+    getPreloadSettings()
+      .then((s) => {
+        setVideoFormat(s.video_format);
+        setSavedFormat(s.video_format);
+      })
+      .catch(() => {});
   }, []);
+
+  // 切格式即存：成功后重拉档位（标题随格式变）。失败回滚 + 报错。
+  const changeFormat = useCallback(
+    (next: PreloadVideoFormat) => {
+      if (next === savedFormat) return;
+      setVideoFormat(next);
+      savePreloadSettings(next)
+        .then((s) => {
+          setSavedFormat(s.video_format);
+          return getPreloadPresets().then(setPresets);
+        })
+        .catch((e) => {
+          setVideoFormat(savedFormat);
+          toast.error(e instanceof Error ? e.message : "保存失败，请稍后重试");
+        });
+    },
+    [savedFormat, toast],
+  );
 
   const previewCleanup = useCallback(async () => {
     setCleaning(true);
@@ -151,13 +214,34 @@ export function TranscodeSection() {
   return (
       <SettingsSection
         title="预转码"
-        description="预转码 Worker 闲时把指定影片提前转成小体积版本（默认省流档 1080p HEVC，约 0.8GB/小时；可选高清档 1080p H.264），外网播放时直接发小文件。Worker 在「设备」分区配对；任务进行中的实时进度（下载量/第几段/剩余时间）看「活动」页。"
+        description="转码 Worker 闲时把指定影片提前转成小体积版本，档位只有省流/高清两档；播放时选了对应清晰度就直接发预转文件，不用实时转码。同一个 Worker 播放时接实时单、闲时接预转码单，在「设备」分区配对；任务进度看「活动」页。"
       >
       {overview && (
         <div className="mb-4">
           <PreloadStatsGrid overview={overview} />
         </div>
       )}
+      <div className="mb-4">
+        <SettingsList>
+          <SettingsRow
+            label="预转码格式"
+            description={
+              videoFormat === "hevc"
+                ? "省流档即可到 1080p · 1.5M——同等流量比 H.264 清晰度高得多；高清档 1080p · 4M 画质更佳。近几年手机/平板及 Safari、Edge 支持；Firefox 和部分老设备不支持，会回退服务器实时转码。拿不准就选 H.264。"
+                : "所有设备都能直接播放——各类浏览器、老手机、电视盒通吃。省流档 480p、高清档 720p，与播放页清晰度对应，选了对应清晰度就直接用预转文件。推荐大多数部署使用。"
+            }
+          >
+            <SettingsTabs<PreloadVideoFormat>
+              tabs={[
+                { id: "h264", label: "H.264" },
+                { id: "hevc", label: "HEVC" },
+              ]}
+              value={videoFormat}
+              onChange={changeFormat}
+            />
+          </SettingsRow>
+        </SettingsList>
+      </div>
       {tasksError ? (
         <Banner tone="warn">
           任务列表加载失败。请检查与服务端的连接后重试
@@ -195,9 +279,7 @@ export function TranscodeSection() {
                     <>
                       {PRELOAD_STATUS_LABELS[task.status]} · 预估 {formatGB(task.estimated_bytes)}
                       {task.actual_bytes > 0 && ` · 实际 ${formatGB(task.actual_bytes)}`}
-                      {task.error && (
-                        <span className="mt-1 block text-[var(--warn)]">{task.error}</span>
-                      )}
+                      {task.error && <TaskErrorText error={task.error} />}
                     </>
                   }
                 >

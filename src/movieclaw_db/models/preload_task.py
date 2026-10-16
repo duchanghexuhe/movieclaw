@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import JSON, BigInteger, Column, ForeignKey, Index, Integer, Text
+from sqlalchemy import JSON, BigInteger, Column, ForeignKey, Index, Integer, String, Text
 from sqlmodel import Field
 
 from movieclaw_db.models.base import TimestampMixin
@@ -69,7 +69,15 @@ class PreloadTask(TimestampMixin, table=True):
         ),
         description="源文件（转码对象）；产物另立 library_file 行",
     )
-    preset_id: str = Field(default="saver_1080p", description="目标档位枚举（§2）")
+    preset_id: str = Field(default="saver", description="目标档位枚举（§2）")
+    video_format: str | None = Field(
+        default=None,
+        sa_column=Column(String(8), nullable=True),
+        description=(
+            "下单时快照的编码格式（h264/hevc）：改全局设置不影响在途任务；"
+            "NULL=格式维度上线前的历史行（读侧回退 h264）"
+        ),
+    )
 
     status: str = Field(
         default=PreloadTaskStatus.QUEUED,

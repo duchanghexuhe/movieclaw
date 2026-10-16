@@ -25,7 +25,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.exceptions import (
@@ -35,11 +35,13 @@ from movieclaw_api.exceptions import (
 )
 from movieclaw_api.services.media_probe import PROBE_SCHEMA_VERSION, MediaSpec
 from movieclaw_api.services.preload.ffmpeg_preload import (
+    FORMAT_DEFAULT,
     PRELOAD_PART_BYTES,
     PRESET_DEFAULT,
-    PRESETS,
     build_preload_command,
+    effective_preset,
     estimate_size_bytes,
+    preset_available,
 )
 from movieclaw_api.settings import PreloadSetting
 from movieclaw_api.settings.store import get_setting_store
@@ -73,8 +75,8 @@ _PRELOAD_ORIGIN = {"kind": "preload", "label": "预转码版本", "detail": None
 
 
 def _preset_of(task: PreloadTask) -> dict:
-    """任务的档位定义（历史任务的档位可能已被移除：回退默认档）。"""
-    return PRESETS.get(task.preset_id) or PRESETS[PRESET_DEFAULT]
+    """任务的档位定义（历史行的格式/档位异常时回退默认档的 H.264 形态）。"""
+    return effective_preset(task.preset_id, task.video_format)
 
 
 class PreloadQuotaExceeded(AppException):
@@ -150,6 +152,18 @@ def _bitrate_label(spec: str) -> str:
     if text.endswith("k"):
         return f"{text[:-1]}Kbps"
     return f"{text}bps"
+
+
+def preset_title(preset: dict) -> str:
+    """档位标题（下单弹窗胶囊的悬停提示）：省流（HEVC · 1080p · 1.5Mbps）。
+
+    规格随格式（用户只认「省流/高清」两个字），标题把实际规格亮出来。
+    """
+    codec = _CODEC_LABELS.get(preset.get("video_codec", "h264"), "H.264")
+    return (
+        f"{preset.get('short', '预转码')}（{codec} · {preset['height']}p"
+        f" · {_bitrate_label(preset['maxrate'])}）"
+    )
 
 
 def artifact_file_name(
@@ -237,14 +251,17 @@ async def create_preload_task(
     *,
     file_id: int,
     preset_id: str = PRESET_DEFAULT,
+    video_format: str = FORMAT_DEFAULT,
 ) -> PreloadTask:
     """下单：源文件 → 预转码任务（§3 入口；预估 + 配额预检后排队）。
 
+    - 格式在**下单时快照**到任务行：之后改全局设置不影响在途任务，
+      重试/断点续转也始终按下单时的格式装配命令；
     - 同源同档已有活跃任务时幂等返回现有任务（详情页按钮防连点）；
-    - 高清档的直拷判定（源已是 ≤1080p H.264 SDR）拒绝——没有要转的东西；
+    - 直拷判定命中（源已 ≤ 档位高度且是 H.264/SDR）拒绝——没有要转的东西；
     - 原盘目录、已有派生产物再派生同样拒绝。
     """
-    if preset_id not in PRESETS:
+    if not preset_available(preset_id, video_format):
         raise BadRequestException(f"未知档位：{preset_id}")
     file = await get_target_file(session, file_id)
     if file.is_disc():
@@ -270,25 +287,25 @@ async def create_preload_task(
     if existing is not None:
         return existing
 
+    preset = effective_preset(preset_id, video_format)
     command = build_preload_command(
         source_path=file.file_path,
         output_path="preview.mkv",
-        preset_id=preset_id,
+        preset=preset,
         source=_source_spec(file),
     )
     if command.video_copy:
-        # 直拷形态：源已经就是档位（≤1080p H.264 SDR），转出来是同一个文件——
-        # 明确拒绝而不是白耗一次上传下载
-        raise BadRequestException("这个版本已经是便携档（≤1080p H.264 SDR），无需转码")
+        # 直拷形态：源已经就是档位（≤档位高度的 H.264 SDR），转出来是同一个
+        # 文件——明确拒绝而不是白耗一次上传下载
+        raise BadRequestException("这个版本已经是便携档（≤档位高度的 H.264 SDR），无需转码")
 
-    estimated = estimate_size_bytes(
-        duration_seconds=file.duration_seconds, preset=PRESETS[preset_id]
-    )
+    estimated = estimate_size_bytes(duration_seconds=file.duration_seconds, preset=preset)
     await check_quota(session, needed_bytes=estimated)
 
     task = PreloadTask(
         target_file_id=file_id,
         preset_id=preset_id,
+        video_format=video_format,
         status=PreloadTaskStatus.QUEUED,
         estimated_bytes=estimated,
         part_bytes=PRELOAD_PART_BYTES,
@@ -300,7 +317,48 @@ async def create_preload_task(
         "预转码下单：file=%s → task=%s（预估 %.1f GB）",
         file_id, task.id, estimated / 1024**3,
     )
+    pruned = await prune_finished_tasks(session)
+    if pruned:
+        logger.info("预转码台账清理：删除 %d 条过期终态任务", pruned)
     return task
+
+
+#: 终态任务台账只保留最近 N 条：任务行只在下单时增长，下单时顺手清理即可
+#: 封顶。列表接口展示最近 100 条，N 留一倍余量——被清掉的旧任务不会出现在
+#: 用户眼前的列表里。
+FINISHED_TASK_KEEP = 200
+
+
+async def prune_finished_tasks(session: AsyncSession) -> int:
+    """终态任务只保留最近 ``FINISHED_TASK_KEEP`` 条，返回删除的行数。
+
+    只清终态（completed/failed/cancelled/invalidated）——活跃任务（排队/
+    领取/执行中）不在清理范围；进行中的实时进度与断点续转台账不受影响。
+    删任务行不动产物（``result_file_id`` 是任务指向产物的单向引用）。
+    """
+    finished = [
+        PreloadTaskStatus.COMPLETED,
+        PreloadTaskStatus.FAILED,
+        PreloadTaskStatus.CANCELLED,
+        PreloadTaskStatus.INVALIDATED,
+    ]
+    stale = (
+        (
+            await session.execute(
+                select(PreloadTask.id)
+                .where(PreloadTask.status.in_(finished))
+                .order_by(PreloadTask.created_at.desc())
+                .offset(FINISHED_TASK_KEEP)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not stale:
+        return 0
+    await session.execute(delete(PreloadTask).where(PreloadTask.id.in_(stale)))
+    await session.commit()
+    return len(stale)
 
 
 async def cancel_task(session: AsyncSession, task_id: int) -> PreloadTask:
@@ -505,7 +563,7 @@ def build_task_command(
     command = build_preload_command(
         source_path="source.mkv",
         output_path=ARTIFACT_UPLOAD_NAME,
-        preset_id=task.preset_id,
+        preset=_preset_of(task),
         source=_source_spec(file),
         hw_backend=hw_backend,
         worker_caps=worker_caps,
