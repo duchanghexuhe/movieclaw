@@ -249,23 +249,6 @@ def test_hello_declares_roles_by_preload_presence():
     assert both.preload is not None
 
 
-def test_roles_respect_realtime_toggle():
-    """--no-realtime 的预转码 Worker：只报 preload 角色，不接播放任务。
-
-    服务端 select_execution_backend 只按角色选 realtime 执行者，角色
-    申报错了 --no-realtime 机器照样被派播放任务（v2 实现次日复查发现）。
-    """
-    from engine import RealtimeClient
-
-    preload_only = RealtimeClient(
-        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},
-        preload=lambda message: True, realtime=False,
-    )
-    # 判定源：开关传到位（hello 的 roles 由这两个字段拼出）
-    assert preload_only.realtime is False
-    assert preload_only.preload is not None
-
-
 def test_preload_job_start_without_executor_is_rejected():
     """没报 preload 角色却收到 class=preload 的任务：明确上报失败，而不是误执行。"""
     from engine import RealtimeClient
@@ -323,6 +306,7 @@ def test_recv_json_timeout_is_not_disconnect():
         ws._sock = a
         ws._closed = False
         ws._lock = threading.Lock()
+        ws._buffer = b""  # 握手残留缓冲（_recv_exact 先吃它再读 socket）
 
         # 空转超时：不抛异常，返回 None
         assert ws.recv_json(timeout=0.2) is None

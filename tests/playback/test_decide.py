@@ -1585,3 +1585,110 @@ def test_unknown_profile_and_old_clients_keep_transcoding():
     assert decide_playback(dv(None, None), DV_TV, WITH_GPU).tier is transcode
     old_client = _replace(EXOPLAYER, hdr_passthrough=True)
     assert decide_playback(dv(8, True), old_client, WITH_GPU).tier is transcode
+
+
+# ---------------------------------------------------------------------------
+# 外网前置降档：家宽上行装不下源片码率 → 起播前直接转码（不弹提示，用户拍板）
+# ---------------------------------------------------------------------------
+
+
+def test_uplink_too_small_forces_transcode():
+    """外网会话源片码率超出家宽上行：直通档换成转码并透出 uplink_forced（网页端弹窗确认用）。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=5_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan), f"期望出计划，实际 {decision}"
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    assert decision.video.action == "transcode"
+    assert "家宽上行" in decision.reason, decision.reason
+    assert decision.uplink_forced is True
+
+
+def test_wide_uplink_still_hits_external_ceiling():
+    """上行再宽也有天花板：几十 G 的原盘不原样推给手机（先爆的是流量费不是线路）。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=100_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    assert "最高 1080p" in decision.reason, decision.reason
+    assert decision.uplink_forced is True
+    # 视频计划目标不超过 1080p 档
+    assert (decision.video.height or 0) <= 1080
+
+
+def test_source_within_ceiling_keeps_direct_play():
+    """源片码率本来就在天花板内（≤6M）：直连——转码不会更省流量还白烧 CPU。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=5_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=100_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.uplink_forced is False
+
+
+def test_below_floor_does_not_step_down():
+    """上行窄到连 480p（1.5M）都装不下：降档不参与——给了也必卡，交给卡顿提示兜底。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=1_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.uplink_forced is False
+
+
+def test_uplink_that_fits_keeps_direct_play():
+    """源片码率装得下：照常直通——不因为「在外网」就降档。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=6_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=30_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_no_uplink_budget_keeps_direct_play():
+    """内网 / 未配置上行（预算 None）：行为与从前完全一致。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_unknown_source_bitrate_keeps_direct_play():
+    """源片码率未知（老台账没探到）：无从比较，按「不降档」诚实处理。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=None), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=30_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_uplink_forces_transcode_over_audio_only_tier():
+    """HEVC 可直通、音频要单转的片：上行装不下时视频也不再 copy——
+    音频单转省下的带宽远不如视频降档，两件事不混。"""
+    decision = decide_playback(
+        media(video_codec="hevc", audio_tracks=(TRUEHD_71,), bit_rate_bps=54_000_000),
+        SAFARI_MAC, WITH_GPU, uplink_bps=30_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+
+
+def test_upline_budget_skips_keyframe_probe():
+    """上行把直通档前置换成转码后，视频不再 copy——关键帧采样（慢存储 IO）直接跳过。"""
+    # MKV 常规走 remux（视频仍 copy，要采样）；上行装不下时视频被强制转码，采样跳过
+    assert not needs_keyframe_probe(
+        media(bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=30_000_000,
+    )
+    # 没有上行预算时照旧要采样
+    assert needs_keyframe_probe(
+        media(bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+    )

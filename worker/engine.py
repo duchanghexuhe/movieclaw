@@ -45,6 +45,9 @@ PROTOCOL_VERSION = 2
 #: 心跳间隔与服务端静默判离线窗口（对齐 Mac 客户端的 45 秒）
 HEARTBEAT_SECONDS = 15.0
 SERVER_SILENCE_SECONDS = 45.0
+# ffmpeg 子进程不弹控制台窗：pythonw 启动时子进程无可继承的控制台，
+# 不加这个每次起 ffmpeg 都会自建黑窗。常量仅 Windows 有，其它平台取 0
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 #: ffmpeg 输出分片化 MP4 的片段时长（与服务端 PROGRESSIVE_FRAGMENT_US 一致）
 FRAGMENT_SECONDS = 0.5
 #: 取源代理的块大小与预取参数（对齐 Mac 的 SourceReadProxy）
@@ -864,6 +867,12 @@ class _SocketIdle(Exception):
     """
 
 
+#: 帧读到一半的收尾宽限。recv_json 的空等超时压得很短（见主循环注释），
+#: 大报文（job.start 带整条 ffmpeg 命令）会跨几个 TCP 段，后一段慢半拍
+#: 不该被当成断线。
+_FRAME_GRACE_S = 5.0
+
+
 class _WebSocket:
     """RFC6455 客户端的最小实现（文本帧收发 + 心跳），够本协议使用。"""
 
@@ -962,6 +971,11 @@ class _WebSocket:
 
     def _recv_exact(self, count: int) -> bytes | None:
         chunks = b""
+        # 握手响应可能与第一条 WS 帧挤在同一个 TCP 段里：先吃残留再读
+        # socket，否则这帧被当丢失、流解析从此错位
+        if self._buffer:
+            chunks, self._buffer = self._buffer[:count], self._buffer[count:]
+        grace_until: float | None = None
         while len(chunks) < count:
             try:
                 chunk = self._sock.recv(count - len(chunks))
@@ -970,7 +984,15 @@ class _WebSocket:
                     # 帧边界超时≠断线：让 recv_json 转成 None 继续等；
                     # 半截数据卡住才算连接有问题，维持抛超时由上层断线
                     raise _SocketIdle
-                raise
+                # 帧开了头才超时：多半是跨段报文的后一段慢了半拍，不是断线。
+                # 给一段宽限收完本帧，宽限烧完才按断线上抛——空等超时被压短
+                # 之后，没有这道宽限慢帧会被误杀（fc03ad2d 同类教训）
+                if grace_until is None:
+                    grace_until = time.monotonic() + _FRAME_GRACE_S
+                elif time.monotonic() > grace_until:
+                    raise
+                self._sock.settimeout(_FRAME_GRACE_S)
+                continue
             if not chunk:
                 return None if not chunks else chunks
             chunks += chunk
@@ -1241,6 +1263,7 @@ class RealtimeJob:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            creationflags=_NO_WINDOW,
         )
         if feeder is not None:
             feeder.start()
@@ -1423,7 +1446,6 @@ class RealtimeClient:
         max_jobs: int = 1,
         log: Callable[[str], None] | None = None,
         preload: Callable[[dict], bool] | None = None,
-        realtime: bool = True,
     ) -> None:
         self.server = server.rstrip("/")
         self.token = token
@@ -1435,9 +1457,6 @@ class RealtimeClient:
         # 预转码执行器（worker.process_task 的包装）：None=本客户端
         # 只报 realtime 角色，收到 class=preload 的 job.start 直接拒掉
         self.preload = preload
-        # realtime 开关只影响角色申报（--no-realtime 的机器不该被派播放任务，
-        # 但连接本身要维持——预转码派单走同一条 WS）
-        self.realtime = realtime
         self.jobs: dict[str, RealtimeJob] = {}
         self.jobs_lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -1493,11 +1512,7 @@ class RealtimeClient:
                     "encoders": self.caps.get("encoders", []),
                     "backends": ["nvenc"],
                     "max_jobs": self.max_jobs,
-                    "roles": (
-                        (["realtime"] if self.realtime else []) + ["preload"]
-                        if self.preload
-                        else ["realtime"]
-                    ),
+                    "roles": ["realtime", "preload"] if self.preload else ["realtime"],
                     "server_config": True,
                     "hardware": self.caps.get("hardware", {}),
                     "segment_types": ["fmp4"],
@@ -1515,10 +1530,13 @@ class RealtimeClient:
             self._current_ws = ws
             while not self.stop_event.is_set():
                 self._flush_outbox(ws)
-                # 短超时空转：任务线程投进 outbox 的状态消息最长 5s 就发出去
-                #（原来要等 15s/45s 的收包超时，服务端的速度采样长期欠采样）；
-                # 半开连接由下面的静默窗口与心跳线程共同判定
-                message = ws.recv_json(timeout=5.0)
+                # 短超时空转：任务线程投进 outbox 的状态消息最长要等一个超时
+                # 周期才发出去，而 job.accepted 服务端开会话时是**阻塞等待**
+                # 的——这里等多久，用户起播的「正在判断播放方式」就白转多久
+                # （2026-10-16 NAS 实测：5s 超时下远程首播稳定多转约 5 秒，
+                # 全部耗在派单→接单回执之间）。0.5s 让接单回执与进度及时出户；
+                # 判断半开连接靠下面的静默窗口与心跳线程，不靠这个值
+                message = ws.recv_json(timeout=0.5)
                 if message is None:
                     if time.time() - last_seen_box[0] > SERVER_SILENCE_SECONDS:
                         raise OSError(f"{int(SERVER_SILENCE_SECONDS)} 秒没有服务端消息")
@@ -1582,7 +1600,9 @@ class RealtimeClient:
             with self.jobs_lock:
                 job = self.jobs.pop(job_id, None)
             if job is not None:
-                self.log(f"NAS 要求停止任务 {job_id[-6:]}（force={force}）")
+                # force=True 是拖进度条重启（马上有新单接上）；不透传协议细节
+                suffix = "（拖动进度，重启）" if force else ""
+                self.log(f"停止播放转码 {job_id[-6:]}{suffix}")
                 job.stop(force)
         elif message_type == "job.pause":
             with self.jobs_lock:
@@ -1696,5 +1716,5 @@ class RealtimeClient:
         task_id = message.get("task_id")
         stopper = getattr(self, "preload_stop", None)
         if stopper is not None and task_id is not None:
-            self.log(f"NAS 抢占预转码任务 {task_id}（实时任务优先），停止转码")
+            self.log(f"预转码 {task_id} 停止（让位播放/取消，断点保留）")
             stopper(task_id)

@@ -111,7 +111,7 @@ def make_media(root: Path, name: str, *, codec: str, container: str) -> Path:
     return path
 
 
-async def _seed(path: Path, *, codec: str, container: str) -> int:
+async def _seed(path: Path, *, codec: str, container: str, bit_rate: int | None = None) -> int:
     async with get_database().session() as session:
         library = await LibraryRepository(session).create(
             name=f"库-{path.stem}", kind="movie", root_paths=[str(path.parent)]
@@ -127,7 +127,7 @@ async def _seed(path: Path, *, codec: str, container: str) -> int:
             file_path=str(path), size_bytes=path.stat().st_size,
             source=FileSource.SCANNED, state=FileState.IN_PLACE,
             container=container, video_codec=codec, resolution="240p",
-            duration_seconds=DURATION,
+            duration_seconds=DURATION, bit_rate=bit_rate,
             audio_streams=[{"codec": "aac", "channels": 2, "default": True}],
         )
         session.add(row)
@@ -416,3 +416,123 @@ def test_embedded_subtitle_is_served_over_http(client, tmp_path):
     assert plain.status_code == 200, plain.text
     assert plain.text.startswith("WEBVTT")
     assert "纯文本字幕" in plain.text
+
+
+# ---------------------------------------------------------------------------
+# 外网前置降档：外网 + 源片码率超出家宽上行 → 起播前直接转码（不弹提示）
+# ---------------------------------------------------------------------------
+
+def _fake_client_address(address: str):
+    """TestClient 的 client 是 "testclient"（非 IP，判定为取不到）——
+    把 client_address 替换成固定地址来模拟外网 / 内网来源。"""
+    return lambda request: address
+
+
+def test_wan_source_over_uplink_transcodes_before_stalling(client, tmp_path, monkeypatch):
+    """外网 + 源片 6 Mbps > 上行 2 Mbps：起播前直接转码，不用等卡了再提示。"""
+    from movieclaw_api.settings import PlaybackPolicySetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    async def _setup():
+        await get_setting_store().set(
+            PlaybackPolicySetting(software_transcode_enabled=True)
+        )
+
+    client.portal.call(_setup)
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
+    assert resp.status_code == 200, resp.text
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.playback.client_address",
+        _fake_client_address("1.2.3.4"),
+    )
+
+    path = make_media(tmp_path / "m", "wan", codec="h264", container="mp4")
+    file_id = client.portal.call(
+        partial(_seed, path, codec="h264", container="mp4", bit_rate=6_000_000)
+    )
+    data = start(client, file_id)
+    decision = data["decision"]
+    # 直通档在起播前换成转码：档 4（夹具固定无硬件走软件路径）
+    assert decision["tier"] == 4, decision["reason"]
+    assert "家宽上行" in decision["reason"], decision["reason"]
+    # 弹窗确认标记随计划透出：网页端拿它拦起播问「降档播还是原画质播」
+    assert decision["uplink_step_down"] is True
+
+    wait_for_segments(client, data, count=1)
+    assembled = fetch_whole_stream(client, data, tmp_path)
+    _run(["ffprobe", "-v", "error", str(assembled)])
+
+
+def test_wan_source_fitting_uplink_still_direct_plays(client, tmp_path, monkeypatch):
+    """外网但源片码率装得下：照常直通——不因为「在外网」就降档。"""
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.playback.client_address",
+        _fake_client_address("1.2.3.4"),
+    )
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 30})
+    assert resp.status_code == 200, resp.text
+
+    path = make_media(tmp_path / "m", "wan-fast", codec="h264", container="mp4")
+    file_id = client.portal.call(
+        partial(_seed, path, codec="h264", container="mp4", bit_rate=6_000_000)
+    )
+    data = start(client, file_id)
+    assert data["decision"]["tier"] == 0, data["decision"]["reason"]
+
+
+def test_lan_source_ignores_uplink_and_direct_plays(client, tmp_path, monkeypatch):
+    """内网来源走的是局域网速度：配了上行带宽也永不降档。"""
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.playback.client_address",
+        _fake_client_address("192.168.31.5"),
+    )
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
+    assert resp.status_code == 200, resp.text
+
+    path = make_media(tmp_path / "m", "lan", codec="h264", container="mp4")
+    file_id = client.portal.call(
+        partial(_seed, path, codec="h264", container="mp4", bit_rate=6_000_000)
+    )
+    data = start(client, file_id)
+    assert data["decision"]["tier"] == 0, data["decision"]["reason"]
+
+
+def test_unset_uplink_keeps_current_behavior(client, tmp_path, monkeypatch):
+    """没配置上行带宽：外网也按从前处理（直通，卡顿后由播放器提示兜底）。"""
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.playback.client_address",
+        _fake_client_address("1.2.3.4"),
+    )
+
+    path = make_media(tmp_path / "m", "unset", codec="h264", container="mp4")
+    file_id = client.portal.call(
+        partial(_seed, path, codec="h264", container="mp4", bit_rate=6_000_000)
+    )
+    data = start(client, file_id)
+    assert data["decision"]["tier"] == 0, data["decision"]["reason"]
+
+
+def test_manual_quality_overrides_uplink_step_down(client, tmp_path, monkeypatch):
+    """用户手动选了画质上限：他的选择优先——上行判定不参与（与 adapt_to_downlink 同一口径）。
+
+    手选 1080p 上限 + 源片 240p：分辨率不超上限照常直通。"""
+    from movieclaw_api.settings import PlaybackPolicySetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    async def _enable_software():
+        await get_setting_store().set(PlaybackPolicySetting(software_transcode_enabled=True))
+
+    client.portal.call(_enable_software)
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
+    assert resp.status_code == 200, resp.text
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.playback.client_address",
+        _fake_client_address("1.2.3.4"),
+    )
+
+    path = make_media(tmp_path / "m", "manual", codec="h264", container="mp4")
+    file_id = client.portal.call(
+        partial(_seed, path, codec="h264", container="mp4", bit_rate=6_000_000)
+    )
+    data = start(client, file_id, max_height=1080)
+    assert data["decision"]["tier"] == 0, data["decision"]["reason"]

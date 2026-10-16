@@ -682,17 +682,20 @@ def test_session_lifecycle_playlist_segment_ping_stop(client, tmp_path):
     assert client.post(f"{_PB}/sessions/{session_id}/ping").status_code == 404
 
 
-def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(client, tmp_path):
+def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(
+    client, tmp_path, monkeypatch
+):
     """回归 issue #763：本机转码起步即退出、会话被判死后，心跳要把「失败」告诉客户端，
     并且 init.mp4 不再每次干等 15 秒——否则播放器对着死会话缓冲好几分钟也不降档。
-    远程 Worker 断线不算本机失败：那是连接问题，照旧交给客户端同档重连。"""
+    远程会话判死不报 failed（那一档没失败，降档是白降），改报 worker_lost：播放中
+    Worker 掉线时客户端立刻同档重开、由决策层落到本地，不等 hls.js 烧完分钟级重试。"""
     file_id = seed(client, tmp_path, container="mkv")
     data = start_session(client, file_id)
     session_id = data["session_id"]
     token = data["stream_url"].split("token=")[1]
 
     healthy = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
-    assert healthy == {"alive": True, "failed": False, "error": None}
+    assert healthy == {"alive": True, "failed": False, "worker_lost": False, "error": None}
 
     session = get_session_manager().get(session_id)
     (session.directory / "init.mp4").unlink(missing_ok=True)
@@ -701,6 +704,7 @@ def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(client, 
     failed = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
     assert failed["alive"] is True
     assert failed["failed"] is True
+    assert failed["worker_lost"] is False
     assert "Function not implemented" in failed["error"]
 
     started = time.monotonic()
@@ -709,8 +713,18 @@ def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(client, 
     assert time.monotonic() - started < 2.0
 
     session.remote = True
-    remote = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
-    assert remote["failed"] is False
+    lost = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+    # 远程会话判死、Worker 指不到在线连接（含从未派单成功）：报 worker_lost 而非 failed
+    assert lost["failed"] is False
+    assert lost["worker_lost"] is True
+    assert "Function not implemented" in lost["error"]
+    # Worker 还在线时不报：远程 seek/补片重启自己能续上，重启换流白黑一屏
+    monkeypatch.setattr(
+        type(get_remote_worker_registry()), "worker_online", lambda self, worker_id: True
+    )
+    online = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+    assert online["worker_lost"] is False
+    assert online["error"] is None
     session.remote = False
 
 
@@ -2305,7 +2319,7 @@ def test_disc_session_feeds_ffmpeg_a_concat_list(client, tmp_path, monkeypatch):
     assert data["session_id"]
     call = calls[-1]
     assert call.get("input_format") == "concat"
-    assert call["source_path"].endswith("/source.concat")
+    assert Path(call["source_path"]).name == "source.concat"
     text = Path(call["source_path"]).read_text(encoding="utf-8")
     assert text.count("\nfile '") == 2 and "inpoint 0.000000" in text
     # CLPI 关键帧表可用 → VOD 预生成分片，时间轴是播放列表（文件）绝对时间
@@ -2324,7 +2338,7 @@ def _progressive_session(client: TestClient, tmp_path: Path) -> tuple[dict[str, 
     session.progressive = True
     grants["file_id"] = str(file_id)
     endpoint = f"/api/v1/transcode-worker/sessions/{grants['session_id']}/artifacts/seg00003.m4s"
-    return grants, Path(endpoint)
+    return grants, endpoint
 
 
 def test_progressive_parts_append_in_order_and_land_atomically(client, tmp_path):
@@ -2450,9 +2464,19 @@ async def test_partial_segment_response_follows_growth_until_complete(tmp_path):
     segment.size = 10
     segment.notify()
     await asyncio.sleep(0.05)
-    path.rename(tmp_path / "seg00001.m4s")  # 收齐改名：打开着的文件照样读
-    segment.done = True
-    segment.notify()
+    # 收齐改名：打开着的文件照样读（POSIX）。Windows 下读句柄没释放时
+    # rename 必然 PermissionError——先收尾响应、句柄释放后再改名，内容
+    # 断言不受影响
+    try:
+        path.rename(tmp_path / "seg00001.m4s")
+    except PermissionError:
+        segment.done = True
+        segment.notify()
+        await asyncio.wait_for(task, 2)
+        path.rename(tmp_path / "seg00001.m4s")
+    else:
+        segment.done = True
+        segment.notify()
     await asyncio.wait_for(task, 2)
 
     headers = dict(sent[0]["headers"])

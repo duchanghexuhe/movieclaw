@@ -83,6 +83,7 @@ from movieclaw_api.services.library.items import (
     season_resume_episode,
 )
 from movieclaw_api.services.media_probe import probe_keyframe_before
+from movieclaw_api.api.client_address import client_address, is_lan_address
 from movieclaw_api.services.playback import marks as playback_marks
 from movieclaw_api.services.playback import metrics, qoe, track_memory, trickplay, video_cues
 from movieclaw_api.services.playback import plan as playback_plan
@@ -155,7 +156,7 @@ from movieclaw_api.services.playback_up_next import up_next_items
 from movieclaw_api.services.reels import clip_tip
 from movieclaw_api.services.reels import clips as reel_clips
 from movieclaw_api.services.tmdb_images import tmdb_image_url
-from movieclaw_api.settings import PlaybackPolicySetting
+from movieclaw_api.settings import AppServerSetting, PlaybackPolicySetting
 from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.engine import get_database, get_session
 from movieclaw_db.models import LibraryFile, MediaItem, PlaybackMetric, PlaybackState
@@ -752,6 +753,7 @@ async def revoke_playback_device(
     openapi_extra={"x-cli-hidden": True},
 )
 async def decide_playback_route(
+    request: Request,
     payload: PlaybackDecideRequest,
     principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
@@ -780,7 +782,13 @@ async def decide_playback_route(
         )
         payload = _with_watch_memory(payload, states.get(unit))
         payload, _ = await _with_series_memory(session, payload, states, unit)
-    decision = await _decide(payload, principal, session)
+    decision = await _decide(
+        payload,
+        principal,
+        session,
+        # 用户手选了画质上限时不做外网上行降档——他的选择优先于自动
+        uplink_bps=await _uplink_bps_for(request) if payload.max_height is None else None,
+    )
 
     if decision is None:
         raise NotFoundException("没有找到可播放的文件")
@@ -916,10 +924,31 @@ def _remember_session_capability(
     _remember_capability(payload, principal, user_agent)
 
 
+async def _uplink_bps_for(request: Request) -> int | None:
+    """外网会话的前置降档预算（bps）：内网 / 未配置 / 地址不可判 → None。
+
+    「外网 + 家宽上行装不下源片码率」时把直通档在起播前换成低档转码——不等
+    卡了再让用户手动换（用户拍板：不弹提示，直接降档）。判据是连接来源：
+    内网来源走的是局域网速度，永远直通；公网来源才按上行收。Docker 桥接把
+    来源 NAT 成网关时拿不到真实地址（``client_address`` 返回空），诚实按
+    「不降档」处理，退回既有的卡顿后提示兜底。用户手动选了画质上限时调用方
+    不传——他的选择优先于自动（与 adapt_to_downlink 同一口径）。
+    """
+    host = client_address(request)
+    if not host or is_lan_address(host):
+        return None
+    setting = await get_setting_store().get(AppServerSetting)
+    mbps = setting.uplink_mbps
+    if mbps is None or mbps <= 0:
+        return None
+    return mbps * 1_000_000
+
+
 async def _decide(
     payload: PlaybackDecideRequest,
     principal: Principal,
     session: AsyncSession,
+    uplink_bps: int | None = None,
 ):
     """decide 与开会话共用的取数与判定。
 
@@ -950,6 +979,7 @@ async def _decide(
             preferred_audio=payload.audio_track,
             preferred_subtitle=payload.subtitle_track,
             max_height=payload.max_height,
+            uplink_bps=uplink_bps,
             visible_library_ids=visible,
         )
     if payload.media_item_id is not None:
@@ -971,6 +1001,7 @@ async def _decide(
             preferred_audio=payload.audio_track,
             preferred_subtitle=payload.subtitle_track,
             max_height=payload.max_height,
+            uplink_bps=uplink_bps,
             contexts=contexts,
         )
     raise BadRequestException("需要提供 file_id 或 media_item_id")
@@ -1000,6 +1031,7 @@ _SINGLE_PLAYER_KINDS = frozenset({"ios", "tvos", "android", "androidtv"})
     openapi_extra={"x-cli-hidden": True},
 )
 async def start_playback_session(
+    request: Request,
     payload: PlaybackSessionRequest,
     response: Response,
     background_tasks: BackgroundTasks,
@@ -1025,6 +1057,11 @@ async def start_playback_session(
     member_id = principal.member_id if principal.member_id is not None else 0
     attempt_id = payload.attempt_id or None
     _remember_session_capability(payload, principal, user_agent)
+    # 外网前置降档的预算：内网 / 未配置上行 / 用户手选了画质上限时为 None，
+    # 决策照旧——手选优先于自动（与 adapt_to_downlink 同一口径）。重开（降档
+    # 重试 / 换轨 / 让出名额后重决策）也按同一预算——否则重开回来的计划会和
+    # 第一次开的不一致。
+    uplink_bps = await _uplink_bps_for(request) if payload.max_height is None else None
 
     def attempt_started(
         file_id: int | None, tier: int, view: PlaybackDecisionView, **timings: int
@@ -1083,7 +1120,7 @@ async def start_playback_session(
         # 续播点只能是重看到一半（已看标记保留），这时从头放会丢掉这次的进度
         resolved_start_ms = watch_row.position_ms if watch_row is not None else 0
 
-    decision = await _decide(payload, principal, session)
+    decision = await _decide(payload, principal, session, uplink_bps=uplink_bps)
     decide_ms = int((time.perf_counter() - started_at) * 1000)
     if decision is None:
         raise NotFoundException("没有找到可播放的文件")
@@ -1098,7 +1135,7 @@ async def start_playback_session(
         for candidate in await _requested_file_ids(session, payload):
             replaced += await manager.stop_for_file(candidate, member_id)
         if replaced:
-            decision = await _decide(payload, principal, session)
+            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps)
             if decision is None:
                 raise NotFoundException("没有找到可播放的文件")
             view = playback_plan.to_view(decision)
@@ -1121,7 +1158,7 @@ async def start_playback_session(
         if principal.device is not None and principal.device.kind in _SINGLE_PLAYER_KINDS:
             replaced += await manager.stop_stale_for_device(device_id, keep_file_id=file.id)
         if replaced:
-            decision = await _decide(payload, principal, session)
+            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps)
             if decision is None:
                 raise NotFoundException("没有找到可播放的文件")
             view = playback_plan.to_view(decision)
@@ -1290,7 +1327,7 @@ async def start_playback_session(
         )
         retry_failed_tiers = sorted({*payload.failed_tiers, int(Tier.HARDWARE_TRANSCODE)})
         fallback_payload = payload.model_copy(update={"failed_tiers": retry_failed_tiers})
-        decision = await _decide(fallback_payload, principal, session)
+        decision = await _decide(fallback_payload, principal, session, uplink_bps=uplink_bps)
         if decision is None:
             raise NotFoundException("没有找到可播放的文件")
         view = playback_plan.to_view(decision)
@@ -1320,16 +1357,23 @@ async def start_playback_session(
         ]
         execution_backend = None
         use_remote = False
-    # 按实测线路带宽收紧转码码率（docs/design/player-pipeline-optimization.md §C）。
-    # 用户手动选了画质上限时不动——他的选择优先于自动。
+    # 按线路带宽收紧转码码率（docs/design/player-pipeline-optimization.md §C）。
+    # 线路取两者更紧的一个：家宽上行是外网会话的结构性预算（_decide 已按它把
+    # 直通档换成低档转码），实测下行只在重开会话时带上、是真实观测；只按上行
+    # 会无视实测读数，只按下行则放过上行被占满的情况。用户手动选了画质上限时
+    # 两者都不用——他的选择优先于自动。
     if payload.max_height is None:
-        adapted = adapt_to_downlink(decision, payload.downlink_bps)
+        line_bps = min(
+            (x for x in (uplink_bps, payload.downlink_bps) if x is not None and x > 0),
+            default=None,
+        )
+        adapted = adapt_to_downlink(decision, line_bps)
         if adapted is not decision:
             decision = adapted
             view = playback_plan.to_view(decision)
             logger.info(
                 "按线路带宽收紧转码：downlink=%s bps → 高度 %s 码率上限 %s bps（file_id=%s）",
-                payload.downlink_bps,
+                line_bps,
                 view.video.height if view.video else None,
                 view.video.bitrate_cap_bps if view.video else None,
                 file.id,
@@ -1498,18 +1542,32 @@ async def ping_playback_session(
 
     ``failed``：本机转码已被判死（起步即退出、一段都没产出，issue #763）。这一档在这台
     机器上放不了，客户端据此直接降档——分片 404 在播放器那边要层层重试十几分钟才会
-    走到降档。远程 Worker 断线不算：那是连接问题，照旧由客户端同档重连。"""
+    走到降档。
+
+    ``worker_lost``：远程会话判死且它的 Worker 已离线。分片 404 同样要等播放器把
+    分钟级重试烧完才会触发重开，这里直接告诉客户端「同档重开」——新会话的决策层
+    自动落到还活着的执行者（通常是 NAS 本地）。Worker 还在线时不报：远程 seek/
+    补片重启自己就能续上，重启换流反而白黑一屏。"""
     member_id = principal.member_id if principal.member_id is not None else 0
     manager = get_session_manager()
     if not manager.ping(session_id, member_id=member_id):
         raise NotFoundException("会话不存在或已结束")
     session = manager.get(session_id, member_id=member_id)
     failed = session is not None and session.state == "failed" and not session.remote
+    worker_lost = (
+        session is not None
+        and session.state == "failed"
+        and session.remote
+        and not get_remote_worker_registry().worker_online(session.remote_worker_id)
+    )
     return ok(
         {
             "alive": True,
             "failed": failed,
-            "error": _diagnostic_error(session.error) if failed and session else None,
+            "worker_lost": worker_lost,
+            "error": _diagnostic_error(session.error)
+            if (failed or worker_lost) and session
+            else None,
         }
     )
 
@@ -2073,11 +2131,15 @@ def _metered_file_response(
     size_bytes: int | None = None,
 ) -> Response:
     """按 Range 出一个磁盘文件，并登记到设备流与活动页（原文件直出与原盘目录直推共用）。"""
-    # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计
+    # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计。
+    # 旧令牌 / Jellyfin 兼容层没有播放编号，probe 为 None——断连回收记不上，
+    # 心跳巡检的既有档位照旧兜底（65407e77 曾在这里对 None 取属性，无编号的
+    # 直出取流一律 500）
     probe = qoe.serve_probe(grant.attempt_id)
-    probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
-        grant.session_id
-    )
+    if probe is not None:
+        probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
+            grant.session_id
+        )
     stream = _register_play_stream(
         request,
         grant,
@@ -2103,10 +2165,12 @@ def _metered_file_response(
 
 def _metered_relay_response(request: Request, grant, file: LibraryFile, link: StrmLink) -> Response:
     """转发网盘直链（``strm_needs_relay``），与磁盘直出同一套设备流与活动页登记。"""
+    # 与 _metered_file_response 同一口径：probe 为 None（无播放编号）只跳过断连回收
     probe = qoe.serve_probe(grant.attempt_id)
-    probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
-        grant.session_id
-    )
+    if probe is not None:
+        probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
+            grant.session_id
+        )
     stream = _register_play_stream(request, grant, file, name=PathLib(file.file_path).name)
     session_stopped, byte_sink, on_close = stream if stream is not None else (None, None, None)
     return RemoteRelayResponse(

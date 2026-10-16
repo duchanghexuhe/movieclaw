@@ -206,6 +206,46 @@ def _startup_dir() -> Path:
     return Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup"
 
 
+#: GUI 日志的落盘文件：与 worker.json 同目录。文本框超 400 行就滚动裁剪，
+#: 重启即清空——排查「起播慢」这类时序问题要对着服务端日志比时间戳，
+#: 留不住现场就无从查起。
+LOG_FILE = Path(__file__).with_name("worker-gui.log")
+_LOG_ROTATE_BYTES = 5 * 1024 * 1024
+
+
+def _append_log_file(line: str) -> None:
+    """一行日志带时间戳追加进文件；写失败静默——日志绝不能拖垮 GUI。"""
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > _LOG_ROTATE_BYTES:
+            LOG_FILE.replace(LOG_FILE.with_name("worker-gui.old.log"))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with LOG_FILE.open("a", encoding="utf-8", errors="replace") as f:
+            f.write(f"{stamp} | {line}\n")
+    except OSError:
+        pass
+
+
+def _fmt_eta(seconds: object) -> str:
+    try:
+        secs = int(seconds or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if secs <= 0:
+        return ""
+    if secs < 60:
+        return "剩余不足 1 分"
+    minutes = secs // 60
+    if minutes < 60:
+        return f"剩余约 {minutes} 分"
+    return f"剩余约 {minutes // 60} 时 {minutes % 60} 分"
+
+
+def _fmt_bytes(nbytes: float) -> str:
+    if nbytes >= 1024 ** 3:
+        return f"{nbytes / 1024 ** 3:.1f}GB"
+    return f"{nbytes / 1024 ** 2:.0f}MB"
+
+
 class WorkerGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -224,6 +264,7 @@ class WorkerGUI:
         root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
         self._install_tray()
         root.after(120, self._poll_queue)
+        _append_log_file(f"—— GUI 启动（PID {os.getpid()}）——")
 
     # -- UI 构建 -------------------------------------------------------------
 
@@ -260,14 +301,10 @@ class WorkerGUI:
         ).grid(row=2, column=1, sticky=tk.W, padx=(52, 0))
         self.var_ac_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="仅接通电源时执行", variable=self.var_ac_only).grid(
-            row=2, column=2, sticky=tk.W)
-        self.var_realtime = tk.BooleanVar(value=True)
-        ttk.Checkbutton(config, text="接实时转码（播放优先，转码让位；关闭则只跑预转码）",
-                        variable=self.var_realtime).grid(
-            row=3, column=0, columnspan=2, sticky=tk.W, padx=(6, 0))
+            row=3, column=0, sticky=tk.W, padx=(6, 0))
         self.var_autostart = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="开机自启", variable=self.var_autostart,
-                        command=self._toggle_autostart).grid(row=3, column=2, sticky=tk.W)
+                        command=self._toggle_autostart).grid(row=3, column=1, sticky=tk.W)
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill=tk.X, **pad)
@@ -290,10 +327,6 @@ class WorkerGUI:
         self.var_ffmpeg.set(self.config.get("ffmpeg") or "")
         self.var_concurrency.set(int(self.config.get("concurrency") or 1))
         self.var_ac_only.set(bool(self.config.get("ac_only")))
-        # v2 默认开实时（统一调度主推形态）；老配置里明确存过 false 的尊重原值
-        self.var_realtime.set(
-            bool(self.config.get("realtime", True)) if "realtime" in self.config else True
-        )
         self.var_autostart.set((_startup_dir() / STARTUP_BAT_NAME).exists())
 
     # -- 动作 ----------------------------------------------------------------
@@ -311,7 +344,6 @@ class WorkerGUI:
             "ffmpeg": self.var_ffmpeg.get().strip(),
             "concurrency": max(1, min(int(self.var_concurrency.get() or 1), 8)),
             "ac_only": bool(self.var_ac_only.get()),
-            "realtime": bool(self.var_realtime.get()),
         }
 
     def _start(self) -> None:
@@ -330,7 +362,6 @@ class WorkerGUI:
             name=self.config.get("name") or "Preload Worker",
             concurrency=config["concurrency"],
             ac_only=config["ac_only"],
-            realtime=config["realtime"],
             on_token=lambda token: save_config({**self.config, "token": token}),
             status_cb=self._on_runtime_event,
         )
@@ -379,12 +410,45 @@ class WorkerGUI:
         self.ui_queue.put((kind, fields))
 
     def _log(self, line: str) -> None:
+        _append_log_file(line)
         self.txt_log.configure(state=tk.NORMAL)
         self.txt_log.insert(tk.END, line + "\n")
         if float(self.txt_log.index("end-1c").split(".")[0]) > 400:
             self.txt_log.delete("1.0", "100.0")  # 超过 400 行滚动裁剪
         self.txt_log.see(tk.END)
         self.txt_log.configure(state=tk.DISABLED)
+
+    def _refresh_tasks_label(self) -> None:
+        """状态栏的任务行：轮询 progress_view，显示每个在跑任务的实时进度。"""
+        if self.runtime is None:
+            return
+        rows: list[str] = []
+        for name, prog in self.runtime.progress_view():
+            phase = prog.get("phase")
+            if phase == "downloading":
+                done = int(prog.get("downloaded_bytes") or 0)
+                total = int(prog.get("total_bytes") or 0)
+                if total:
+                    rows.append(
+                        f"· {name} — 下载源 {done / total * 100:.0f}%"
+                        f"（{_fmt_bytes(done)}/{_fmt_bytes(total)}）"
+                    )
+                else:
+                    rows.append(f"· {name} — 下载源文件…")
+            elif phase == "transcoding":
+                idx = max(int(prog.get("segment_index") or 0), 1)
+                total_seg = int(prog.get("segment_total") or 0)
+                pct = (idx - 1) / total_seg * 100 if total_seg else 0
+                eta = _fmt_eta(prog.get("eta_seconds"))
+                eta_text = f"，{eta}" if eta else ""
+                rows.append(f"· {name} — 转码 {pct:.0f}%（第 {idx}/{total_seg} 段{eta_text}）")
+            elif phase == "finalizing":
+                rows.append(f"· {name} — 拼接收尾（服务端校验登记）")
+            else:
+                rows.append(f"· {name} — 准备中")
+        text = "任务：\n" + "\n".join(rows) if rows else "任务：—"
+        if text != self.lbl_slots.cget("text"):
+            self.lbl_slots.configure(text=text)
 
     def _poll_queue(self) -> None:
         try:
@@ -408,16 +472,6 @@ class WorkerGUI:
                         self._log(fields["line"])
                     elif kind == "pairing":
                         self.lbl_connection.configure(text="等待配对：请在浏览器批准配对码")
-                    elif kind == "task":
-                        name = fields.get("name") or ""
-                        phase = fields.get("phase") or ""
-                        suffix = {
-                            "claimed": "（转码中）", "done": "（完成）", "failed": "（失败）",
-                        }.get(phase, "")
-                        if phase == "claimed":
-                            self.lbl_slots.configure(text=f"任务：槽 {fields.get('slot')} → {name} {suffix}")
-                        else:
-                            self.lbl_slots.configure(text=f"任务：{name} {suffix}")
         except queue.Empty:
             pass
         # 运行态刷新
@@ -427,6 +481,7 @@ class WorkerGUI:
                     text=f"已连接 {self.runtime.server}"
                          + ("（使用电池，已暂停）" if self.runtime.ac_only and on_battery() else "")
                 )
+            self._refresh_tasks_label()
             # 停止收尾完成：复位按钮与标签，允许再次启动
             if (
                 self.runtime.stop_event.is_set()
@@ -438,6 +493,7 @@ class WorkerGUI:
                 self.btn_start.configure(state=tk.NORMAL)
                 self.btn_stop.configure(state=tk.DISABLED)
                 self.lbl_connection.configure(text="已停止")
+                self.lbl_slots.configure(text="任务：—")
         # 退出等待：收尾完成（或 30s 兜底）后真正关窗
         if self._exiting:
             if self.runtime is None or time.monotonic() - self._exit_at > 30:

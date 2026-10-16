@@ -151,6 +151,17 @@ class PlaybackDeliveryView(BaseModel):
     reason: str | None = Field(default=None, description="服务端为什么选这个播放方式（中文）")
 
 
+class PlaybackStallHintView(BaseModel):
+    """服务端视角推断的卡顿迹象（不是播放器实测）：null = 没观察到迹象。
+
+    服务端看不到播放器的缓冲，两条判据都是迹象——等分片等太久（转码端
+    供不上片）、拉流速率低于码率（线路吃不下）；怎么推的在 reason 里说清。
+    """
+
+    cause: str = Field(description="decode=转码端供不上片；bandwidth=客户端拉流低于码率")
+    reason: str = Field(description="中文一句话，说清依据（含读数）")
+
+
 class ActivePlaybackSessionView(BaseModel):
     """一台设备正在进行的播放会话。"""
 
@@ -177,6 +188,8 @@ class ActivePlaybackSessionView(BaseModel):
     # 网盘直链（play_method=remote）为 null。seek 重启的一瞬间会话可能正在重建，
     # 这一轮会短暂显示成直连，下一轮轮询即恢复
     delivery: PlaybackDeliveryView | None = None
+    # 服务端推断的卡顿迹象（cause + 一句依据）；网盘直链与已暂停的会话为 null
+    stall: PlaybackStallHintView | None = None
     started_at: datetime
     last_report_at: datetime
 
@@ -487,6 +500,10 @@ class PlaybackDecisionView(BaseModel):
     disc: str | None = None
     #: 目录直推时服务端选中的主播放列表文件名（如 ``00800.mpls``），播放器按名字选主片
     disc_playlist: str | None = None
+    #: 计划是外网线路降档的结果（源码率超出上行/外网上限）。网页端拿它拦一下
+    #: 起播、弹窗确认「降档播还是原画质播」；不认它的客户端直接播＝自动降档。
+    #: 推荐档就是计划本身的 ``video.height``，不用另带字段。
+    uplink_step_down: bool = False
 
     # outcome == "consent"
     cost_hint: str | None = None

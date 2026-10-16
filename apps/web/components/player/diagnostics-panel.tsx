@@ -355,6 +355,8 @@ export function DiagnosticsPanel({
             </ActionLine>
           ) : null}
           {diagnostics?.worker_id ? (
+            // worker_version 不并入这行：Windows Worker 把它写死成主机名风格
+            // 的占位串，显示出来会被读成第二个 Worker（worker/engine.py 握手）
             <ActionLine>
               Worker：<span className="break-all">{diagnostics.worker_id}</span>
               {diagnostics.worker_online === true
@@ -362,13 +364,7 @@ export function DiagnosticsPanel({
                 : diagnostics.worker_online === false
                   ? " · 离线"
                   : " · 切换中"}
-            </ActionLine>
-          ) : null}
-          {diagnostics?.worker_version || diagnostics?.ffmpeg_version ? (
-            <ActionLine>
-              {diagnostics.worker_version ? `Worker ${diagnostics.worker_version}` : null}
-              {diagnostics.worker_version && diagnostics.ffmpeg_version ? " · " : null}
-              {diagnostics.ffmpeg_version ? `ffmpeg ${diagnostics.ffmpeg_version}` : null}
+              {diagnostics.ffmpeg_version ? ` · ffmpeg ${diagnostics.ffmpeg_version}` : null}
             </ActionLine>
           ) : null}
           {diagnostics?.worker_platform || diagnostics?.worker_arch ? (

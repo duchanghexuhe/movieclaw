@@ -47,6 +47,9 @@ CONFIG_FILE = (
 )
 PROGRESS_SECONDS = 60
 PART_BYTES_DEFAULT = 64 * 1024 * 1024
+# ffmpeg 子进程不弹控制台窗：pythonw 启动时子进程无可继承的控制台，
+# 不加这个每段 ffmpeg 都会自建黑窗。常量仅 Windows 有，其它平台取 0
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 #: 内网 NAS 地址直连 opener：urllib 默认读进程环境里的 http_proxy——挂机的
 #: 机器带着 Clash 等代理环境变量时，控制面 REST 与大文件传输会被绕去代理
@@ -175,7 +178,8 @@ def run_ffmpeg(
     停止路径之外（进程退出兜底）杀掉它。
     """
     proc = subprocess.Popen(
-        [ffmpeg, *argv], cwd=workdir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        [ffmpeg, *argv], cwd=workdir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        creationflags=_NO_WINDOW,
     )
     if register is not None:
         register(proc)
@@ -220,7 +224,8 @@ def probe_caps(ffmpeg: str) -> dict:
     caps: dict = {"encoders": [], "filters": [], "hw_decoders": []}
     try:
         probe = subprocess.run(
-            [ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True, timeout=15
+            [ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True,
+            timeout=15, creationflags=_NO_WINDOW,
         )
         out = probe.stdout
         first = (out.splitlines() or [""])[0]
@@ -228,9 +233,9 @@ def probe_caps(ffmpeg: str) -> dict:
             # hello 的 ffmpeg_version 字段：状态页 Worker 列表按它展示
             caps["ffmpeg_version"] = first[len("ffmpeg version "):].split()[0]
         caps["hardware"] = {"cpu_cores": os.cpu_count() or 0, "memory_bytes": _total_memory()}
-        out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW).stdout
         caps["encoders"] = sorted(set(out.split()) & {"h264_nvenc", "hevc_nvenc"})
-        out = subprocess.run([ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run([ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW).stdout
         tokens = set(out.split())
         caps["filters"] = sorted(
             {"scale_cuda", "hwupload_cuda", "hwdownload", "tonemapx", "tonemap_cuda"} & tokens
@@ -281,8 +286,12 @@ def process_task(
     *,
     stop: threading.Event | None = None,
     register=None,  # Callable[[subprocess.Popen], None] | None
+    progress: dict | None = None,
 ) -> bool:
     """执行一个任务；返回是否成功（失败已上报）。
+
+    ``progress`` 是调用方的进度台账（如 WorkerRuntime 传给 GUI 轮询的
+    dict）：本函数原地更新 phase/段位/ETA，调用方随时可读；不传则自用。
 
     转码按段推进（§7 断点续转）：每段独立 ffmpeg（-ss/-t），传完一段服务端
     台账 +1；重领时 resume_parts 之前的段直接跳过——被打断只重转缺的段。
@@ -313,7 +322,8 @@ def process_task(
     # 1) 进度上报线程（续约 + 活动页实时进度）：共享 dict 主线程更新、
     #    上报线程快照发送（CPython dict 读写在 GIL 下原子，不需要锁）。
     #    先于下载启动——慢网络下大源下载也要续约，下载进度活动页才看得到
-    progress: dict = {}
+    if progress is None:
+        progress = {}
     seg_times: list[float] = []
     progress_stop = threading.Event()
 
@@ -491,7 +501,6 @@ def load_config(overrides: dict | None = None) -> dict:
             config[key] = value
     config.setdefault("concurrency", 1)
     config.setdefault("ac_only", False)
-    config.setdefault("realtime", True)
     return config
 
 
@@ -541,7 +550,6 @@ class WorkerRuntime:
         name: str = "Preload Worker",
         concurrency: int = 1,
         ac_only: bool = False,
-        realtime: bool = False,
         on_token=None,  # Callable[[str], None] | None
         status_cb=None,  # Callable[..., None] | None
     ) -> None:
@@ -551,14 +559,16 @@ class WorkerRuntime:
         self.name = name
         self.concurrency = max(1, min(int(concurrency), 8))
         self.ac_only = ac_only
-        self.realtime = realtime
         self.on_token = on_token
         self.status_cb = status_cb or (lambda *a, **k: None)
         self.stop_event = threading.Event()
         self.api: Api | None = None
         self.caps: dict = {}
-        self.tasks: dict[int, str] = {}  # slot -> display（GUI 显示当前任务）
+        self.tasks: dict[int, str] = {}  # task_id -> display（GUI 显示当前任务）
         self._tasks_lock = threading.Lock()
+        # 在跑任务的进度台账（task_id -> process_task 原地更新的 dict）：
+        # progress_view() 给 GUI 状态栏轮询
+        self._progress: dict[int, dict] = {}
         # 预转码并发闸：同时在跑的分段转码数。注意这是**本机**闸（电源/停止
         # 之外的唯一本地限制）——服务端按 max_concurrency−1 派单，这里再拦
         # 一道防派单与断线重连交错时短暂超发
@@ -598,12 +608,10 @@ class WorkerRuntime:
         nvenc = "h264_nvenc" in self.caps["encoders"]
         self.log(
             f"Worker 已连接 {self.server}（并发 {self.concurrency}，"
-            f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}"
-            f"{'，实时转码: 开' if self.realtime else '，实时转码: 关（只跑预转码）'}）"
+            f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}）"
         )
-        # v2 统一调度：一条 WS 连接同时报 realtime+preload 角色（GUI 勾了实时
-        # 才报 realtime；预转码永远是本程序的主职）。REST 轮询 claim 已删除，
-        # 任务由服务端推送。
+        # v2 统一调度：一条 WS 连接同时报 realtime+preload 角色（预转码与实时
+        # 播放都是本程序的主职）。REST 轮询 claim 已删除，任务由服务端推送。
         client = self._start_realtime()
         try:
             while not self.stop_event.is_set():
@@ -645,7 +653,6 @@ class WorkerRuntime:
             max_jobs=self.concurrency,
             log=lambda line: self.log(f"[WS] {line}"),
             preload=self._run_preload,
-            realtime=self.realtime,
         )
         client.preload_stop = self._stop_preload_task
         # 实时任务进入时让位钩子：本机预转码占用超出「并发 − 实时任务数」的
@@ -661,10 +668,7 @@ class WorkerRuntime:
 
         thread = threading.Thread(target=watch, daemon=True, name="realtime")
         thread.start()
-        self.log(
-            "统一调度已连接：预转码任务由服务端推送"
-            + ("（同时接实时播放任务）" if self.realtime else "（实时转码未开，只跑预转码）")
-        )
+        self.log("统一调度已连接：预转码+实时播放任务均由服务端推送")
         return client
 
     def _run_preload(self, message: dict) -> bool:
@@ -696,6 +700,7 @@ class WorkerRuntime:
         finally:
             with self._tasks_lock:
                 self.tasks.pop(task_id, None)
+                self._progress.pop(task_id, None)
                 if self._preload_stop.get(task_id) is stop:
                     self._preload_stop.pop(task_id, None)
                 self._preload_procs.pop(task_id, None)
@@ -706,15 +711,14 @@ class WorkerRuntime:
                 return False
             with self._tasks_lock:
                 self.tasks[task_id] = task.get("display_name", f"#{task_id}")
+                # 进度台账先于 process_task 登记：下载阶段状态栏就有进度可看
+                progress: dict = {}
+                self._progress[task_id] = progress
 
             def _register_proc(proc: subprocess.Popen) -> None:
                 with self._tasks_lock:
                     self._preload_procs[task_id] = proc
 
-            self._emit(
-                "task", slot=task_id, task_id=task_id,
-                name=task.get("display_name", f"#{task_id}"), phase="claimed",
-            )
             try:
                 # 服务端抢占（job.stop class=preload）置位 stop：run_ffmpeg 的
                 # 停止看门狗立即杀掉在跑的分段，断点台账在服务端，重派自动续转
@@ -723,11 +727,7 @@ class WorkerRuntime:
                     Path(__file__).parent / "work" / str(task_id),
                     stop=stop,
                     register=_register_proc,
-                )
-                self._emit(
-                    "task", slot=task_id, task_id=task_id,
-                    name=task.get("display_name", f"#{task_id}"),
-                    phase="done" if ok else "failed",
+                    progress=progress,
                 )
                 return ok
             except Exception as exc:  # 任何意外：上报失败，继续接下一单
@@ -763,6 +763,19 @@ class WorkerRuntime:
             self.log(f"[实时优先] 预转码 {task_id} 让出并发位（断点保留，稍后续转）")
             self._stop_preload_task(task_id)
 
+    def progress_view(self) -> list[tuple[str, dict]]:
+        """GUI 状态栏轮询：在跑任务的 [(显示名, 进度快照)]，按接单先后。
+
+        快照是浅拷贝（dict 读取在 GIL 下原子，与 process_task 的原地更新
+        共用同一前提）；任务未登记进度（刚接单还没进 process_task）给空
+        dict，GUI 显示「准备中」。
+        """
+        with self._tasks_lock:
+            return [
+                (name, dict(self._progress.get(task_id) or {}))
+                for task_id, name in self.tasks.items()
+            ]
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MovieClaw Windows Worker（预转码+实时统一调度）")
@@ -771,12 +784,6 @@ def main() -> None:
     parser.add_argument("--name", help="配对显示名；缺省读配置文件")
     parser.add_argument("--concurrency", type=int, help="并发槽位数 1-8")
     parser.add_argument("--ac-only", action="store_true", help="仅接通电源时执行")
-    parser.add_argument(
-        "--realtime",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="是否接实时转码（默认开；--no-realtime 只跑预转码）",
-    )
     parser.add_argument(
         "--once",
         action="store_true",
@@ -803,8 +810,6 @@ def main() -> None:
     })
     if args.ac_only:
         config["ac_only"] = True
-    if args.realtime is not None:
-        config["realtime"] = args.realtime
     if args.reset_token:
         config.pop("token", None)
     save_config(config)
@@ -820,7 +825,6 @@ def main() -> None:
         name=config.get("name") or "Preload Worker",
         concurrency=config.get("concurrency") or 1,
         ac_only=bool(config.get("ac_only")),
-        realtime=bool(config.get("realtime")),
         on_token=lambda token: save_config({**config, "token": token}),
         status_cb=lambda kind, **fields: print(fields.get("line") or f"（{kind}）"),
     )

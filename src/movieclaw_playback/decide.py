@@ -42,6 +42,12 @@ MAX_KEYFRAME_INTERVAL_S = 15.0
 #: 能被 ``<video src>`` 直接消费的容器。其余（mkv/ts/m2ts…）都要 remux。
 DIRECT_PLAY_CONTAINERS = frozenset({"mp4", "m4v", "mov"})
 
+#: 外网播放的画质天花板：1080p 档的码率（≈2.7 GB/小时）。与上行无关的硬上限
+#: ——上行再宽也不把几十 G 的原盘原样推给手机，先爆的是流量费不是线路。
+EXTERNAL_VIDEO_CAP_BPS = 6_000_000
+#: 外网阶梯的地板：上行窄到 480p 档都装不下时，降档不参与（给了也必卡）。
+EXTERNAL_FLOOR_BPS = 1_500_000
+
 #: 归一化分辨率标签 → 高度。media_probe 只落标签不落 width/height。
 _RESOLUTION_HEIGHT = {
     "4320p": 4320, "2160p": 2160, "1440p": 1440,
@@ -142,6 +148,10 @@ class MediaProfile:
     #: 插不插色彩空间转换——只看 hdr 是不够的。
     color_space: str | None = None
     bit_depth: int | None = None
+    #: 源片总码率（bps，台账 bit_rate 真值）。外网前置降档拿它和家宽上行比：
+    #  直通档发出去的就是这条码率，装不下就得在起播前转码——不等卡了再让
+    #  用户手动换。未知时无从比较，按「不降档」处理。
+    bit_rate_bps: int | None = None
     duration_ms: int | None = None
     audio_tracks: tuple[AudioTrack, ...] = ()
     subtitle_tracks: tuple[SubtitleTrack, ...] = ()
@@ -269,6 +279,10 @@ class PlaybackPlan:
     disc: str | None = None
     #: 目录直推时服务端选中的主播放列表文件名
     disc_playlist: str | None = None
+    #: 该计划是外网线路降档的结果（源码率超出上行/外网上限）。网页端拿它拦
+    #: 一下起播、弹窗让用户确认「降档播还是原画质播」；不认这个字段的客户端
+    #: （App）拿到计划直接播，等于维持自动降档。
+    uplink_forced: bool = False
 
 
 @dataclass(frozen=True)
@@ -309,6 +323,7 @@ def decide_playback(
     preferred_audio: str | None = None,
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
 ) -> PlaybackDecision:
     """按 web-player.md §3.3 的判定顺序算出最优播放计划。
 
@@ -326,6 +341,11 @@ def decide_playback(
     直通是无损的，比转出来的同分辨率画质更好也更省资源；超了才强制转码降
     到该高度。None = 自动（不限制）。universal 分支与未探测到规格的 strm
     不受它影响：前者是全解码客户端自己拉流，后者无从判断、只能乐观直连。
+
+    ``uplink_bps`` 是外网会话的家宽上行预算（bps；内网 / 未配置为 None，同 max_height 一样不参与判定）。源片码率超出
+    min(上行, 外网天花板 1080p 档) 时直通档换成转码——但**不自动生效**：计划带
+    ``uplink_forced`` 透出，网页端拦下起播弹窗让用户确认。与 max_height 互斥地
+    生效：手选了画质上限就不传上行，用户的选择优先。universal 分支同样不受影响。
 
     ``preferred_subtitle`` 是**用户选中的字幕轨**（None/"off" 与文本轨都是
     no-op）。只有当它指向本文件的**内封 PGS 轨**时才改变决策：视频强制转码、
@@ -449,7 +469,7 @@ def decide_playback(
         )
 
     # 3–5. 视频、HDR、音频三项判定，各自算出「能不能 copy」。
-    video_verdict = _judge_video(media, capability, policy, max_height)
+    video_verdict = _judge_video(media, capability, policy, max_height, uplink_bps)
     audio_verdict = _judge_audio(media, capability, preferred_audio)
 
     # 用户显式选中内封 PGS → 烧录：视频不再允许 copy（硬边界 1 唯一例外）。
@@ -500,6 +520,7 @@ def decide_playback(
         audio_tracks=media.audio_tracks,
         reason=reason,
         degraded_from=degraded_from,
+        uplink_forced=video_verdict.uplink_forced,
     )
 
 
@@ -521,6 +542,8 @@ class _VideoVerdict:
     reason: str
     #: 无法直通且连转码也不该做（如 HDR 需 tone-map 但没有 GPU）
     blocked: str | None = None
+    #: 是否因外网线路（上行/外网上限）放弃直通——随计划透出，供前端弹窗确认
+    uplink_forced: bool = False
 
 
 @dataclass(frozen=True)
@@ -549,8 +572,16 @@ def _judge_video(
     capability: ClientCapability,
     policy: PlaybackPolicy,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
 ) -> _VideoVerdict:
-    """视频编码 + HDR + 用户画质上限，三项判定（§3.3 步骤 3–4）。"""
+    """视频编码 + HDR + 用户画质上限 + 外网上行，判定（§3.3 步骤 3–4）。
+
+    ``uplink_bps`` 是外网会话的家宽上行预算（内网 / 未配置时为 None，不参与
+    判定——调用方负责收口，本函数不知道「外网」这个概念）。只对直通判定
+    生效：装不下源片码率就强制转码，目标高度交给 ``_build_video_plan`` 按
+    常规阶梯取。放在所有硬性判定之后——编码/分辨率/HDR 命中时归因给它们
+    （那是硬性的，线路只是偏好）。
+    """
     support = capability.video_support(media.video_codec)
     codec_label = (media.video_codec or "未知").upper()
 
@@ -644,6 +675,27 @@ def _judge_video(
                 ),
             )
         return _VideoVerdict(can_copy=False, reason=f"{media.hdr} 已转换为 SDR 显示")
+
+    # 外网画质阶梯：先问「装不装得下」，也问「该不该给」。天花板 1080p 档
+    # （6 Mbps ≈ 2.7 GB/小时）跟上行无关——上行再宽也不把几十 G 的原盘原样
+    # 推给手机，流量费先爆的是用户账单不是线路；源片本身 ≤ 天花板时直连，
+    # 转码不会更省流量还白烧 CPU。上行窄到连 480p（1.5M）都装不下时不参与
+    # 降档，照旧直连交给卡顿后提示兜底——给了也必卡。触发后不自动生效：
+    # 随计划透出 uplink_forced，网页端弹窗让用户确认（App 不认就直接播）。
+    if uplink_bps is not None and media.bit_rate_bps:
+        limit = min(uplink_bps, EXTERNAL_VIDEO_CAP_BPS)
+        if media.bit_rate_bps > limit and limit >= EXTERNAL_FLOOR_BPS:
+            if uplink_bps <= EXTERNAL_VIDEO_CAP_BPS:
+                reason = (
+                    f"外网线路：源码率 {media.bit_rate_bps / 1_000_000:.1f} Mbps 超出"
+                    f"家宽上行 {uplink_bps / 1_000_000:g} Mbps，已转码降码率"
+                )
+            else:
+                reason = (
+                    f"外网线路：外网播放最高 1080p（6 Mbps），源码率 "
+                    f"{media.bit_rate_bps / 1_000_000:.1f} Mbps，已转码降码率"
+                )
+            return _VideoVerdict(can_copy=False, reason=reason, uplink_forced=True)
 
     hdr_note = f"（{media.hdr} 直通）" if media.hdr else ""
     return _VideoVerdict(can_copy=True, reason=f"视频编码 {codec_label} 可直通{hdr_note}")
@@ -1053,6 +1105,7 @@ def needs_keyframe_probe(
     preferred_audio: str | None = None,
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
 ) -> bool:
     """判断当前候选是否需要读取源片关键帧密度。
 
@@ -1064,7 +1117,7 @@ def needs_keyframe_probe(
     if _unprobed_strm(media) or capability.universal:
         return False
 
-    video_verdict = _judge_video(media, capability, policy, max_height)
+    video_verdict = _judge_video(media, capability, policy, max_height, uplink_bps)
     audio_verdict = _judge_audio(media, capability, preferred_audio)
     burn_track = _burn_target(media, preferred_subtitle)
     if burn_track is not None and video_verdict.blocked is None:

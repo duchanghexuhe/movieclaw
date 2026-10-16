@@ -490,7 +490,7 @@ class RemoteWorkerRegistry:
                         f"在线的 Worker 版本过旧，不支持 {segment_type} 分片，"
                         "请把 MovieClaw 转码器更新到与服务端相同的版本"
                     )
-                raise RemoteWorkerUnavailable("没有在线且空闲的 Apple VideoToolbox Worker")
+                raise RemoteWorkerUnavailable("没有在线且空闲的远程转码 Worker")
             self._job_workers[job_id] = connection.worker_id
             self._job_attempts[job_id] = (
                 attempt_id if isinstance(attempt_id, str) and attempt_id else job_id

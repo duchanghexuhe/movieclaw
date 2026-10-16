@@ -665,7 +665,13 @@ def build_hls_command(
             f"{output_base_url.rstrip('/')}/{playlist.name}{output_url_suffix}"
         )
     else:
-        argv.append(str(playlist))
+        # ffmpeg 的 HLS muxer 按播放列表路径解析 init 段的目录。Windows 反斜杠
+        # 路径下它解析不出目录，把 init.mp4 写进**进程工作目录**而不是会话目录
+        # ——init 等待随之超时 404，本地转码起播全挂（仓库根的散落 init.mp4 即
+        # 此症状）。正斜杠路径 ffmpeg 照常接受，playlist 里的 init 引用也保持
+        # 相对文件名（客户端按播放列表自身的 URL 解析）；分片文件名是显式绝对
+        # 路径，不受影响。
+        argv.append(str(playlist).replace("\\", "/"))
     return TranscodeCommand(
         argv=argv, playlist_path=playlist, init_path=session_dir / INIT_NAME
     )

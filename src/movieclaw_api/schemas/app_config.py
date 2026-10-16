@@ -15,6 +15,12 @@ class AppConfigPayload(BaseModel):
         description="网络可访问到本应用的完整地址（http/https），"
         "如 http://192.168.1.10:3000；空 = 未配置",
     )
+    uplink_mbps: int | None = Field(
+        default=None,
+        ge=1,
+        le=10_000,
+        description="家宽上行带宽（Mbps），填套餐真实值：外网播放时源片码率超过它（或外网上限 1080p）就在起播前询问是否切换画质；空 = 不启用",
+    )
 
 
 class AppConfigView(AppConfigPayload):

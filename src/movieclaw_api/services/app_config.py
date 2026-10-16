@@ -61,6 +61,7 @@ async def build_config_view() -> AppConfigView:
     port, source, rejected = read_web_port_state()
     return AppConfigView(
         external_url=setting.external_url,
+        uplink_mbps=setting.uplink_mbps,
         web_port=port,
         web_port_source=source,
         web_port_default=DEFAULT_WEB_PORT,
@@ -86,6 +87,7 @@ async def save_config(payload: AppConfigPayload) -> AppConfigView:
     setting = AppServerSetting(
         # 规范化：去掉尾部斜杠，后续拼接路径时不用再处理
         external_url=payload.external_url.strip().rstrip("/"),
+        uplink_mbps=payload.uplink_mbps,
     )
     await get_setting_store().set(setting)
     return await build_config_view()

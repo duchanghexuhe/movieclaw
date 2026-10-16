@@ -363,6 +363,8 @@ async def test_relayed_strm_session_reports_server_delivery(client: TestClient, 
         view = client.get("/api/v1/playback/activity").json()["data"]["sessions"][0]
         assert view["play_method"] == "local"
         assert view["delivery"]["mode"] != "direct"
+        # 卡顿迹象字段随视图装配；这场没有供片压力，为 null
+        assert view["stall"] is None
     finally:
         manager._sessions.pop("relay", None)
 
@@ -1334,3 +1336,103 @@ def test_pick_transcode_prefers_playing_file_then_newest() -> None:
     assert _pick_transcode([old_same, new_other], 7) is old_same
     assert _pick_transcode([old_same, new_other], 99) is new_other
     assert _pick_transcode([], 7) is None
+
+
+# ---------------------------------------------------------------------------
+# 卡顿迹象（服务端推断，不是播放器实测）
+# ---------------------------------------------------------------------------
+
+
+def _fake_stall_session(video, audio, *, remote=False, wait_ms=None, pending_ago=None):
+    """带卡顿迹象字段的假转码会话：pending_ago 是最近一次等片挂号的秒数前。"""
+    import time as _time
+    from types import SimpleNamespace
+
+    from movieclaw_playback.decide import PlaybackPlan, PlaybackTier
+
+    plan = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE, file_id=1, container="hls-fmp4",
+        video=video, audio=audio, reason="浏览器不支持 HEVC",
+    )
+    pending_since = {} if pending_ago is None else {5: _time.monotonic() - pending_ago}
+    return SimpleNamespace(
+        plan=plan, hw_backend=None, remote=remote, remote_worker_id="w" if remote else None,
+        remote_job_id="job-1" if remote else None, file_id=1, created_at=0.0,
+        device_id="dev", state="ready", pending_since=pending_since,
+        last_segment_wait_ms=wait_ms,
+    )
+
+
+def _meter(rate_bytes: int):
+    from types import SimpleNamespace
+
+    from movieclaw_playback.activity import StreamMeter
+
+    meter = StreamMeter(
+        device_id="dev", kind=activity.STREAM_KIND_PLAY, member_id=0, unit=(1, 0, 0),
+        file_id=None, file_name="x.mkv", size_bytes=0, client=ClientInfo(name="网页"),
+    )
+    meter.add(rate_bytes)
+    return meter
+
+
+def test_stall_hint_is_bandwidth_when_stream_lags_bitrate() -> None:
+    """拉流速率低于码率九成：标成带宽瓶颈，措辞带两个读数。"""
+    from types import SimpleNamespace
+
+    from movieclaw_api.services.playback_activity import _stall_hint
+
+    hint = _stall_hint(
+        None, meters=[_meter(100_000)], file=SimpleNamespace(bit_rate=2_900_000), paused=False
+    )
+    assert hint is not None and hint.cause == "bandwidth"
+    assert "0.8 Mbps" in hint.reason and "2.9 Mbps" in hint.reason
+
+
+def test_stall_hint_decode_when_remote_speed_lags(monkeypatch) -> None:
+    """远程转码速度跟不上实时：标成解码瓶颈，即使拉流速率正常。"""
+    from movieclaw_api.services.playback_activity import _stall_hint
+    from movieclaw_api.services.playback import remote_worker
+    from movieclaw_playback.decide import AudioPlan, VideoPlan
+
+    class _Registry:
+        def job_state(self, _job_id: str):
+            return {"speed": "0.8x"}
+
+    monkeypatch.setattr(remote_worker, "get_remote_worker_registry", lambda: _Registry())
+    video = VideoPlan(action="transcode", codec="h264", height=1080, bitrate_cap_bps=8_000_000)
+    hint = _stall_hint(
+        _fake_stall_session(video, AudioPlan(action="copy"), remote=True, wait_ms=100),
+        meters=[_meter(2_000_000)],  # 16 Mbps，远高于输出码率：排除带宽
+        file=None,
+        paused=False,
+    )
+    assert hint is not None and hint.cause == "decode"
+    assert "0.8x" in hint.reason
+
+
+def test_stall_hint_decode_when_player_waits_for_segments() -> None:
+    """播放器等分片已 10 秒（当前还挂着）：标成解码端供不上片。"""
+    from movieclaw_api.services.playback_activity import _stall_hint
+    from movieclaw_playback.decide import AudioPlan, VideoPlan
+
+    video = VideoPlan(action="transcode", codec="h264", height=1080, bitrate_cap_bps=8_000_000)
+    hint = _stall_hint(
+        _fake_stall_session(video, AudioPlan(action="copy"), pending_ago=10),
+        meters=[], file=None, paused=False,
+    )
+    assert hint is not None and hint.cause == "decode"
+    assert "10 秒" in hint.reason
+
+
+def test_stall_hint_none_for_healthy_paused_and_cloud() -> None:
+    """速率正常、已暂停、网盘直链：都不出卡顿迹象。"""
+    from movieclaw_api.services.playback_activity import _stall_hint
+    from movieclaw_playback.decide import AudioPlan, VideoPlan
+
+    video = VideoPlan(action="transcode", codec="h264", height=1080, bitrate_cap_bps=8_000_000)
+    session = _fake_stall_session(video, AudioPlan(action="copy"))
+    # 缓冲攒满后播放器停止拉流（速率为 0）与高速率都不算
+    assert _stall_hint(session, meters=[_meter(2_000_000)], file=None, paused=False) is None
+    assert _stall_hint(session, meters=[], file=None, paused=True) is None
+    assert _stall_hint(None, meters=[], file=None, paused=False) is None
