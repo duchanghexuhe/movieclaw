@@ -18,6 +18,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -213,6 +214,9 @@ class WorkerGUI:
         root.minsize(620, 480)
         self.config = load_config()
         self.runtime: WorkerRuntime | None = None
+        self._start_thread: threading.Thread | None = None
+        self._exiting = False
+        self._exit_at = 0.0
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self.tray: TrayIcon | None = None
         self._build_ui()
@@ -334,12 +338,13 @@ class WorkerGUI:
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
         self.lbl_connection.configure(text="连接中…")
-        threading.Thread(target=runtime.start, daemon=True).start()
+        self._start_thread = threading.Thread(target=runtime.start, daemon=True)
+        self._start_thread.start()
 
     def _stop(self) -> None:
-        if self.runtime is not None:
+        if self.runtime is not None and not self.runtime.stop_event.is_set():
             self.runtime.stop_event.set()
-            self._log("正在停止（进行中的分段完成后收尾）…")
+            self._log("正在停止（在跑的分段 ffmpeg 会被杀掉，断点保留）…")
 
     def _toggle_autostart(self) -> None:
         bat = _startup_dir() / STARTUP_BAT_NAME
@@ -392,8 +397,11 @@ class WorkerGUI:
                     self._stop()
                     if self.tray is not None:
                         self.tray.remove()
-                    self.root.after(600, self.root.destroy)
-                    return
+                    # 等停止收尾（杀 ffmpeg / 断 WS）完成再关窗：直接 destroy
+                    # 会把守护线程和 ffmpeg 一起撂在半路
+                    self._exiting = True
+                    self._exit_at = time.monotonic()
+                    break
                 else:
                     kind, fields = item
                     if kind == "log":
@@ -419,10 +427,22 @@ class WorkerGUI:
                     text=f"已连接 {self.runtime.server}"
                          + ("（使用电池，已暂停）" if self.runtime.ac_only and on_battery() else "")
                 )
-            if self.runtime.stop_event.is_set() and not any(
-                t.is_alive() for t in []
+            # 停止收尾完成：复位按钮与标签，允许再次启动
+            if (
+                self.runtime.stop_event.is_set()
+                and self._start_thread is not None
+                and not self._start_thread.is_alive()
             ):
-                pass
+                self.runtime = None
+                self._start_thread = None
+                self.btn_start.configure(state=tk.NORMAL)
+                self.btn_stop.configure(state=tk.DISABLED)
+                self.lbl_connection.configure(text="已停止")
+        # 退出等待：收尾完成（或 30s 兜底）后真正关窗
+        if self._exiting:
+            if self.runtime is None or time.monotonic() - self._exit_at > 30:
+                self.root.destroy()
+                return
         self.root.after(150, self._poll_queue)
 
 

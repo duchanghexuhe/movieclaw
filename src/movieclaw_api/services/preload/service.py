@@ -309,6 +309,7 @@ async def cancel_task(session: AsyncSession, task_id: int) -> PreloadTask:
         raise NotFoundException("任务不存在")
     if task.status in (PreloadTaskStatus.COMPLETED, PreloadTaskStatus.CANCELLED):
         raise BadRequestException(f"任务已结束（{task.status}），不能取消")
+    worker_device_id = task.worker_device_id
     task.status = PreloadTaskStatus.CANCELLED
     task.lease_expires_at = None
     task.updated_at = utcnow()
@@ -316,6 +317,22 @@ async def cancel_task(session: AsyncSession, task_id: int) -> PreloadTask:
     # 半成品目录在提交后清理（失败只记日志，取消本身已成立）
     shutil.rmtree(artifact_dir_for(task_id), ignore_errors=True)
     logger.info("预转码任务已取消：task=%s", task_id)
+    if worker_device_id is None:
+        # 本地执行器（worker_device_id 为 NULL）在跑的任务：取消它的后台协程；
+        # 排队中的任务（也是 NULL）没有协程，cancel_local_task 无操作
+        from movieclaw_api.services.preload.dispatcher import cancel_local_task
+
+        cancel_local_task(task_id)
+        return task
+    from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
+
+    registry = get_remote_worker_registry()
+    # 推送记账随终态释放（Worker 被叫停后的各路径都不上报 fail，不释放会
+    # 把这台 Worker 的预转码预算永久压到 0）
+    registry.release_preload_task(task_id)
+    # 通知执行中的 Worker 停下来（杀掉在跑的分段 ffmpeg）；它稍后的
+    # fail/complete 上报会被终态校验挡住，不产生任何状态变化
+    await registry.send_preload_stop(worker_device_id, task_id)
     return task
 
 
@@ -331,6 +348,8 @@ async def retry_task(session: AsyncSession, task_id: int) -> PreloadTask:
     task.worker_device_id = None
     task.claimed_at = None
     task.lease_expires_at = None
+    # 熔断计数清零：attempts 是「连续失败」语义，手动重试意味着新一轮
+    task.attempts = 0
     task.updated_at = utcnow()
     await session.commit()
     await session.refresh(task)
@@ -393,10 +412,18 @@ async def reclaim_expired_leases(session: AsyncSession) -> int:
         task.status = PreloadTaskStatus.QUEUED
         task.lease_expires_at = None
         task.claimed_at = None
+        task.worker_device_id = None
         task.updated_at = now
         logger.info("预转码任务租约到期回队：task=%s", task.id)
     if rows:
         await session.commit()
+        # 回队 = 推送记账终态：卡死 Worker 的在途账立即归还，否则重派会让
+        # 预算越扣越负（重派到已删源的任务直接 FAILED，永远等不到上报来释放）
+        from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
+
+        registry = get_remote_worker_registry()
+        for task in rows:
+            registry.release_preload_task(task.id)
         # 回队的任务可能立刻有 Worker 能接：触发一次推送派单（在事件循环里
         # 才触发，定时任务/测试的同步上下文由下一个触发点兜底）
         try:
@@ -550,6 +577,10 @@ async def complete_task(
         if file is not None:
             return file
         raise BadRequestException("任务已完成但产物缺失，请删除后重转")
+    if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
+        # 取消/失效后迟到的完成上报（本地协程被取消的瞬间、REST 侧终态闸
+        # 之后的极窄窗口）不能把任务翻回已完成
+        raise BadRequestException(f"任务已不在执行态（{task.status}），完成上报被拒")
     # 重转场景：同任务目录下可能还挂着上一轮的派生行（file_path 唯一约束
     # 会炸登记）。产物可再生的语义下，新产物直接顶掉旧版本行；按任务目录圈
     # 定范围——产物名是动态的，旧命名（portable.mkv）的历史行也在内
@@ -576,7 +607,8 @@ async def complete_task(
     if not path.is_file():
         raise BadRequestException("产物文件不存在，无法登记")
     size = path.stat().st_size
-    if actual_bytes and abs(size - actual_bytes) > 1024 and abs(size - actual_bytes) > actual_bytes * 0.01:
+    size_drift = abs(size - actual_bytes)
+    if actual_bytes and size_drift > 1024 and size_drift > actual_bytes * 0.01:
         raise BadRequestException("产物大小与上报不一致，可能上传不完整")
     if duration_seconds is None:
         raise BadRequestException("产物探测失败（无时长），整件作废")
@@ -646,7 +678,17 @@ def command_acceptable(task: PreloadTask, video_codec: str | None) -> bool:
 
 
 async def fail_task(session: AsyncSession, task: PreloadTask, error: str) -> PreloadTask:
-    """Worker 失败上报：记因、断点保留（重试时续传）、释放租约。"""
+    """Worker 失败上报：记因、断点保留（重试时续传）、释放租约。
+
+    状态闸：只有执行态（CLAIMED/RUNNING）能落失败。取消/回队后迟到的
+    上报不能把任务翻成 FAILED——用户会看到「已取消」变「失败」的假象，
+    还能对一个不存在的执行再点重试。
+    """
+    if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
+        logger.info(
+            "预转码任务失败上报被忽略（任务已 %s）：task=%s", task.status, task.id
+        )
+        return task
     task.status = PreloadTaskStatus.FAILED
     task.error = error[:2000]
     task.lease_expires_at = None
@@ -663,37 +705,48 @@ async def fail_task(session: AsyncSession, task: PreloadTask, error: str) -> Pre
 
 
 async def stale_preload_files(
-    session: AsyncSession, *, days: int
+    session: AsyncSession, *, days: int, library_ids: set[int] | None = None
 ) -> list[tuple[LibraryFile, int]]:
     """超期未播的预转码产物 [(行, 距上次播放天数)]，按最久未播排序。
 
     「最近一次播放」取 playback_log 里该派生行的最后一次 start（以
     media_item + 季集定位同一播放单元）；从未播过按产物生成时间算。
+    ``library_ids`` 圈定范围（成员可见性）；None=全部库（管理员/统计）。
     """
     horizon = utcnow() - timedelta(days=days)
-    rows = list(
-        (
-            await session.execute(
-                select(LibraryFile).where(LibraryFile.derivation.is_not(None))  # type: ignore[union-attr]
-            )
-        ).scalars()
-    )
-    out: list[tuple[LibraryFile, int]] = []
+    stmt = select(LibraryFile).where(LibraryFile.derivation.is_not(None))  # type: ignore[union-attr]
+    if library_ids is not None:
+        stmt = stmt.where(LibraryFile.library_id.in_(library_ids))  # type: ignore[union-attr]
+    rows = list((await session.execute(stmt)).scalars())
     from movieclaw_db.models import PlaybackLog
 
-    for row in rows:
-        last = (
-            await session.execute(
-                select(PlaybackLog.started_at)
-                .where(
-                    PlaybackLog.media_item_id == row.media_item_id,
-                    PlaybackLog.season_number == row.season_number,
-                    PlaybackLog.episode_number == row.episode_number,
-                )
-                .order_by(PlaybackLog.started_at.desc())
-                .limit(1)
+    # 最近一次播放一把查齐：按播放单元聚合，不逐行查（产物多时是 N+1）
+    last_played: dict[tuple[Any, Any, Any], Any] = {}
+    item_ids = {row.media_item_id for row in rows if row.media_item_id}
+    if item_ids:
+        grouped = await session.execute(
+            select(
+                PlaybackLog.media_item_id,
+                PlaybackLog.season_number,
+                PlaybackLog.episode_number,
+                func.max(PlaybackLog.started_at),
             )
-        ).scalar_one_or_none()
+            .where(PlaybackLog.media_item_id.in_(item_ids))  # type: ignore[arg-type]
+            .group_by(
+                PlaybackLog.media_item_id,
+                PlaybackLog.season_number,
+                PlaybackLog.episode_number,
+            )
+        )
+        last_played = {
+            (int(media_item_id), season, episode): last
+            for media_item_id, season, episode, last in grouped.all()
+        }
+    out: list[tuple[LibraryFile, int]] = []
+    for row in rows:
+        last = last_played.get(
+            (row.media_item_id, row.season_number, row.episode_number)
+        )
         anchor = last or row.created_at
         if anchor is None or anchor < horizon:
             days_since = (
@@ -705,10 +758,18 @@ async def stale_preload_files(
 
 
 async def cleanup_stale(
-    session: AsyncSession, *, days: int, dry_run: bool = False
+    session: AsyncSession,
+    *,
+    days: int,
+    dry_run: bool = False,
+    library_ids: set[int] | None = None,
 ) -> dict[str, Any]:
-    """「清理冷数据」：预览（dry_run）或执行删除，返回将删列表与可释放总量。"""
-    stale = await stale_preload_files(session, days=days)
+    """「清理冷数据」：预览（dry_run）或执行删除，返回将删列表与可释放总量。
+
+    ``library_ids`` 圈定删除范围（成员可见性）——破坏性动作必须在查询处
+    收口，路由层事后过滤返回值等于没防。
+    """
+    stale = await stale_preload_files(session, days=days, library_ids=library_ids)
     preview = [
         {
             "file_id": row.id,
@@ -716,6 +777,8 @@ async def cleanup_stale(
             "title": (row.origin or {}).get("label") if row.origin else None,
             "size_bytes": row.size_bytes,
             "days_since_play": days_since,
+            # 成员可见性过滤用（管理员不筛）
+            "library_id": row.library_id,
         }
         for row, days_since in stale
     ]
@@ -736,7 +799,10 @@ async def cleanup_stale(
         shutil.rmtree(path.parent, ignore_errors=True)
         await session.delete(row)
     await session.commit()
-    logger.info("预转码冷数据清理：删除 %d 个产物，释放 %.1f GB", freed and len(stale), freed / 1024**3)
+    logger.info(
+        "预转码冷数据清理：删除 %d 个产物，释放 %.1f GB",
+        len(stale), freed / 1024**3,
+    )
     return {
         "count": len(stale),
         "total_bytes": total,
@@ -751,31 +817,39 @@ async def cleanup_stale(
 # ---------------------------------------------------------------------------
 
 
-async def overview(session: AsyncSession) -> dict[str, Any]:
-    """预转码产物的总量统计。``oldest_days`` 以最近一次播放计（从未播按生成时间）。"""
-    usage = await preload_usage_bytes(session)
-    setting = await get_setting_store().get(PreloadSetting)
-    stale = await stale_preload_files(session, days=1)  # ≥1 天未播即计入最老值
-    rows = list(
-        (
-            await session.execute(
-                select(LibraryFile.size_bytes, LibraryFile.created_at).where(
-                    LibraryFile.derivation.is_not(None)  # type: ignore[union-attr]
-                )
-            )
-        ).all()
-    )
-    oldest_days = 0
+async def overview(
+    session: AsyncSession, *, library_ids: set[int] | None = None
+) -> dict[str, Any]:
+    """预转码产物的总量统计。``oldest_days`` 以最近一次播放计（从未播按生成时间）。
 
-    for _size, created_at in rows:
-        anchor = created_at
-        if anchor is not None:
-            days = (utcnow() - anchor).days
-            oldest_days = max(oldest_days, days)
-    # 播放时间锚：取所有派生单元最近一次播放的最小值 = "最老的多久没播"
-    del stale
+    ``library_ids`` 圈定统计范围（成员可见性）；None=全部库（管理员）。
+    """
+    stmt = (
+        select(func.count())
+        .select_from(LibraryFile)
+        .where(LibraryFile.derivation.is_not(None))  # type: ignore[union-attr]
+    )
+    if library_ids is not None:
+        stmt = stmt.where(LibraryFile.library_id.in_(library_ids))  # type: ignore[union-attr]
+    count = (await session.execute(stmt)).scalar_one()
+    if library_ids is None:
+        usage = await preload_usage_bytes(session)
+    else:
+        usage = int(
+            (
+                await session.execute(
+                    select(func.coalesce(func.sum(LibraryFile.size_bytes), 0)).where(
+                        LibraryFile.derivation.is_not(None),  # type: ignore[union-attr]
+                        LibraryFile.library_id.in_(library_ids),  # type: ignore[union-attr]
+                    )
+                )
+            ).scalar_one()
+        )
+    setting = await get_setting_store().get(PreloadSetting)
+    stale = await stale_preload_files(session, days=1, library_ids=library_ids)
+    oldest_days = max((days for _, days in stale), default=0)
     return {
-        "count": len(rows),
+        "count": int(count),
         "total_bytes": usage,
         "quota_bytes": setting.quota_bytes,
         "oldest_days": oldest_days,

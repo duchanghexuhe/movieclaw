@@ -240,7 +240,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
     <>
       <SettingsSection
         title="远程转码"
-        description="只把需要远程硬件能力的转码任务交给兼容 Worker。NAS 仍负责鉴权、播放会话和 HLS 缓存；修改后立即生效，不需要重启应用。当前可用的 Worker 实现为 macOS Apple Silicon 版本。"
+        description="只把需要远程硬件能力的转码任务交给兼容 Worker。NAS 仍负责鉴权、播放会话和 HLS 缓存；修改后立即生效，不需要重启应用。当前可用的 Worker 实现是 macOS Apple Silicon 转码器与 Windows Worker（预转码 + NVENC 实时转码）。"
       >
         <div className="space-y-3">
           {error && <ErrorBanner>{error}</ErrorBanner>}

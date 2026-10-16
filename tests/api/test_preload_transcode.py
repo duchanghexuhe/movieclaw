@@ -25,10 +25,9 @@ from fastapi.testclient import TestClient
 
 from movieclaw_api.services.media_probe import MediaSpec
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import FileState, LibraryFile
+from movieclaw_db.models import FileState, LibraryFile, MediaItem
 from movieclaw_db.models.preload_task import PreloadTaskStatus
 from movieclaw_db.repositories.library_repo import LibraryRepository
-from movieclaw_db.models import MediaItem
 
 _PRELOAD = "/api/v1/preload"
 _WORKER = "/api/v1/preload-worker"
@@ -63,10 +62,10 @@ def client(tmp_path, monkeypatch):
         c.post(f"{_AUTH}/login", json=_ADMIN)
         yield c
 
+    from movieclaw_api.core.config import get_settings
     from movieclaw_api.services.auth import reset_auth_state
     from movieclaw_api.settings.store import reset_setting_store
     from movieclaw_db.crypto import reset_secret_box
-    from movieclaw_api.core.config import get_settings
 
     reset_setting_store()
     reset_secret_box()
@@ -92,6 +91,7 @@ def _seed_file(
         path.write_bytes(b"FAKE-MEDIA-BYTES" * 256)
         async with get_database().session() as session:
             from sqlmodel import select
+
             from movieclaw_db.models import Library
 
             library = (
@@ -370,7 +370,6 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
         f"{artifact_url}{sep}part=0", content=part_a, headers={"Content-Type": "application/octet-stream"}
     )
     assert first.status_code == 201, (first.status_code, first.text)
-    import os as _os
     gap = client.put(
         f"{artifact_url}{sep}part=2", content=b"B" * 8, headers={"Content-Type": "application/octet-stream"}
     )
@@ -521,7 +520,6 @@ def test_source_delete_invalidates_derived(client, tmp_path, monkeypatch):
 
     # 删源（走详情页删除路径：单文件删除服务）
     from movieclaw_api.services.library.recycle import purge_file  # noqa: F401
-    from movieclaw_api.services.library import items as library_items
 
     async def _delete_source() -> None:
         async with get_database().session() as session:
@@ -624,8 +622,9 @@ def test_cleanup_stale_preview_and_run(client, tmp_path, monkeypatch):
     # created_at 是刚刚 → 不超期。把阈值调成 0 天语义不允许（ge=1），
     # 因此直接把产物行的 created_at 改老
     async def _age() -> None:
-        from movieclaw_db.models.base import utcnow
         from datetime import timedelta
+
+        from movieclaw_db.models.base import utcnow
 
         async with get_database().session() as session:
             row = await session.get(LibraryFile, derived_id)
@@ -731,3 +730,149 @@ def test_invalidate_orphans_respects_registered_dirs(client, tmp_path):
     client.portal.call(partial(_scenario))  # type: ignore[attr-defined]
     assert not (_svc.preload_root() / "999").exists()
     assert (_svc.preload_root() / "777" / "示例 - 省流 1080p HEVC 1.5Mbps.mkv").exists()
+
+
+# ---------------------------------------------------------------------------
+# 状态闸与认领轮次（2026-10-16 审查回归）
+# ---------------------------------------------------------------------------
+
+
+def test_fail_report_ignored_after_cancel(client, tmp_path):
+    """取消后迟到的失败上报不能把任务翻成 FAILED（用户看到假失败）。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    token = _pair_worker(client)
+    task = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    task_id = task["id"]
+    claimed = client.post(f"{_WORKER}/claim", headers=_worker_headers(token)).json()["data"]["task"]
+    assert claimed is not None and claimed["task_id"] == task_id
+    assert client.post(f"{_PRELOAD}/tasks/{task_id}/cancel", json={}).status_code == 200
+    resp = client.post(
+        f"{_WORKER}/tasks/{task_id}/fail",
+        json={"error": "迟到的失败"},
+        headers=_worker_headers(token),
+    )
+    assert resp.status_code == 200
+    view = client.get(f"{_PRELOAD}/tasks/{task_id}").json()["data"]
+    assert view["status"] == "cancelled"  # 不被翻成 failed
+
+
+def test_artifact_put_rejected_after_cancel(client, tmp_path):
+    """取消后分段上传被拒：在途上传不会重建已被删除的任务目录。"""
+    from movieclaw_api.services.preload import service as _svc
+
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    token = _pair_worker(client)
+    task = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    task_id = task["id"]
+    claimed = client.post(f"{_WORKER}/claim", headers=_worker_headers(token)).json()["data"]["task"]
+    artifact_url = "/" + claimed["artifact_url"]
+    sep = "&" if "?" in artifact_url else "?"
+    assert client.post(f"{_PRELOAD}/tasks/{task_id}/cancel", json={}).status_code == 200
+    put = client.put(
+        f"{artifact_url}{sep}part=0",
+        content=b"x" * 32,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert put.status_code == 400
+    assert not (_svc.artifact_dir_for(task_id) / "seg00000.mkv").exists()
+
+
+def test_artifact_put_rejected_for_stale_claimer(client, tmp_path):
+    """凭据绑定认领轮次：任务被重派给别的执行者后，旧 Worker 的长凭据写不进产物。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    token = _pair_worker(client)
+    _pair_worker(client)  # 第二台设备：重派目标（FK 需要真实设备行）
+    task = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    task_id = task["id"]
+    claimed = client.post(f"{_WORKER}/claim", headers=_worker_headers(token)).json()["data"]["task"]
+    artifact_url = "/" + claimed["artifact_url"]
+    sep = "&" if "?" in artifact_url else "?"
+
+    async def _reclaim_to_other_device() -> None:
+        from sqlmodel import select
+
+        from movieclaw_db.models import LoginDevice, PreloadTask
+
+        async with get_database().session() as session:
+            device_ids = list(
+                (await session.execute(select(LoginDevice.id).order_by(LoginDevice.id))).scalars()
+            )
+            row = (
+                await session.execute(select(PreloadTask).where(PreloadTask.id == task_id))
+            ).scalar_one()
+            # 仍处执行态但认领者换成另一台设备：旧凭据只该被「设备绑定」闸拦下
+            row.worker_device_id = device_ids[-1]
+            await session.commit()
+
+    client.portal.call(partial(_reclaim_to_other_device))  # type: ignore[attr-defined]
+    put = client.put(
+        f"{artifact_url}{sep}part=0",
+        content=b"x" * 32,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert put.status_code == 400
+
+
+def test_local_executor_lands_artifact_under_dynamic_name(client, tmp_path, monkeypatch):
+    """本地执行器产物必须先改名成动态片名再登记——按协议名登记会被 complete 拦死。"""
+    from functools import partial
+
+    from movieclaw_api.services.preload import dispatcher as _dispatcher
+    from movieclaw_api.services.preload import service as _svc
+
+    # SDR 源：本地软编链装得出来（HDR 源在无 caps 时 unusable、argv 为空）
+    file_id = _seed_file(client, tmp_path)
+    task = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    task_id = task["id"]
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            # 模拟 ffmpeg 写出协议名产物（argv 尾部的输出路径）
+            out = Path(command_holder["argv"][-1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"FAKE-ARTIFACT" * 64)
+            return b"", b""
+
+    command_holder: dict = {}
+
+    async def _fake_exec(*argv, **kwargs):  # type: ignore[no-untyped-def]
+        command_holder["argv"] = list(argv)
+        return _FakeProcess()
+
+    monkeypatch.setattr(_dispatcher.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(
+        "movieclaw_api.services.media_probe.probe_media",
+        lambda path: MediaSpec(
+            resolution="1080p", video_codec="hevc", hdr=None, bit_depth=8,
+            duration_seconds=7200, bit_rate=1_500_000,
+        ),
+    )
+
+    async def _claim_and_run() -> None:
+        from sqlmodel import select
+
+        from movieclaw_db.models import PreloadTask
+
+        async with get_database().session() as session:
+            claimed = await _svc.claim_next_task(session, device_id=None)
+            assert claimed is not None
+            task_row, file_row = claimed
+            command = _svc.build_task_command(task_row, file_row, worker_caps=None)
+            await _dispatcher._execute_local_task(task_row.id, file_row, command["argv"])
+        async with get_database().session() as session:
+            row = (
+                await session.execute(select(PreloadTask).where(PreloadTask.id == task_id))
+            ).scalar_one()
+            assert row.status == PreloadTaskStatus.COMPLETED, row.error
+
+    client.portal.call(partial(_claim_and_run))  # type: ignore[attr-defined]
+    # 产物以动态片名落盘且已登记；协议名不残留
+    directory = _svc.artifact_dir_for(task_id)
+    dynamic = directory / "示例 - 省流 1080p HEVC 1.5Mbps.mkv"
+    assert dynamic.exists()
+    assert not (directory / "artifact.mkv").exists()
+    view = client.get(f"{_PRELOAD}/tasks/{task_id}").json()["data"]
+    assert view["status"] == "completed"
+    assert view["result_file_id"]

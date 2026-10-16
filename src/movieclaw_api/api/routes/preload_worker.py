@@ -16,11 +16,13 @@ remote_signing 的签名 URL 域（kind 扩展 ``preload.source`` / ``preload.ar
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
 from pathlib import Path
 from typing import Annotated, Any
 
+import anyio
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi import Path as PathParam
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,6 +60,16 @@ async def _load_task(session: AsyncSession, task_id: int) -> PreloadTask:
         raise NotFoundException("预转码任务不存在")
     return task
 
+def _worker_id_of(principal) -> str | None:
+    """REST 数据面主体（transcode 设备凭证）对应的在线 Worker 连接 id。"""
+    from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
+
+    for connection in get_remote_worker_registry().snapshot():
+        if connection.get("device_id") == principal.device.id:
+            return str(connection["worker_id"])
+    return None
+
+
 def _assert_claimer(task: PreloadTask, principal) -> None:
     """只有领取它的那台 Worker 能对这个任务做数据面操作。"""
     if task.worker_device_id != principal.device.id:
@@ -66,7 +78,7 @@ def _assert_claimer(task: PreloadTask, principal) -> None:
 
 @router.post(
     "/claim",
-    summary="预转码 Worker 领取任务",
+    summary="预转码 Worker 领取任务（旧版 Worker 兼容通道）",
     operation_id="preload.claim",
     openapi_extra={"x-cli-hidden": True},
 )
@@ -77,18 +89,37 @@ async def claim_preload_task(
 ) -> ApiResponse[dict[str, Any]]:
     """领取下一个排队任务；队列空时返回 ``task: null``（Worker 稍后再来）。
 
+    v2 起推送派单是主通道，这里保留给旧版 Worker。在线连接必须申报过
+    preload 角色才允许领（--no-realtime 的纯实时 Worker 凭证不能把队列
+    搬空），且吃同一份预算——否则 REST 通道就绕开了推送侧的记账。
+
     ``payload.caps`` 是 Worker 上报的本机能力（encoders/filters/hw_decoders），
     服务端据此选 NVENC 或软件编码链；不报按软编。
 
     源文件是 strm 网盘条目时返回 ``source_url``（跟随跳转的直链），否则返回
     服务端签名 URL：Worker 从这里 Range 读源。产物回传同样是签名 URL。
     """
+    from movieclaw_api.exceptions import ForbiddenException
+    from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
+
+    registry = get_remote_worker_registry()
+    connection = registry.connection_for_device(principal.device.id)
+    if connection is not None:
+        if "preload" not in connection.capabilities.roles:
+            raise ForbiddenException(
+                "这台 Worker 未申报预转码角色（升级 Worker，或在 GUI 保持预转码开启）"
+            )
+        if registry.preload_capacity(connection) <= 0:
+            return ok({"task": None})
     claimed = await preload_service.claim_next_task(session, device_id=principal.device.id)
     if claimed is None:
         return ok({"task": None})
     task, file = claimed
     task_id = task.id
-    grant = await issue_preload_grant(task_id=task_id, file_id=file.id, ttl_seconds=GRANT_TTL_S)
+    grant = await issue_preload_grant(
+        task_id=task_id, file_id=file.id, ttl_seconds=GRANT_TTL_S,
+        device_id=principal.device.id,
+    )
     command = preload_service.build_task_command(
         task, file, worker_caps=(payload or {}).get("caps")
     )
@@ -102,6 +133,8 @@ async def claim_preload_task(
     command["display_name"] = Path(file.file_path).name
     command["resume_parts"] = task.resume_parts
     command["part_bytes"] = task.part_bytes
+    if connection is not None:
+        registry.note_preload_pushed(connection, task_id)
     return ok({"task": command})
 
 
@@ -158,6 +191,14 @@ async def put_preload_artifact(
     if grant is None:
         raise NotFoundException("凭据无效或已过期")
     task = await _load_task(session, task_id)
+    # 终态/回队的任务拒绝再写：取消后残留在途分段会重建刚被删掉的目录，
+    # 且这些目录永远不会有人来清理
+    if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
+        raise BadRequestException("任务已不在执行态，停止上传")
+    # 凭据绑定认领者：任务被回收重派给别的 Worker 后，旧 Worker 的 24h
+    # 长凭据不能再写当前段（两台 Worker 交错分段 = 产物无声损坏）
+    if grant.device_id is not None and task.worker_device_id != grant.device_id:
+        raise BadRequestException("任务已被其他执行者认领，凭据失效")
     if part is None:
         part = task.resume_parts  # 缺省按台账续传位
     # 段号校验在写盘**之前**：乱序/跳段回 409，不留半截文件
@@ -173,20 +214,26 @@ async def put_preload_artifact(
     # 64MiB byte-range 上限只会在中途断连（服务端断、客户端 10053）。
     # 上限放宽到 2GB，仅作防呆
     part_bytes = max(task.part_bytes or 0, 2 * 1024**3)
+    # 任务级总量上限：段数无界时（凭据泄漏/异常 Worker）能把 data/preload
+    # 写满盘。预估的 1.5 倍已是宽裕上限（预估按码率上限算）
+    total_cap = max(int((task.estimated_bytes or 0) * 1.5), 2 * 1024**3)
+    existing = sum(p.stat().st_size for p in directory.glob("seg*.mkv") if p.is_file())
     written = 0
     try:
         # **整文件覆盖写**（每段是独立完整的 MKV，不是 byte-range）：
         # 追加模式 + 上次中断的半截文件 = 段损坏、concat 时长全是垃圾
         # （2026-10-14 本地流程实测 514% 时长偏差即此因）
-        with open(part_path, "wb") as output:
+        # 异步写盘：300MB 段体同步 write 会反复卡住事件循环（WS 心跳、
+        # 播放会话、其他 API 全部停摆）
+        async with await anyio.open_file(part_path, "wb") as output:
             async for chunk in request.stream():
                 if not chunk:
                     continue
                 written += len(chunk)
-                if written > part_bytes:
-                    output.truncate(0)
+                if written > part_bytes or existing + written > total_cap:
+                    await output.truncate(0)
                     raise BadRequestException("分段超过大小上限")
-                output.write(chunk)
+                await output.write(chunk)
     except ClientDisconnect:
         # 半段不能留：中断的段在重传时整段覆盖
         part_path.unlink(missing_ok=True)
@@ -218,6 +265,13 @@ async def complete_preload_task(
     不做部分采纳（§7 扩展点 2）。校验通过返回登记后的文件版本 id。
     """
     task = await _load_task(session, task_id)
+    # 记账释放放在归属校验之前：任务被重领后旧 Worker 的迟到上报也要把
+    # 自己那台连接的在途账清掉（幂等 pop，不存在即无操作）
+    from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
+
+    get_remote_worker_registry().release_preload_task(
+        task_id, _worker_id_of(principal)
+    )
     _assert_claimer(task, principal)
     if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
         raise BadRequestException("任务不在执行态")
@@ -236,14 +290,19 @@ async def complete_preload_task(
         for part_path in parts:
             # 单引号转义防路径特殊字符；absolute 可读（同目录相对亦可）
             listing.write("file '" + part_path.resolve().as_posix() + "'\n")
-    concat = subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_list),
-            "-c", "copy", "-map_chapters", "0", str(final_path),
-        ],
-        capture_output=True, text=True, timeout=3600,
-    )
+
+    def _concat() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                "-c", "copy", "-map_chapters", "0", str(final_path),
+            ],
+            capture_output=True, text=True, timeout=3600,
+        )
+
+    # 2GB 级拼接不能占着事件循环：放线程池，WS 心跳/播放会话照常跑
+    concat = await asyncio.to_thread(_concat)
     concat_list.unlink(missing_ok=True)
     if concat.returncode != 0:
         logger.warning("预转码 concat 失败：task=%s %s", task_id, concat.stderr[-500:])
@@ -254,7 +313,7 @@ async def complete_preload_task(
     if size <= 0:
         raise BadRequestException("产物为空，整件作废")
 
-    spec = probe_media(str(final_path))
+    spec = await asyncio.to_thread(probe_media, str(final_path))
     duration = spec.duration_seconds if spec else None
     video_codec = spec.video_codec if spec else None
     try:
@@ -289,6 +348,12 @@ async def fail_preload_task(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[None]:
     task = await _load_task(session, task_id)
+    # 记账释放同 complete：这台 Worker 停手了，在途账就该清
+    from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
+
+    get_remote_worker_registry().release_preload_task(
+        task_id, _worker_id_of(principal)
+    )
     _assert_claimer(task, principal)
     error = str((payload or {}).get("error") or "Worker 上报失败")
     await preload_service.fail_task(session, task, error)

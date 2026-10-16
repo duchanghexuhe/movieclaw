@@ -145,6 +145,11 @@ class WorkerConnection:
     connected_at: float = field(default_factory=time.monotonic)
     last_seen: float = field(default_factory=time.monotonic)
     jobs: set[str] = field(default_factory=set)
+    #: 已推送给这台 Worker、尚未终态的预转码任务（task_id → 推送时刻）。
+    #: 预算记账的唯一事实来源——不记的话派单循环每轮读到的容量都是旧值，
+    #: 会把整条队列一口气全推给同一台 Worker（推送后任务仍 CLAIMED，Worker
+    #: 端信号量把它排成幻影线程，租约到期回收再派，churn 循环）。
+    preload_jobs: dict[int, float] = field(default_factory=dict)
     draining: bool = False
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     max_jobs: int = 1
@@ -171,6 +176,9 @@ class RemoteWorkerRegistry:
         self._workers: dict[str, WorkerConnection] = {}
         self._job_workers: dict[str, str] = {}
         self._job_attempts: dict[str, str] = {}
+        #: 预转码在途任务反查表（task_id → worker_id）：complete/fail/取消时
+        #: 按 task_id 释放记账，不必知道它当时在哪台 Worker 上
+        self._preload_task_workers: dict[int, str] = {}
         self._job_events: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._job_states: dict[str, dict[str, Any]] = {}
         self._job_profiles: dict[str, tuple[Any, ...]] = {}
@@ -268,6 +276,7 @@ class RemoteWorkerRegistry:
             self._workers.clear()
             self._job_workers.clear()
             self._job_attempts.clear()
+            self._preload_task_workers.clear()
             self._job_events.clear()
             self._job_states.clear()
             self._job_profiles.clear()
@@ -311,6 +320,7 @@ class RemoteWorkerRegistry:
             self._workers.clear()
             self._job_workers.clear()
             self._job_attempts.clear()
+            self._preload_task_workers.clear()
         for connection in workers:
             await self._close_quietly(connection.websocket, code=1012, reason=reason)
 
@@ -335,6 +345,7 @@ class RemoteWorkerRegistry:
         with self._lock:
             return any(
                 backend in connection.capabilities.backends
+                and "realtime" in connection.capabilities.roles
                 and len(connection.jobs) >= connection.max_jobs
                 and not connection.draining
                 and self._is_fresh(connection)
@@ -376,6 +387,7 @@ class RemoteWorkerRegistry:
                     "hw_decoders": list(connection.capabilities.hw_decoders),
                     "filters": list(connection.capabilities.filters),
                     "active_jobs": len(connection.jobs),
+                    "preload_jobs": len(connection.preload_jobs),
                     "jobs": [
                         {
                             "job_id": job_id,
@@ -463,6 +475,11 @@ class RemoteWorkerRegistry:
                 backend, segment_type, disc=disc, plan=plan, source_id=source_id
             )
             if connection is None:
+                # 全员满员时看能不能抢占一个在跑的预转码任务让位（T2 预算只
+                # 约束派单时刻；实时任务后到时这里是「realtime 永远优先」的
+                # 兜底执行点）
+                connection = self._preempt_preload_for_realtime(backend, segment_type, disc=disc)
+            if connection is None:
                 if disc and self._select_worker(backend, segment_type) is not None:
                     raise RemoteWorkerUnavailable(
                         "在线的 Worker 版本过旧，不支持原盘，"
@@ -492,13 +509,14 @@ class RemoteWorkerRegistry:
     def preload_capacity(self, connection: WorkerConnection) -> int:
         """这台 Worker 现在还能接几个预转码任务（realtime 永远优先）。
 
-        预算 = max_concurrency − 1 − 在跑的实时任务数，最小 0：并发=1 的机器
-        只服务实时；空闲出来的并发位才允许预转码占用。实时任务在连接断开时
-        全部判失败释放，预转码按数据库任务状态独立记账（掉线不影响在跑的
-        预转码），所以实时占用只看 ``connection.jobs``。
+        预算 = max_concurrency − 1 − 在跑的实时任务数 − 在途的预转码任务数，
+        最小 0：并发=1 的机器只服务实时；空闲出来的并发位才允许预转码占用。
+        实时任务在连接断开时全部判失败释放；预转码的已推送任务由
+        ``preload_jobs`` 记账直到终态（complete/fail/取消/回队时释放），
+        推送成功一个记一个，派单循环不会重复计数。
         """
         with self._lock:
-            busy = len(connection.jobs)
+            busy = len(connection.jobs) + len(connection.preload_jobs)
         return max(0, connection.max_jobs - 1 - busy)
 
     def preload_workers(self) -> list[WorkerConnection]:
@@ -514,6 +532,42 @@ class RemoteWorkerRegistry:
         candidates.sort(key=lambda c: (len(c.jobs) / max(1, c.max_jobs), -c.connected_at))
         return candidates
 
+    def connection_for_device(self, login_device_id: int) -> WorkerConnection | None:
+        """某登录设备此刻的活连接（REST claim 端点做角色/预算校验用）。"""
+        with self._lock:
+            return next(
+                (
+                    c
+                    for c in self._workers.values()
+                    if c.login_device_id == login_device_id and self._is_fresh(c)
+                ),
+                None,
+            )
+
+    def note_preload_pushed(self, connection: WorkerConnection, task_id: int) -> None:
+        """任务成功推送给这台 Worker 后记账（直到终态才释放）。"""
+        with self._lock:
+            connection.preload_jobs[task_id] = time.monotonic()
+            self._preload_task_workers[task_id] = connection.worker_id
+
+    def release_preload_task(self, task_id: int, worker_id: str | None = None) -> None:
+        """预转码任务到达终态（complete/fail/取消/回队/回收）后释放记账。
+
+        ``worker_id`` 给出时只清该 Worker 的账——旧 Worker 对已重派任务的
+        迟到上报不能把接手者的在途账释放掉（记账被覆盖后仅按 task_id pop
+        会短暂超发）。不给 worker_id 按反查表清（服务端单方回队/取消的场景）。
+        """
+        with self._lock:
+            owner = self._preload_task_workers.get(task_id)
+            if owner is None:
+                return
+            if worker_id is not None and owner != worker_id:
+                return
+            self._preload_task_workers.pop(task_id, None)
+            connection = self._workers.get(owner)
+            if connection is not None:
+                connection.preload_jobs.pop(task_id, None)
+
     async def send_preload_job(
         self, connection: WorkerConnection, payload: dict[str, Any]
     ) -> bool:
@@ -521,17 +575,20 @@ class RemoteWorkerRegistry:
 
         由正在事件循环里的调用方直接 await（不内嵌 create_task——抢占式
         claim 的原子性要求发送结果当场可知，异步丢弃会把失败留成无人认领
-        的 CLAIMED 任务等 10 分钟租约）。
+        的 CLAIMED 任务等 10 分钟租约）。发送成功即记账，预算立即扣减。
         """
+        task_id = payload.get("task_id")
         try:
             await connection.send({"type": "job.start", "class": "preload", **payload})
         except Exception:  # noqa: BLE001
             logger.warning(
                 "预转码任务下发失败：worker=%s task=%s",
                 connection.worker_id,
-                payload.get("task_id"),
+                task_id,
             )
             return False
+        if isinstance(task_id, int):
+            self.note_preload_pushed(connection, task_id)
         return True
 
     async def send_preload_stop(self, device_id: int, task_id: int) -> None:
@@ -696,6 +753,22 @@ class RemoteWorkerRegistry:
         if message_type == "worker.goodbye":
             logger.info("远程转码 Worker 主动断开：%s", connection.worker_id)
             return None
+        if message_type == "job.failed" and str(message.get("class") or "") == "preload":
+            # 预转码任务的 WS 拒单（未开 preload 角色被误派 / 本机并发已满）。
+            # 任务立即回队重派，不等 10 分钟租约；归属校验防止别的 Worker
+            # 伪造拒收把别人的任务踢回队列
+            task_id = message.get("task_id")
+            logger.warning(
+                "预转码任务被 Worker 拒收：worker=%s task=%s：%s",
+                connection.worker_id,
+                task_id,
+                message.get("error"),
+            )
+            if isinstance(task_id, int):
+                # 记账释放放在回队协程里（归属校验通过之后）：伪造的拒单
+                # 不能提前释放他机的在途账
+                asyncio.create_task(self._requeue_rejected_preload(connection, task_id))
+            return None
         if (
             message_type
             in {
@@ -747,6 +820,23 @@ class RemoteWorkerRegistry:
 
     # -- 内部 ------------------------------------------------------------
 
+    async def _requeue_rejected_preload(self, connection: WorkerConnection, task_id: int) -> None:
+        """被拒收的预转码任务立即回队（归属校验后）。失败等租约兜底。"""
+        try:
+            from movieclaw_api.services.preload.dispatcher import return_task
+            from movieclaw_db.engine import get_database
+            from movieclaw_db.models import PreloadTask
+
+            async with get_database().session() as session:
+                task = await session.get(PreloadTask, task_id)
+                if task is not None and task.worker_device_id == connection.login_device_id:
+                    self.release_preload_task(task_id, connection.worker_id)
+                    await return_task(
+                        session, task_id, reason="Worker 拒收（角色未开或并发已满）"
+                    )
+        except Exception:  # noqa: BLE001
+            logger.warning("拒收任务回队失败（租约兜底）：task=%s", task_id, exc_info=True)
+
     def _select_worker(
         self,
         backend: str,
@@ -762,6 +852,9 @@ class RemoteWorkerRegistry:
                 for connection in self._workers.values()
                 if backend in connection.capabilities.backends
                 and segment_type in connection.capabilities.segment_types
+                # 实时任务只派给申报了 realtime 角色的 Worker：--no-realtime
+                # 的机器仍会申报 nvenc 后端（预转码用），但没有资格接播放任务
+                and "realtime" in connection.capabilities.roles
                 and (not disc or connection.capabilities.disc_sources)
                 and len(connection.jobs) < connection.max_jobs
                 and not connection.draining
@@ -804,10 +897,57 @@ class RemoteWorkerRegistry:
 
             return min(candidates, key=rank)
 
-    async def configure_device(self, device_id: int, max_jobs: int) -> None:
-        """v2 起废弃：并发只在 Worker 本机配置。保留方法以兼容旧测试签名，
-        实际不动任何状态。"""
-        return None
+    def _preempt_preload_for_realtime(
+        self, backend: str, segment_type: str, *, disc: bool
+    ) -> WorkerConnection | None:
+        """实时接单全员满员时，抢一台 Worker 的一个在跑预转码任务让位。
+
+        T2 预算（预转码最多占并发−1）只约束推送时刻——实时任务是在预转码
+        之后到的。抢占 = 记账立即释放 + 给 Worker 发 job.stop(class=preload)
+        （Worker 停掉分段 ffmpeg，断点台账在服务端）；任务本身保持 CLAIMED，
+        10 分钟租约到期自动回队重派。返回被抢占的连接供实时任务直接接单。
+        """
+        with self._lock:
+            victim: WorkerConnection | None = None
+            victim_task: int | None = None
+            for connection in self._workers.values():
+                if (
+                    backend not in connection.capabilities.backends
+                    or segment_type not in connection.capabilities.segment_types
+                    or (disc and not connection.capabilities.disc_sources)
+                    or "realtime" not in connection.capabilities.roles
+                    or connection.draining
+                    or not self._is_fresh(connection)
+                    or not connection.preload_jobs
+                ):
+                    continue
+                if victim is None or len(connection.jobs) < len(victim.jobs):
+                    victim = connection
+                    victim_task = min(connection.preload_jobs, key=connection.preload_jobs.get)  # type: ignore[type-var]
+            if victim is None or victim_task is None:
+                return None
+            task_id: int = victim_task
+            self.release_preload_task(task_id)
+        logger.warning(
+            "实时任务抢占预转码并发位：worker=%s task=%s（断点保留，租约到期回队）",
+            victim.worker_id,
+            task_id,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return victim  # 无事件循环（同步测试上下文）：记账已释放，停止消息由重连后的派单兜底
+        loop.create_task(self._send_preload_stop_message(victim, task_id))
+        return victim
+
+    @staticmethod
+    async def _send_preload_stop_message(connection: WorkerConnection, task_id: int) -> None:
+        try:
+            await connection.send(
+                {"type": "job.stop", "class": "preload", "task_id": task_id}
+            )
+        except Exception:  # noqa: BLE001
+            logger.info("预转码抢占停止消息发送失败（租约会兜底）：task=%s", task_id)
 
     @staticmethod
     def _profile(plan: PlaybackPlan, source_id: int) -> tuple[Any, ...]:
@@ -1021,6 +1161,7 @@ def reset_remote_worker_registry() -> None:
         _registry._progress_samples.clear()
         _registry._job_speeds.clear()
         _registry._paused_jobs.clear()
+        _registry._preload_task_workers.clear()
 
 
 def remote_worker_enabled() -> bool:

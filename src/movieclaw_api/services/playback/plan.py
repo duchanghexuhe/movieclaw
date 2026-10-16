@@ -277,10 +277,12 @@ def select_execution_backend(
             and effective_hw_backend(decision, backend) is not None
         )
     )
-    prefer_remote = (
+    # HDR / 超高分辨率这类本地执行不了的片属性：远程有候选时直接给远程
+    #（命名避开已删除的 prefer_remote 配置项，防误读）
+    force_remote = (
         decision.video.tone_map or (decision.video.height or 0) > MAX_TRANSCODE_HEIGHT
     )
-    if prefer_remote and remote_candidates:
+    if force_remote and remote_candidates:
         return remote_candidates[0], True
 
     # 本地执行不了才轮到远程 Worker。远程后端按优先级排：videotoolbox 在前

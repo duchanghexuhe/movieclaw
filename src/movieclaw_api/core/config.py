@@ -301,7 +301,7 @@ class Settings(BaseSettings):
     # 剩余空间——盘满会让 SQLite 写不进去、整个应用不可用
     # （docs/design/web-player.md §4.6）。会话结束即删，重启清残留。
     transcode_dir: str = Field(default="./data/transcodes", alias="MOVIECLAW_TRANSCODE_DIR")
-    # 预转码产物（docs/design/preload-transcode.md §6）：Worker 上传的便携版本
+    # 预转码产物（docs/design/preload-transcode.md §6）：Worker 上传的预转码版本
     # 长期保存在这里，登记为库文件的派生行后由播放链路直接读取。与数据库同在
     # data/ 卷上，配额兜底必须留出余量（配额预检只算本目录的占用）。
     preload_dir: str = Field(default="./data/preload", alias="MOVIECLAW_PRELOAD_DIR")

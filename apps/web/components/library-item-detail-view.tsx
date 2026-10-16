@@ -66,6 +66,7 @@ import {
   transferLibraryItem,
 } from "@/lib/api/libraries";
 import {
+  PRELOAD_STATUS_LABELS,
   type PreloadPreset,
   type PreloadTaskView,
   cancelPreloadTask,
@@ -506,9 +507,13 @@ export function LibraryItemDetailView({
     async (file: LibraryItemFile, presetId?: string) => {
       try {
         const est = await estimatePreload(file.id, presetId);
+        const sizeNote =
+          est.estimated_bytes > 0
+            ? `约多占 ${(est.estimated_bytes / 1024 ** 3).toFixed(1)} GB`
+            : "占用体积未知（源缺少时长信息）";
         const ok = await confirm({
           title: `把「${file.file_name}」预转码？`,
-          description: `约多占 ${(est.estimated_bytes / 1024 ** 3).toFixed(1)} GB（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后文件区会出现一个 1080p 低码率的可选版本。`,
+          description: `${sizeNote}（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由预转码 Worker 在后台闲时完成，完成后文件区会出现一个 1080p 低码率的可选版本。`,
           confirmLabel: "加入转码队列",
           cancelLabel: "先不",
         });
@@ -2603,11 +2608,7 @@ function PreloadDialog({
                         : "border-white/15 text-[var(--text-muted)]"
                     }`}
                   >
-                    {task.status === "queued" && "排队中"}
-                    {task.status === "claimed" && "已领取"}
-                    {task.status === "running" && "转码中"}
-                    {task.status === "failed" && "失败"}
-                    {task.status === "invalidated" && "已失效"}
+                    {PRELOAD_STATUS_LABELS[task.status]}
                   </span>
                 )}
                 {task &&
@@ -2630,15 +2631,17 @@ function PreloadDialog({
                     重试
                   </button>
                 )}
-                {(!task || task.status === "invalidated") && onPreload && (
-                  <button
-                    type="button"
-                    onClick={() => onPreload(file, selectedPreset)}
-                    className="shrink-0 rounded-full border border-white/[0.14] px-3 py-1 text-caption font-medium text-[var(--text)] transition hover:border-white/[0.25]"
-                  >
-                    转码
-                  </button>
-                )}
+                {/* 终态（完成/取消/失败/失效）允许再下单：后端幂等只拦活跃态 */}
+                {(!task || !["queued", "claimed", "running"].includes(task.status)) &&
+                  onPreload && (
+                    <button
+                      type="button"
+                      onClick={() => onPreload(file, selectedPreset)}
+                      className="shrink-0 rounded-full border border-white/[0.14] px-3 py-1 text-caption font-medium text-[var(--text)] transition hover:border-white/[0.25]"
+                    >
+                      转码
+                    </button>
+                  )}
               </div>
             );
           })}
@@ -2700,7 +2703,16 @@ function FileSection({
       </h2>
       <div className="overflow-hidden rounded-xl border border-white/[0.04] bg-white/[0.015]">
         {files.map((file) => {
-          const task = preloadTasks?.find((t) => t.target_file_id === file.id) ?? null;
+          // 一个源文件可能同时有多个档位的任务：活跃态优先展示，否则取最近一单
+          //（只按 target_file_id 匹配会让任意档位的任务挡住这行的预转码入口）
+          const fileTasks =
+            preloadTasks?.filter((t) => t.target_file_id === file.id) ?? [];
+          const task =
+            fileTasks.find((t) =>
+              ["queued", "claimed", "running"].includes(t.status),
+            ) ??
+            fileTasks[0] ??
+            null;
           return (
             <FileRow
               key={file.id}
@@ -2825,6 +2837,9 @@ function FileRow({
             {preloadTask.status === "claimed" && "转码已领取"}
             {preloadTask.status === "running" && "转码进行中"}
             {preloadTask.status === "failed" && "转码失败"}
+            {preloadTask.status === "completed" && "转码完成"}
+            {preloadTask.status === "cancelled" && "已取消"}
+            {preloadTask.status === "invalidated" && "已失效"}
           </span>
         )}
         {preloadTask?.status === "failed" && onPreloadRetry && (
@@ -2847,16 +2862,21 @@ function FileRow({
               取消
             </button>
           )}
-        {!preloadTask && onPreload && file.state === "in_place" && !file.derivation && (
-          <button
-            type="button"
-            onClick={onPreload}
-            title="预转码（提前转好 1080p 低码率版本，外网播放更省带宽）"
-            className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
-          >
-            预转码
-          </button>
-        )}
+        {/* 终态（完成/取消/失败/失效）允许再下单；无任务时给默认入口 */}
+        {(!preloadTask ||
+          !["queued", "claimed", "running"].includes(preloadTask.status)) &&
+          onPreload &&
+          file.state === "in_place" &&
+          !file.derivation && (
+            <button
+              type="button"
+              onClick={onPreload}
+              title="预转码（提前转好 1080p 低码率版本，外网播放更省带宽）"
+              className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+            >
+              预转码
+            </button>
+          )}
         {file.state === "trashed" && onRestore && (
           <button
             type="button"

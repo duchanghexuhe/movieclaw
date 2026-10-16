@@ -15,13 +15,18 @@ MUTEX_NAME = "Global\\MovieClawWorker"
 #: CreateMutexW 在互斥体已存在时返回有效句柄 + ERROR_ALREADY_EXISTS
 _ERROR_ALREADY_EXISTS = 183
 
+#: 进程生命周期内持有互斥体句柄。模块级引用别丢：返回值被调用方当普通整数
+#: 丢弃也无妨（句柄由本模块持有），但谁都不持有就给将来封装句柄对象埋雷
+_HELD_HANDLE: object | None = None
+
 
 def acquire_singleton_lock() -> object | None:
-    """尝试拿全局互斥体；已有实例返回 None，其余返回一个持有物（进程存活期间有效）。
+    """尝试拿全局互斥体；已有实例返回 None，其余返回句柄（进程存活期间有效）。
 
     非 Windows 恒成功；创建失败（极少见的权限问题）也放行——防呆锁不能
-    升级成可用性风险。返回值只需保持在进程生命周期内不被回收即可。
+    升级成可用性风险。句柄由本模块持有到进程退出。
     """
+    global _HELD_HANDLE
     if sys.platform != "win32":
         return True
     import ctypes
@@ -33,4 +38,5 @@ def acquire_singleton_lock() -> object | None:
     if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(handle)
         return None
+    _HELD_HANDLE = handle
     return handle

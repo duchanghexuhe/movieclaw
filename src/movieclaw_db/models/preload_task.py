@@ -41,14 +41,14 @@ class PreloadTaskStatus(StrEnum):
 
 
 class PreloadTask(TimestampMixin, table=True):
-    """一次"把这个源文件转成便携版本"的任务台账。
+    """一次"把这个源文件转成小体积预转码版本"的任务台账。
 
     - ``target_file_id`` 是**源**文件（库里的原始版本），产物登记时另立
       ``LibraryFile`` 行并回填 ``id``；
     - ``lease_expires_at`` 是领取租约：Worker 在线时领、离线无碍——租约到期
       仍无进度上报的任务自动回到 queued（断点台账保留，续转不丢）；
-    - ``resume_offset_bytes`` 是断点续转的台账：Worker 分段上传产物，服务端
-      记录已收到的字节数，Worker 重领时从该偏移继续。
+    - ``resume_parts`` 是断点续转的台账：Worker 按固定时长分段转码上传，
+      服务端记录已收到的连续段数，Worker 重领时跳过这些段。
     """
 
     __tablename__ = "preload_task"
@@ -69,7 +69,7 @@ class PreloadTask(TimestampMixin, table=True):
         ),
         description="源文件（转码对象）；产物另立 library_file 行",
     )
-    preset_id: str = Field(default="portable_1080p", description="目标档位枚举（§2）")
+    preset_id: str = Field(default="saver_1080p", description="目标档位枚举（§2）")
 
     status: str = Field(
         default=PreloadTaskStatus.QUEUED,

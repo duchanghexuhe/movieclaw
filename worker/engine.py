@@ -23,7 +23,6 @@ HTTP 代理用 http.server + urllib。
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 import secrets
@@ -35,7 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -1155,8 +1154,10 @@ class RealtimeJob:
             # job 换轮次重派时移除，ffmpeg 自然结束（无论成败）条目留在表里，
             # 之后每个 job.start 都被"Worker 并发已满"挡住，直到 Worker 重连
             #（2026-10-15 真机：两个失败任务把并发占死约 5 分钟）。
+            # **身份校验**：seek 换轮次时旧线程的收尾不能把新轮次的条目弹掉
             with self.client.jobs_lock:
-                self.client.jobs.pop(self.job_id, None)
+                if self.client.jobs.get(self.job_id) is self:
+                    self.client.jobs.pop(self.job_id, None)
 
     def _run_inner(self, message: dict) -> None:
         arguments = list(message.get("ffmpeg_args") or [])
@@ -1485,7 +1486,9 @@ class RealtimeClient:
                     "server_config": True,
                     "hardware": self.caps.get("hardware", {}),
                     "segment_types": ["fmp4"],
-                    "playback_progress": True,
+                    # 本程序没有面板消费 job.playback；申报 true 会让服务端
+                    # 每 3 秒白发一条播放位置
+                    "playback_progress": False,
                     "disc_sources": False,
                     "hw_decoders": self.caps.get("hw_decoders", []),
                     "filters": self.caps.get("filters", []),
@@ -1497,10 +1500,14 @@ class RealtimeClient:
             self._current_ws = ws
             while not self.stop_event.is_set():
                 self._flush_outbox(ws)
-                message = ws.recv_json(timeout=HEARTBEAT_SECONDS)
+                # 短超时空转：任务线程投进 outbox 的状态消息最长 5s 就发出去
+                #（原来要等 15s/45s 的收包超时，服务端的速度采样长期欠采样）；
+                # 半开连接由下面的静默窗口与心跳线程共同判定
+                message = ws.recv_json(timeout=5.0)
                 if message is None:
-                    # 心跳超时窗口：主动断开重连（半开连接检测）
-                    raise OSError(f"{int(SERVER_SILENCE_SECONDS)} 秒没有服务端消息")
+                    if time.time() - last_seen_box[0] > SERVER_SILENCE_SECONDS:
+                        raise OSError(f"{int(SERVER_SILENCE_SECONDS)} 秒没有服务端消息")
+                    continue
                 last_seen_box[0] = time.time()
                 self._handle(ws, message)
         finally:
@@ -1509,6 +1516,14 @@ class RealtimeClient:
                 self._outbox.clear()
             self._current_ws = None
             ws.close()
+            # 断线后服务端已把这些任务判失败重派；本地立即收掉 ffmpeg 释放
+            # 并发位——旧进程占着 self.jobs 会把重派回来的新任务顶成
+            # 「Worker 并发已满」，播放直接失败
+            with self.jobs_lock:
+                orphaned = list(self.jobs.values())
+                self.jobs.clear()
+            for job in orphaned:
+                job.stop(force=True)
 
     def _flush_outbox(self, ws: _WebSocket) -> None:
         while True:
@@ -1527,15 +1542,12 @@ class RealtimeClient:
         message_type = str(message.get("type", ""))
         if message_type == "worker.accepted":
             limit = message.get("max_jobs")
-            if isinstance(limit, int) and 1 <= limit <= 4:
+            # 服务端按 hello 申报的原值回传（上限 8 与 GUI 旋钮一致）；1..4
+            # 的旧钳制会把并发 5-8 的首轮实时任务顶成「并发已满」拒单
+            if isinstance(limit, int) and 1 <= limit <= 8:
                 self.max_jobs = limit
             self.last_problem = None
             self.log("实时通道握手完成，可以接单")
-        elif message_type == "worker.config":
-            limit = message.get("max_jobs")
-            if isinstance(limit, int) and 1 <= limit <= 4:
-                self.max_jobs = limit
-                self.log(f"并发上限同步为 {limit}")
         elif message_type == "job.start":
             # v2 统一调度：同一连接里实时与预转码任务按 class 分流
             if message.get("class") == "preload":
@@ -1569,7 +1581,7 @@ class RealtimeClient:
                 job.resume()
         elif message_type in ("worker.heartbeat.ack", "job.playback"):
             # job.playback 是观众播放位置（服务端只发给声明了 playback_progress
-            # 的 Worker，原本是给 Mac 面板显示用的）；本 Worker 无面板，静默即可
+            # 的 Worker）；本 Worker 无面板，hello 已不再申报，收到的都是旧服务端
             pass
         elif message_type == "worker.config":
             # v2 起服务端不再下发并发上限；收到说明对端还是旧版，忽略即可
@@ -1595,6 +1607,10 @@ class RealtimeClient:
     def _start_job(self, ws: _WebSocket, message: dict) -> None:
         job_id = str(message.get("job_id") or "")
         if not job_id:
+            return
+        # 连接已被替换/断开（finally 清 jobs 与这里的注册存在竞态）：不再
+        # 接单，服务端会在断线后把任务判失败重派
+        if self._current_ws is not ws or self.stop_event.is_set():
             return
         attempt_id = str(message.get("attempt_id") or job_id)
         with self.jobs_lock:
@@ -1622,6 +1638,11 @@ class RealtimeClient:
         job = RealtimeJob(job_id, message, self.ffmpeg, self)
         with self.jobs_lock:
             self.jobs[job_id] = job
+        # 实时优先（T2）：本机预转码占用超出「并发 −1 − 实时任务数」的部分
+        # 立即让位——预算公式与服务端 preload_capacity 同一口径
+        yield_slots = getattr(self, "preload_yield", None)
+        if yield_slots is not None:
+            yield_slots(max(0, self.max_jobs - 1 - len(self.jobs)))
         threading.Thread(target=job.run, args=(message,), name=f"job-{job_id[-6:]}", daemon=True).start()
 
     def _send_safe(self, payload: dict) -> None:

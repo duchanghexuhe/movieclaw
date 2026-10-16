@@ -1,8 +1,10 @@
 """预转码的用户面路由（docs/design/preload-transcode.md §3/§6）。
 
-成员区：下单/取消/重试/任务列表/冷数据清理——全部挂登录鉴权（router.py
-成员区统一注入），下单与产物删除的管理边界在服务层（谁能点详情页按钮谁
-就能给自己看得见的版本下单；配额与失效是机制行为，不是权限）。
+成员区：下单/取消/重试/任务列表/冷数据清理——挂登录鉴权（router.py
+成员区统一注入），**对象级授权也在路由层做**：下单/取消/重试/详情/删产物
+都要求目标文件所在库对请求主体可浏览（复用库可见性矩阵），任务列表对成员
+按可见库过滤——成员不能借任务视图探到隐藏库的内容，也不能取消/删除别人
+库里的任务与产物。
 """
 
 from __future__ import annotations
@@ -15,9 +17,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.api.deps import require_login
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.base import utc_isoformat
 from movieclaw_api.schemas.response import ApiResponse, ok
+from movieclaw_api.services.auth import Principal
+from movieclaw_api.services.library.access import (
+    assert_library_visible,
+    visible_library_ids,
+)
 from movieclaw_api.services.library.duplicates import quality_label_of
 from movieclaw_api.services.preload import service as preload_service
 from movieclaw_api.services.preload.ffmpeg_preload import (
@@ -53,6 +61,7 @@ def _task_view(
     season_number: int | None = None,
     episode_number: int | None = None,
     source_quality: str | None = None,
+    library_id: int | None = None,
 ) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -74,6 +83,8 @@ def _task_view(
         "episode_number": episode_number,
         # 源文件的规格签名（「2160p WEB-DL DV」），帮人认出转的是哪个版本
         "source_quality": source_quality,
+        # 成员可见性过滤用（成员区列表按库筛；管理员不限）
+        "library_id": library_id,
     }
 
 
@@ -108,6 +119,7 @@ async def enriched_task_views(
                 season_number=file.season_number if file else None,
                 episode_number=file.episode_number if file else None,
                 source_quality=quality_label_of(file) if file else None,
+                library_id=file.library_id if file else None,
             )
         )
     return views
@@ -135,9 +147,11 @@ async def list_presets() -> ApiResponse[list[dict[str, str]]]:
 async def estimate(
     payload: PreloadEstimatePayload,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict[str, Any]]:
     """点「预转码」时先展示预估体积与当前剩余配额（§6 价格标签）。"""
     file = await preload_service.get_target_file(session, payload.file_id)
+    await assert_library_visible(session, principal, file.library_id)  # type: ignore[arg-type]
     preset = PRESETS.get(payload.preset_id)
     if preset is None:
         raise BadRequestException(f"未知档位：{payload.preset_id}")
@@ -168,8 +182,13 @@ async def get_setting_store_dep():
 )
 async def overview(
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict[str, Any]]:
-    return ok(await preload_service.overview(session))
+    """成员只见可浏览库的聚合；管理员全库（None=不筛）。"""
+    visible: set[int] | None = None
+    if principal.kind != "admin" or principal.share is not None:
+        visible = await visible_library_ids(session, principal)
+    return ok(await preload_service.overview(session, library_ids=visible))
 
 
 @router.post(
@@ -180,7 +199,10 @@ async def overview(
 async def create_task(
     payload: PreloadCreatePayload,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict[str, Any]]:
+    file = await preload_service.get_target_file(session, payload.file_id)
+    await assert_library_visible(session, principal, file.library_id)  # type: ignore[arg-type]
     task = await preload_service.create_preload_task(
         session, file_id=payload.file_id, preset_id=payload.preset_id
     )
@@ -199,9 +221,15 @@ async def create_task(
 )
 async def list_tasks(
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[list[dict[str, Any]]]:
     tasks = await preload_service.list_tasks(session)
-    return ok(await enriched_task_views(session, tasks))
+    views = await enriched_task_views(session, tasks)
+    if principal.kind != "admin" or principal.share is not None:
+        # 成员/分享访客只见自己可浏览库的任务（视图带 library_id，一次过滤）
+        visible = await visible_library_ids(session, principal)
+        views = [v for v in views if v["library_id"] in visible]
+    return ok(views)
 
 
 @router.get(
@@ -212,11 +240,24 @@ async def list_tasks(
 async def get_task(
     task_id: int,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict[str, Any]]:
+    task, library_id = await _load_visible_task(session, principal, task_id)
+    return ok((await enriched_task_views(session, [task]))[0])
+
+
+async def _load_visible_task(
+    session: AsyncSession, principal: Principal, task_id: int
+) -> tuple[PreloadTask, int | None]:
+    """取任务并断言其源文件所在库对主体可浏览（取消/重试/详情共用）。"""
     task = await session.get(PreloadTask, task_id)
     if task is None:
         raise NotFoundException("任务不存在")
-    return ok((await enriched_task_views(session, [task]))[0])
+    file = await session.get(LibraryFile, task.target_file_id)
+    library_id = file.library_id if file else None
+    if library_id is not None:
+        await assert_library_visible(session, principal, library_id)
+    return task, library_id
 
 
 @router.post(
@@ -227,7 +268,9 @@ async def get_task(
 async def cancel_task(
     task_id: int,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict[str, Any]]:
+    await _load_visible_task(session, principal, task_id)
     task = await preload_service.cancel_task(session, task_id)
     return ok((await enriched_task_views(session, [task]))[0], message="任务已取消")
 
@@ -240,7 +283,9 @@ async def cancel_task(
 async def retry_task(
     task_id: int,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict[str, Any]]:
+    await _load_visible_task(session, principal, task_id)
     task = await preload_service.retry_task(session, task_id)
     return ok((await enriched_task_views(session, [task]))[0], message="已重新排队")
 
@@ -253,7 +298,12 @@ async def retry_task(
 async def delete_preload_file(
     file_id: int,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[None]:
+    file = await session.get(LibraryFile, file_id)
+    if file is None or file.derivation is None:
+        raise NotFoundException("预转码产物不存在")
+    await assert_library_visible(session, principal, file.library_id)  # type: ignore[arg-type]
     await preload_service.delete_derived_file(session, file_id)
     return ok(None, message="预转码产物已删除")
 
@@ -266,11 +316,21 @@ async def delete_preload_file(
 async def cleanup_stale(
     payload: StaleCleanupPayload,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[dict[str, Any]]:
-    """预览：``confirm=false`` 返回将删列表与可释放总量；确认：执行删除（§6）。"""
+    """预览：``confirm=false`` 返回将删列表与可释放总量；确认：执行删除（§6）。
+
+    管理员全库；成员只删可浏览库的（可见库集合传进 service 层圈定范围）。
+    """
     setting = await get_setting_store_dep()
     days = (payload.days if payload else None) or setting.stale_days
+    visible: set[int] | None = None
+    if principal.kind != "admin" or principal.share is not None:
+        visible = await visible_library_ids(session, principal)
     result = await preload_service.cleanup_stale(
-        session, days=days, dry_run=not (payload.confirm if payload else False)
+        session,
+        days=days,
+        dry_run=not (payload.confirm if payload else False),
+        library_ids=visible,
     )
     return ok(result)

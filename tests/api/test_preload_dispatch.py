@@ -26,7 +26,6 @@ from movieclaw_api.services.playback.remote_worker import (
     get_remote_worker_registry,
     reset_remote_worker_registry,
 )
-from movieclaw_db.engine import get_database
 from movieclaw_db.models.preload_task import PreloadTaskStatus
 
 _PRELOAD = "/api/v1/preload"
@@ -39,6 +38,14 @@ def client(tmp_path, monkeypatch):
         c.post(f"{_AUTH}/bootstrap", json=_ADMIN)
         c.post(f"{_AUTH}/login", json=_ADMIN)
         c.put("/api/v1/transcode-worker/config", json={"enabled": True})
+
+        async def _enable_preload() -> None:
+            from movieclaw_api.settings import PreloadSetting
+            from movieclaw_api.settings.store import get_setting_store
+
+            await get_setting_store().set(PreloadSetting(enabled=True))
+
+        c.portal.call(_enable_preload)  # type: ignore[attr-defined]
         yield c
 
     reset_remote_worker_registry()
@@ -170,45 +177,56 @@ def test_realtime_jobs_reduce_preload_budget(client, tmp_path):
 
 
 def test_preempt_for_realtime_returns_task_and_sends_stop(client, tmp_path):
-    """实时抢占：在跑的预转码任务回队（断点保留），Worker 收到 class=preload 的 job.stop。"""
-    from movieclaw_api.services.preload.dispatcher import preempt_for_realtime
-
+    """实时抢占（v2：接线在 reserve 全员满员时）：
+    记账释放 + Worker 收到 class=preload 的 job.stop。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
     token = _pair_worker(client)
     created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
     task_id = created["id"]
-    device_id = None
     with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
         ws.send_json(_hello("win-e", max_jobs=2, roles=["realtime", "preload"]))
         assert ws.receive_json()["type"] == "worker.accepted"
         message = ws.receive_json()
         assert message["type"] == "job.start" and message["task_id"] == task_id
-        device_id = next(
-            c.login_device_id
-            for c in get_remote_worker_registry()._workers.values()
-            if c.worker_id == "win-e"
+        registry = get_remote_worker_registry()
+        connection = registry._workers["win-e"]
+        assert registry.preload_capacity(connection) == 0  # 预算 1 已被推送占用
+        # 模拟实时任务把并发位占满，然后从实时路径请求抢占
+        with registry._lock:
+            connection.jobs.add("job-rt-1")
+            connection.jobs.add("job-rt-2")
+        victim = client.portal.call(
+            lambda: registry._preempt_preload_for_realtime("nvenc", "fmp4", disc=False)
         )
-        client.portal.call(preempt_for_realtime, device_id)
+        assert victim is connection
         stop = ws.receive_json()
         assert stop["type"] == "job.stop"
         assert stop["class"] == "preload"
         assert stop["task_id"] == task_id
+        # 记账当场释放：实时任务退光后预转码预算立刻回到 1
+        assert connection.preload_jobs == {}
+        with registry._lock:
+            connection.jobs.clear()
+        assert registry.preload_capacity(connection) == 1
 
-    # 任务回到队列，断点台账没有被清（resume_parts 保留）
-    assert task_id in _queued_task_ids(client)
 
-    async def _resume_parts() -> int:
-        from sqlmodel import select
-
-        from movieclaw_db.models import PreloadTask
-
-        async with get_database().session() as session:
-            row = (
-                await session.execute(select(PreloadTask).where(PreloadTask.id == task_id))
-            ).scalar_one()
-            return row.resume_parts
-
-    assert client.portal.call(_resume_parts) == 0
+def test_push_accounting_bounds_queue_dispatch(client, tmp_path):
+    """队列深于预算时只推预算内数量：不会把整条队列一口气推给同一台 Worker。"""
+    file_ids = [_seed_file(client, tmp_path, hdr="HDR10") for _ in range(3)]
+    token = _pair_worker(client)
+    for file_id in file_ids:
+        client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
+    pushed = []
+    with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
+        ws.send_json(_hello("win-f", max_jobs=2, roles=["realtime", "preload"]))
+        assert ws.receive_json()["type"] == "worker.accepted"
+        # 预算 = 2-1 = 1：只推第一个；第二条 job.start 永远不会来——
+        # 队列里剩两个任务但记账已满，这正是要防的「整条队列一口气推」
+        first = ws.receive_json()
+        assert first["type"] == "job.start" and first.get("class") == "preload"
+        pushed.append(first["task_id"])
+        assert len(_queued_task_ids(client)) == 2
+        assert pushed[0] not in _queued_task_ids(client)
 
 
 # ---------------------------------------------------------------------------

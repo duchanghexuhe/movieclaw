@@ -596,7 +596,7 @@ def test_observed_base_url_is_empty_without_host_header():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("principal", "enabled", "hint"),
-    [(None, True, "重新配对"), (object(), False, "打开开关")],
+    [(None, True, "重新配对"), (object(), False, "打开远程转码开关")],
     ids=["凭证无效", "开关没开"],
 )
 async def test_handshake_rejection_reason_reaches_the_worker(monkeypatch, principal, enabled, hint):

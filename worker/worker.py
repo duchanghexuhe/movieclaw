@@ -6,7 +6,7 @@
 
 用法::
 
-    python worker.py --server http://nas:3000 [--ffmpeg ffmpeg.exe] [--once]
+    python worker.py --server http://nas:3000 [--ffmpeg ffmpeg.exe]
 
 - 首次运行走设备配对（浏览器开 NAS 的 /activate 页，批准 Worker 的请求）；
 - 配对令牌存本地 worker.json（与配置同文件）；
@@ -22,7 +22,10 @@ Windows 机器跑，不要求装 MovieClaw 客户端。
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -42,10 +45,14 @@ _LEGACY_CONFIG_FILE = Path(__file__).with_name("preload_worker.json")
 CONFIG_FILE = (
     _LEGACY_CONFIG_FILE if _LEGACY_CONFIG_FILE.exists() else Path(__file__).with_name("worker.json")
 )
-#: 失败上报的退避间隔（推送派单后 REST 调用失败时用）
-POLL_SECONDS = 30
 PROGRESS_SECONDS = 60
 PART_BYTES_DEFAULT = 64 * 1024 * 1024
+
+#: 内网 NAS 地址直连 opener：urllib 默认读进程环境里的 http_proxy——挂机的
+#: 机器带着 Clash 等代理环境变量时，控制面 REST 与大文件传输会被绕去代理
+#:（实测内网吞吐掉到 1.7MB/s，2026-10-15 真机）。与 engine.py 的
+#: _NO_PROXY_OPENER 同一取缔：全部内网请求显式直连。
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class Api:
@@ -83,7 +90,9 @@ class Api:
             head.update(headers)
         req = urllib.request.Request(url, data=data, method=method, headers=head)
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            # 显式直连（见 _NO_PROXY_OPENER）：预转码的大文件上行/下行同实时
+            # 一样不能被代理环境变量劫持
+            with _NO_PROXY_OPENER.open(req, timeout=600) as resp:
                 body = resp.read()
                 if raw:
                     return resp.status, body
@@ -103,7 +112,6 @@ class Api:
 
         ``status_cb(kind, **fields)``：GUI 接管展示时传入；CLI 缺省打印。
         """
-        from typing import Callable
 
         emit = status_cb or (lambda kind, **fields: print(fields.get("line") or f"（{kind}）"))
 
@@ -139,6 +147,11 @@ class Api:
                 return token
             if status == 202:
                 continue
+            if status == 429:
+                # SLOW_DOWN：OAuth 设备流约定客户端放慢轮询（+5s），不退避
+                # 会一直撞到配对码过期
+                interval = min(interval + 5, 30)
+                continue
             raise RuntimeError(f"配对失败（{status}），请重新运行")
 
 
@@ -147,11 +160,32 @@ class Api:
 # ---------------------------------------------------------------------------
 
 
-def run_ffmpeg(ffmpeg: str, argv: list[str], workdir: Path) -> int:
-    """执行 ffmpeg（argv 不含 ffmpeg 本身），返回退出码。"""
+def run_ffmpeg(
+    ffmpeg: str,
+    argv: list[str],
+    workdir: Path,
+    *,
+    stop: threading.Event | None = None,
+    register=None,  # Callable[[subprocess.Popen], None] | None
+) -> int:
+    """执行 ffmpeg（argv 不含 ffmpeg 本身），返回退出码。
+
+    ``stop`` 是停止钩子：置位后立即杀掉在跑的进程（抢占/取消/退出不等
+    600s 的段跑完）。``register`` 在进程起来时交出句柄——调用方据此能在
+    停止路径之外（进程退出兜底）杀掉它。
+    """
     proc = subprocess.Popen(
         [ffmpeg, *argv], cwd=workdir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
+    if register is not None:
+        register(proc)
+    if stop is not None:
+        def watchdog() -> None:
+            stop.wait()
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+        threading.Thread(target=watchdog, name="ff-stop", daemon=True).start()
     tail: list[bytes] = []
     assert proc.stderr is not None
     for line in proc.stderr:
@@ -171,7 +205,11 @@ def probe_caps(ffmpeg: str) -> dict:
     探测结果缓存同目录 caps.json，换 ffmpeg 路径后自动重探。
     """
     caps_file = Path(__file__).with_name("caps.json")
-    cache_key = f"{ffmpeg}|{Path(ffmpeg).stat().st_mtime_ns if Path(ffmpeg).exists() else 0}"
+    # v2：key 带字段 schema 版本——新增上报字段（ffmpeg_version/hardware）时
+    # 存量部署的旧缓存必须失效重探，否则 hello 的新字段恒空
+    cache_key = (
+        f"v2|{ffmpeg}|{Path(ffmpeg).stat().st_mtime_ns if Path(ffmpeg).exists() else 0}"
+    )
     if caps_file.exists():
         try:
             cached = json.loads(caps_file.read_text())
@@ -181,6 +219,15 @@ def probe_caps(ffmpeg: str) -> dict:
             pass
     caps: dict = {"encoders": [], "filters": [], "hw_decoders": []}
     try:
+        probe = subprocess.run(
+            [ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True, timeout=15
+        )
+        out = probe.stdout
+        first = (out.splitlines() or [""])[0]
+        if first.lower().startswith("ffmpeg version"):
+            # hello 的 ffmpeg_version 字段：状态页 Worker 列表按它展示
+            caps["ffmpeg_version"] = first[len("ffmpeg version "):].split()[0]
+        caps["hardware"] = {"cpu_cores": os.cpu_count() or 0, "memory_bytes": _total_memory()}
         out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=30).stdout
         caps["encoders"] = sorted(set(out.split()) & {"h264_nvenc", "hevc_nvenc"})
         out = subprocess.run([ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=30).stdout
@@ -200,12 +247,47 @@ def probe_caps(ffmpeg: str) -> dict:
     return caps
 
 
-def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path, *,
-                 stop: threading.Event | None = None) -> bool:
+def _total_memory() -> int:
+    """物理内存字节数（Windows GlobalMemoryStatusEx；其他平台 0=未知）。"""
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return 0
+    return int(status.ullTotalPhys)
+
+
+def process_task(
+    api: Api,
+    ffmpeg: str,
+    task: dict,
+    workdir: Path,
+    *,
+    stop: threading.Event | None = None,
+    register=None,  # Callable[[subprocess.Popen], None] | None
+) -> bool:
     """执行一个任务；返回是否成功（失败已上报）。
 
     转码按段推进（§7 断点续转）：每段独立 ffmpeg（-ss/-t），传完一段服务端
     台账 +1；重领时 resume_parts 之前的段直接跳过——被打断只重转缺的段。
+    停止钩子（``stop``）置位后的所有失败都**不上报**：中断不是失败，断点
+    台账保留，租约到期自动回队。
     """
     task_id = task["task_id"]
     display = task.get("display_name", f"#{task_id}")
@@ -229,16 +311,37 @@ def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path, *,
     base_argv = task["argv"]  # 末两个元素是 -f matroska <output>
 
     # 1) 取源（签名 URL；整文件下载对断线重试与 NAS 磁盘更友好）。
-    # 已下载且大小与台账一致才复用；中断的半截文件直接重下
+    # 已下载且大小与台账一致才复用；中断的半截文件直接重下。
+    # 下载带重试：17GB 源一次网络抖动就整任务 FAILED、断点归零，太脆
     expected = task.get("source_size_bytes") or 0
     if source.exists() and (not expected or source.stat().st_size != expected):
         source.unlink()
     if not source.exists():
         url = api.server + "/" + task["source_url"]
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=600) as resp, open(source, "wb") as out:
-            while chunk := resp.read(4 * 1024 * 1024):
-                out.write(chunk)
+        last_error: Exception | None = None
+        for attempt in range(3):
+            if stop is not None and stop.is_set():
+                print(f"[{task_id}] 停止中断于下载（断点保留）")
+                return False
+            try:
+                req = urllib.request.Request(url)
+                with _NO_PROXY_OPENER.open(req, timeout=600) as resp, open(source, "wb") as out:
+                    while chunk := resp.read(4 * 1024 * 1024):
+                        out.write(chunk)
+                last_error = None
+                break
+            except (urllib.error.URLError, OSError) as exc:
+                last_error = exc
+                source.unlink(missing_ok=True)
+                print(f"[{task_id}] 源下载失败（第 {attempt + 1}/3 次）：{exc}")
+                time.sleep(2 * (attempt + 1))
+        if last_error is not None:
+            api.request(
+                "POST",
+                f"/api/v1/preload-worker/tasks/{task_id}/fail",
+                json_body={"error": f"源文件下载失败（重试 3 次）：{last_error}"},
+            )
+            return False
     print(f"[{task_id}] 源已就绪（{source.stat().st_size / 1024**2:.0f} MB）")
 
     # 2) 计算段数并跳过已收段
@@ -284,8 +387,15 @@ def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path, *,
                     url_idx += 2
                 if part < total_parts - 1:
                     seg_argv[url_idx + 1:url_idx + 1] = ["-t", str(segment_seconds)]
-            code, stderr_tail = run_ffmpeg(ffmpeg, seg_argv, workdir)
+            code, stderr_tail = run_ffmpeg(
+                ffmpeg, seg_argv, workdir, stop=stop, register=register
+            )
             if code != 0:
+                if stop is not None and stop.is_set():
+                    # 停止中断（抢占/取消/退出）杀掉了 ffmpeg：不是任务失败，
+                    # 不上报——断点台账保留，租约到期自动回队
+                    print(f"[{task_id}] 停止中断在第 {part + 1} 段（断点保留）")
+                    return False
                 api.request(
                     "POST",
                     f"/api/v1/preload-worker/tasks/{task_id}/fail",
@@ -302,6 +412,13 @@ def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path, *,
                     headers={"Content-Type": "application/octet-stream"},
                 )
             if status not in (200, 201):
+                if stop is not None and stop.is_set():
+                    print(f"[{task_id}] 停止中断于第 {part + 1} 段上传（断点保留）")
+                    return False
+                if status == 400:
+                    # 任务已不在执行态（取消/被重领）：本地半成品一并清掉，
+                    # 源文件与分段不会有人再来续写
+                    shutil.rmtree(workdir, ignore_errors=True)
                 api.request(
                     "POST",
                     f"/api/v1/preload-worker/tasks/{task_id}/fail",
@@ -320,6 +437,11 @@ def process_task(api: Api, ffmpeg: str, task: dict, workdir: Path, *,
         "POST", f"/api/v1/preload-worker/tasks/{task_id}/complete", json_body={}
     )
     if status != 200:
+        if stop is not None and stop.is_set():
+            print(f"[{task_id}] 停止中断于 complete（断点保留）")
+            return False
+        if status == 400:
+            shutil.rmtree(workdir, ignore_errors=True)  # 任务已终态：本地半成品一并清
         api.request(
             "POST",
             f"/api/v1/preload-worker/tasks/{task_id}/fail",
@@ -397,7 +519,6 @@ class WorkerRuntime:
         name: str = "Preload Worker",
         concurrency: int = 1,
         ac_only: bool = False,
-        once: bool = False,
         realtime: bool = False,
         on_token=None,  # Callable[[str], None] | None
         status_cb=None,  # Callable[..., None] | None
@@ -408,7 +529,6 @@ class WorkerRuntime:
         self.name = name
         self.concurrency = max(1, min(int(concurrency), 8))
         self.ac_only = ac_only
-        self.once = once
         self.realtime = realtime
         self.on_token = on_token
         self.status_cb = status_cb or (lambda *a, **k: None)
@@ -422,6 +542,9 @@ class WorkerRuntime:
         # 一道防派单与断线重连交错时短暂超发
         self._preload_slots = threading.Semaphore(max(1, self.concurrency - 1) or 1)
         self._preload_stop: dict[int, threading.Event] = {}
+        # 在跑分段 ffmpeg 的句柄（task_id → 最近一段的进程）：停止/退出路径
+        # 用来立即杀进程，不等 600s 的段自然跑完
+        self._preload_procs: dict[int, subprocess.Popen] = {}
         self._realtime_client = None
 
     def _emit(self, kind: str, **fields: object) -> None:
@@ -447,7 +570,7 @@ class WorkerRuntime:
             self.on_token(self.token)
 
     def start(self) -> None:
-        """阻塞直到 stop_event 置位（或 --once 队列清空）。"""
+        """阻塞直到 stop_event 置位。"""
         self.ensure_token()
         self.caps = probe_caps(self.ffmpeg)
         nvenc = "h264_nvenc" in self.caps["encoders"]
@@ -462,12 +585,30 @@ class WorkerRuntime:
         client = self._start_realtime()
         try:
             while not self.stop_event.is_set():
-                # stop_event 只拦"还没进 ffmpeg 的下一单"；进行中的 ffmpeg
-                # 由 stop()/preload 停止钩子收尾
                 self.stop_event.wait(0.5)
         finally:
             client.stop()
+            # 退出不留后事：杀掉所有在跑的分段 ffmpeg（否则进程退了、ffmpeg
+            # 成孤儿继续烧 GPU，还锁着源文件），等任务线程收尾
+            self._stop_all_preloads()
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with self._tasks_lock:
+                    if not self._preload_stop:
+                        break
+                time.sleep(0.2)
             self._emit("stopped")
+
+    def _stop_all_preloads(self) -> None:
+        """置位所有预转码停止钩子并杀掉在跑的 ffmpeg。"""
+        with self._tasks_lock:
+            stops = list(self._preload_stop.values())
+            procs = list(self._preload_procs.values())
+        for stop in stops:
+            stop.set()
+        for proc in procs:
+            with contextlib.suppress(OSError):
+                proc.kill()
 
     def _start_realtime(self):
         """拉起统一 WS 客户端（实时任务 + 预转码推送派单同一条连接）。"""
@@ -485,6 +626,9 @@ class WorkerRuntime:
             realtime=self.realtime,
         )
         client.preload_stop = self._stop_preload_task
+        # 实时任务进入时让位钩子：本机预转码占用超出「并发 − 实时任务数」的
+        # 部分立即停掉（断点台账在服务端，租约到期回队续转）
+        client.preload_yield = self._yield_preload_slots
         self._realtime_client = client
 
         def watch() -> None:
@@ -514,25 +658,49 @@ class WorkerRuntime:
             # 后自动回队。本地记一条，GUI 能看到为什么没在转
             self.log(f"[{task_id}] 使用电池中，跳过执行（任务将回队）")
             return False
-        with self._preload_slots:
-            if self.stop_event.is_set():
+        # 停止钩子**先注册再等槽位**：等槽位期间服务端抢占/取消经
+        # _stop_preload_task 才找得到这个任务（查不到的叫停会被静默丢掉）
+        stop = threading.Event()
+        with self._tasks_lock:
+            if task_id in self._preload_stop:
+                # 同一任务重复派单（服务端重启/租约回收后重派到同一台机）：
+                # 本机已有线程在跑，这条直接丢弃——跑着的那条会持续续约并
+                # 最终 complete；起第二个线程会双写同一个源文件
+                self.log(f"[{task_id}] 任务已在本机执行，忽略重复派单")
                 return False
-            stop = threading.Event()
+            self._preload_stop[task_id] = stop
+        try:
+            return self._run_preload_locked(task, task_id, stop)
+        finally:
             with self._tasks_lock:
-                self._preload_stop[task_id] = stop
+                self.tasks.pop(task_id, None)
+                if self._preload_stop.get(task_id) is stop:
+                    self._preload_stop.pop(task_id, None)
+                self._preload_procs.pop(task_id, None)
+
+    def _run_preload_locked(self, task: dict, task_id: int, stop: threading.Event) -> bool:
+        with self._preload_slots:
+            if self.stop_event.is_set() or stop.is_set():
+                return False
+            with self._tasks_lock:
                 self.tasks[task_id] = task.get("display_name", f"#{task_id}")
+
+            def _register_proc(proc: subprocess.Popen) -> None:
+                with self._tasks_lock:
+                    self._preload_procs[task_id] = proc
+
             self._emit(
                 "task", slot=task_id, task_id=task_id,
                 name=task.get("display_name", f"#{task_id}"), phase="claimed",
             )
             try:
-                # 服务端抢占（job.stop class=preload）置位 stop：process_task
-                # 在段间检查，断点台账在服务端，重派自动续转
-                stop.wait(0)  # 占位让 stop 变量在闭包里可见
+                # 服务端抢占（job.stop class=preload）置位 stop：run_ffmpeg 的
+                # 停止看门狗立即杀掉在跑的分段，断点台账在服务端，重派自动续转
                 ok = process_task(
                     self.api, self.ffmpeg, task,
                     Path(__file__).parent / "work" / str(task_id),
                     stop=stop,
+                    register=_register_proc,
                 )
                 self._emit(
                     "task", slot=task_id, task_id=task_id,
@@ -545,23 +713,33 @@ class WorkerRuntime:
 
                 self.log(f"[{task_id}] 异常：{exc}")
                 self.log(traceback.format_exc()[-900:])
-                self.api.request(
-                    "POST",
-                    f"/api/v1/preload-worker/tasks/{task_id}/fail",
-                    json_body={"error": str(exc)[:2000]},
-                )
+                if not stop.is_set():
+                    self.api.request(
+                        "POST",
+                        f"/api/v1/preload-worker/tasks/{task_id}/fail",
+                        json_body={"error": str(exc)[:2000]},
+                    )
                 return False
-            finally:
-                with self._tasks_lock:
-                    self.tasks.pop(task_id, None)
-                    self._preload_stop.pop(task_id, None)
 
     def _stop_preload_task(self, task_id) -> None:
-        """服务端抢占时停掉对应任务的 ffmpeg（断点保留在服务端台账）。"""
+        """服务端抢占/取消时停掉对应任务：置位停止钩子并杀掉在跑的分段。"""
         with self._tasks_lock:
             stop = self._preload_stop.get(task_id)
+            proc = self._preload_procs.get(task_id)
         if stop is not None:
             stop.set()
+        if proc is not None:
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+    def _yield_preload_slots(self, keep: int) -> None:
+        """实时任务进入时让位：预转码占用超出 keep 的部分（按开始先后）停掉。"""
+        with self._tasks_lock:
+            running = list(self._preload_stop)
+            over = running[: max(0, len(running) - keep)]
+        for task_id in over:
+            self.log(f"[实时优先] 预转码 {task_id} 让出并发位（断点保留，稍后续转）")
+            self._stop_preload_task(task_id)
 
 
 def main() -> None:
@@ -577,15 +755,20 @@ def main() -> None:
         default=None,
         help="是否接实时转码（默认开；--no-realtime 只跑预转码）",
     )
-    parser.add_argument("--once", action="store_true", help="处理完队列里现有任务后退出")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="（轮询时代遗留）推送派单模式下无效果，仅保留参数兼容",
+    )
     parser.add_argument("--reset-token", action="store_true", help="丢弃已存令牌重新配对")
     parser.add_argument("--autostart", action="store_true", help="开机自启调用；已有实例时静默退出")
     args = parser.parse_args()
 
-    # 单实例防呆锁：同机第二个 Worker 只会互顶 WS 连接、抢同一块 GPU
-    from single_instance import acquire_singleton_lock
+    # 单实例防呆锁：同机第二个 Worker 只会互顶 WS 连接、抢同一块 GPU。
+    # 句柄留在模块级（返回值丢弃的话锁的语义会随实现漂移）
+    import single_instance
 
-    if acquire_singleton_lock() is None:
+    if single_instance.acquire_singleton_lock() is None:
         if not args.autostart:
             print("已有 MovieClaw Worker 在运行，本进程退出（同机只需一个 Worker）。")
         sys.exit(0)
@@ -604,6 +787,10 @@ def main() -> None:
         config.pop("token", None)
     save_config(config)
 
+    if args.once:
+        print("提示：--once 是轮询领取时代的参数，推送派单模式下没有可判定的"
+              "「队列清空」时刻，已忽略。")
+
     runtime = WorkerRuntime(
         server=config["server"],
         token=config.get("token"),
@@ -611,7 +798,6 @@ def main() -> None:
         name=config.get("name") or "Preload Worker",
         concurrency=config.get("concurrency") or 1,
         ac_only=bool(config.get("ac_only")),
-        once=args.once,
         realtime=bool(config.get("realtime")),
         on_token=lambda token: save_config({**config, "token": token}),
         status_cb=lambda kind, **fields: print(fields.get("line") or f"（{kind}）"),

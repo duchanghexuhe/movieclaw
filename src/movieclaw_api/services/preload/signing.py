@@ -25,17 +25,28 @@ class PreloadGrant:
     task_id: int
     file_id: int
     kind: str  # preload.source | preload.artifact
+    #: 签发时绑定的认领设备；凭据只在任务仍由这台设备认领时有效（任务被
+    #: 回收重派给别的 Worker 后，旧 Worker 拿着 24h 长凭据不能再写产物）
+    device_id: int | None
     expires_at: int
 
 
 async def issue_preload_grant(
-    *, task_id: int, file_id: int, kind: str = "preload.source", ttl_seconds: int = DEFAULT_PRELOAD_TTL_S
+    *,
+    task_id: int,
+    file_id: int,
+    kind: str = "preload.source",
+    device_id: int | None = None,
+    ttl_seconds: int = DEFAULT_PRELOAD_TTL_S,
 ) -> str:
     """给一个任务签发数据面凭据。
 
     同一凭据串同时用于取源（``preload.source``）与产物回传
     （``preload.artifact``）——两者都只属于这个任务，端点侧按 kind 二次校验：
     签发时 kind 记 ``preload.source``，校验函数接受同任务的两种 kind。
+    ``device_id`` 绑定认领者；本地执行器（不属任何设备）签 None。
+    校验端对 ``device_id=None`` 的旧凭据放行（升级瞬间的在途上传不打断）——
+    这是 24h TTL 内的已知兼容窗口，非漏洞。
     """
     serializer = URLSafeSerializer(await get_signing_secret(), salt=_PRELOAD_SALT)
     return serializer.dumps(
@@ -43,6 +54,7 @@ async def issue_preload_grant(
             "t": task_id,
             "f": file_id,
             "k": kind,
+            "d": device_id,
             "exp": int(time.time()) + ttl_seconds,
         }
     )
@@ -66,10 +78,12 @@ async def verify_preload_grant(
     if not isinstance(payload, dict):
         return None
     try:
+        raw_device = payload.get("d")
         grant = PreloadGrant(
             task_id=int(payload["t"]),
             file_id=int(payload["f"]),
             kind=str(payload["k"]),
+            device_id=int(raw_device) if raw_device is not None else None,
             expires_at=int(payload["exp"]),
         )
     except (KeyError, TypeError, ValueError):

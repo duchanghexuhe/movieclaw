@@ -15,12 +15,16 @@ DEFAULT_PRELOAD_STALE_DAYS = 90
 
 @register_setting(namespace="library.preload_transcode", title="预转码")
 class PreloadSetting(SettingSchema):
-    """预转码（便携版本）的网页配置。
+    """预转码的网页配置。
 
     Worker 凭证同样是逐台设备配对签发（device-auth.md），这里没有令牌字段。
     """
 
-    enabled: bool = Field(default=False, description="是否启用预转码任务队列")
+    enabled: bool = Field(
+        default=False,
+        description="是否启用预转码任务队列（关闭后暂停派发，排队任务保留）；"
+        "存量部署升级后需在设置页手动打开",
+    )
     quota_bytes: int = Field(
         default=DEFAULT_PRELOAD_QUOTA_BYTES,
         gt=0,

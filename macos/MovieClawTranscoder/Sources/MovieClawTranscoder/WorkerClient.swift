@@ -467,7 +467,7 @@ actor WorkerClient {
             // 旧版服务端在 accept 之前就关连接，uvicorn 只回一个空的 403、理由丢了：
             // 凭证失效和开关没开分不出来，两种都得说
             return NASRejectionError(
-                reason: "NAS 拒绝了连接（HTTP 403）：请确认网页「应用 → 远程转码」已经打开；"
+                reason: "NAS 拒绝了连接（HTTP 403）：请确认网页设置「转码」页的远程转码开关已经打开；"
                     + "已经打开的话，说明这台 Mac 的授权已失效，请在网页「设置 → 设备」重新配对"
             )
         case 404:

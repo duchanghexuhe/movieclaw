@@ -279,7 +279,7 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
         await _reject_before_hello(websocket, reason)
         return
     if not remote_worker_enabled():
-        reason = "服务端尚未启用远程转码，请在网页「应用 → 远程转码」打开开关并确认地址"
+        reason = "服务端尚未启用远程转码，请在网页设置「转码」页打开远程转码开关"
         _warn_throttled(
             ("ws-disabled", client), "拒绝远程转码 Worker 连接（来自 %s）：%s", client, reason
         )

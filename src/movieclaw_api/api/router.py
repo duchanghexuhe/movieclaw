@@ -147,7 +147,7 @@ _MEMBER_ROUTERS = [
     # 我的通知（docs/design/cloud-push.md §7.3）：每个人只管自己的开关和设备；
     # App 登记只接受 App 类设备自己的凭证（服务层判定）
     push_member_router,
-    # 预转码（docs/design/preload-transcode.md）：逐部/逐集手动下单便携版本，
+    # 预转码（docs/design/preload-transcode.md）：逐部/逐集手动下单预转码版本，
     # 任务队列与冷数据清理是成员使用面
     preload_router,
     # 使用提示（docs/design/tips.md）：每个人自己的事件计数与提示展示/作废记录

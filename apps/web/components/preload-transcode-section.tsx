@@ -43,22 +43,34 @@ function formatGB(bytes: number): string {
 export function TranscodeSection() {
   const [overview, setOverview] = useState<PreloadOverview | null>(null);
   const [tasks, setTasks] = useState<PreloadTaskView[] | null>(null);
+  const [tasksError, setTasksError] = useState(false);
   const [presets, setPresets] = useState<PreloadPreset[]>([]);
   const [cleanupPreview, setCleanupPreview] = useState<StaleCleanupResult | null>(null);
   const [staleDays, setStaleDays] = useState("90");
+  // 预览时的天数快照：确认执行用的是它，不是输入框的当前值——预览与确认
+  // 之间用户改输入框，删除集合必须还是预览过的那份
+  const [previewDays, setPreviewDays] = useState<number | null>(null);
   const [cleaning, setCleaning] = useState(false);
   const toast = useToast();
   const confirm = useConfirm();
 
   const reload = useCallback(() => {
     listPreloadTasks()
-      .then(setTasks)
-      .catch(() => setTasks([]));
+      .then((data) => {
+        setTasks(data);
+        setTasksError(false);
+      })
+      .catch(() => setTasksError(true));
     getPreloadOverview()
       .then(setOverview)
       .catch(() => {});
   }, []);
   useEffect(reload, [reload]);
+  // 任务在 Worker 侧推进，设置页定期跟随（任务中心已由全局 Provider 轮询）
+  useEffect(() => {
+    const timer = setInterval(reload, 15_000);
+    return () => clearInterval(timer);
+  }, [reload]);
   useEffect(() => {
     getPreloadPresets()
       .then(setPresets)
@@ -68,8 +80,10 @@ export function TranscodeSection() {
   const previewCleanup = useCallback(async () => {
     setCleaning(true);
     try {
-      const result = await cleanupStalePreload(Number(staleDays) || undefined, false);
+      const days = Number(staleDays) || undefined;
+      const result = await cleanupStalePreload(days, false);
       setCleanupPreview(result);
+      setPreviewDays(days ?? null);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "预览失败，请稍后重试");
     } finally {
@@ -89,15 +103,16 @@ export function TranscodeSection() {
     if (!ok) return;
     setCleaning(true);
     try {
-      const result = await cleanupStalePreload(Number(staleDays) || undefined, true);
+      const result = await cleanupStalePreload(previewDays ?? undefined, true);
       toast.success(`已清理 ${result.count} 个版本，释放约 ${formatGB(result.freed_bytes ?? 0)}`);
       setCleanupPreview(null);
+      setPreviewDays(null);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "清理失败，请稍后重试");
     } finally {
       setCleaning(false);
     }
-  }, [cleanupPreview, confirm, staleDays, toast]);
+  }, [cleanupPreview, confirm, previewDays, toast]);
 
   return (
     <SettingsSection
@@ -130,7 +145,14 @@ export function TranscodeSection() {
           </div>
         </div>
       )}
-      {tasks === null ? (
+      {tasksError ? (
+        <Banner tone="warn">
+          任务列表加载失败。请检查与服务端的连接后重试
+          <button type="button" className="ml-2 underline underline-offset-2" onClick={reload}>
+            重试
+          </button>
+        </Banner>
+      ) : tasks === null ? (
         <SettingsEmpty title="加载中…" />
       ) : (
         <div className="space-y-10">

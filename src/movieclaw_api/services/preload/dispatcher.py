@@ -30,7 +30,7 @@ from movieclaw_api.services.preload import service as preload_service
 from movieclaw_api.services.preload.service import ARTIFACT_UPLOAD_NAME
 from movieclaw_api.services.preload.signing import issue_preload_grant
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import PreloadTaskStatus
+from movieclaw_db.models import PreloadTask, PreloadTaskStatus
 
 logger = logging.getLogger("movieclaw_api.preload.dispatcher")
 
@@ -41,18 +41,57 @@ GRANT_TTL_S = 24 * 3600
 #: 软件档同一口径）。预转码是小时级后台活，不跟播放抢即时性。
 _LOCAL_MAX_CONCURRENCY = 1
 
+#: 本地执行连续失败的熔断线：attempts 在每次抢占时 +1，坏源/坏参数的任务
+#: 回队重转会无限烧算力（推送失败回队不受此限——那是环境问题不是任务问题）
+_LOCAL_FAIL_MAX_ATTEMPTS = 3
+
+_dispatch_lock: asyncio.Lock | None = None
+_dispatch_lock_loop: asyncio.AbstractEventLoop | None = None
+_dispatch_rerun = False
+
+
+def _get_dispatch_lock() -> asyncio.Lock:
+    """派发单飞锁（按事件循环惰性创建；测试的多个循环各自一把）。
+
+    两个并发触发点（下单 / 租约回收）同时派发时，会各自读到旧的容量快照
+    然后都去推送——Worker 端信号量把超发任务排成幻影线程，租约到期回收
+    再派，churn 循环。同一循环内串行化即可根除。
+    """
+    global _dispatch_lock, _dispatch_lock_loop
+    loop = asyncio.get_running_loop()
+    if _dispatch_lock is None or _dispatch_lock_loop is not loop:
+        _dispatch_lock = asyncio.Lock()
+        _dispatch_lock_loop = loop
+    return _dispatch_lock
+
 
 async def dispatch_queued_tasks() -> None:
     """调度排队任务：本地优先，远程 Worker 兜底。
 
-    顺序（每一步不可用时自动落到下一步，都不行就等下一个触发点）：
-    1. **本地执行器**：NAS 硬件可用、播放不吃紧、本机并发位有空、命令
-       装得出来（HDR 源在没有 tonemapx 的上游 ffmpeg 上装不出正确链）；
-    2. **WS 推送派单**：带 preload 角色的在线 Worker 有余量（并发−1）。
-
-    幂等：抢占成功但执行/推送失败的行会当场回队，重试由下一个触发点
-    （下单、任务结束、Worker 上线、租约回收）驱动。
+    单飞：一轮进行中时再触发只记「要重跑」标记，本轮结束后自动补一轮——
+    队列不会因为并发触发而漏派，也不会两个循环同时读容量互相超发。
     """
+    global _dispatch_rerun
+    lock = _get_dispatch_lock()
+    if lock.locked():
+        _dispatch_rerun = True
+        return
+    async with lock:
+        while True:
+            _dispatch_rerun = False
+            await _dispatch_round()
+            if not _dispatch_rerun:
+                return
+
+
+async def _dispatch_round() -> None:
+    """一轮派发（调用方保证持有派发锁）。"""
+    from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    setting = await get_setting_store().get(PreloadSetting)
+    if not setting.enabled:
+        return  # 预转码队列已停用：任务留在队列里，重新打开开关后继续派
     dispatched = 0
     # 本地能吃几个就先吃几个（每轮重读容量：占用是动态的）
     while _local_capacity() > 0:
@@ -67,7 +106,7 @@ async def dispatch_queued_tasks() -> None:
                 # 远程 Worker（jellyfin-ffmpeg 有 tonemapx；直拷的远程路径
                 # 已有）。**必须跳出本地循环**——队列头就是这个任务，留在
                 # 循环里会原样再抢一次
-                await _return_task(session, task.id, reason="本地不可执行，转远程")
+                await return_task(session, task.id, reason="本地不可执行，转远程")
                 break
             _run_local(task, file, command)
             dispatched += 1
@@ -94,12 +133,15 @@ async def _dispatch_one_remote(session: AsyncSession) -> int | None:
         if claimed is None:
             return None  # 队列空了
         task, file = claimed
-        # 硬编能力从 hello 申报取（与实时同源），软编回落
-        payload = await _payload_for(session, task, file, _preload_caps(worker))
+        # 硬编能力从 hello 申报取（与实时同源），软编回落；凭据绑定认领者，
+        # 任务被回收重派后旧 Worker 的长凭据写不进产物
+        payload = await _payload_for(
+            session, task, file, _preload_caps(worker), device_id=worker.login_device_id
+        )
         ok = await registry.send_preload_job(worker, payload)
         if ok:
             return 1
-        await _return_task(session, task.id, reason="推送失败")
+        await return_task(session, task.id, reason="推送失败")
         # 这台连接可疑，本轮不再派给它
     return None
 
@@ -130,11 +172,11 @@ async def _claim_for(session: AsyncSession, *, device_id: int | None):
 
 
 async def _payload_for(
-    session: AsyncSession, task, file, worker_caps: dict | None
+    session: AsyncSession, task, file, worker_caps: dict | None, *, device_id: int | None
 ) -> dict:
     """组装与 claim 长轮询完全同构的 job.start 载荷（Worker 端只认这一种）。"""
     grant = await issue_preload_grant(
-        task_id=task.id, file_id=file.id, ttl_seconds=GRANT_TTL_S
+        task_id=task.id, file_id=file.id, ttl_seconds=GRANT_TTL_S, device_id=device_id
     )
     command = preload_service.build_task_command(
         task, file, worker_caps=worker_caps
@@ -153,10 +195,8 @@ async def _payload_for(
     return command
 
 
-async def _return_task(session: AsyncSession, task_id: int, *, reason: str) -> None:
-    """推送失败当场退回队列（断点台账保留，下一次触发点重派）。"""
-    from movieclaw_db.models import PreloadTask
-
+async def return_task(session: AsyncSession, task_id: int, *, reason: str) -> None:
+    """当场退回队列（断点台账保留，下一次触发点重派）。"""
     task = await session.get(PreloadTask, task_id)
     if task is not None and task.status in (
         PreloadTaskStatus.CLAIMED,
@@ -170,48 +210,24 @@ async def _return_task(session: AsyncSession, task_id: int, *, reason: str) -> N
         logger.warning("预转码任务已退回队列：task=%s（%s）", task_id, reason)
 
 
-async def preempt_for_realtime(device_id: int) -> None:
-    """实时任务需要并发位时，抢占该设备最早的一个在跑预转码任务。
+async def return_task_or_fail(session: AsyncSession, task_id: int, *, reason: str) -> None:
+    """本地执行失败回队；同任务反复失败（毒源/坏参数）直接置失败。
 
-    预算公式保证正常情况下用不着走到这里（realtime 永远优先）；兜底场景是
-    同机既有 preload 又有 realtime 角色时，实时占用与预转码占用错峰变化的
-    边界。抢占 = 任务回队 + 给 Worker 发 job.stop（Worker 停掉 ffmpeg，
-    断点台账在服务端，重派时自动续转）。
+    回队重转对「播放抢占 / 服务重启」这类环境中断是正确语义，但对坏源是
+    无限重转——每次触发点都会把整部电影重新烧一遍。attempts 在每次抢占时
+    +1，连续超过熔断线就置 FAILED 交给用户处置（可重试）。
     """
-    from sqlalchemy import select
-
-    from movieclaw_db.models import PreloadTask
-
-    registry = get_remote_worker_registry()
-    async with get_database().session() as session:
-        task = (
-            await session.execute(
-                select(PreloadTask)
-                .where(
-                    PreloadTask.worker_device_id == device_id,
-                    PreloadTask.status.in_(
-                        [PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING]
-                    ),
-                )
-                .order_by(PreloadTask.claimed_at.asc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if task is None:
-            return
-        task_id = task.id
-        task.status = PreloadTaskStatus.QUEUED
-        task.worker_device_id = None
-        task.claimed_at = None
-        task.lease_expires_at = None
-        await session.commit()
-        logger.info(
-            "预转码任务被实时任务抢占回队：task=%s device=%s（断点保留）",
-            task_id,
-            device_id,
+    task = await session.get(PreloadTask, task_id)
+    if task is None:
+        return
+    if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
+        return
+    if task.attempts >= _LOCAL_FAIL_MAX_ATTEMPTS:
+        await preload_service.fail_task(
+            session, task, f"连续失败 {task.attempts} 次，已熔断：{reason}"
         )
-    # job.stop 语义复用实时路径：消息带 class=preload，Worker 只停预转码任务
-    await registry.send_preload_stop(device_id, task_id)
+    else:
+        await return_task(session, task_id, reason=reason)
 
 
 def trigger_dispatch() -> None:
@@ -264,15 +280,26 @@ def _run_local(task, file, command: dict) -> None:
     logger.info("预转码任务由本地执行：task=%s（软编链）", task.id)
 
 
+def cancel_local_task(task_id: int) -> bool:
+    """取消本地执行器在跑的任务（服务层 cancel_task 的本地臂）。"""
+    runner = _LOCAL_RUNNING.get(task_id)
+    if runner is None or runner.done():
+        return False
+    runner.cancel()
+    logger.info("本地预转码任务已请求取消：task=%s", task_id)
+    return True
+
+
 async def _execute_local_task(
     task_id: int, file, argv: list[str]
 ) -> None:
     """跑一条本地预转码命令并登记产物（与 Worker 的 REST 数据面等价）。
 
     与 Worker 路径的差异：源直接读 NAS 盘上的原文件（argv 里的 source.mkv
-    换成真实路径），产物直接写任务目录（不经历上传），完成时直接调
-    complete 的服务层校验登记。失败/异常时任务回队（断点保留）而不是置
-    失败——本地路径随时可能因播放抢占而中断，回队让下一个触发点重派。
+    换成真实路径），产物先写协议名（artifact.mkv），完成后改名为动态片名
+    （与 REST complete 的 concat 目标同名），再调 complete 的服务层校验登记。
+    失败/异常时任务回队（断点保留）——本地路径随时可能因播放抢占而中断，
+    回队让下一个触发点重派。
     """
     from movieclaw_api.services.media_probe import probe_media
 
@@ -283,8 +310,10 @@ async def _execute_local_task(
     local_argv = list(argv)
     input_index = local_argv.index("-i")
     local_argv[input_index + 1] = file.file_path
-    local_argv[-1] = str(directory / ARTIFACT_UPLOAD_NAME)
+    tmp_path = directory / ARTIFACT_UPLOAD_NAME
+    local_argv[-1] = str(tmp_path)
     final_path = None
+    process = None
     try:
         # 续约线程：任务跑几小时，租约 10 分钟一续
         stop_renew = asyncio.Event()
@@ -305,36 +334,53 @@ async def _execute_local_task(
                 "本地预转码失败：task=%s 退出码 %s：%s", task_id, process.returncode, tail
             )
             async with get_database().session() as session:
-                await _return_task(session, task_id, reason=f"ffmpeg 退出码 {process.returncode}")
+                await return_task_or_fail(
+                    session, task_id, reason=f"ffmpeg 退出码 {process.returncode}"
+                )
             return
-        final_path = directory / ARTIFACT_UPLOAD_NAME
-        spec = probe_media(str(final_path))
+        spec = probe_media(str(tmp_path))
         async with get_database().session() as session:
             from movieclaw_db.models import PreloadTask
 
             task = await session.get(PreloadTask, task_id)
             if task is None:
                 return
+            # 与 REST complete 同一收尾：产物定名为动态片名后再校验登记
+            #（complete_task 按 artifact_path_for 找文件——协议名不是它要的）
+            final_path = await preload_service.artifact_path_for(session, task)
+            if final_path != tmp_path:
+                tmp_path.replace(final_path)
+            else:
+                final_path = None  # 源条目已失效：complete 会拦下，占位文件留给 finally 清
             derived = await preload_service.complete_task(
                 session,
                 task,
-                actual_bytes=final_path.stat().st_size,
+                actual_bytes=(final_path or tmp_path).stat().st_size,
                 duration_seconds=spec.duration_seconds if spec else None,
                 video_codec=spec.video_codec if spec else None,
             )
-            logger.info("本地预转码完成：task=%s → file=%s", task_id, derived.id)
+        final_path = None  # 已登记为版本（file_path 指向它），finally 不再清理
+        logger.info("本地预转码完成：task=%s → file=%s", task_id, derived.id)
     except asyncio.CancelledError:
+        # 用户取消：communicate() 被取消不会杀子进程——手动收掉，否则小时级
+        # ffmpeg 成孤儿继续烧机，容量位还被 done_callback 提前还给派单器
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
         raise
     except Exception:  # noqa: BLE001
         logger.exception("本地预转码异常：task=%s", task_id)
         async with get_database().session() as session:
-            await _return_task(session, task_id, reason="本地执行异常")
+            await return_task_or_fail(session, task_id, reason="本地执行异常")
     finally:
-        # complete_task 成功时会把产物改名登记；失败/异常时协议名的临时
-        # 文件留在目录里会污染下一轮（断点续转按段文件算），清掉
+        # 失败/异常时协议名与改名后的半成品都留在目录里会污染下一轮
+        #（断点续转按段文件算），清掉；成功时 final_path 已置 None
         with contextlib.suppress(OSError):
             if final_path is not None and final_path.exists():
                 final_path.unlink()
+        with contextlib.suppress(OSError):
+            if tmp_path.exists():
+                tmp_path.unlink()
 
 
 async def _renew_local_lease(task_id: int, stop: asyncio.Event) -> None:
