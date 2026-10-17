@@ -63,6 +63,7 @@ async def decide_for_file(
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
     uplink_bps: int | None = None,
+    external: bool = False,
     visible_library_ids: set[int] | None = None,
 ) -> PlaybackDecision | None:
     """对一个台账文件出播放决策；文件不存在或当前账号不可见时返回 None。
@@ -83,6 +84,7 @@ async def decide_for_file(
         preferred_subtitle=preferred_subtitle,
         max_height=max_height,
         uplink_bps=uplink_bps,
+        external=external,
         contexts=await track_contexts(session, [file]),
     )
 
@@ -97,6 +99,7 @@ async def decide_for_files(
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
     uplink_bps: int | None = None,
+    external: bool = False,
     contexts: dict[int, TrackContext] | None = None,
 ) -> PlaybackDecision | None:
     """多候选择优（§3.5）：同一条目常有 1080p/2160p 两个版本，能直通的
@@ -201,6 +204,7 @@ async def decide_for_files(
                     preferred_subtitle=preferred_subtitle,
                     max_height=max_height,
                     uplink_bps=uplink_bps,
+                    external=external,
                 ),
                 profile.height,
                 profile.bit_rate_bps,

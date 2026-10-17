@@ -91,7 +91,7 @@ def client(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-def make_media(root: Path, name: str, *, codec: str, container: str) -> Path:
+def make_media(root: Path, name: str, *, codec: str, container: str, audio: str = "aac") -> Path:
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{name}.{container}"
     encoder = {"h264": "libx264", "hevc": "libx265"}[codec]
@@ -101,7 +101,7 @@ def make_media(root: Path, name: str, *, codec: str, container: str) -> Path:
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={DURATION}",
         "-c:v", encoder, "-preset", "ultrafast",
         "-g", "50", "-keyint_min", "50",
-        "-c:a", "aac", "-shortest", "-y", str(path),
+        "-c:a", audio, "-shortest", "-y", str(path),
     ]
     if codec == "hevc":
         argv[argv.index("-preset") + 2 : argv.index("-preset") + 2] = [
@@ -461,6 +461,37 @@ def test_wan_source_over_uplink_transcodes_before_stalling(client, tmp_path, mon
     wait_for_segments(client, data, count=1)
     assembled = fetch_whole_stream(client, data, tmp_path)
     _run(["ffprobe", "-v", "error", str(assembled)])
+
+
+def test_wan_transcode_pins_audio_to_aac(client, tmp_path, monkeypatch):
+    """外网转码会话音轨固定 AAC 双声道（2026-10-17 外网 480p 卡顿治理）：
+    E-AC-3 源轨可直通也不 copy，给丢包线路省出码率；手选画质上限不影响。"""
+    from movieclaw_api.settings import PlaybackPolicySetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    async def _setup():
+        await get_setting_store().set(
+            PlaybackPolicySetting(software_transcode_enabled=True)
+        )
+
+    client.portal.call(_setup)
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
+    assert resp.status_code == 200, resp.text
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.playback.client_address",
+        _fake_client_address("1.2.3.4"),
+    )
+
+    path = make_media(tmp_path / "m", "wan-aac", codec="h264", container="mp4", audio="eac3")
+    file_id = client.portal.call(
+        partial(_seed, path, codec="h264", container="mp4", bit_rate=6_000_000)
+    )
+    data = start(client, file_id)
+    decision = data["decision"]
+    assert decision["video"]["action"] == "transcode", decision["reason"]
+    assert decision["audio"]["codec"] == "aac", decision["reason"]
+    assert decision["audio"]["channels"] == 2
+    assert "外网" in decision["reason"], decision["reason"]
 
 
 def test_wan_source_fitting_uplink_still_direct_plays(client, tmp_path, monkeypatch):

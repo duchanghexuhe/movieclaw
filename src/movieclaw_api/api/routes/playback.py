@@ -788,6 +788,7 @@ async def decide_playback_route(
         session,
         # 用户手选了画质上限时不做外网上行降档——他的选择优先于自动
         uplink_bps=await _uplink_bps_for(request) if payload.max_height is None else None,
+        external=_is_external_request(request),
     )
 
     if decision is None:
@@ -944,11 +945,23 @@ async def _uplink_bps_for(request: Request) -> int | None:
     return mbps * 1_000_000
 
 
+def _is_external_request(request: Request) -> bool:
+    """会话是否来自外网（按连接来源判定，不依赖 uplink_mbps 配置）。
+
+    音轨省流量规则（转码会话固定 AAC 双声道）只看「是不是外网」：用户没填
+    上行数值也应该生效。Docker 桥接把来源 NAT 成网关时拿不到真实地址，与
+    ``_uplink_bps_for`` 同一口径按内网处理。
+    """
+    host = client_address(request)
+    return bool(host) and not is_lan_address(host)
+
+
 async def _decide(
     payload: PlaybackDecideRequest,
     principal: Principal,
     session: AsyncSession,
     uplink_bps: int | None = None,
+    external: bool = False,
 ):
     """decide 与开会话共用的取数与判定。
 
@@ -980,6 +993,7 @@ async def _decide(
             preferred_subtitle=payload.subtitle_track,
             max_height=payload.max_height,
             uplink_bps=uplink_bps,
+            external=external,
             visible_library_ids=visible,
         )
     if payload.media_item_id is not None:
@@ -1002,6 +1016,7 @@ async def _decide(
             preferred_subtitle=payload.subtitle_track,
             max_height=payload.max_height,
             uplink_bps=uplink_bps,
+            external=external,
             contexts=contexts,
         )
     raise BadRequestException("需要提供 file_id 或 media_item_id")
@@ -1062,6 +1077,10 @@ async def start_playback_session(
     # 重试 / 换轨 / 让出名额后重决策）也按同一预算——否则重开回来的计划会和
     # 第一次开的不一致。
     uplink_bps = await _uplink_bps_for(request) if payload.max_height is None else None
+    # 外网标识与上行配置解耦：音轨省流量规则（转码时固定 AAC 双声道）只看
+    # 「是不是外网」，用户没填上行数值也应该生效。手选画质上限不影响它——
+    # 外网 + 手选 480p 恰恰是最需要省流量的组合。
+    external = _is_external_request(request)
 
     def attempt_started(
         file_id: int | None, tier: int, view: PlaybackDecisionView, **timings: int
@@ -1120,7 +1139,7 @@ async def start_playback_session(
         # 续播点只能是重看到一半（已看标记保留），这时从头放会丢掉这次的进度
         resolved_start_ms = watch_row.position_ms if watch_row is not None else 0
 
-    decision = await _decide(payload, principal, session, uplink_bps=uplink_bps)
+    decision = await _decide(payload, principal, session, uplink_bps=uplink_bps, external=external)
     decide_ms = int((time.perf_counter() - started_at) * 1000)
     if decision is None:
         raise NotFoundException("没有找到可播放的文件")
@@ -1135,7 +1154,7 @@ async def start_playback_session(
         for candidate in await _requested_file_ids(session, payload):
             replaced += await manager.stop_for_file(candidate, member_id)
         if replaced:
-            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps)
+            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps, external=external)
             if decision is None:
                 raise NotFoundException("没有找到可播放的文件")
             view = playback_plan.to_view(decision)
@@ -1158,7 +1177,7 @@ async def start_playback_session(
         if principal.device is not None and principal.device.kind in _SINGLE_PLAYER_KINDS:
             replaced += await manager.stop_stale_for_device(device_id, keep_file_id=file.id)
         if replaced:
-            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps)
+            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps, external=external)
             if decision is None:
                 raise NotFoundException("没有找到可播放的文件")
             view = playback_plan.to_view(decision)
@@ -1327,7 +1346,9 @@ async def start_playback_session(
         )
         retry_failed_tiers = sorted({*payload.failed_tiers, int(Tier.HARDWARE_TRANSCODE)})
         fallback_payload = payload.model_copy(update={"failed_tiers": retry_failed_tiers})
-        decision = await _decide(fallback_payload, principal, session, uplink_bps=uplink_bps)
+        decision = await _decide(
+            fallback_payload, principal, session, uplink_bps=uplink_bps, external=external
+        )
         if decision is None:
             raise NotFoundException("没有找到可播放的文件")
         view = playback_plan.to_view(decision)

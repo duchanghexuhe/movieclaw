@@ -324,6 +324,7 @@ def decide_playback(
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
     uplink_bps: int | None = None,
+    external: bool = False,
 ) -> PlaybackDecision:
     """按 web-player.md §3.3 的判定顺序算出最优播放计划。
 
@@ -346,6 +347,10 @@ def decide_playback(
     min(上行, 外网天花板 1080p 档) 时直通档换成转码——但**不自动生效**：计划带
     ``uplink_forced`` 透出，网页端拦下起播弹窗让用户确认。与 max_height 互斥地
     生效：手选了画质上限就不传上行，用户的选择优先。universal 分支同样不受影响。
+
+    ``external`` 是会话是否来自外网（按连接来源判定，与 uplink_mbps 配置无关）。
+    为 True 且视频已判转码时，音轨强制 AAC-LC 双声道（省流量；见 _judge_audio），
+    不影响直连 / 重封装档。
 
     ``preferred_subtitle`` 是**用户选中的字幕轨**（None/"off" 与文本轨都是
     no-op）。只有当它指向本文件的**内封 PGS 轨**时才改变决策：视频强制转码、
@@ -470,7 +475,14 @@ def decide_playback(
 
     # 3–5. 视频、HDR、音频三项判定，各自算出「能不能 copy」。
     video_verdict = _judge_video(media, capability, policy, max_height, uplink_bps)
-    audio_verdict = _judge_audio(media, capability, preferred_audio)
+    audio_verdict = _judge_audio(
+        media,
+        capability,
+        preferred_audio,
+        # 外网省流量只在视频本来就要转码的会话生效：直连 / 重封装档的音轨
+        # copy 是零成本，改转码反而把无损档抬成有损档
+        force_stereo_aac=external and not video_verdict.can_copy,
+    )
 
     # 用户显式选中内封 PGS → 烧录：视频不再允许 copy（硬边界 1 唯一例外）。
     # blocked（如 HDR 无 GPU）原样保留——烧录也救不了放不出来的画面。
@@ -705,12 +717,19 @@ def _judge_audio(
     media: MediaProfile,
     capability: ClientCapability,
     preferred_audio: str | None = None,
+    *,
+    force_stereo_aac: bool = False,
 ) -> _AudioVerdict:
     """音轨判定（§3.3 步骤 5）：先找能直通的轨，找不到才转。
 
     ``preferred_audio`` 是**用户在播放器里点选的轨**。给了就认它，不再自动
     换轨——自动换轨是「用户没表态时帮他找一条能放的」，用户表了态还替他改
     等于点了没用。它放不了就转它，也不去动别的轨。
+
+    ``force_stereo_aac`` 是外网会话的省流量规则（调用方在视频已判转码时才
+    置位）：能直通的音轨也固定转 AAC-LC 双声道——E-AC-3 5.1 直通要 448-640
+    kbps，转 AAC 后总码率给丢包线路留出余量；与原生 HLS 分支的固定 AAC 同
+    一先例，只对外网生效，局域网多声道体验不变。
     """
     tracks = media.audio_tracks
     if not tracks:
@@ -720,6 +739,19 @@ def _judge_audio(
     # 直出时浏览器放的那条（容器默认轨）：放的不是它就得重封装（needs_remap）
     container_default = _container_default_audio(tracks)
     chosen = next((t for t in tracks if t.ref == preferred_audio), None)
+
+    def _stereo_aac_verdict(track: AudioTrack) -> _AudioVerdict | None:
+        if not force_stereo_aac:
+            return None
+        channels = track.channels or 2
+        if (track.codec or "").lower() == "aac" and channels <= 2:
+            return None  # 已是目标格式，直通
+        return _transcode_audio(
+            track,
+            capability,
+            prefix=f"外网播放，音轨 {_track_label(track)}",
+            force_aac=True,
+        )
 
     # 原生 HLS（AVPlayer）的解码链比 MSE/hls.js 更挑剔：即使能力探测报告
     # E-AC-3 或多声道 AAC 可用，放进 fMP4 后仍可能在 init/首片阶段直接报
@@ -750,6 +782,9 @@ def _judge_audio(
         support = capability.audio_support(chosen.codec)
         channels = chosen.channels or 2
         label = _track_label(chosen)
+        stereo_aac = _stereo_aac_verdict(chosen)
+        if stereo_aac is not None:
+            return stereo_aac
         if support is not None and channels <= support.max_channels:
             return _AudioVerdict(
                 can_copy=True,
@@ -764,6 +799,9 @@ def _judge_audio(
     # 而音频转码本来就便宜；换过去的轨还会被当成记忆带到别的设备上。都没标语言的轨视为同一种。
     alternatives = (t for t in tracks if _same_language(t, default))
     for track, is_preferred in ((default, True), *((t, False) for t in alternatives)):
+        stereo_aac = _stereo_aac_verdict(track)
+        if stereo_aac is not None:
+            return stereo_aac
         support = capability.audio_support(track.codec)
         if support is None:
             continue

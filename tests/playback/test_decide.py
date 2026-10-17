@@ -1692,3 +1692,73 @@ def test_upline_budget_skips_keyframe_probe():
     assert needs_keyframe_probe(
         media(bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
     )
+
+
+# ---------------------------------------------------------------------------
+# 外网音轨省流量：外网 + 视频转码 → 音轨固定 AAC 双声道（2026-10-17 外网
+# 480p 卡顿治理：E-AC-3 直通 448-640 kbps 在丢包线路上是纯负担，转 AAC 后
+# 总码率从 2.0M 降到 ~1.76M，给 4.7M 实测管道留出余量）
+# ---------------------------------------------------------------------------
+
+
+def test_external_transcode_pins_heavy_audio_to_aac_stereo():
+    """外网 + 视频转码：可直通的多声道音轨固定转 AAC-LC 双声道。"""
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+        external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.video.action == "transcode"
+    assert decision.audio.action == "transcode"
+    assert decision.audio.codec == "aac"
+    assert decision.audio.channels == 2
+    assert decision.audio.downmix is True
+    assert "外网" in decision.reason, decision.reason
+
+
+def test_external_capped_480p_also_pins_audio():
+    """手选画质上限的外网会话同样生效——恰是最需要省流量的组合。
+
+    手选上限时上行预算不传（max_height 优先），外网标识必须独立生效。
+    """
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+        max_height=480, external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.codec == "aac"
+    assert decision.audio.channels == 2
+
+
+def test_lan_transcode_keeps_multichannel_audio():
+    """内网会话不受影响：同样的片，转码时多声道照旧保留（TrueHD 转 E-AC-3）。"""
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.codec == "eac3"
+    assert (decision.audio.channels or 2) > 2
+
+
+def test_external_video_copy_keeps_audio_plan_untouched():
+    """外网但视频能直通（remux / 音频单转档）：音轨计划不因外网改写——
+    省流量规则只在视频本来就要转码的会话生效。"""
+    decision = decide_playback(
+        media(video_codec="hevc", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+        external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.video.action == "copy"
+    assert decision.audio.codec == "eac3"
+
+
+def test_external_multichannel_aac_also_pins_to_stereo():
+    """外网 + 转码时 AAC 5.1 也降双声道：声道数是负担，编码不是。"""
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(AAC_51,)), CHROME_NO_HEVC, WITH_GPU,
+        external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.codec == "aac"
+    assert decision.audio.channels == 2
+    assert decision.audio.downmix is True
