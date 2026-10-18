@@ -2748,6 +2748,34 @@
     "stability": "experimental",
     "version": "1.0"
   },
+  "library.preload.cleaned": {
+    "doc": "按「N 天未播」规则自动清理便携版本",
+    "durable": true,
+    "kind": "event",
+    "mode": "emit",
+    "payload": {
+      "properties": {
+        "freed_bytes": {
+          "type": "integer"
+        },
+        "removed": {
+          "type": "integer"
+        },
+        "stale_days": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "removed",
+        "freed_bytes",
+        "stale_days"
+      ],
+      "type": "object"
+    },
+    "result": null,
+    "stability": "experimental",
+    "version": "1.0"
+  },
   "playback.completed": {
     "doc": "看完（越过已看阈值）",
     "durable": true,
