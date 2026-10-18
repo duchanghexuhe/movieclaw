@@ -612,6 +612,32 @@
     "stability": "experimental",
     "version": "1.0"
   },
+  "drive-backends": {
+    "doc": "网盘存储后端：插件贡献一家网盘的协议实现（登录、文件操作），主程序负责账号、调度与界面",
+    "item": {
+      "class": "DriveBackend",
+      "methods": {
+        "account_info": "(self, account: 'DriveAccount') -> 'AccountInfo'",
+        "begin_login": "(self, options: 'dict[str, str]') -> 'LoginFlow'",
+        "begin_upload": "(self, account: 'DriveAccount', dir_id: 'str', name: 'str', fingerprint: 'Fingerprint', state: 'dict[str, Any] | None', range_data: 'bytes | None') -> 'UploadStep'",
+        "cancel_login": "(self, flow_id: 'str') -> 'None'",
+        "changes": "(self, account: 'DriveAccount', cursor: 'str | None') -> 'ChangePage'",
+        "delete": "(self, account: 'DriveAccount', remote_ids: 'list[str]') -> 'None'",
+        "direct_link": "(self, account: 'DriveAccount', remote_id: 'str', user_agent: 'str') -> 'DirectLink'",
+        "ensure_dir": "(self, account: 'DriveAccount', parent_id: 'str', path: 'str') -> 'str'",
+        "finish_upload": "(self, account: 'DriveAccount', state: 'dict[str, Any]') -> 'RemoteFile'",
+        "list_dir": "(self, account: 'DriveAccount', dir_id: 'str') -> 'list[RemoteDir]'",
+        "list_tree": "(self, account: 'DriveAccount', dir_id: 'str') -> 'RemoteTree'",
+        "login_state": "(self, flow_id: 'str') -> 'LoginFlow'",
+        "login_with_cookie": "(self, cookie_header: 'str') -> 'LoginResult'",
+        "stat": "(self, account: 'DriveAccount', remote_id: 'str') -> 'RemoteFile'",
+        "upload_part": "(self, account: 'DriveAccount', state: 'dict[str, Any]', index: 'int', data: 'bytes') -> 'dict[str, Any]'"
+      }
+    },
+    "kind": "registry",
+    "stability": "experimental",
+    "version": "1.4"
+  },
   "host-ops": {
     "doc": "宿主操作：插件以自己的身份调用本进程的 OpenAPI 操作（按操作授权）",
     "kind": "service",
@@ -875,6 +901,38 @@
     "result": null,
     "stability": "experimental",
     "version": "2.0"
+  },
+  "library.file.local-released": {
+    "doc": "库文件的本地副本已腾空（已在网盘上）",
+    "durable": true,
+    "kind": "event",
+    "mode": "emit",
+    "payload": {
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "file_id": {
+          "type": "integer"
+        },
+        "hardlinked": {
+          "type": "boolean"
+        },
+        "library_id": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "library_id",
+        "file_id",
+        "bytes",
+        "hardlinked"
+      ],
+      "type": "object"
+    },
+    "result": null,
+    "stability": "experimental",
+    "version": "1.0"
   },
   "library.file.purged": {
     "doc": "回收站里的文件被彻底清除",
@@ -3897,6 +3955,55 @@
       "type": "object"
     },
     "result": null,
+    "stability": "experimental",
+    "version": "1.0"
+  },
+  "playback.strm.direct-link": {
+    "doc": "网盘挂载直链：strm 指向服务器挂载目录里的文件时，给播放器换一个能直连的网盘地址（302 过去，视频流量不经服务器）；不认领返回 None。只读查询可以，但要快",
+    "durable": false,
+    "kind": "event",
+    "mode": "bail",
+    "payload": {
+      "properties": {
+        "file_id": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "user_agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "file_id",
+        "path"
+      ],
+      "type": "object"
+    },
+    "result": {
+      "properties": {
+        "ttl_s": {
+          "default": 60,
+          "type": "integer"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
     "stability": "experimental",
     "version": "1.0"
   },

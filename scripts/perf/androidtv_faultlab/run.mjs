@@ -6,6 +6,8 @@
 //   ATV_FAULTLAB_DIRECT=/play/965/s01e01?t=600 ATV_FAULTLAB_HLS=/play/867/s01e05?t=600 \
 //   node scripts/perf/androidtv_faultlab/run.mjs cut-direct cut-hls   （all = 全部；--list 列场景）
 //
+// 手机包：再加 ATV_FAULTLAB_PKG=io.movieclaw.android（调试包认同一组 mc_* 直达参数，见手机的 DebugLaunch）
+//
 // 模拟器里 10.0.2.2 是宿主机：App 的服务器地址填 http://10.0.2.2:<代理端口>（第一次用密码登录，之后复用凭证）。
 // 每场的事件流写在 /tmp/mc-atv-faultlab/<场景>-<时间>/events.jsonl。跑完 App 停在代理地址上，
 // 要连回原服务器时用 mc_server 指回去。
@@ -39,7 +41,9 @@ if (!server || !user || !password) {
   process.exit(2);
 }
 const ADB = process.env.ADB ?? path.join(os.homedir(), "Library/Android/sdk/platform-tools/adb");
-const PKG = "io.movieclaw.androidtv";
+// 手机包也能跑（统一引擎同一套探针与直达参数）：ATV_FAULTLAB_PKG=io.movieclaw.android；按方向键的场景只对电视有意义
+const PKG = process.env.ATV_FAULTLAB_PKG ?? "io.movieclaw.androidtv";
+const SINGLE_TOP = "0x20000000";
 const upstream = new URL(server);
 const port = Number(opt("port", "3921"));
 const outRoot = opt("out", path.join(os.tmpdir(), "mc-atv-faultlab"));
@@ -154,8 +158,9 @@ async function runScenario(name, scenario) {
 
   if (scenario.link) proxy.setLink(scenario.link.mbps, scenario.link.rttMs ?? 0);
   t0 = Date.now();
+  // SINGLE_TOP：手机的 MainActivity 是 standard 启动模式，不带它时参数到不了已在前台的实例（拖动 / 切轨全被吞掉）
   adb(
-    "shell", "am", "start", "-n", `${PKG}/.MainActivity`,
+    "shell", "am", "start", "-f", SINGLE_TOP, "-n", `${PKG}/.MainActivity`,
     "--es", "mc_server", `http://10.0.2.2:${port}`,
     "--es", "mc_user", user,
     "--es", "mc_pass", password,
@@ -164,9 +169,9 @@ async function runScenario(name, scenario) {
   );
   const key = async (code) => adb("shell", "input", "keyevent", code);
   // 调试包的实验台入口：让正在放的播放器跳到文件时间（毫秒）
-  const seekTo = async (ms) => adb("shell", "am", "start", "-n", `${PKG}/.MainActivity`, "--el", "mc_seek_ms", String(Math.round(ms)));
+  const seekTo = async (ms) => adb("shell", "am", "start", "-f", SINGLE_TOP, "-n", `${PKG}/.MainActivity`, "--el", "mc_seek_ms", String(Math.round(ms)));
   const position = () => result.states[result.states.length - 1]?.pos ?? 0;
-  const adbStart = async (extra, value) => adb("shell", "am", "start", "-n", `${PKG}/.MainActivity`, "--es", extra, value);
+  const adbStart = async (extra, value) => adb("shell", "am", "start", "-f", SINGLE_TOP, "-n", `${PKG}/.MainActivity`, "--es", extra, value);
   const steps = (scenario.steps ?? []).map((s) => ({ ...s, done: false }));
   // 时长从出画算起（起播耗时不计入）；60 秒还没出画就按超时收场
   while (true) {

@@ -87,6 +87,18 @@ struct LiveDecodeTests {
     @Test func dlTypesList() async throws {
         try await LiveServer.check { try await $0.dlTypesList() }
     }
+    @Test func drivesAccountsList() async throws {
+        try await LiveServer.check { try await $0.drivesAccountsList() }
+    }
+    @Test func drivesBackendsList() async throws {
+        try await LiveServer.check { try await $0.drivesBackendsList() }
+    }
+    @Test func drivesSettingsGet() async throws {
+        try await LiveServer.check { try await $0.drivesSettingsGet() }
+    }
+    @Test func drivesStatus() async throws {
+        try await LiveServer.check { try await $0.drivesStatus() }
+    }
     @Test func extensionPing() async throws {
         try await LiveServer.check { try await $0.extensionPing() }
     }
@@ -146,6 +158,9 @@ struct LiveDecodeTests {
     }
     @Test func llmProvidersList() async throws {
         try await LiveServer.check { try await $0.llmProvidersList() }
+    }
+    @Test func llmWebSearchShow() async throws {
+        try await LiveServer.check { try await $0.llmWebSearchShow() }
     }
     @Test func mcpStatus() async throws {
         try await LiveServer.check { try await $0.mcpStatus() }

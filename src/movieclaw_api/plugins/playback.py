@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from movieclaw_api.plugins.keys import REMOTE_WORKERS, SETTING_STORE
+from movieclaw_api.plugins.keys import DB, REMOTE_WORKERS, SETTING_STORE
 from movieclaw_kernel import Context, plugin
 
 logger = logging.getLogger("movieclaw_api.plugins.playback")
@@ -88,5 +88,71 @@ async def transcode(ctx: Context) -> None:
     await asyncio.to_thread(sessions.cleanup_orphans)
     sessions.start_reaper()
     ctx.effect(sessions.shutdown, label="shutdown-transcode-sessions")
+    # 离线下载的转码导出（docs/design/offline-download.md §5.3）：同样起在独立进程组，退出前整组杀掉
+    from movieclaw_api.services.offline.exports import get_export_manager
+
+    ctx.effect(get_export_manager().shutdown, label="shutdown-offline-exports")
     # 硬件加速自检放后台：逐个后端真跑一秒编码要几秒，不该拖慢启动，也不能等到首次播放
     ctx.task(_warm_hardware_probe(), name="warm-hwprobe")
+
+
+@plugin("drives.sources", title="网盘片源", inject=(DB,), reloadable=True)
+async def drive_sources(ctx: Context) -> None:
+    """把只在网盘上的库文件接到播放的读字节入口：转码、字幕、关键帧读网盘直链。
+
+    docs/design/cloud-storage.md §7。没有插件提供网盘后端时不登记（§11.8）。
+    """
+    from movieclaw_api.services.drives import registry, sources
+
+    sources.bind()
+    ctx.effect(sources.unbind, label="unbind-drive-sources")
+
+    async def on_change(awake: bool) -> None:
+        if not awake:
+            sources.reset_state()
+            return
+        count = await sources.load_registry()
+        if count:
+            logger.info("已登记 %d 个只在网盘上的库文件", count)
+
+    registry.follow(ctx, on_change)
+
+
+@plugin("drives.uploads", title="网盘上传", inject=(DB,), reloadable=True)
+async def drive_uploads(ctx: Context) -> None:
+    """主根在网盘的库：新入库的本地文件传到网盘并核验，核验后腾空本地；网盘变化同步与规格补探
+    （docs/design/cloud-storage.md §4、§5、§6）。
+
+    定时任务只在有插件提供网盘后端时挂上，后端都撤走就撤下（§11.8）：没用网盘的用户不跑这些任务、
+    不留运行记录，定时任务列表里也没有它们。任务处理器常驻，好让排着的上传任务在后端回来后接着跑。
+    """
+    from movieclaw_api.services.drives import registry, release, uploads
+    from movieclaw_api.services.jobs import contribute_job_handlers
+    from movieclaw_api.services.library import cloud
+    from movieclaw_scheduler import SCHEDULED_TASKS
+    from movieclaw_scheduler.registry import declared_tasks
+    from movieclaw_sdk.events import LIBRARY_FILES_ADDED, FilesAdded
+
+    contribute_job_handlers(ctx, uploads)
+    tasks = ctx.registry(SCHEDULED_TASKS)
+    withdraw: list = []
+
+    def withdraw_tasks() -> None:
+        while withdraw:
+            withdraw.pop()()
+
+    async def on_change(awake: bool) -> None:
+        withdraw_tasks()
+        if awake:
+            for module in (uploads, release, cloud):
+                for definition in declared_tasks(module):
+                    withdraw.append(tasks.add(definition.key, definition, entry_id=ctx.entry_id))
+
+    ctx.effect(withdraw_tasks, label="withdraw-drive-tasks")
+    registry.follow(ctx, on_change)
+
+    async def on_added(added: FilesAdded) -> None:
+        if registry.active():
+            await uploads.enqueue(added.library_id)
+
+    ctx.on(LIBRARY_FILES_ADDED, on_added, id="files-added")

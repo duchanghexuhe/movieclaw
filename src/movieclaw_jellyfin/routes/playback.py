@@ -72,19 +72,20 @@ from movieclaw_api.services.playback.session import (
     get_session_manager,
 )
 from movieclaw_api.services.playback.signing import issue_stream_token, verify_stream_token
+from movieclaw_api.services.playback.strm_direct import mounted_redirect
 from movieclaw_api.services.playback.strm_probe import ensure_strm_spec
 from movieclaw_api.services.playback.track_context import files_with_contexts, track_context
 from movieclaw_api.settings import PlaybackPolicySetting
 from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import LibraryFile, MediaMetadata
+from movieclaw_db.models import LibraryFile, MediaMetadata, Member
 from movieclaw_jellyfin.catalog import (
     audio_track_for_index,
     index_for_subtitle_track,
     media_source_dto,
     subtitle_track_for_index,
 )
-from movieclaw_jellyfin.errors import bad_request_text, not_found
+from movieclaw_jellyfin.errors import bad_request_text, forbidden, not_found, unavailable_text
 from movieclaw_jellyfin.ids import (
     EntityKind,
     EntityRef,
@@ -677,6 +678,10 @@ async def video_stream(
         # 管理员刚在活动页结束了这台设备的播放：拒绝窗口内不再供流，否则
         # 播放器换条 Range 连接就续上了。设备重新上报开始播放即解除。
         raise bad_request_text("播放已被管理员结束")
+    # 外网取流：后台的网盘上传先让路（cloud-storage.md §5.3）
+    from movieclaw_api.services.drives import uplink
+
+    uplink.note(request.client.host if request.client else None)
 
     files = await _files_for_ref(ref, identity.device.member_id)
     selected = _select_source(files, request.query_params.get("mediaSourceId"), item_id)
@@ -686,6 +691,28 @@ async def video_stream(
 
     path = Path(f.file_path)
     file_container = f.container
+    if f.local_bytes and f.id is not None:
+        from movieclaw_api.services.drives import release
+
+        release.note_read(f.id)
+    if not f.local_bytes:
+        # 只在网盘上（cloud-storage.md §7.2）：家里转发或 302 到网盘直链。自家 App 带
+        # X-MovieClaw-Relay-Fallback: 1 声明直连失败会带 relay=1 改走转发，「自动」下才可能直连
+        cloud = await _cloud_target(request, identity, f)
+        if cloud.direct_url is not None:
+            return RedirectResponse(cloud.direct_url, status_code=302)
+        assert cloud.relay is not None
+        session_stopped, byte_sink, on_close = await _register_stream(
+            request, identity, ref, f, name=path.name
+        )
+        return RemoteRelayResponse(
+            cloud.relay.url,
+            range_header=request.headers.get("range"),
+            upstream_headers=cloud.relay.headers,
+            session_stopped=session_stopped,
+            byte_sink=byte_sink,
+            on_close=on_close,
+        )
     if is_strm(f.file_path):
         source = resolve_strm(f.file_path)
         if source is None:
@@ -708,7 +735,9 @@ async def video_stream(
                 )
             # 302 直链：HEAD 同样 302、不塞 body；重定向目标自己支持 Range
             return RedirectResponse(target, status_code=302)
-        # 指向挂载目录里的文件：往下与本地文件同样直出
+        # 指向挂载目录里的文件：插件给了网盘直链就 302 过去，否则往下与本地文件同样直出
+        if target := await mounted_redirect(f.id, source, request.headers.get("user-agent")):
+            return RedirectResponse(target, status_code=302)
         path = source
         file_container = local_strm_container(f.container, path)
 
@@ -749,6 +778,23 @@ async def video_stream(
         on_close=on_close,
         byte_patches=byte_patches,
     )
+
+
+async def _cloud_target(request: Request, identity: RequestIdentity, f: LibraryFile):
+    """只在网盘上的文件这次取流怎么走；失败给播放器一句 503 原因。"""
+    from movieclaw_api.services.drives import sources
+
+    try:
+        return await sources.stream_target(
+            f.file_path,
+            holder=f"play:{identity.device.device_id}:{f.id}",
+            client_host=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            relay_fallback=sources.declares_fallback(request.headers, request.query_params),
+            force_relay=request.query_params.get("relay") == "1",
+        )
+    except Exception as exc:  # noqa: BLE001 -- 网盘的各种失败都换成给用户看的一句话
+        raise unavailable_text(sources.stream_error(exc)) from exc
 
 
 async def _register_stream(
@@ -793,6 +839,15 @@ async def _register_stream(
     return session_stopped, meter.add, _close
 
 
+async def _member_may_download(member_id: int) -> bool:
+    """下载影片到设备的开关（member-permissions-v2.md §3.2）：超管（0）恒可。"""
+    if not member_id:
+        return True
+    async with get_database().session() as session:
+        member = await session.get(Member, member_id)
+    return member is not None and bool(member.allow_video_download)
+
+
 @router.get("/Items/{item_id}/Download")
 @router.head("/Items/{item_id}/Download")
 @router.get("/Items/{item_id}/File")
@@ -818,6 +873,8 @@ async def download_item(
     ref = decode_guid(item_id)
     if ref is None or ref.kind not in (EntityKind.ITEM, EntityKind.EPISODE):
         raise not_found()
+    if not await _member_may_download(identity.device.member_id):
+        raise forbidden()
 
     files = await _files_for_ref(ref, identity.device.member_id)
     selected = _select_source(files, request.query_params.get("mediaSourceId"), item_id)
@@ -826,6 +883,17 @@ async def download_item(
     f = selected[0]
 
     path = Path(f.file_path)
+    if not f.local_bytes:
+        # 只在网盘上：下载与取流同一套取流方式（家里转发或直连网盘）
+        cloud = await _cloud_target(request, identity, f)
+        if cloud.direct_url is not None:
+            return RedirectResponse(cloud.direct_url, status_code=302)
+        assert cloud.relay is not None
+        return RemoteRelayResponse(
+            cloud.relay.url,
+            range_header=request.headers.get("range"),
+            upstream_headers=cloud.relay.headers,
+        )
     if is_strm(f.file_path):
         source = resolve_strm(f.file_path)
         if source is None:
@@ -840,7 +908,10 @@ async def download_item(
                     upstream_headers=source.headers,
                 )
             return RedirectResponse(target, status_code=302)
-        path = source  # 指向挂载目录里的文件：按本地文件下载
+        # 指向挂载目录里的文件：插件给了网盘直链就 302 过去，否则按本地文件下载
+        if target := await mounted_redirect(f.id, source, request.headers.get("user-agent")):
+            return RedirectResponse(target, status_code=302)
+        path = source
     if f.is_disc() or not path.is_file():
         # 原盘是目录，没有"一个文件"可下（CanDownload 已恒 false，这里是兜底）
         raise not_found()

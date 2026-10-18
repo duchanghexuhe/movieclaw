@@ -7,7 +7,7 @@ import SwiftUI
 ///
 /// 交互要点：
 /// - 进入时拉轨迹回放；会话仍在运行则自动接上事件流（离开再回来不重拉，继续跟随）；
-/// - 每次进入会话都停在最底部（最新一轮），见 `pinnedToBottom`；
+/// - 每次进入会话都停在最底部（最新一轮），见 `AgentTranscriptScroll`；
 /// - 生成中可继续打字，发送键变停止键；
 /// - 自动滚动只在用户本就贴近底部时跟随新内容（上滚查看历史时不打断），离开底部给「回到最新消息」按钮；
 /// - 「改写这条提问」只进入本地编辑态，发送时二次确认「替换并重新提问」才调用 retry；
@@ -33,23 +33,20 @@ struct AgentConversationView: View {
     @State private var retryTarget: String?
     @State private var retrying = false
     @State private var askingConsent = false
-    @State private var position = ScrollPosition(edge: .bottom)
-    @State private var nearBottom = true
-    /// 手指没在拖、也没在惯性滑（黑屏兜底只在静止时动手，见 `offscreen`）
-    @State private var scrollIdle = true
-    /// 进入会话后的贴底期。懒加载列表的内容高度是边渲染边算的：首帧只估出一小段
-    /// （真机实测大会话首帧 8645pt，几十毫秒内涨到 35749pt），只在首次布局定位到底部会停在对话中间。
-    /// 贴底期内内容再怎么长高都锚在底部；用户一开始拖动或 1.5 秒后结束，之后回到「贴近底部才跟随」的规则
-    @State private var pinnedToBottom = true
-    /// 第几次进入贴底期：进入会话是第 0 次；发出新消息（含改写重问）再来一次，见 `pinToLatest`
-    @State private var pinRound = 0
+    @State private var latestRequest = 0
+    @State private var scroll = AgentTranscriptScroll()
+    /// 消息列是否整列排版（见 AgentTranscriptLayout.prefersEagerLayout）：进页面时定一次，流式变长也不中途换容器
+    @State private var eagerLayout: Bool?
     @State private var kickoff = AgentLoadKickoff()
     /// 输入框晚一拍建：App 这次运行里第一次建输入框很重（模拟器实测 120～280ms，同一次运行里再建只要约 10ms），
     /// 跟着页面一起建会把页面跳转推迟这么久。首帧先放等高占位，跳转画面出去后马上建——此时正在等轨迹，
     /// 主线程空着（真机上跳转排版约 30ms、轨迹网络 70～100ms），这笔一次性开销被网络等待吸收
     @State private var composerReady = false
+    /// 正在输入（小幕抬头倾听）
+    @State private var composerAttentive = false
     /// 上次量到的输入区高度，占位按它留空，换成真输入框时底部不跳（初值取 iPhone Air 实测的单行输入区高度）
     private static var composerHeight: CGFloat = 126
+    private static let bottomID = "agent-transcript-bottom"
 
     init(sessionId: String) {
         self.sessionId = sessionId
@@ -63,11 +60,13 @@ struct AgentConversationView: View {
             conversation.prefetch(api: api)
             Task { await conversation.open(api: api) }
         }
-        content
+        ScrollViewReader { proxy in
+            content(proxy: proxy)
+        }
             .background(Theme.background.ignoresSafeArea())
             .navigationTitle(conversation.loaded ? conversation.title : "AI 会话")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarVisibility(.hidden, for: .tabBar)
+            .background { HidesTabBarWhenPushed() }
             .toolbar {
                 // 右上角只留「⋯」，操作的是当前会话；Web 顶栏的搜索与「+」在会话页里用不上（2026-09-26 用户决定去掉）
                 if conversation.loaded {
@@ -114,7 +113,7 @@ struct AgentConversationView: View {
 
     /// 输入区挂在「加载中 / 消息列」的分支之外：跳转首帧后马上建好（加载期间禁用，见 composerReady），
     /// 等轨迹的那段网络时间里顺手完成创建与排版；数据到了只剩消息列要排。放进分支里切换时会被当成新视图重建
-    private var content: some View {
+    private func content(proxy: ScrollViewProxy) -> some View {
         Group {
             if !conversation.loaded, let error = conversation.loadError {
                 VStack(spacing: 8) {
@@ -137,10 +136,10 @@ struct AgentConversationView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityIdentifier("agent-loading")
             } else {
-                transcript
+                transcript(proxy: proxy)
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+        .safeAreaBar(edge: .bottom, spacing: 0) {
             // 会话打不开时不给输入框（没有可续聊的会话）
             if conversation.loaded || conversation.loadError == nil {
                 if composerReady {
@@ -151,15 +150,19 @@ struct AgentConversationView: View {
                 }
             }
         }
+        .agentCompanion(.resolve(turn: conversation.turns.last, busy: conversation.running,
+                                 unavailable: llmConfigured == false || !conversation.loaded),
+                        attentive: composerAttentive)
     }
 
     // MARK: 消息列
 
-    private var transcript: some View {
+    private func transcript(proxy: ScrollViewProxy) -> some View {
         let running = conversation.running
+        let eager = eagerLayout ?? AgentTranscriptLayout.prefersEagerLayout(conversation.turns)
         return ScrollView {
-            // 段落级的行（见 AgentTranscriptRows）：进页面只构建、排版最底下一屏，长会话不再整轮卡住
-            LazyVStack(alignment: .leading, spacing: 0) {
+            // 段落级的行（见 AgentTranscriptRows）：长会话懒加载，进页面只构建、排版最底下一屏，不再整轮卡住
+            AgentTranscriptStack(eager: eager) {
                 ForEach(conversation.rows) { row in
                     // 运行中不给改写入口：服务端会拒绝替换正在写轨迹的会话
                     AgentTranscriptRowView(
@@ -173,67 +176,65 @@ struct AgentConversationView: View {
                     )
                     .equatable()
                     .padding(.top, row.spacing)
+                    // 每个定位目标都占满视口并包含左右留白，避免首次按行定位时横向偏移。
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
                 }
+                Color.clear.frame(height: 16).id(Self.bottomID)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 16)
+            .padding(.top, 16)
         }
-        .scrollPosition($position)
+        .onAppear { if eagerLayout == nil { eagerLayout = eager } }
+        .accessibilityIdentifier("agent-transcript")
         .defaultScrollAnchor(.bottom, for: .initialOffset)
-        .defaultScrollAnchor(pinnedToBottom ? .bottom : nil, for: .sizeChanges)
+        .defaultScrollAnchor(scroll.followsLatest ? .bottom : nil, for: .sizeChanges)
         .onScrollPhaseChange { _, phase in
-            if phase == .interacting { pinnedToBottom = false }
-            scrollIdle = phase == .idle
+            if scroll.update(phase: phase) { scrollToLatest(proxy) }
         }
-        // 黑屏兜底：懒加载的行边排版边改高度，滚动位置可能整个落到内容末尾之后（或开头之前），满屏黑、
-        // 要手动滑一下才回来（2026-10-13 真机：第一次进较长的会话偶尔黑屏）。静止时一旦出现就回到最新
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            Self.offscreen(visible: geometry.visibleRect, contentHeight: geometry.contentSize.height)
-        } action: { _, offscreen in
-            if offscreen, scrollIdle { position.scrollTo(edge: .bottom) }
+        .onScrollGeometryChange(for: AgentTranscriptScroll.Viewport.self) { geometry in
+            Self.viewport(contentHeight: geometry.contentSize.height, visible: geometry.visibleRect, insets: geometry.contentInsets)
+        } action: { _, viewport in
+            if scroll.update(viewport: viewport) { scrollToLatest(proxy) }
         }
-        .task(id: pinRound) {
-            // 从会话里推进的页面返回时不再跳到底部：只有贴底期（刚进入会话、刚发出消息）才定位
-            guard pinnedToBottom else { return }
-            let round = pinRound
-            position.scrollTo(edge: .bottom)
-            try? await Task.sleep(for: .seconds(1.5))
-            // 期间又发了一条：新一轮贴底期接着算，不提前结束
-            if round == pinRound { pinnedToBottom = false }
+        .task {
+            // 与「回到最新」使用同一个底边定位；懒加载高度变化由几何回调校正。
+            // 返回子页面时，保留用户正在阅读的历史位置。
+            if scroll.followsLatest { scrollToLatest(proxy) }
         }
         .scrollDismissesKeyboard(.interactively)
-        .scrollEdgeEffectStyle(.hard, for: .bottom)
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            geometry.contentSize.height - geometry.visibleRect.maxY < 120
-        } action: { _, near in
-            nearBottom = near
+        // 只让输入框自身呈现玻璃；系统底部渐隐会在悬浮宠物周围形成黑色遮罩。
+        .scrollEdgeEffectHidden(true, for: .bottom)
+        // 比行不比轮：思考增量不上屏（处理过程隐藏），不该每 80ms 跟着发一次滚动请求
+        .onChange(of: conversation.rows) {
+            if scroll.followsLatest { scrollToLatest(proxy) }
         }
-        .onChange(of: conversation.turns) {
-            if nearBottom { position.scrollTo(edge: .bottom) }
-        }
+        .onChange(of: latestRequest) { scrollToLatest(proxy) }
         .overlay(alignment: .bottom) {
-            if !nearBottom {
-                // 液态玻璃圆形按钮（原先是手画的深色圆 + 描边 + 阴影，与页面其余玻璃控件不是一套）。
-                // 与输入框的加号 / 发送键同为 36pt（2026-10-12 用户要求）：系统 .glass 按钮样式会在内容外再加一圈边距，
-                // 量不准，改成自定尺寸 + 玻璃效果
-                Button {
-                    withAnimation { position.scrollTo(edge: .bottom) }
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 14, weight: .semibold))
-                        .frame(width: AgentComposer.control, height: AgentComposer.control)
-                        .glassEffect(.regular.interactive(), in: .circle)
-                        .expandedHitArea(horizontal: 4, vertical: 4)
+            // 只动画按钮；不要把懒加载行的高度修正也放进弹簧动画。
+            ZStack {
+                if !scroll.viewport.nearBottom {
+                    // 液态玻璃圆形按钮（原先是手画的深色圆 + 描边 + 阴影，与页面其余玻璃控件不是一套）。
+                    // 与输入框的加号 / 发送键同为 36pt（2026-10-12 用户要求）：系统 .glass 按钮样式会在内容外再加一圈边距，
+                    // 量不准，改成自定尺寸 + 玻璃效果
+                    Button {
+                        pinToLatest()
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 14, weight: .semibold))
+                            .frame(width: AgentComposer.control, height: AgentComposer.control)
+                            .glassEffect(.regular.interactive(), in: .circle)
+                            .expandedHitArea(horizontal: 4, vertical: 4)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Theme.text)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
+                    .padding(.bottom, 10)
+                    .accessibilityLabel("回到最新消息")
+                    .accessibilityIdentifier("agent-scroll-latest")
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(Theme.text)
-                .transition(.scale(scale: 0.6).combined(with: .opacity))
-                .padding(.bottom, 10)
-                .accessibilityLabel("回到最新消息")
-                .accessibilityIdentifier("agent-scroll-latest")
             }
+            .animation(.snappy, value: scroll.viewport.nearBottom)
         }
-        .animation(.snappy, value: nearBottom)
     }
 
     // MARK: 底部输入
@@ -272,6 +273,7 @@ struct AgentConversationView: View {
                 disabled: locked || !conversation.loaded || (retrying && retryTarget != nil),
                 // 改写模式不开图片入口：retry 沿用原消息的图，新加的图无处安放，藏起入口比静默丢弃诚实
                 imageUpload: retryTarget == nil,
+                onAttentionChange: { composerAttentive = $0 },
                 modelOptions: modelOptions,
                 modelValue: displayedModel,
                 onModelChange: { ref in
@@ -288,15 +290,12 @@ struct AgentConversationView: View {
                 onSubmit: submit,
                 onStop: stop
             )
+            .agentCompanionAnchor()
             if locked { AgentLLMSetupNotice() }
         }
         .padding(.horizontal, 12)
         .padding(.top, 8)
         .modifier(AgentComposerBottomGap())
-        .background {
-            // 沉浸页纯色底：输入区不透出下方消息（同 Web 贴底输入行）
-            Theme.background.ignoresSafeArea(edges: .bottom)
-        }
     }
 
     /// 线上值：没动过不传（服务端沿用）；显式默认传 "default"
@@ -348,19 +347,32 @@ struct AgentConversationView: View {
         }
     }
 
-    /// 视口与内容完全不相交（纯函数，单元测试见 AgentLogicTests）。内容还没出来（高度 0）不算
-    static func offscreen(visible: CGRect, contentHeight: CGFloat) -> Bool {
-        guard contentHeight > 0, visible.height > 0 else { return false }
-        return visible.minY >= contentHeight || visible.maxY <= 0
+    /// 滚动几何 → 贴底状态（纯函数，单元测试见 AgentLogicTests）。
+    /// `visibleRect` 覆盖整个屏幕，包括顶栏与输入区背后（实测贴底时 maxY = 内容高 + 输入区高），
+    /// 要扣掉安全区才是读得到的区域。滚过头（内容缩短后底部留空白）不算贴底，否则页面停在空白处无人校正。
+    static func viewport(contentHeight: CGFloat, visible: CGRect, insets: EdgeInsets) -> AgentTranscriptScroll.Viewport {
+        let top = visible.minY + insets.top
+        let bottom = visible.maxY - insets.bottom
+        let gap = contentHeight - bottom
+        return .init(
+            nearBottom: gap < 120,
+            // 内容还没出来（高度 0）不算
+            offscreen: contentHeight > 0 && bottom > top && (top >= contentHeight || bottom <= 0),
+            // 不满一屏时位置由系统的底部锚点摆放（实测会停在负偏移），不再校正，否则与锚点来回拉扯
+            atBottom: abs(gap) <= 1 || contentHeight <= bottom - top,
+            contentHeight: contentHeight.rounded(),
+            visibleHeight: visible.height.rounded()
+        )
     }
 
-    /// 发出新消息后回到最新：重新进入贴底期。翻到很上面时只跳一次到底不够——懒加载的行边排版边长高，
-    /// 估出来的「底」不是真的底，会停在半路，之后流式回答也不再跟随（2026-10-13 用户反馈）。
-    /// 贴底期里内容再怎么长高都锚在底部，用户一拖动就结束
+    /// 发出新消息或点击「回到最新」时恢复跟随；用户开始拖动立即让出控制。
     private func pinToLatest() {
-        nearBottom = true
-        pinnedToBottom = true
-        pinRound += 1
+        scroll.followsLatest = true
+        latestRequest += 1
+    }
+
+    private func scrollToLatest(_ proxy: ScrollViewProxy) {
+        proxy.scrollTo(Self.bottomID, anchor: .bottom)
     }
 
     // MARK: 会话菜单
@@ -437,6 +449,20 @@ struct AgentConversationView: View {
     }
 }
 
+/// 消息列的容器：短会话整列排版，长会话懒加载
+private struct AgentTranscriptStack<Content: View>: View {
+    let eager: Bool
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        if eager {
+            VStack(alignment: .leading, spacing: 0) { content }.scrollTargetLayout()
+        } else {
+            LazyVStack(alignment: .leading, spacing: 0) { content }.scrollTargetLayout()
+        }
+    }
+}
+
 /// 会话页的抢跑加载开关：每个页面实例只在 body 首次求值时发一次轨迹请求（body 会被反复求值，
 /// 不能每次都发）；`.task` 第一次触发时据此跳过，免得同一份轨迹拉两遍
 final class AgentLoadKickoff {
@@ -454,44 +480,6 @@ final class AgentLoadKickoff {
         defer { firstAppearanceConsumed = true }
         return !firstAppearanceConsumed
     }
-}
-
-/// 输入框预热：App 这次运行里第一次建输入框很重（模拟器实测创建 + 首次上屏共 200～300ms，
-/// 同一次运行里再建只要约 10ms），点进会话时会和对话首屏抢主线程、把字拖晚。挂在会话入口所在的页面
-/// （「我的」页的最近会话），页面出现、空闲下来后在背景里悄悄建一个看不见的输入框再拆掉，
-/// 把这笔一次性开销提前消化；每次运行只做一次
-struct AgentComposerWarmup: ViewModifier {
-    private static var done = false
-    @State private var showing = false
-    @State private var draft = AgentDraft()
-
-    func body(content: Content) -> some View {
-        // 挂在前景（overlay）不挂背景：标签栏按层级顺序找页面的主滚动视图来决定下滑收起，挂在背景时
-        // 这个多行输入框（底层是可滚动的文本视图）排在列表前面先被找到，拆掉后标签栏就再也不收起，
-        // 要等附件开关过一次重新找才好（2026-10-13「我的」页：点过一次输入框后下滑才折叠）
-        content
-            .overlay {
-                if showing {
-                    AgentComposer(draft: $draft, onSubmit: {})
-                        .opacity(0)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-            }
-            .task {
-                guard !Self.done else { return }
-                Self.done = true
-                // 先让页面自己显示完，再建；建好并上过一次屏后拆掉（框架层的初始化成果会留下）
-                try? await Task.sleep(for: .milliseconds(600))
-                showing = true
-                try? await Task.sleep(for: .seconds(1))
-                showing = false
-            }
-    }
-}
-
-extension View {
-    func agentComposerWarmup() -> some View { modifier(AgentComposerWarmup()) }
 }
 
 /// 未接入模型时的公共引导（对应 Web `LlmSetupNotice`）：说明能解锁什么，并给唯一的设置入口

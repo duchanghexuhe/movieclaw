@@ -280,7 +280,12 @@ def playback_load() -> str:
     iOS / Jellyfin 客户端都汇到这里）。外置 Worker 上的转码不占本机 CPU，按「在看」算。
     """
     now = time.monotonic()
-    fresh = [t for t in get_session_manager().active() if now - t.last_ping <= _FRESH_S]
+    fresh = [
+        t
+        for t in get_session_manager().active()
+        # 外置 Worker 上的离线导出没人在看、也不占本机：不算负载
+        if now - t.last_ping <= _FRESH_S and not (t.export_id is not None and t.remote)
+    ]
     if any(t.is_transcoding and not t.remote for t in fresh):
         return TRANSCODING
     if fresh:
@@ -644,6 +649,31 @@ def _complete_audio_index(streams: list[dict], duration: float) -> int:
 _COSTLY_AUDIO_CODECS = frozenset({"truehd", "mlp"})
 
 
+def _decodable(stream: dict) -> bool:
+    """ffprobe 认得出编码的轨。认不出的（华语 WEB-DL 里的 Audio Vivid / AV3A）ffmpeg 没有解码器。"""
+    return (stream.get("codec_name") or "unknown").lower() not in ("unknown", "none")
+
+
+def _decodable_audio_index(streams: list[dict], index: int, duration: float) -> int:
+    """选中的轨 ffmpeg 解不了时，换同语言、完整、解得了的轨。
+
+    NAS 醉梦 E01～E03（QHstudIo 4Audios）：第一轨是 Audio Vivid，后面才是 EAC3 / AAC
+    同混音；只认第一轨整季都算不出指纹。换不了就维持原轨，由解码报错说明原因。
+    """
+    if not 0 <= index < len(streams) or duration <= 0 or _decodable(streams[index]):
+        return index
+    language = (streams[index].get("tags") or {}).get("language")
+    for other, stream in enumerate(streams):
+        if other == index or not _decodable(stream):
+            continue
+        if not _same_content_track(stream, language):
+            continue
+        track_length = _stream_length(stream)
+        if track_length is not None and abs(track_length - duration) <= 5:
+            return other
+    return index
+
+
 def _cheaper_audio_index(streams: list[dict], index: int, duration: float) -> int:
     """选中的轨是 TrueHD 时，换同语言、完整的有损轨，省四分之三的解码 CPU。
 
@@ -658,6 +688,8 @@ def _cheaper_audio_index(streams: list[dict], index: int, duration: float) -> in
     language = (chosen.get("tags") or {}).get("language")
     for other, stream in enumerate(streams):
         if other == index or (stream.get("codec_name") or "").lower() in _COSTLY_AUDIO_CODECS:
+            continue
+        if not _decodable(stream):
             continue
         if not _same_content_track(stream, language):
             continue
@@ -716,6 +748,15 @@ async def _fingerprint_audio_index(file: LibraryFile) -> int:
         logger.warning(
             "文件 #%s 的第一条音轨时长不足，改用第 %s 条完整音轨识别片头片尾", file.id, index + 1
         )
+    decodable = _decodable_audio_index(streams, index, duration)
+    if decodable != index:
+        logger.info(
+            "文件 #%s 的第 %s 条音轨编码无法解码，改用同语言的第 %s 条音轨识别片头片尾",
+            file.id,
+            index + 1,
+            decodable + 1,
+        )
+        index = decodable
     cheaper = _cheaper_audio_index(streams, index, duration)
     if cheaper != index:
         logger.info(
@@ -758,6 +799,8 @@ async def _chromaprint_window(
             raise FingerprintError("文件没有音轨")
         if "No such file" in text:
             raise FingerprintError("文件读不到（可能已被移走）")
+        if "no decoder found" in text:
+            raise FingerprintError("音轨编码无法解码（如 Audio Vivid），也没有可替代的音轨")
         if "Invalid data found" in text or "moov atom not found" in text:
             raise FingerprintError("文件已损坏或不是可识别的视频")
         tail = text.splitlines()[-1] if text else f"ffmpeg 退出码 {proc.returncode}"

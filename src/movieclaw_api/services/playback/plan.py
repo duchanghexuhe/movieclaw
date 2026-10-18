@@ -17,7 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.services.media_probe import probe_keyframe_interval
 from movieclaw_api.services.playback.disc_source import disc_source_for_file
-from movieclaw_api.services.playback.ffmpeg_args import effective_hw_backend
+from movieclaw_api.services.playback.ffmpeg_args import (
+    effective_hw_backend,
+    tonemap_reads_dolby_vision,
+)
 from movieclaw_api.services.playback.hwprobe import hardware_available
 from movieclaw_api.services.playback.iso_source import iso_disc_source
 from movieclaw_api.services.playback.limits import MAX_TRANSCODE_HEIGHT
@@ -121,9 +124,11 @@ async def decide_for_files(
             disc = await asyncio.to_thread(iso_disc_source, file.file_path)
         disc_clips = len(disc.clips) if disc is not None else 0
         disc_playlist = disc.playlist_name if disc is not None else None
+        # 原盘目录只有蓝光（disc_source_for_file 不认 DVD 目录），镜像按读出的盘内结构
+        disc_format = (disc.image or "bluray") if disc is not None else None
         context = (contexts or {}).get(file.id or 0)
         profile = media_profile_from_file(
-            file, disc_clips=disc_clips, disc_playlist=disc_playlist,
+            file, disc_clips=disc_clips, disc_playlist=disc_playlist, disc_format=disc_format,
             context=context, preferred_audio=preferred_audio,
         )
         interval = None
@@ -134,6 +139,7 @@ async def decide_for_files(
                 keyframe_interval_s=interval,
                 disc_clips=disc_clips,
                 disc_playlist=disc_playlist,
+                disc_format=disc_format,
                 context=context,
                 preferred_audio=preferred_audio,
             )
@@ -219,15 +225,19 @@ def select_execution_backend(
     if decision.tier is not Tier.HARDWARE_TRANSCODE or decision.video.action != "transcode":
         return None, False
 
-    for backend in local_backends:
-        if effective_hw_backend(decision, backend) is not None:
-            return backend, False
-
-    if (
+    remote_ok = (
         remote_video_available
         and "videotoolbox" in available
         and effective_hw_backend(decision, "videotoolbox") is not None
-    ):
+    )
+    usable = [b for b in local_backends if effective_hw_backend(decision, b) is not None]
+    if decision.video.dolby_vision == "apply" and remote_ok:
+        # P5 的 IPT 基础层只有吃 RPU 才出得了对的颜色。本机只有 VAAPI / QSV（硬件色调映射
+        # 不认 RPU，整片发紫）而 Mac 转码器在线时，交给它
+        usable = [b for b in usable if tonemap_reads_dolby_vision(b)]
+    if usable:
+        return usable[0], False
+    if remote_ok:
         return "videotoolbox", True
     return None, False
 
@@ -348,7 +358,9 @@ def capability_from_request(payload) -> ClientCapability:  # noqa: ANN001
         universal=payload.universal,
         disc_image=payload.disc_image,
         disc_folder=payload.disc_folder,
+        bluray_clips=payload.bluray_clips,
         local_tracks=payload.local_tracks,
         dolby_vision_profiles=frozenset(payload.dolby_vision_profiles),
         dolby_vision_base_layer_profiles=frozenset(payload.dolby_vision_base_layer_profiles),
+        dolby_vision_record_audit=payload.dolby_vision_record_audit,
     )

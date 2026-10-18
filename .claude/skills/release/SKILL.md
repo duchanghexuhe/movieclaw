@@ -72,6 +72,9 @@ python3 scripts/release-status.py --ref origin/main
 
 1. **改版本号 + 写 changelog**（`docs/changelog/<tag>.md`，第四节），同一个 PR 合入 main。
    Android 的 `versionName` 与 `versionCode` 一起递增；Windows 的 Cargo.toml 与 package.json 一起改。
+   **合入前核对说明**：按指南第五节「发版前核对说明」逐条对照代码。只核说明的事实，不在发版阶段
+   找代码缺陷（缺陷在开发阶段、合并 PR 前解决）；默认自查，只有单个产品改动很大时才另起一个子代理。
+   「待真机复核」的项写进发版 PR 描述。
 2. **推 tag**：`git fetch origin main && git tag <tag> origin/main && git push origin <tag>`，构建的就是
    tag 所在的提交（可以是 main 上任意一个已合入的提交）。
    推不了 tag 的环境（远程会话的 git 凭证只能推分支）走点火通道
@@ -82,8 +85,11 @@ python3 scripts/release-status.py --ref origin/main
 3. **流水线**：核对 tag 与版本号 → 建 draft → 构建 / 签名 / 测试 → 校验产物 → 转正。draft 期间对
    应用内更新、官网、install-cli.sh 都不可见。**任何一步失败 Release 停在 draft，修好后重跑整个
    工作流即可**（上传均带 `--clobber`，可安全重入）。
-4. **验证**：Release 页附件齐全、标题对、正文是 changelog 而不是自动生成的 PR 清单、没有被标成 latest
-   （服务器除外）。
+4. **官网同步**：流水线最后一步通知官网（`scripts/notify-cloud.sh`），官网自己去 GitHub 拉这个版本，
+   一分钟内出现在官网下载页和更新日志。通知失败只告警、不挡发版，官网每天全量对账一次兜底。
+   手动改过 Release（改标题、补传附件、删除）想立刻生效：Actions → cloud-sync 运行（填 tag 或留空全量）。
+5. **验证**：Release 页附件齐全、标题对、正文是 changelog 而不是自动生成的 PR 清单、没有被标成 latest
+   （服务器除外）；官网 https://movieclaw.io/zh/changelog 出现了这一版。
 
 推荐 changelog 与版本号同一个 PR 合入；来不及也可以先发后补：发版时没有 changelog 的，正文先用
 GitHub 自动生成的提交清单（Windows 用一句默认说明），changelog 合入后 release-notes.yml 自动同步成
@@ -99,7 +105,7 @@ GitHub 自动生成的提交清单（Windows 用一句默认说明），changelo
 - **以发版 PR 的 CI 全绿为准**：改了 `__init__.py` 的版本号会触发全量检查（ruff / pytest / cli / web /
   Worker 加 iOS 编译），无需本地重跑全量——本地 pytest 要先下载 NER 模型，沙箱代理还会误报。
 - **产物**：应用三件套（app-web.tar.gz / app-backend.tar.gz / manifest.json，启用签名时含
-  manifest.json.sig）、mclaw 六平台归档 + checksums.txt、release.json（官网更新日志读它），同时
+  manifest.json.sig）、mclaw 六平台归档 + checksums.txt、host-constraints.txt（镜像自带的 Python 包，插件依赖锁文件按它解析）、release.json（官网更新日志读它），同时
   发布多架构 Docker 镜像（movieclaw/movieclaw：正式版打 vX.Y.Z + runtime-N + latest，预发布只打
   vX.Y.Z-…）。不带任何客户端。
 - **正文**：changelog 原文，末尾由 `scripts/publish-release-body.sh` 自动补「Apps / 客户端」一节——
@@ -116,7 +122,7 @@ GitHub 自动生成的提交清单（Windows 用一句默认说明），changelo
 
 ### Apple 平台（`ios-v` / `tvos-v` / `macos-v` / `transcoder-v`）
 
-- 一个工作流 `apple-release.yml` 按 tag 前缀分别构建：iPhone 编未签名 IPA；Apple TV 不构建，只建一条带
+- 一个工作流 `apple-release.yml` 按 tag 前缀分别构建：iPhone / iPad（同一个包）编未签名 IPA；Apple TV 不构建，只建一条带
   说明的 Release；Mac 版与转码器在 xcode-27 / macos-26 上编译，Developer ID 签名并公证，生成
   `downloads.json` 供官网下载页读取（macOS runner 上复核签名与公证）。
 - 转码器版本只在它自己的 `Info.plist`，不跟服务器走。
@@ -155,9 +161,10 @@ GitHub 自动生成的提交清单（Windows 用一句默认说明），changelo
   产品名用 `iPhone and iPad`、`Apple TV`、`Mac`、`Mac transcoder`、`Android`、`Android TV`、`Windows`
   （中文段对应 iPhone 与 iPad、Mac 转码器等），只写这个 App 自己的变化。
 - 客户端的盘点范围是**同前缀的上一个 tag**到本次（`git log --first-parent android-v0.3.1..HEAD --
-  apps/android`），文末对比链接也用同前缀的 tag（`android-v0.3.1...android-v0.3.2`）。某个客户端
-  第一次单独发版时，以 v0.37.0（最后一个附带客户端的服务器版本）为基线；Windows 首发 0.1.0 没有
-  基线，写成首个正式版本的介绍，不放对比链接。
+  apps/android`），文末对比链接也用同前缀的 tag（`android-v0.3.1...android-v0.3.2`）。基线永远是
+  **用户手上的上一版**：第一次单独发版时，用最后一次随服务器发出去的那一版（如 Windows 0.1.0 对照随
+  v0.37.0 发的 1.0.4）；只有用户手上从没有过任何版本的产品才算首发。写法见 `changelog-guide.md`
+  「客户端」与「首发版本」。
 - **服务器 changelog 不罗列各 App 的当前版本**（客户端一节自动生成），但功能需要的 App 最低版本、
   必须更新的 App 要写在正文里。
 
@@ -185,8 +192,10 @@ GitHub 自动生成的提交清单（Windows 用一句默认说明），changelo
 2. 从 main 打包上传：`source <本机 env> && apps/apple/scripts/release.sh --upload`
    （不带 `--upload` 只导出，用于先验证签名）。构建号取 UTC 时间自动递增。
    Apple TV 版加 `--tv`、Mac 版加 `--mac`（同一条 App 记录、各自一条构建序列），几端都要发就各跑一次。
+   iPad 不用另打包：默认那个 iOS 构建同时是 iPhone 与 iPad 版（`release.sh` 归档后会核对包里声明了 iPad）。
    TestFlight 的审核账号、备注与「Beta 版 App 描述」三端共用，提审前按 `docs/design/ios-release.md` §4 核对；
-   各端的「测试内容」只写那一端真有的功能。
+   各端的「测试内容」只写那一端真有的功能，iOS 构建的测试内容同时写 iPad 上的入口差异（同备注）。
+   提审正式版时 iPad 也要截图（13 英寸），Vision Pro 的分发开关见 ios-release.md §4。
 3. 上传后 5～30 分钟处理完；可用 ASC API 查 `processingState` / `buildAudienceType`。
    开了自动分发的内部测试组会自动收到；对外测试组按 checklist §5 加构建、提审。
 4. 看 Apple 邮件：ITMS-91053 等警告按邮件补隐私清单。
@@ -270,3 +279,4 @@ ffmpeg 版本，发版前按下表逐项过一遍。
 - [ ] App 依赖新服务器接口且不能降级 → 服务器已先发，App 的最低服务器版本已上调到它
 - [ ] 对应工作流全绿，Release 已转正、没有标成 latest，附件齐全
 - [ ] Mac 版 / 转码器 / Android：官网下载页显示了新版本（缓存最多 1 小时）
+- [ ] iOS 构建（iPhone 与 iPad 同一个包）：改了导航或页面布局时，iPhone 和 iPad 各装一次 TestFlight 看过

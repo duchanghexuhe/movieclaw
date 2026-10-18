@@ -12,6 +12,7 @@ import SwiftUI
 /// 库状态、要取的行、合集都没变时不重拉各行条目（空闲时每 30 秒不必打 1+N 个请求）。
 /// 瞬时失败不清已有数据，只挂提示条；一次都没成功过才整页报错。
 struct LibraryHomeView: View {
+    @Environment(\.cardMetrics) private var cards
     @Environment(\.api) private var api
     @Environment(\.permissions) private var permissions
     @Environment(Router.self) private var router
@@ -33,17 +34,25 @@ struct LibraryHomeView: View {
     @State private var clearingLibrary = false
     /// 片段（docs/design/reels.md）：蜂窝网络下进入前的确认
     @State private var confirmingReelsOnCellular = false
+    /// 离线模式（docs/design/offline-download.md §1）：同一个页签，内容换成 iPhone 上已下载的
+    @State private var reachability = ServerReachability.shared
+    @State private var offline = OfflineStore.shared
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                content
-                footer
+                if reachability.isOffline {
+                    OfflineLibraryHomeView()
+                } else {
+                    content
+                    footer
+                }
             }
             .padding(.bottom, 32)
         }
         .appBackground()
-        .navigationTitle("媒体库")
+        // iPad 上叫「首页」：各个库逐个列在侧边栏里（同 Mac 版）
+        .navigationTitle(MainTabView.isPad ? "首页" : "媒体库")
         .toolbarTitleDisplayMode(.inlineLarge)
         .toolbar {
             // 页面级动作都是低频的配置入口，收进一个 ⋯ 菜单：顶栏与发现、订阅页一致，
@@ -160,7 +169,7 @@ struct LibraryHomeView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
                 .accessibilityIdentifier("library-stats")
-                .padding(.horizontal, Theme.pagePadding)
+                .padding(.horizontal, cards.edge)
                 .padding(.top, 28)
         }
     }
@@ -185,14 +194,23 @@ struct LibraryHomeView: View {
             .padding(.top, 64)
         } else if let libraries {
             if failed {
-                Text("与后端通信失败，正在自动重试；下方显示的是最近一次成功加载的数据")
-                    .font(.footnote)
-                    .foregroundStyle(Color(red: 0.99, green: 0.9, blue: 0.54))
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("与后端通信失败，正在自动重试；下方显示的是最近一次成功加载的数据")
+                        .font(.footnote)
+                        .foregroundStyle(Color(red: 0.99, green: 0.9, blue: 0.54))
+                    // 断网时不自动切离线（网慢不误判），给一个按钮由用户决定（docs/design/offline-download.md §2.4）
+                    if !offline.downloadedItemIds.isEmpty {
+                        Button("看 \(ClientPlatform.deviceName) 上的 \(offline.downloadedItemIds.count) 部") { reachability.enterOffline() }
+                            .font(.footnote.weight(.semibold))
+                            .buttonStyle(.glass)
+                            .accessibilityIdentifier("enter-offline")
+                    }
+                }
                     .padding(.horizontal, 16).padding(.vertical, 12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Theme.warning.opacity(0.1), in: .rect(cornerRadius: 12))
                     .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.warning.opacity(0.25)))
-                    .padding(.horizontal, Theme.pagePadding)
+                    .padding(.horizontal, cards.edge)
                     .padding(.top, 16)
             }
             if libraries.isEmpty {
@@ -220,10 +238,11 @@ struct LibraryHomeView: View {
                     .padding(.horizontal, 24).padding(.vertical, 32)
                     .frame(maxWidth: .infinity)
                     .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5])).foregroundStyle(.white.opacity(0.15)))
-                    .padding(.horizontal, Theme.pagePadding)
+                    .padding(.horizontal, cards.edge)
                     .padding(.top, 64)
                     .accessibilityIdentifier("home-all-hidden")
                 }
+                OfflineDownloadingRow()
                 ForEach(visibleRows) { row in
                     rowView(row)
                 }
@@ -243,10 +262,10 @@ struct LibraryHomeView: View {
                         WatchHistoryMenu(onCleared: { Task { await reload() } }, pickLibrary: { clearingLibrary = true })
                     }
                     ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(alignment: .top, spacing: 12) {
+                        LazyHStack(alignment: .top, spacing: cards.spacing) {
                             ForEach(upNext, id: \.mediaItemId) { UpNextCard(item: $0) }
                         }
-                        .padding(.horizontal, Theme.pagePadding)
+                        .padding(.horizontal, cards.edge)
                     }
                     .scrollClipDisabled()
                 }
@@ -279,7 +298,8 @@ struct LibraryHomeView: View {
                         }
                     }
                     ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(alignment: .top, spacing: 14) {
+                        // 库卡比海报宽，手机上原本就多留 2 点
+                        LazyHStack(alignment: .top, spacing: max(14, cards.spacing)) {
                             ForEach(visibleLibraries, id: \.id) { library in
                                 NavigationLink(value: AppRoute.library(id: library.id)) {
                                     LibraryHomeCard(library: library, hasPosters: !(itemsByKey[LibraryHomeStore.coverKey(library.id)] ?? []).isEmpty)
@@ -297,7 +317,7 @@ struct LibraryHomeView: View {
                                 .accessibilityIdentifier("collection-library-card-\(collection.id)")
                             }
                         }
-                        .padding(.horizontal, Theme.pagePadding)
+                        .padding(.horizontal, cards.edge)
                     }
                     .scrollClipDisabled()
                 }
@@ -309,14 +329,14 @@ struct LibraryHomeView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     LibrarySectionHeader(title: row.title)
                     ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(alignment: .top, spacing: 12) {
+                        LazyHStack(alignment: .top, spacing: cards.spacing) {
                             ForEach(genres, id: \.value) { genre in
                                 if let id = Int(genre.value) {
                                     NavigationLink(value: AppRoute.libraryKind(kind: kind, genre: id)) {
                                         GenreCardFace(
                                             label: genre.label, count: genre.count, mediaKind: kind,
-                                            coverURL: api.image(genre.coverUrl, width: ImageWidth.points(PhoneCardWidth.genreTile)),
-                                            width: PhoneCardWidth.genreTile
+                                            coverURL: api.image(genre.coverUrl, width: ImageWidth.points(cards.genreTile)),
+                                            width: cards.genreTile
                                         )
                                     }
                                     .buttonStyle(GenreTileButtonStyle())
@@ -324,7 +344,7 @@ struct LibraryHomeView: View {
                                 }
                             }
                         }
-                        .padding(.horizontal, Theme.pagePadding)
+                        .padding(.horizontal, cards.edge)
                     }
                     .scrollClipDisabled()
                 }
@@ -360,21 +380,22 @@ struct LibraryHomeView: View {
                 NavigationLink(value: more) { Text(moreTitle) }
             }
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(alignment: .top, spacing: 12) {
+                LazyHStack(alignment: .top, spacing: cards.spacing) {
                     ForEach(items) { item in
                         NavigationLink(value: AppRoute.libraryItem(libraryId: item.libraryId, itemId: item.id)) {
                             LibraryPosterCell(title: item.title, year: item.year,
-                                              url: api.image(item.posterUrl, width: ImageWidth.points(PhoneCardWidth.homePoster)),
+                                              url: api.image(item.posterUrl, width: ImageWidth.points(cards.homePoster)),
                                               imageAspect: item.aspect)
-                                .frame(width: PhoneCardWidth.homePoster)
+                                .frame(width: cards.homePoster)
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
                             ForEach(item.info, id: \.self) { Text($0) }
+                            OfflineDeleteMenuButton(itemId: item.id, title: item.title)
                         }
                     }
                 }
-                .padding(.horizontal, Theme.pagePadding)
+                .padding(.horizontal, cards.edge)
             }
             .scrollClipDisabled()
         }
@@ -432,6 +453,7 @@ private struct PosterRowItem: Identifiable {
 /// 库卡片（Web `LibraryCard`）：服务端拼好的「氛围光货架」封面 + 库名（`ShelfCardCaption`）；
 /// 扫描 / 整理 / 元数据刷新进行中时封面归进度环并写出阶段，其余时间有待入账文件就挂「N 个新文件入库中」。
 private struct LibraryHomeCard: View {
+    @Environment(\.cardMetrics) private var cards
     let library: API.LibraryView
     /// 库里有没有海报素材（没有且没自定义封面时直接画类型占位，不请求拼贴）
     let hasPosters: Bool
@@ -448,7 +470,7 @@ private struct LibraryHomeCard: View {
                     .font(.system(size: 40))
                     .foregroundStyle(.white.opacity(0.13))
                 if hasPosters || library.customCover {
-                    RemoteImage(url: api.image("/libraries/\(library.id)/cover", width: ImageWidth.points(PhoneCardWidth.libraryCover)),
+                    RemoteImage(url: api.image("/libraries/\(library.id)/cover", width: ImageWidth.points(cards.libraryCover)),
                                 placeholderSymbol: LibraryKindMeta.symbol(library.kind))
                 }
                 if busy {
@@ -495,7 +517,7 @@ private struct LibraryHomeCard: View {
             .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(.white.opacity(0.1)))
             ShelfCardCaption(name: library.name)
         }
-        .frame(width: PhoneCardWidth.libraryCover)
+        .frame(width: cards.libraryCover)
         .contentShape(.rect)
     }
 }
@@ -505,6 +527,7 @@ private struct LibraryHomeCard: View {
 /// 首页合集的虚拟库卡片：复用真实媒体库的服务端货架封面，也不计入真实库统计。
 /// 卡片规格沿用 LibraryHomeCard（名称同为 `ShelfCardCaption`，封面左下挂「合集」标签），名字用合集原名，与可单独改名的海报行分开。
 private struct CollectionLibraryHomeCard: View {
+    @Environment(\.cardMetrics) private var cards
     let collection: API.CollectionView
     @Environment(\.api) private var api
 
@@ -516,7 +539,7 @@ private struct CollectionLibraryHomeCard: View {
                     .font(.system(size: 40))
                     .foregroundStyle(.white.opacity(0.13))
                 if !collection.covers.isEmpty {
-                    RemoteImage(url: api.image("/collections/\(collection.id)/cover", width: ImageWidth.points(PhoneCardWidth.libraryCover)),
+                    RemoteImage(url: api.image("/collections/\(collection.id)/cover", width: ImageWidth.points(cards.libraryCover)),
                                 placeholderSymbol: "rectangle.stack")
                 }
             }
@@ -526,7 +549,7 @@ private struct CollectionLibraryHomeCard: View {
             .overlay(alignment: .bottomLeading) { CollectionCoverTag() }
             ShelfCardCaption(name: collection.name)
         }
-        .frame(width: PhoneCardWidth.libraryCover)
+        .frame(width: cards.libraryCover)
         .contentShape(.rect)
     }
 }
@@ -536,6 +559,7 @@ private struct CollectionLibraryHomeCard: View {
 /// 「接下来继续」横卡（Web `UpNextCard`）：分集剧照或背景图、续播进度、「还有 N 集」，
 /// 中央常驻空心播放键直接进播放器（触摸屏没有悬停，藏起来等于不存在）；点卡片进条目详情。
 private struct UpNextCard: View {
+    @Environment(\.cardMetrics) private var cards
     let item: API.UpNextItemView
     @Environment(\.api) private var api
     @Environment(Router.self) private var router
@@ -612,7 +636,7 @@ private struct UpNextCard: View {
             }
             .buttonStyle(.plain)
         }
-        .frame(width: PhoneCardWidth.upNext)
+        .frame(width: cards.upNext)
     }
 
     /// 剧照加载失败时的兜底（与「没有剧照」同一套画法）
@@ -621,7 +645,7 @@ private struct UpNextCard: View {
         if isEpisode {
             LibraryArtwork(url: nil, frameAspect: 16 / 9, fallbackText: code)
         } else {
-            LibraryArtwork(url: api.image(item.posterUrl, width: ImageWidth.points(PhoneCardWidth.upNext)), imageAspect: item.posterAspect,
+            LibraryArtwork(url: api.image(item.posterUrl, width: ImageWidth.points(cards.upNext)), imageAspect: item.posterAspect,
                            frameAspect: 16 / 9, fallbackText: item.posterUrl == nil ? item.title : nil)
         }
     }
@@ -634,7 +658,7 @@ private struct UpNextCard: View {
                 Color.clear
                     .aspectRatio(16 / 9, contentMode: .fit)
                     .overlay {
-                        LazyImage(url: api.image(url, width: ImageWidth.points(PhoneCardWidth.upNext))) { state in
+                        LazyImage(url: api.image(url, width: ImageWidth.points(cards.upNext))) { state in
                             Group {
                                 if let image = state.image {
                                     image.resizable().aspectRatio(contentMode: .fill)
@@ -644,7 +668,7 @@ private struct UpNextCard: View {
                                     Theme.surfaceRaised
                                 }
                             }
-                            .perfImage(api.image(url, width: ImageWidth.points(PhoneCardWidth.upNext)), state)
+                            .perfImage(api.image(url, width: ImageWidth.points(cards.upNext)), state)
                         }
                     }
                     .clipped()
@@ -652,7 +676,7 @@ private struct UpNextCard: View {
                 LibraryArtwork(url: nil, frameAspect: 16 / 9, fallbackText: code)
             } else {
                 // 缺横向剧照：用海报按真实比例模糊铺底兜底
-                LibraryArtwork(url: api.image(item.posterUrl, width: ImageWidth.points(PhoneCardWidth.upNext)), imageAspect: item.posterAspect,
+                LibraryArtwork(url: api.image(item.posterUrl, width: ImageWidth.points(cards.upNext)), imageAspect: item.posterAspect,
                                frameAspect: 16 / 9, fallbackText: item.posterUrl == nil ? item.title : nil)
             }
             LinearGradient(colors: [.black.opacity(0.75), .clear], startPoint: .bottom, endPoint: .top).frame(height: 56)
@@ -785,7 +809,7 @@ private struct ClearLibraryHistorySheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
             }
         }
-        .presentationDetents([.medium])
+        .adaptiveDetents([.medium])
         .onAppear { libraryId = libraryId ?? libraries.first?.id }
     }
 

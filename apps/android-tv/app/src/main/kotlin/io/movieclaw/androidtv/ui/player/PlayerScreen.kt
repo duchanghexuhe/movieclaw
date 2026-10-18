@@ -54,12 +54,13 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.compose.ContentFrame
 import io.movieclaw.androidtv.LocalGraph
 import io.movieclaw.androidtv.LocalSession
-import io.movieclaw.androidtv.core.playback.PlaybackController
-import io.movieclaw.androidtv.core.playback.PlaybackTarget
-import io.movieclaw.androidtv.core.playback.Phase
-import io.movieclaw.androidtv.core.playback.PlayerState
-import io.movieclaw.androidtv.core.playback.PrefsStore
-import io.movieclaw.androidtv.core.playback.ScrubMath
+import io.movieclaw.core.playback.MemberBackend
+import io.movieclaw.core.playback.PlaybackController
+import io.movieclaw.core.playback.PlaybackTarget
+import io.movieclaw.core.playback.Phase
+import io.movieclaw.core.playback.PlayerState
+import io.movieclaw.core.playback.PrefsStore
+import io.movieclaw.core.playback.ScrubMath
 import io.movieclaw.androidtv.ui.shell.PlayRequest
 import io.movieclaw.androidtv.ui.theme.pt
 import kotlinx.coroutines.delay
@@ -75,8 +76,8 @@ import kotlinx.coroutines.launch
  * | 点按左 / 右 | 后退 / 前进 10 秒（控制层收起时也行） |
  * | 按住左 / 右 | 拖动进度（Apple TV 是触控板横滑；安卓遥控器没有触控板）：带缩略图，松手跳过去 |
  * | 下 | 信息面板：字幕、音轨、画质 |
- * | 上 | 显示控制层；剧集时焦点到进度条上方的「下一集」「选集」（下键回到画面） |
- * | 返回 | 依次：取消拖动 → 收起选集 / 面板 → 焦点从「下一集」「选集」回画面 → 收起「下一集」卡片 → 收起换画质建议 → 退出播放 |
+ * | 上 | 显示控制层，焦点到进度条上方的工具行：剧集的「下一集」「选集」，以及「播放诊断」（下键回到画面） |
+ * | 返回 | 依次：取消拖动 → 收起选集 / 面板 → 焦点从工具行回画面 → 收起「下一集」卡片 → 收起换画质建议 → 收起播放诊断 → 退出播放 |
  * | 快进 / 快退 / 下一首 / 上一首键 | ±10 秒 / 下一集 / 上一集 |
  *
  * 片头片尾时段右下角出现「跳过」按钮、片尾出现「下一集」卡片，焦点自动落在上面，按一下就生效。
@@ -89,7 +90,7 @@ fun PlayerScreen(request: PlayRequest, onClose: () -> Unit) {
     val controller = remember(request) {
         PlaybackController(
             context = context.applicationContext,
-            api = account.api,
+            backend = MemberBackend(account.api),
             server = account.server,
             http = graph.http,
             identity = graph.identity,
@@ -155,6 +156,10 @@ private fun PlayerContent(controller: PlaybackController, state: PlayerState, ht
     var panelOpen by remember { mutableStateOf(false) }
     // 选集面板（同详情页的「全部分集」：左栏分段、右边宫格）
     var episodesOpen by remember { mutableStateOf(false) }
+    // 播放诊断（Apple 端同款）：工具行里的「播放诊断」开关，左上角常驻，不抢焦点
+    var diagnosticsOpen by remember(controller) { mutableStateOf(false) }
+    LaunchedEffect(controller, diagnosticsOpen) { controller.setDiagnosticsOpen(diagnosticsOpen) }
+    val diagnostics by controller.diagnostics.collectAsState()
     val episodic = state.unit.isEpisode && state.episodes.isNotEmpty()
     var scrubMs by remember { mutableStateOf<Long?>(null) }
     var scrubBase by remember { mutableLongStateOf(0L) }
@@ -241,6 +246,10 @@ private fun PlayerContent(controller: PlaybackController, state: PlayerState, ht
             focusSurfaceSoon()
             return
         }
+        if (diagnosticsOpen) {
+            diagnosticsOpen = false
+            return
+        }
         exit()
     }
     BackHandler(onBack = ::back)
@@ -306,7 +315,7 @@ private fun PlayerContent(controller: PlaybackController, state: PlayerState, ht
             AndroidKeyEvent.KEYCODE_DPAD_UP -> if (down) {
                 controller.noteUserActivity()
                 showChrome()
-                if (episodic && native.repeatCount == 0 && state.hasSession && !state.isModal) focusActionsSoon()
+                if (native.repeatCount == 0 && state.hasSession && !state.isModal) focusActionsSoon()
             }
             AndroidKeyEvent.KEYCODE_DPAD_DOWN -> if (down && native.repeatCount == 0) {
                 controller.noteUserActivity()
@@ -440,8 +449,14 @@ private fun PlayerContent(controller: PlaybackController, state: PlayerState, ht
         // 4. 控制层（面板打开时让位）
         AnimatedVisibility(chromeVisible && !panelOpen && !episodesOpen, enter = fadeIn(tween(250)), exit = fadeOut(tween(250))) {
             Chrome(state, scrubMs, trickplay) {
-                if (episodic) {
+                if (state.hasSession) {
                     EpisodeActions(
+                        episodic = episodic,
+                        diagnosticsOpen = diagnosticsOpen,
+                        onDiagnostics = {
+                            controller.noteUserActivity()
+                            diagnosticsOpen = !diagnosticsOpen
+                        },
                         next = state.nextEpisode,
                         onNext = {
                             controller.noteUserActivity()
@@ -457,6 +472,11 @@ private fun PlayerContent(controller: PlaybackController, state: PlayerState, ht
                     )
                 }
             }
+        }
+
+        // 4½. 播放诊断：左上角，控制层收起也留着（截图给开发看）；纯展示，不接焦点
+        diagnostics?.let { sections ->
+            TvDiagnosticsPanel(sections, Modifier.align(Alignment.TopStart).padding(start = 80.pt, top = 60.pt))
         }
 
         // 5. 转圈

@@ -74,6 +74,43 @@ def test_incomplete_audio_does_not_switch_without_suitable_alternative(reason: s
     assert skip_segments._complete_audio_index(streams, 2700) == 0
 
 
+def _audio_vivid_fixture() -> list[dict]:
+    """NAS 醉梦 E01 的真实 ffprobe 输出：第一轨 Audio Vivid（ffprobe 不给 codec_name）。"""
+    fixtures = Path(__file__).parents[1] / "playback/fixtures/skip_segments"
+    fixture = fixtures / "nas-audio-vivid-first.json"
+    return json.loads(fixture.read_text())["streams"]
+
+
+def test_undecodable_first_audio_selects_decodable_track() -> None:
+    """醉梦 E01～E03：ffmpeg 解不了第一轨 Audio Vivid，改用同语言的第二轨 EAC3。"""
+    streams = _audio_vivid_fixture()
+    assert skip_segments._complete_audio_index(streams, 2819) == 0
+    assert skip_segments._decodable_audio_index(streams, 0, 2819) == 1
+    # 解得了的轨不动
+    assert skip_segments._decodable_audio_index(streams, 3, 2819) == 3
+
+
+@pytest.mark.parametrize("reason", ["all_undecodable", "different_language", "short"])
+def test_undecodable_audio_kept_without_suitable_alternative(reason: str) -> None:
+    streams = _audio_vivid_fixture()
+    for stream in streams[1:]:
+        if reason == "all_undecodable":
+            stream.pop("codec_name")
+        elif reason == "different_language":
+            stream["tags"]["language"] = "eng"
+        else:
+            stream["duration"] = "2700"
+    assert skip_segments._decodable_audio_index(streams, 0, 2819) == 0
+
+
+def test_truehd_never_switches_to_undecodable_track() -> None:
+    streams = [
+        {"codec_name": "truehd", "duration": "2700", "tags": {"language": "chi"}},
+        {"duration": "2700", "tags": {"language": "chi"}},
+    ]
+    assert skip_segments._cheaper_audio_index(streams, 0, 2700) == 0
+
+
 def _truehd_streams() -> list[dict]:
     return [
         {"codec_name": "truehd", "duration": "2700", "tags": {"language": "eng"}},
@@ -525,9 +562,12 @@ def _track_parallel_reads(monkeypatch, delay: float = 0.05) -> dict[str, int]:
 class _FakeTranscode:
     """转码会话管理器里的一路会话（只带 ``playback_load`` 看的字段）。"""
 
-    def __init__(self, *, transcoding: bool = True, remote: bool = False) -> None:
+    def __init__(
+        self, *, transcoding: bool = True, remote: bool = False, export_id: str | None = None
+    ) -> None:
         self.is_transcoding = transcoding
         self.remote = remote
+        self.export_id = export_id
         self.last_ping = time.monotonic()
 
 
@@ -612,7 +652,8 @@ def test_backfill_pauses_while_transcoding_and_resumes_after(
 
 
 def test_playback_load_tiers() -> None:
-    """转码 > 在看 > 空闲；外置 Worker 上的转码、本机直通都不算本机转码；没心跳的会话不算。"""
+    """转码 > 在看 > 空闲；外置 Worker 上的转码、本机直通都不算本机转码；没心跳的会话不算。
+    外置 Worker 上的离线导出什么都不算。"""
     manager = get_session_manager()
     activity.reset()
     cases = [
@@ -620,6 +661,9 @@ def test_playback_load_tiers() -> None:
         ([_FakeTranscode(transcoding=False)], skip_segments.PLAYING),
         ([_FakeTranscode(remote=True)], skip_segments.PLAYING),
         ([_FakeTranscode(transcoding=False), _FakeTranscode()], skip_segments.TRANSCODING),
+        # 离线导出：在转码器上转的没人在看、不占本机，不算负载；在本机转的照样算本机转码
+        ([_FakeTranscode(remote=True, export_id="e")], skip_segments.IDLE),
+        ([_FakeTranscode(export_id="e")], skip_segments.TRANSCODING),
     ]
     stale = _FakeTranscode()
     stale.last_ping -= 60

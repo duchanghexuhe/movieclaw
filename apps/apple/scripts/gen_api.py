@@ -40,6 +40,13 @@ API_PREFIX = "/api/v1"
 
 # 新增响应字段在旧服务器中不存在。保持可选，也保留既有 Swift 本地构造调用。
 BACKWARD_COMPATIBLE_RESPONSE_FIELDS = {
+    "ModelInfo": {
+        "requires_responses_for_tools",
+        "chat_tools_require_no_reasoning",
+        "max_tokens_parameter",
+        "sampling_requires_no_reasoning",
+        "fixed_sampling",
+    },
     "SubscriptionView": {"selection_mode"},
     "SubscriptionDetailView": {"selection_mode"},
     "WantedView": {"selection_version"},
@@ -385,6 +392,9 @@ def main() -> int:
     skipped = []
     for route in routes:
         method = sorted(m for m in route.methods if m != "HEAD")[0]
+        # 订阅授权由 Web / 电脑助手管理，原生 App 只消费服务器已有的模型目录。
+        if route.path in {f"{API_PREFIX}/llm/chatgpt/authorize", f"{API_PREFIX}/llm/chatgpt/complete"}:
+            continue
         rm = route.response_model
         if rm is None:
             skipped.append(f"{method} {route.path}（无响应模型：文件流/SSE 等，需手写）")

@@ -69,7 +69,14 @@ from movieclaw_events import new_ulid
 from movieclaw_playback import activity
 from movieclaw_playback.decide import PlaybackPlan, PlaybackTier
 from movieclaw_playback.hls_vod import SegmentPlan
-from movieclaw_playback.streaming import StrmError, is_strm, parse_strm, strm_source_input
+from movieclaw_playback.streaming import (
+    StrmError,
+    cloud_link,
+    is_cloud,
+    is_strm,
+    parse_strm,
+    strm_source_input,
+)
 
 logger = logging.getLogger("movieclaw_api.playback.session")
 
@@ -143,6 +150,11 @@ _RECENT_REQUESTS_KEEP = 32
 #: 配额。24 小时盖住「今天看一半明天接着看」；更久的重看本来就少，而且
 #: 配额 LRU 也会先淘汰它们（docs/design/player-pipeline-optimization.md §B）。
 CACHE_RETENTION_S = 24 * 3600.0
+
+
+def _remote_export(session: TranscodeSession) -> bool:
+    """跑在外置 Worker 上的离线导出：不占本机名额，播放要转码器时由名额登记表让路。"""
+    return session.export_id is not None and session.remote
 
 
 def _dir_size(directory: Path) -> int:
@@ -433,6 +445,12 @@ class TranscodeSession:
     #: 起会话的浏览器设备标识（web-<成员>-<浏览器>），管理员「结束播放」按它
     #: 找到并停掉这台浏览器的全部会话。
     device_id: str = ""
+    #: 离线下载的转码导出（offline-download.md §5.3）由一个「只下载、不看」的会话驱动：
+    #: 非 None 即导出号。播放要名额时它让路（services/offline/exports.py），本机执行时
+    #: ffmpeg 降优先级跑。
+    export_id: str | None = None
+    #: 被播放挤掉而停的（导出据此知道不是失败，稍后从断点接着转）
+    preempted: bool = False
     #: App 的播放编号（docs/design/playback-qoe.md §2）：会话结束时把摘要交给这次播放的记录
     attempt_id: str | None = None
     #: 首个分片距会话创建的毫秒数（起播最后一公里），交给播放记录用
@@ -920,6 +938,7 @@ class TranscodeSessionManager:
         cache: bool = True,
         source_concat: str | None = None,
         attempt_id: str | None = None,
+        export_id: str | None = None,
     ) -> TranscodeSession:
         """起一个会话。playlist 出现即返回，不等全部分片转完。
 
@@ -940,6 +959,8 @@ class TranscodeSessionManager:
 
         await self.reap()  # 顺手清掉超时的，给新会话腾位置
         transcoding = plan.tier >= PlaybackTier.HARDWARE_TRANSCODE
+        if transcoding and export_id is None:
+            await self._evict_export_for_local(max_transcode)
         self._check_capacity(transcoding, max_transcode, max_remux)
         self._check_disk(quota_bytes)
 
@@ -972,6 +993,7 @@ class TranscodeSessionManager:
             hw_backend=hw_backend,
             remote=use_remote,
             concat_list=source_concat,
+            export_id=export_id,
         )
         if cache and segment_plan is not None:
             self._assign_cache_directory(session)
@@ -1006,6 +1028,7 @@ class TranscodeSessionManager:
                 # 再由统一降档逻辑决定是否展示 consent 或使用本地软转。
                 await self._spawn_remote(session, remote_base_url or "")
             else:
+                await self._prepare_cloud_source(session)
                 command = self._local_command(
                     session, start_number=head_segment if segment_plan is not None else None
                 )
@@ -1021,12 +1044,39 @@ class TranscodeSessionManager:
             raise
         return session
 
+    async def _prepare_cloud_source(self, session: TranscodeSession) -> None:
+        """只在网盘上的片源：在事件循环上先取好直链（``_local_command`` 是同步的，只读缓存），
+        并占一个网盘名额（转码会话读网盘就是一路播放，会话结束时让出，cloud-storage.md §7.3）。"""
+        if not is_cloud(session.source_path):
+            return
+        from movieclaw_api.services.drives import sources
+        from movieclaw_sdk.drives import DriveError
+
+        item = sources.cloud_file(session.source_path)
+        try:
+            if item is not None:
+                await sources.take_slot(item.account_id, f"transcode:{session.id}", pinned=True)
+            await sources.prefetch(session.source_path)
+        except sources.SlotsFull as exc:
+            session.error = exc.message
+            raise SessionStartError(exc.message) from exc
+        except DriveError as exc:
+            session.error = f"网盘取不到这个文件：{exc.message}"
+            raise SessionStartError(session.error) from exc
+
     def _local_command(self, session: TranscodeSession, *, start_number: int | None):
         """本地 ffmpeg 命令：起播与 seek 重启共用一处装配，输入形态在这里分叉。"""
         # 只在 concat 形态下才传 input_format：普通文件的调用形状保持不变
         extra: dict[str, Any] = {}
         source_path = session.source_path
-        if is_strm(source_path):
+        if is_cloud(source_path):
+            # 只在网盘上的库文件：ffmpeg 读网盘直链（取链与占名额在 _prepare_cloud_source）
+            link = cloud_link(source_path)
+            if link is None:
+                session.error = "网盘直链取不到"
+                raise SessionStartError(session.error)
+            source_path, extra["input_options"] = strm_source_input(link)
+        elif is_strm(source_path):
             # 网盘（strm）条目：ffmpeg 直接读直链（或 strm 指向的挂载文件）。每轮（含 seek
             # 重启）都现读 strm——直链多带时效签名，开播时解析的那条可能已经过期；缓存指纹仍按
             # strm 文件算（cache.py）
@@ -1181,6 +1231,7 @@ class TranscodeSessionManager:
         # 先登记 job_id 再做任何可能失败的事：外层 start() 的兜底清理靠
         # session.remote_job_id 找任务，晚一步登记就会漏掉一条清理路径。
         session.remote_job_id = job_id
+        await self._evict_export_for_remote(session)
         # 先占位再拼 URL：得先知道是谁接单，才能用它连上来的地址拼。
         try:
             connection = registry.reserve(
@@ -1192,6 +1243,7 @@ class TranscodeSessionManager:
                 plan=session.plan,
                 source_id=session.file_id,
                 learn_speed=session.segment_plan is not None,
+                preemptible=session.export_id is not None,
             )
         except RemoteWorkerUnavailable as exc:
             session.error = str(exc)
@@ -1276,13 +1328,68 @@ class TranscodeSessionManager:
         session.error = "远程 Worker 超时未上传播放列表"
         raise SessionStartError(session.error)
 
+    async def _preempt(self, victim: TranscodeSession) -> None:
+        victim.preempted = True
+        await self.stop(victim.id, reason="播放要用转码名额，离线导出让路（稍后从断点接着转）")
+
+    async def _evict_export_for_local(self, max_transcode: int) -> None:
+        """本机转码名额满了、其中有离线导出：先停导出，播放优先。"""
+        if self.active_transcodes() < max_transcode:
+            return
+        victim = next(
+            (
+                s
+                for s in self._sessions.values()
+                if s.export_id is not None
+                and not s.remote
+                and s.is_transcoding
+                and s.state in ("spawning", "ready")
+            ),
+            None,
+        )
+        if victim is not None:
+            await self._preempt(victim)
+
+    async def _evict_export_for_remote(self, session: TranscodeSession) -> None:
+        """播放要派远程任务、转码器只剩离线导出占着的名额：停掉那个导出。"""
+        if session.export_id is not None or not any(
+            s.export_id is not None and s.remote for s in self._sessions.values()
+        ):
+            return
+        job_id = get_remote_worker_registry().preemptible_job_for(
+            session.hw_backend or "videotoolbox",
+            segment_type(session.plan),
+            disc=session.concat_list is not None,
+        )
+        if job_id is None:
+            return
+        victim = next(
+            (s for s in self._sessions.values() if s.remote_job_id == job_id), None
+        )
+        if victim is not None:
+            await self._preempt(victim)
+        else:  # 台账不同步的边角：至少把名额还出来
+            get_remote_worker_registry().remove_job(job_id)
+
+    def active_transcodes(self) -> int:
+        """占本机转码名额的会话数。外置 Worker 上的离线导出不占（它让路走转码器的名额）。"""
+        return sum(
+            1
+            for s in self._sessions.values()
+            if s.state in ("spawning", "ready") and s.is_transcoding and not _remote_export(s)
+        )
+
     def _check_capacity(self, transcoding: bool, max_transcode: int, max_remux: int) -> None:
         """两个独立信号量：转码按 CPU/GPU 算，直通按 IO 算。
 
         机械盘上两路 4K remux 就能打满随机读，而 CPU 几乎是空的——瓶颈不在
         算力，合成一个上限会误判。
         """
-        active = [s for s in self._sessions.values() if s.state in ("spawning", "ready")]
+        active = [
+            s
+            for s in self._sessions.values()
+            if s.state in ("spawning", "ready") and not _remote_export(s)
+        ]
         if transcoding:
             used = sum(1 for s in active if s.is_transcoding)
             if used >= max_transcode:
@@ -1398,9 +1505,13 @@ class TranscodeSessionManager:
     async def _spawn(self, session: TranscodeSession, command: TranscodeCommand) -> None:
         # 新进程从不挂起态起步：旧进程的挂起原因随它一起消失
         session.pause_reasons.clear()
+        argv = list(command.argv)
+        if session.export_id is not None and shutil.which("nice"):
+            # 离线导出在本机转：让着实时播放（宁可导出慢，不让播放卡）
+            argv = ["nice", "-n", "10", *argv]
         # 契约 1+2：异步子进程 + 独立进程组
         process = await asyncio.create_subprocess_exec(
-            *command.argv,
+            *argv,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -1982,6 +2093,7 @@ class TranscodeSessionManager:
             session.start_ms = int(plan.boundaries[index] * 1000)
             session.state = "spawning"
             session.error = None
+            await self._prepare_cloud_source(session)
             command = self._local_command(session, start_number=index)
             # 旧轮次的清单先并入台账再删：这一轮转出的分片下次回看直接可用；
             # 跨会话台账也顺手刷一遍，进程崩了这一轮的产出也不丢
@@ -2073,6 +2185,7 @@ class TranscodeSessionManager:
                 # 必须用**接单的这台** Worker 连上来的地址拼（理由见
                 # ``_spawn_remote``）。不能沿用上一轮的地址——seek 完全可能被
                 # 另一台从不同入口连进来的 Worker 接走。
+                await self._evict_export_for_remote(session)
                 connection = registry.reserve(
                     job_id,
                     backend=session.hw_backend or "videotoolbox",
@@ -2082,6 +2195,7 @@ class TranscodeSessionManager:
                     plan=session.plan,
                     source_id=session.file_id,
                     learn_speed=session.segment_plan is not None,
+                    preemptible=session.export_id is not None,
                 )
                 session.progressive = _wants_progressive(session, connection)
                 try:
@@ -2162,6 +2276,10 @@ class TranscodeSessionManager:
         while (produced + 1) in session.completed_segments:
             produced += 1
         return produced
+
+    def files_in_use(self) -> set[int]:
+        """正在被转码会话（含离线导出驱动的会话）读的库文件 id。"""
+        return {s.file_id for s in self._sessions.values()}
 
     def get(self, session_id: str, *, member_id: int | None = None) -> TranscodeSession | None:
         """取会话。``member_id`` 非空时校验归属——会话是私人资源。"""
@@ -2263,6 +2381,12 @@ class TranscodeSessionManager:
         if session is None:
             return False
         self._log_session_summary(session, reason)
+        if is_cloud(session.source_path):
+            from movieclaw_api.services.drives import sources
+
+            item = sources.cloud_file(session.source_path)
+            if item is not None:
+                sources.release_slot(item.account_id, f"transcode:{session.id}")
         # 先置状态再抢重启锁：正在排队等锁的 VOD 分片重启会在临界区入口看到
         # stopped 直接放弃。终止必须与 _maybe_restart_for 互斥——不互斥的话，
         # 一次「杀旧进程 → 拉新进程」的重启可能在本次 killpg **之后**才把新

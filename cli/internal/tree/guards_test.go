@@ -16,6 +16,13 @@ import (
 // knownNonGenerated 是唯二允许不生成命令的两类端点：x-cli-hidden（Web 基础
 // 设施，或语义由精选命令承担）与 x-cli-stream（SSE 流，精选层手写接入）。
 var knownNonGenerated = []string{
+	"llm.chatgpt.authorize",
+	"llm.chatgpt.complete",
+	// 智能体网页搜索的密钥：设置页的事。隐藏是为了不让对话式 Agent 经 mclaw 读到或改写密钥
+	"llm.web-search.show",
+	"llm.web-search.update",
+	"llm.web-search.clear",
+	"llm.web-search.test",
 	// 会话图片附件：二进制上传/下载是 Web 基础设施，CLI 场景无消费方
 	"session.attachments.upload",
 	"session.attachments.download",
@@ -89,6 +96,9 @@ var knownNonGenerated = []string{
 	// 原盘目录直推（disc-direct-play.md）：目录清单与盘内文件的 Range 取流，只给播放引擎用
 	"playback.file.disc.list",
 	"playback.file.disc.file",
+	// 蓝光剪辑清单（disc-clip-play.md）：Android 统一引擎按剪辑取字节，只给播放引擎用
+	"playback.file.bluray",
+	"playback.file.bluray.clip",
 	"playback.file.subtitle",
 	"playback.file.fonts",
 	"playback.file.font",
@@ -210,12 +220,25 @@ var knownNonGenerated = []string{
 	"push.me.stream",
 	"push.me.ack",
 	"push.images.get",
+	// Android 客户端自身更新：只给 App 查新版、经服务器下载 APK
+	"app.clients.latest",
+	"app.clients.apk",
 	// 使用提示（docs/design/tips.md）：各端界面内部的提示状态，CLI 无消费方
 	"tips.state.show",
 	"tips.state.reset",
 	"tips.events.donate",
 	"tips.displays.record",
 	"tips.invalidate",
+	// 离线下载（docs/design/offline-download.md）：App 后台下载会话与本机播放的协议端点，
+	// 产物是二进制或给本机存档用，CLI 无消费方
+	"offline.manifest",
+	"offline.profiles",
+	"offline.file.content",
+	"offline.exports.create",
+	"offline.exports.get",
+	"offline.exports.content",
+	"offline.exports.release",
+	"playback.viewings",
 }
 
 // TestNonGeneratedEndpointsAreAllKnown 强制新端点显式表态：进命令树，或登记豁免。

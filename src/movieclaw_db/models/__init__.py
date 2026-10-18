@@ -19,6 +19,7 @@ from movieclaw_db.models.download_file_source import DownloadFileSource
 from movieclaw_db.models.download_hint import DownloadHint
 from movieclaw_db.models.download_target_pref import DownloadTargetPref
 from movieclaw_db.models.downloader_client import ClientType, DownloaderClient
+from movieclaw_db.models.drive_account import DriveAccount
 from movieclaw_db.models.import_watch import ImportWatch
 from movieclaw_db.models.ingest_entry import IngestEntry, IngestStatus
 from movieclaw_db.models.jellyfin_device import JellyfinDevice
@@ -32,9 +33,12 @@ from movieclaw_db.models.job import (
     JobStatus,
 )
 from movieclaw_db.models.library import Library
+from movieclaw_db.models.library_cloud_folder import LibraryCloudFolder
 from movieclaw_db.models.library_dir_snapshot import LibraryDirSnapshot
 from movieclaw_db.models.library_duplicate_unit import LibraryDuplicateUnit
 from movieclaw_db.models.library_file import FileSource, FileState, LibraryFile
+from movieclaw_db.models.library_file_fingerprint import LibraryFileFingerprint
+from movieclaw_db.models.library_file_replica import LibraryFileReplica
 from movieclaw_db.models.llm_provider import LlmProvider
 from movieclaw_db.models.login_device import LoginDevice
 from movieclaw_db.models.manual_download_intent import ManualDownloadIntent
@@ -106,6 +110,7 @@ __all__ = [
     "CacheEntry",
     "ChannelAccount",
     "ChannelAccountStatus",
+    "DriveAccount",
     "SiteCookie",
     "SiteCredential",
     "AuthType",
@@ -140,6 +145,9 @@ __all__ = [
     "LibraryDirSnapshot",
     "LibraryDuplicateUnit",
     "LibraryFile",
+    "LibraryCloudFolder",
+    "LibraryFileFingerprint",
+    "LibraryFileReplica",
     "LlmProvider",
     "LoginDevice",
     "ManualDownloadIntent",

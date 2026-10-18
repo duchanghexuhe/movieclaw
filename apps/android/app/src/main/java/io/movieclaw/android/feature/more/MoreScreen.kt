@@ -89,6 +89,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -99,15 +101,23 @@ class MoreViewModel @Inject constructor(
     private val apiFactory: ApiFactory,
     /** 底栏形态试用开关（液态玻璃新版 ⇄ 当前形态） */
     private val tabBarPrefs: io.movieclaw.android.core.session.TabBarPrefs,
+    /** 底部版本号那一行：点一下手动检查 App 更新 */
+    val appUpdate: io.movieclaw.android.feature.update.AppUpdateController,
 ) : ViewModel() {
     val ui = repository.ui
     val servers = repository.servers
 
-    val liquidTabBar = tabBarPrefs.liquid.stateIn(
-        viewModelScope,
-        kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
-        false,
-    )
+    // 初始值给 null（"还不知道"）：DataStore 是异步读的，先给 false 会让「玻璃底栏」那颗
+    // Switch 以"关"组合、拿到真实值（通常是开）后再自己播一遍开启动画——切到「我的」时
+    // 那一下明显的开关动画（实机反馈）。null 期间不挂 Switch，行高不变所以不会跳。
+    val liquidTabBar: kotlinx.coroutines.flow.StateFlow<Boolean?> =
+        tabBarPrefs.liquid
+            .map { it as Boolean? }
+            .stateIn(
+                viewModelScope,
+                kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
+                null,
+            )
 
     fun setLiquidTabBar(on: Boolean) {
         viewModelScope.launch { tabBarPrefs.setLiquid(on) }
@@ -177,6 +187,9 @@ class MoreViewModel @Inject constructor(
             )
         }
     }
+
+    /** Agent 会话变化信号（SessionRepository）：供页面订阅，替代轮询 */
+    val agentSessionsVersion get() = repository.agentSessionsVersion
 
     fun loadSessions() {
         if (!isAdmin) { _sessions.value = Sessions(loading = false); return }
@@ -287,6 +300,23 @@ fun MoreScreen(
     val sessions by vm.sessions.collectAsStateWithLifecycle()
     // 底栏形态试用开关（开 = 液态玻璃新版，关 = 当前形态）
     val liquidTabBar by vm.liquidTabBar.collectAsStateWithLifecycle()
+
+
+    // 会话列表会在别处变化（新建会话、在对话里跑完一轮）：切回本页刷一次，
+    // 另外订阅 SessionRepository 的变化信号立即重拉——不再轮询（iOS 是靠共享 store 天然做到，
+    // 这里用信号达成同样效果：新建完回到本页就是最新的，零等待）
+    val moreTabActive = io.movieclaw.android.core.designsystem.LocalTabActive.current
+    LaunchedEffect(moreTabActive) {
+        if (!moreTabActive) return@LaunchedEffect
+        vm.loadSessions()
+    }
+    LaunchedEffect(Unit) {
+        // 防抖：信号可能连着来（一次会话既有加载又有重试），合并成一次拉取
+        vm.agentSessionsVersion.collectLatest {
+            kotlinx.coroutines.delay(300)
+            vm.loadSessions()
+        }
+    }
     val permissions = LocalPermissions.current
     val feedback = LocalFeedback.current
 
@@ -431,10 +461,13 @@ fun MoreScreen(
             }
             item(key = "tail") {
                 Text(
-                    // 「版本（构建号）」：反馈问题时据此认出装的是哪一次构建（iOS 关于页同口径）
-                    "MovieClaw Android · ${BuildInfo.DISPLAY_VERSION}",
+                    // 「版本（构建号）」：反馈问题时据此认出装的是哪一次构建（iOS 关于页同口径）；点一下检查更新
+                    "MovieClaw Android · ${BuildInfo.DISPLAY_VERSION} · 检查更新",
                     style = McType.micro, color = TextFaint,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 22.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = vm.appUpdate::checkNow)
+                        .padding(vertical = 22.dp),
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 )
             }

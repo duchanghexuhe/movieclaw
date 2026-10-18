@@ -220,6 +220,12 @@ movies released by the Blender Foundation and others (CC BY).
 - Updates and rollbacks are buttons in the web UI. Routine upgrades download only a few megabytes, a broken update rolls itself back, and your data is never touched.
 - Errors are written for humans, for the person who deploys things but doesn't write code. (Log and UI messages are currently in Chinese.)
 
+### Plugins
+
+- The core stays general; personal setups are plugins. Messaging channels, downloaders, cloud-drive direct links and more live in the
+  [movieclaw-plugins](https://github.com/movieclaw/movieclaw-plugins) repo. Download a `.mcplugin` and upload it on the **Plugins** page in Settings.
+- Want to write one? Start with that repo's `example/GUIDE.md`, or ask the AI assistant to write it for you.
+
 ## Boundaries
 
 ### What it won't do
@@ -660,6 +666,10 @@ live in [`docs/design/`](docs/design/), one file per topic: library, metadata, s
 quality upgrades, Jellyfin compatibility, in-app updates, the CLI… browse by filename.
 The reasoning behind this README's own structure is in
 [readme-rewrite.md](docs/design/readme-rewrite.md).
+
+Third-party plugins, and the store metadata next to each of them (`store.json`), live in
+[movieclaw-plugins](https://github.com/movieclaw/movieclaw-plugins). How to write one is in that
+repo's `example/GUIDE.md`. This server still installs a plugin only by uploading a `.mcplugin` file.
 
 Questions, ideas, bug reports — please
 [open an issue](https://github.com/movieclaw/movieclaw/issues).

@@ -71,6 +71,8 @@ enum AppRoute: Hashable {
 
     // MARK: 我的 / 设置
     case my
+    /// /my/downloads：下载（「我的」里的入口与页面都叫「下载」；docs/design/offline-download.md §8）
+    case offlineStorage
     case settings
     /// /settings/{section}?…：query 原样透传给分区页（如 /settings/app?tab=storage、
     /// /settings/downloaders?limits=… 的预填与直达），分区页经 `@Environment(\.routeQuery)` 读取
@@ -151,7 +153,7 @@ enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
         case .appPush: "官方推送与自建推送中继，各 App 走哪个通道"
         case .imPush: "微信 / Telegram / Discord / 飞书 推送与 AI 对话"
         case .webhook: "向外部服务推送播放、收藏等事件"
-        case .llm: "接入 OpenAI、百炼等模型供应商，可同时接入多家"
+        case .llm: "接入 OpenAI、百炼等模型供应商，查看服务器已有接入"
         case .mcp: "把 movieclaw 的能力开放给 Claude Code、Cursor 等 AI 客户端"
         case .ai: "智能体与字幕处理使用的默认模型"
         case .cloud: "连接到 MovieClaw 账号，家人的手机就能收到通知"
@@ -301,7 +303,7 @@ extension AppRoute {
             guard parts.count >= 2 else { return nil }
             self = .session(id: parts[1])
         case "my":
-            self = .my
+            self = parts.count >= 2 && parts[1] == "downloads" ? .offlineStorage : .my
         case "activate":
             self = .deviceApproval(code: query["code"])
         case "settings":
@@ -332,7 +334,7 @@ extension AppRoute {
         case .libraryHome, .libraryCustomize, .favorites, .allCollections, .collection, .library, .libraryKind, .libraryItem, .libraryManage, .reels: .library
         case .subscriptions, .subscription, .subscriptionWall: .subscriptions
         case .activity, .activityPage: .activity
-        case .my: .more
+        case .my, .offlineStorage: .more
         case .searchHome, .search, .newSession, .session, .settings, .settingsSection, .deviceApproval, .share: nil
         }
     }

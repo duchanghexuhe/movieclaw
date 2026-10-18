@@ -183,6 +183,12 @@ MovieClaw 把一个自主的通用 Agent 装进了影音服务器。打理片库
 - 更新和回退都在网页上点，日常升级只下几 MB 产物包，坏了会自动回落，数据不动。
 - 出错说人话：日志和界面提示都是中文，写给「部署了但不写代码」的人。
 
+### 插件
+
+- 主程序只做通用能力，个性化玩法交给插件：消息通道、下载器、网盘直链这类插件都在
+  [movieclaw-plugins](https://github.com/movieclaw/movieclaw-plugins) 插件仓库，下载 `.mcplugin` 在设置里的「插件」页上传即可安装。
+- 想自己写一个？看插件仓库的 `example/GUIDE.md`，或者直接让 AI 助手帮你写。
+
 <a id="boundaries"></a>
 
 ## 不做什么、不锁你什么
@@ -551,6 +557,10 @@ Web 控制台 `http://127.0.0.1:3000`，API 文档 `http://127.0.0.1:8000/docs`�
 各模块的重大设计与取舍都记录在 [`docs/design/`](docs/design/)，一事一档：媒体库、元数据、
 订阅、洗版、Jellyfin 兼容、应用内更新、CLI……按文件名找感兴趣的主题即可。
 本 README 自身的结构依据见 [readme-rewrite.md](docs/design/readme-rewrite.md)。
+
+第三方插件，以及每个插件旁边的商店元数据（`store.json`），在
+[movieclaw-plugins](https://github.com/movieclaw/movieclaw-plugins)。怎么写见该仓库的 `example/GUIDE.md`。
+服务器现在仍然只通过上传 `.mcplugin` 安装插件。
 
 有问题、有建议、发现 Bug，都欢迎开
 [Issue](https://github.com/movieclaw/movieclaw/issues)。

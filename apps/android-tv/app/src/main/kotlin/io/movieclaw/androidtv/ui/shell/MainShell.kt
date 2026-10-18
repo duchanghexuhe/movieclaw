@@ -89,6 +89,9 @@ fun MainShell(args: LaunchArgs) {
     val graph = io.movieclaw.androidtv.LocalGraph.current
     val session = io.movieclaw.androidtv.LocalSession.current
     val homeStore = remember(session.key) { io.movieclaw.androidtv.ui.home.HomeStore(session.api) }
+    // App 自身更新：进主界面后每天最多自动问一次；有新版弹窗（「谁在看」页底部可手动检查）
+    LaunchedEffect(session.key) { graph.appUpdate.autoCheck(session) }
+    io.movieclaw.androidtv.ui.update.TvUpdateDialog(graph.appUpdate, session)
     val upNextUnit: (Long) -> Pair<Long, Long>? = { id ->
         homeStore.upNext?.firstOrNull { it.mediaItemId == id && it.kind == "tv" }?.let { it.seasonNumber to it.episodeNumber }
     }

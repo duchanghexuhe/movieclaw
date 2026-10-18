@@ -102,22 +102,41 @@ BITRATE_LADDER: dict[int, str] = {
 }
 
 
-def maxrate_for_height(height: int | None) -> str:
+#: HEVC 输出的码率阶梯（只给离线下载的转码导出用）：H.264 阶梯的约 2/3。真片实测
+#: （2026-10-13，h264/hevc_videotoolbox，同一无损中间片，VMAF）：1080p 4M 的 HEVC 平均
+#: 2.7～3.0 Mbps，与 H.264 6M（平均 4.0～4.4 Mbps）分数差在 ±0.5 内；体积小三分之一。
+HEVC_BITRATE_LADDER: dict[int, str] = {
+    2160: "10M",
+    1440: "7M",
+    1080: "4M",
+    720: "2M",
+    480: "1M",
+}
+
+
+def is_hevc_output(video: VideoPlan) -> bool:
+    return video.action == "transcode" and (video.codec or "").lower() in {"hevc", "h265"}
+
+
+def maxrate_for_height(height: int | None, *, hevc: bool = False) -> str:
     """取不小于目标高度的最近阶梯档；无高度信息按 1080p 算。"""
+    ladder = HEVC_BITRATE_LADDER if hevc else BITRATE_LADDER
     if height is None:
-        return BITRATE_LADDER[1080]
-    for step in sorted(BITRATE_LADDER):
+        return ladder[1080]
+    for step in sorted(ladder):
         if height <= step:
-            return BITRATE_LADDER[step]
-    return BITRATE_LADDER[2160]
+            return ladder[step]
+    return ladder[2160]
 
 
-def maxrate_for_video(video: VideoPlan) -> str:
+def maxrate_for_video(video: VideoPlan, *, hevc: bool | None = None) -> str:
     """阶梯值与计划里的码率上限（按实测带宽反推，adaptive.py）取小。
 
     返回 ``<数字>M`` 形态，bufsize 按它的两倍算——两处都吃这个字符串，
     格式不能变。"""
-    ladder = maxrate_for_height(video.height)
+    if hevc is None:
+        hevc = is_hevc_output(video)
+    ladder = maxrate_for_height(video.height, hevc=hevc)
     cap = video.bitrate_cap_bps
     if cap is None or cap <= 0:
         return ladder
@@ -316,6 +335,9 @@ class HwBackend:
     #: 需要 hwupload + init_hw_device 那套显存搬运，碎且驱动相关——烧录时
     #: 这两家直接退软件编码（用户选烧录已经接受了转码代价）。
     sw_frames_ok: bool = False
+    #: 同一后端的 HEVC 编码器；None = 这个后端不出 HEVC。目前只有离线下载的转码导出要
+    #: HEVC（见 ``HEVC_BITRATE_LADDER``），播放一律 H.264。
+    hevc_encoder: str | None = None
 
 
 HW_BACKENDS: dict[str, HwBackend] = {
@@ -359,6 +381,7 @@ HW_BACKENDS: dict[str, HwBackend] = {
     "videotoolbox": HwBackend(
         name="videotoolbox",
         encoder="h264_videotoolbox",
+        hevc_encoder="hevc_videotoolbox",
         hwaccel="videotoolbox",
         hwaccel_output_format="videotoolbox_vld",
         # VideoToolbox 硬解输出是 videotoolbox_vld；软件 scale 前必须显式
@@ -372,6 +395,29 @@ HW_BACKENDS: dict[str, HwBackend] = {
 #: 后端名 → 经硬件自检确认可用的原生 tone-map 滤镜。见 ``NVENC_TONEMAP``。
 _PROBED_TONEMAP: dict[str, str] = {}
 
+#: 认杜比视界 RPU、带 ``apply_dovi`` 开关的色调映射滤镜（jellyfin-ffmpeg）。VAAPI 的
+#: ``tonemap_vaapi`` 与 QSV 的 ``vpp_qsv`` 不认 RPU：P5 的 IPT 基础层喂给它们，出来整片发紫
+_DOVI_AWARE_TONEMAPS = frozenset(
+    {"tonemapx", "tonemap_videotoolbox", "tonemap_cuda", "tonemap_opencl"}
+)
+
+
+def _tonemap_step(expr: str, plan: PlaybackPlan) -> str:
+    """色调映射这一步按计划里的杜比视界处理补参数（``VideoPlan.dolby_vision``）。
+
+    - ``ignore``：记录不可信、只认基础层，关掉 ``apply_dovi``——P5 的还原套在 YCbCr 基础层上
+      整片发绿（《驯龙高手》HDR10 段注入 P5 RPU，软件与 Metal 两条链实测都是）；
+    - Metal 版只认 BT.2020 NCL / BT.709 矩阵（帧上没有 RPU 时），别的直接断言崩溃、ffmpeg 退出码 6：
+      《航拍中国》TS 把 HDR10 的矩阵写成了 gbr（RGB）。HDR10 / HLG 的矩阵按规范就是 BT.2020 NCL，
+      先改正标签；写对了的片是空操作。要吃 RPU 的不动：那条走 RPU，不看矩阵。
+    """
+    name = expr.split("=", 1)[0]
+    if plan.video.dolby_vision == "ignore" and name in _DOVI_AWARE_TONEMAPS:
+        expr += ":apply_dovi=0"
+    if name == "tonemap_videotoolbox" and plan.video.dolby_vision != "apply":
+        expr = "setparams=colorspace=bt2020nc," + expr
+    return expr
+
 
 def register_native_tonemap(backend: str, filter_expr: str | None) -> None:
     """自检确认某后端的原生 tone-map 滤镜可用（或不再可用）。
@@ -383,6 +429,13 @@ def register_native_tonemap(backend: str, filter_expr: str | None) -> None:
         _PROBED_TONEMAP[backend] = filter_expr
     else:
         _PROBED_TONEMAP.pop(backend, None)
+
+
+def tonemap_reads_dolby_vision(backend_name: str) -> bool:
+    """该后端的原生色调映射认不认杜比视界 RPU。VAAPI / QSV 不认：P5 的 IPT 基础层出来整片发紫。"""
+    backend = HW_BACKENDS.get(backend_name)
+    expr = native_tonemap_filter(backend) if backend is not None else None
+    return (expr or "").split("=", 1)[0] in _DOVI_AWARE_TONEMAPS
 
 
 def native_tonemap_filter(backend: HwBackend) -> str | None:
@@ -496,8 +549,13 @@ def build_hls_command(
     seek_pad_s: float = 0.5,
     protocol_whitelist: str | None = None,
     input_options: Sequence[str] = (),
+    export_path: Path | None = None,
 ) -> TranscodeCommand:
     """把播放计划翻成 ffmpeg 命令。档 0（Direct Play）不该走到这里。
+
+    ``export_path``：离线下载的整片导出（docs/design/offline-download.md §5.3）。输出一整个
+    分片化 MP4 文件写到这里，不限读速；分片化保证文件只往后追加、不回头改写，下载接口
+    可以边写边发。
 
     ``input_format="concat"`` 是原盘多剪辑的输入形态（docs/design/disc-playback.md
     §3.4）：``source_path`` 指向 concat 清单而不是媒体文件，``-f concat -safe 0``
@@ -560,7 +618,7 @@ def build_hls_command(
         argv += ["-fflags", "+genpts"]
     # 读入限速也是输入选项，必须在 -i 之前。只给会话相对制：VOD 模式由会话层
     # 按领先量闭环节流（理由见常量注释）
-    if start_number is None:
+    if start_number is None and export_path is None:
         argv += [
             "-readrate", str(READRATE_COPY if not transcoding_video else READRATE),
             "-readrate_initial_burst", str(READRATE_BURST_SECONDS),
@@ -629,6 +687,10 @@ def build_hls_command(
         and start_number is not None
         and not is_mpegts(plan)
     )
+    if export_path is not None:
+        argv += _export_args()
+        argv.append(str(export_path))
+        return TranscodeCommand(argv=argv, playlist_path=export_path, init_path=export_path)
     if progressive:
         argv += _progressive_args()
     else:
@@ -695,7 +757,11 @@ def _burn_filter_graph(plan: PlaybackPlan, subtitle_index: int) -> str:
     ``effective_hw_backend``。
     """
     # HDR 走 tone-map，非 709 的 SDR 走色彩空间转换；两者互斥，都落到 BT.709。
-    color_pre = _SOFTWARE_TONEMAP if plan.video.tone_map else _color_convert_filter(plan)
+    color_pre = (
+        _tonemap_step(_SOFTWARE_TONEMAP, plan)
+        if plan.video.tone_map
+        else _color_convert_filter(plan)
+    )
     base = f"[0:v:0]{color_pre}[tm];[tm]" if color_pre else "[0:v:0]"
     graph = f"{base}[0:s:{subtitle_index}]overlay"
     if plan.video.height:
@@ -751,7 +817,13 @@ def _video_args(
         # 黑屏**——没有 error 事件、没有日志，只有一个不动的黑框（§7-①）。
         # 实测：不加这行 ffmpeg 输出的 codec tag 就是 hev1。
         if (plan.video.codec or "").lower() in {"hevc", "h265"}:
-            args += ["-tag:v", "hvc1"]
+            if plan.video.dolby_vision == "keep":
+                # 给能原生解杜比视界的播放器：打 dvh1 才会写出 dvcC 记录（hvc1 下 ffmpeg 不写，
+                # 换封装后记录就丢了，P5 的 IPT 基础层被当 HDR10 解、整片发绿发紫）。MP4 封装写杜比
+                # 视界记录要 ``-strict unofficial``（jellyfin-ffmpeg 7.1 实测）
+                args += ["-tag:v", "dvh1", "-strict", "unofficial"]
+            else:
+                args += ["-tag:v", "hvc1"]
         return args
 
     # 烧录时滤镜已在 filter_complex 图里（-vf 与 filter_complex 互斥）
@@ -766,9 +838,18 @@ def _video_args(
         # 变化时，ffmpeg 重建滤镜图会按上次输出尺寸插入软件 scaler_out；它接不了
         # videotoolbox_vld，导致 -78 退出。关闭这层自动缩放，保持整条链使用硬件帧。
         args += ["-noautoscale"]
-    maxrate = maxrate_for_video(plan.video)
+    hevc = bool(is_hevc_output(plan.video) and backend is not None and backend.hevc_encoder)
+    # 码率阶梯按**实际**出的编码选：要 HEVC 但后端没有 HEVC 编码器时照旧出 H.264，码率也按 H.264
+    maxrate = maxrate_for_video(plan.video, hevc=hevc)
     bufsize = f"{float(maxrate[:-1]) * 2:g}M"
-    if backend is not None:
+    if backend is not None and hevc:
+        # 离线导出的 HEVC：8-bit Main（输出恒为 SDR BT.709，iPhone 全系硬解），hvc1 标签
+        # 理由同直通档。没有 H.264 那几条：hevc_videotoolbox 不认 -a53cc，High@4.1 是 H.264 的
+        args += ["-c:v", backend.hevc_encoder, *encoder_options(backend), "-profile:v", "main"]
+        if vt_mode != VT_GPU:
+            args += ["-pix_fmt", "yuv420p"]
+        args += ["-tag:v", "hvc1", "-b:v", "0", "-maxrate", maxrate, "-bufsize", bufsize]
+    elif backend is not None:
         args += ["-c:v", backend.encoder, *encoder_options(backend)]
         # iOS 原生 HLS 对 10-bit/High 10 的硬件编码结果兼容性很差，统一锁
         # 到 High profile + 8-bit yuv420p。VideoToolbox 不能在 4K 输出时强制
@@ -876,7 +957,7 @@ def _videotoolbox_gpu_chain(plan: PlaybackPlan) -> str:
     height = plan.video.height
     size = f"w=trunc(iw*{height}/ih/2)*2:h={height}:" if height else ""
     if plan.video.tone_map:
-        return f"scale_vt={size}format=p010le,{VIDEOTOOLBOX_TONEMAP}"
+        return f"scale_vt={size}format=p010le,{_tonemap_step(VIDEOTOOLBOX_TONEMAP, plan)}"
     chain = f"scale_vt={size}format=nv12"
     if _outputs_bt709(plan):
         chain += ",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
@@ -900,7 +981,7 @@ def _filter_chain(
             if backend is not None and not software_filters
             else None
         )
-        parts.append(native or _SOFTWARE_TONEMAP)
+        parts.append(_tonemap_step(native or _SOFTWARE_TONEMAP, plan))
     else:
         # 非 HDR 的非 709 源同样要显式转换，scale 不会替我们做
         convert = _color_convert_filter(plan)
@@ -1003,6 +1084,27 @@ def _progressive_args() -> list[str]:
         "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont+skip_sidx",
         "-frag_duration", str(PROGRESSIVE_FRAGMENT_US),
         "-method", "PUT",
+        "-y",
+    ]
+
+
+#: 离线导出的片段时长上限（微秒）：文件要从头读到尾，不像边播边送那样要小片段起播快；
+#: 片段大一点，片段头的开销与文件尾部的随机访问索引（mfra）都小
+EXPORT_FRAGMENT_US = 2_000_000
+
+
+def _export_args() -> list[str]:
+    """离线导出：与 ``_progressive_args`` 同一组分片 MP4 参数，写本地文件。
+
+    分片模式下 mp4 muxer 只往后追加（写管道与写文件逐字节相同，2026-10-13 实测），尾部
+    带 mfra 索引，播放器打开本地文件时长与拖动都准确。章节同样去掉（理由同上），章节由
+    离线清单另行下发。
+    """
+    return [
+        "-map_chapters", "-1",
+        "-f", "mp4",
+        "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont+skip_sidx",
+        "-frag_duration", str(EXPORT_FRAGMENT_US),
         "-y",
     ]
 

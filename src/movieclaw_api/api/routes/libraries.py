@@ -38,13 +38,19 @@ from movieclaw_api.schemas.library import (
     ChapterView,
     ClaimBatchPayload,
     ClaimPayload,
+    CloudFolderPayload,
+    CloudFolderReportView,
+    CloudFolderView,
+    CloudUploadView,
     ConsolidateRootsPayload,
     ConsolidateRootsPreviewView,
+    DeleteCloudView,
     DeleteFollowUpView,
     DeleteOptionView,
     DeletePreviewLineView,
     DetachPayload,
     DirectorView,
+    FileCloudView,
     FileOriginView,
     IdentityReviewDecision,
     ItemCollectionRef,
@@ -114,9 +120,12 @@ from movieclaw_api.schemas.library_search import LibrarySearchView
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import jobs, media_scrape
 from movieclaw_api.services.auth import Principal
+from movieclaw_api.services.drives import registry as drive_registry
+from movieclaw_api.services.drives import uploads as drive_uploads
 from movieclaw_api.services.library import acquisition, source_annotation
 from movieclaw_api.services.library import chapters as chapters_mod
 from movieclaw_api.services.library import claim as library_claim
+from movieclaw_api.services.library import cloud as library_cloud
 from movieclaw_api.services.library import skip_segments as skip_segments_mod
 from movieclaw_api.services.library.access import (
     ContentLimit,
@@ -187,6 +196,7 @@ from movieclaw_api.services.library.preflight import (
     MAX_SELECTION,
     build_preflight,
 )
+from movieclaw_api.services.library.profile import profile_for
 from movieclaw_api.services.library.scan import (
     PHASE_LABELS,
     ScanPhase,
@@ -257,6 +267,7 @@ from movieclaw_db.models import (
     Subscription,
 )
 from movieclaw_db.repositories import MediaItemRepository
+from movieclaw_db.repositories.library_cloud_repo import LibraryCloudRepository
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_db.repositories.member_repo import MemberRepository
@@ -430,6 +441,158 @@ async def delete_library_cover(library_id: int) -> ApiResponse[dict]:
 # 作业挡在前面，所以往回多看几条。两条取数路径（单库查、列表批量查）必须
 # 用同一个深度，否则同一个库在首页和详情页会显示不同的「上次扫描」
 _SCAN_JOB_LOOKBACK = 10
+
+
+async def _cloud_folder_views(
+    session: AsyncSession, library_ids: list[int]
+) -> dict[int, list[CloudFolderView]]:
+    """库的网盘根目录（含账号名、在位的纳管文件数、最近一次纳管报告）。"""
+    from sqlalchemy import func
+
+    from movieclaw_api.services.drives.registry import backends
+    from movieclaw_db.models.library_cloud_folder import LibraryCloudFolder
+    from movieclaw_db.models.library_file_replica import LibraryFileReplica
+    from movieclaw_db.repositories.drive_account_repo import DriveAccountRepository
+
+    if not library_ids:
+        return {}
+    folders = list(
+        (
+            await session.execute(
+                select(LibraryCloudFolder)
+                .where(LibraryCloudFolder.library_id.in_(library_ids))  # type: ignore[attr-defined]
+                .order_by(LibraryCloudFolder.sort_order, LibraryCloudFolder.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not folders:
+        return {}
+    counts = dict(
+        (
+            await session.execute(
+                select(LibraryFileReplica.folder_id, func.count())
+                .join(LibraryFile, LibraryFile.id == LibraryFileReplica.library_file_id)
+                .where(
+                    LibraryFileReplica.folder_id.in_([f.id for f in folders]),  # type: ignore[union-attr]
+                    LibraryFile.local_bytes.is_(False),  # type: ignore[attr-defined]
+                    LibraryFile.state == FileState.IN_PLACE,
+                )
+                .group_by(LibraryFileReplica.folder_id)
+            )
+        ).all()
+    )
+    accounts = {row.id: row for row in await DriveAccountRepository(session).list_all()}
+    available = backends()
+    views: dict[int, list[CloudFolderView]] = {}
+    for folder in folders:
+        account = accounts.get(folder.account_id)
+        backend_type = account.backend if account is not None else ""
+        backend = available.get(backend_type)
+        report = None
+        if folder.report:
+            try:
+                report = CloudFolderReportView.model_validate(folder.report)
+            except ValueError:
+                report = None
+        views.setdefault(folder.library_id, []).append(
+            CloudFolderView(
+                id=folder.id,  # type: ignore[arg-type]
+                account_id=folder.account_id,
+                account_name=account.name if account is not None else "",
+                backend=backend_type,
+                backend_title=backend.title if backend is not None else backend_type,
+                remote_dir_id=folder.remote_dir_id,
+                display_path=folder.display_path,
+                is_primary=folder.is_primary,
+                file_count=counts.get(folder.id, 0),
+                listed_at=folder.listed_at,
+                report=report,
+            )
+        )
+    return views
+
+
+_ACTIVE_UPLOAD_STATUSES = {"queued", "running", "retry_wait", "blocked", "cancelling"}
+
+
+def _cloud_upload_view(job: Job | None) -> CloudUploadView | None:
+    """库最近一个上传任务的进度；跑完 / 失败 / 取消的不带出。"""
+    if job is None or str(job.status) not in _ACTIVE_UPLOAD_STATUSES:
+        return None
+    progress = job.progress or {}
+    details = progress.get("details") or {}
+    return CloudUploadView(
+        job_id=job.id,
+        status=str(job.status),
+        processed=int(progress.get("current") or 0),
+        total=int(progress.get("total") or 0),
+        rapid=int(details.get("rapid") or 0),
+        failed=int(details.get("failed") or 0),
+        percent=progress.get("percent"),
+        message=str(progress.get("message") or ""),
+    )
+
+
+async def _cloud_upload_views(
+    session: AsyncSession, library_ids: list[int]
+) -> dict[int, CloudUploadView]:
+    from movieclaw_api.services.drives.uploads import JOB_TYPE
+
+    found = await jobs.list_jobs_by_resource(
+        session,
+        resource_type="library",
+        resource_ids=library_ids,
+        job_type=JOB_TYPE,
+        limit_per_resource=1,
+    )
+    views = {}
+    for library_id in library_ids:
+        view = _cloud_upload_view(next(iter(found.get(str(library_id), [])), None))
+        if view is not None:
+            views[library_id] = view
+    return views
+
+
+async def _delete_cloud_view(session: AsyncSession, file_ids: list[int]) -> DeleteCloudView | None:
+    """这次删除会删掉的网盘文件（删除对话框写「将从 115 删除」）。"""
+    from movieclaw_api.services.drives.deletes import needs_remote_call, replicas_of
+    from movieclaw_api.services.drives.registry import backends
+    from movieclaw_db.repositories.drive_account_repo import DriveAccountRepository
+
+    live = [r for r in await replicas_of(file_ids) if needs_remote_call(r)]
+    if not live:
+        return None
+    accounts = {row.id: row for row in await DriveAccountRepository(session).list_all()}
+    available = backends()
+    titles: list[str] = []
+    recycle = True
+    for account_id in {r.account_id for r in live}:
+        account = accounts.get(account_id)
+        backend = available.get(account.backend) if account is not None else None
+        title = backend.title if backend is not None else (account.backend if account else "网盘")
+        if title not in titles:
+            titles.append(title)
+        recycle = recycle and bool(backend is not None and backend.capabilities.recycle_bin)
+    return DeleteCloudView(
+        backend_title="、".join(titles),
+        files=len(live),
+        bytes=sum(r.size_bytes or 0 for r in live),
+        recycle_bin=recycle,
+    )
+
+
+def _folder_specs(payload: list[CloudFolderPayload]) -> list[library_cloud.FolderSpec]:
+    return [
+        library_cloud.FolderSpec(
+            account_id=item.account_id,
+            remote_dir_id=item.remote_dir_id,
+            display_path=item.display_path,
+            is_primary=item.is_primary,
+        )
+        for item in payload
+    ]
 
 
 def _scan_progress_view(library_id: int) -> ScanProgressView | None:
@@ -756,6 +919,11 @@ async def list_libraries(
         job_type=chapters_mod.JOB_TYPE,
         limit_per_resource=1,
     )
+    # 网盘字段只在有插件提供网盘后端时带（cloud-storage.md §11.8）：
+    # 没有就是 None，网页不显示网盘那套
+    drive_views = principal.is_admin and drive_registry.active()
+    cloud_folders = await _cloud_folder_views(session, library_ids) if drive_views else {}
+    uploads = await _cloud_upload_views(session, library_ids) if drive_views else {}
     views = [
         LibraryView.from_model(
             r,
@@ -771,6 +939,8 @@ async def list_libraries(
             ),
             member_ids=members_by_library.get(r.id or -1, []),
             viewer_access=r.id in visible,
+            cloud_folders=cloud_folders.get(r.id or -1, []) if drive_views else None,
+            cloud_upload=uploads.get(r.id or -1),
         )
         for r in rows
     ]
@@ -1048,11 +1218,15 @@ async def search_library(
     if not compact(q) and person_id is None:
         raise BadRequestException("请输入片名、拼音或人物名称")
     result = await ranked_search(
-        session, q, library_ids=await visible_library_ids(session, principal),
+        session,
+        q,
+        library_ids=await visible_library_ids(session, principal),
         member_id=principal.member_id or 0,
         content_limit=await content_limit_for(session, principal),
         owner=f"{principal.kind}:{principal.member_id or principal.name}",
-        limit=limit, cursor=cursor, person_id=person_id,
+        limit=limit,
+        cursor=cursor,
+        person_id=person_id,
     )
     return ok(result)
 
@@ -1099,6 +1273,16 @@ async def get_library(
         ),
         member_ids=member_ids,
         viewer_access=viewer_access,
+        cloud_folders=(
+            (await _cloud_folder_views(session, [library_id])).get(library_id, [])
+            if principal.is_admin and drive_registry.active()
+            else None
+        ),
+        cloud_upload=(
+            (await _cloud_upload_views(session, [library_id])).get(library_id)
+            if principal.is_admin and drive_registry.active()
+            else None
+        ),
     )
     if not principal.is_admin:
         # 成员不暴露服务器目录结构（与列表接口同一口径）
@@ -1125,6 +1309,16 @@ async def create_library(
     realtime_watch = payload.realtime_watch
     if realtime_watch is not False and library_on_network_mount(list(payload.root_paths)):
         realtime_watch = False
+    folder_specs: list[library_cloud.FolderSpec] = []
+    if payload.cloud_folders:
+        if not profile_for(payload.kind, payload.source).playable:
+            raise BadRequestException("这种库不能挂网盘目录")
+        try:
+            folder_specs = await library_cloud.validate_folders(
+                session, None, _folder_specs(payload.cloud_folders)
+            )
+        except ValueError as exc:
+            raise BadRequestException(str(exc)) from exc
     row = await service.create(
         name=payload.name,
         kind=payload.kind,
@@ -1142,10 +1336,17 @@ async def create_library(
         access_mode=payload.access_mode,
         admin_visible=payload.admin_visible,
         member_ids=payload.member_ids,
+        keep_local=payload.keep_local,
     )
-    # 建库即扫描：根路径下的存量文件立刻开始识别入账，不用用户再手动点一次
+    # 建库即扫描：根路径下的存量文件立刻开始识别入账，不用用户再手动点一次。
+    # 网盘根目录没列过，这一轮一并纳管
     assert row.id is not None
+    if folder_specs:
+        await library_cloud.apply_folders(session, row, folder_specs)
     await enqueue_scan_job(session, row.id, row.name, origin=_job_origin(client_name))
+    if any(spec.is_primary for spec in folder_specs):
+        # 主根在网盘：根路径下已有的本地文件开始往网盘传（新入库的会随入库事件再排）
+        await drive_uploads.enqueue(row.id, origin=_job_origin(client_name))
     return ok(
         LibraryView.from_model(
             row,
@@ -1153,6 +1354,11 @@ async def create_library(
             scan_progress=_queued_scan_view(),
             member_ids=payload.member_ids or [],
             viewer_access=row.admin_visible,
+            cloud_folders=(
+                (await _cloud_folder_views(session, [row.id])).get(row.id, [])
+                if drive_registry.active()
+                else None
+            ),
         ),
         message=f"已创建媒体库「{row.name}」，正在扫描存量文件",
     )
@@ -1285,9 +1491,26 @@ async def update_library(
     chapters_were_enabled = before.extract_chapter_images
     segments_were_enabled = before.detect_media_segments
     roots_changed = previous_root_paths != [p.strip() for p in payload.root_paths if p.strip()]
+    folder_specs: list[library_cloud.FolderSpec] | None = None
+    folders_changed = False
+    if payload.cloud_folders is not None:
+        try:
+            folder_specs = await library_cloud.validate_folders(
+                session, before, _folder_specs(payload.cloud_folders)
+            )
+        except ValueError as exc:
+            raise BadRequestException(str(exc)) from exc
+        if folder_specs and not profile_for(before.kind, before.source).playable:
+            raise BadRequestException("这种库不能挂网盘目录")
+        current = {
+            (f.account_id, f.remote_dir_id)
+            for f in await LibraryCloudRepository(session).folders(library_id)
+        }
+        folders_changed = current != {(f.account_id, f.remote_dir_id) for f in folder_specs}
     # 扫描/整理依赖根路径，只有真的改路径才需要锁库；改展示名称、收藏规则
     # 或下轮扫描策略不触碰当前任务正在使用的路径与台账，允许即时保存。
-    if roots_changed:
+    # 增删网盘根目录同理：纳管与拿掉都在改台账
+    if roots_changed or folders_changed:
         await _quiesce_scan_for_mutation(session, before.name, library_id)
         await _assert_not_busy(session, before.name, library_id)
     row = await service.update(
@@ -1297,6 +1520,7 @@ async def update_library(
         match_rules=payload.match_rules,
         auto_clear_missing=payload.auto_clear_missing,
         realtime_watch=payload.realtime_watch,
+        keep_local=payload.keep_local,
         scrape_overrides=payload.scrape_overrides,
         generate_thumbnails=payload.generate_thumbnails,
         extract_chapter_images=payload.extract_chapter_images,
@@ -1307,6 +1531,17 @@ async def update_library(
         admin_visible=payload.admin_visible,
         member_ids=payload.member_ids,
     )
+    folder_change: library_cloud.FolderChange | None = None
+    if folder_specs is not None:
+        folder_change = await library_cloud.apply_folders(session, row, folder_specs)
+        if any(spec.is_primary for spec in folder_specs):
+            # 主根换到（或仍在）网盘：还没传上去的本地文件排进上传（同库已有任务就复用）
+            await drive_uploads.enqueue(library_id, origin=_job_origin(client_name))
+        if folder_change.removed:
+            # 拿掉的网盘目录只删了台账：没有文件了的条目清掉，库存统计刷新
+            await LibraryRepository(session).refresh_stats([library_id])
+            if folder_change.orphan_item_ids:
+                _schedule_orphan_cleanup(set(folder_change.orphan_item_ids))
     if payload.auto_series_collections:
         # 开关打开：把这个库里已有的系列一次补齐（一条 GROUP BY series_key），
         # **不重新联网、不重新刮削**——数据早就在 media_metadata 的列里了
@@ -1330,6 +1565,32 @@ async def update_library(
         origin=_job_origin(client_name),
     )
     member_ids = await MemberRepository(session).get_library_member_ids(library_id)
+    cloud_views = (
+        (await _cloud_folder_views(session, [library_id])).get(library_id, [])
+        if drive_registry.active()
+        else None
+    )
+    # 新挂上的网盘目录：只列它们、立刻纳管（根路径也变了的话下面的整库扫描会一并列）
+    if folder_change is not None and folder_change.added and not roots_changed:
+        await enqueue_scan_job(
+            session,
+            library_id,
+            row.name,
+            origin=_job_origin(client_name),
+            cloud_folder_ids=folder_change.added,
+            cloud_only=True,
+        )
+        return ok(
+            LibraryView.from_model(
+                row,
+                scanning=True,
+                scan_progress=_queued_scan_view(),
+                member_ids=member_ids,
+                viewer_access=row.admin_visible,
+                cloud_folders=cloud_views,
+            ),
+            message="已更新，正在纳管新加的网盘目录",
+        )
     # 根路径变了就自动补扫：新目录的存量立刻入账，移除目录下的文件标记 missing
     if roots_changed:
         # 这轮扫描额外按 inode 对账旧根遗留台账：根路径只是换了挂载别名/软链接
@@ -1350,11 +1611,17 @@ async def update_library(
                 scan_progress=_queued_scan_view(),
                 member_ids=member_ids,
                 viewer_access=row.admin_visible,
+                cloud_folders=cloud_views,
             ),
             message="已更新，正在按新的根路径重新扫描",
         )
     return ok(
-        LibraryView.from_model(row, member_ids=member_ids, viewer_access=row.admin_visible),
+        LibraryView.from_model(
+            row,
+            member_ids=member_ids,
+            viewer_access=row.admin_visible,
+            cloud_folders=cloud_views,
+        ),
         message="已更新",
     )
 
@@ -2482,6 +2749,53 @@ def _chapter_views(row: LibraryFile) -> list[ChapterView] | None:
     return views
 
 
+async def _attach_cloud_views(
+    session: AsyncSession, views: list[LibraryFileView], rows: list[LibraryFile]
+) -> None:
+    """给有网盘副本的文件挂上位置信息（一次查询；没有副本的保持 null）。"""
+    from movieclaw_api.services.drives.registry import backends
+    from movieclaw_db.models.library_file_replica import LibraryFileReplica
+    from movieclaw_db.repositories.drive_account_repo import DriveAccountRepository
+
+    ids = [row.id for row in rows if row.id is not None]
+    if not ids:
+        return
+    replicas = {
+        replica.library_file_id: replica
+        for replica in (
+            await session.execute(
+                select(LibraryFileReplica).where(
+                    LibraryFileReplica.library_file_id.in_(ids)  # type: ignore[attr-defined]
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    if not replicas:
+        return
+    accounts = {row.id: row for row in await DriveAccountRepository(session).list_all()}
+    available = backends()
+    local = {row.id: row.local_bytes for row in rows}
+    for view in views:
+        replica = replicas.get(view.id)
+        if replica is None:
+            continue
+        account = accounts.get(replica.account_id)
+        backend = available.get(account.backend) if account is not None else None
+        view.cloud = FileCloudView(
+            backend_title=(
+                backend.title if backend is not None else (account.backend if account else "网盘")
+            ),
+            account_name=account.name if account is not None else "",
+            remote_path=replica.remote_path,
+            local=bool(local.get(view.id, True)),
+            origin=replica.origin,
+            state=replica.state,
+            error=replica.error,
+        )
+
+
 def _file_view(
     row: LibraryFile,
     external_subs: list[str],
@@ -2782,11 +3096,14 @@ async def get_library_item(
         )
         for row in rows
     ]
+    await _attach_cloud_views(session, file_views, rows)
     entry_dirs = bundle.entry_dirs
     if not principal.is_admin:
         # 成员不暴露落盘路径：文件行只留文件名与规格，条目目录整个不给
         for fv in file_views:
             fv.file_path = ""
+            if fv.cloud is not None:
+                fv.cloud.remote_path = None
         entry_dirs = []
     return ok(
         LibraryItemDetailView(
@@ -3201,9 +3518,7 @@ def _with_follow_ups(
         deleted = [row for row in rows if row.id in deleted_ids]
         if not deleted:
             return
-        request = _delete_request(
-            library_id, item, deleted, whole=len(deleted) == len(rows)
-        )
+        request = _delete_request(library_id, item, deleted, whole=len(deleted) == len(rows))
         sink.extend(await enqueue_follow_ups(session, request, keys, scope))
 
     return before_commit
@@ -3220,9 +3535,7 @@ async def preview_library_delete(
     library_id: int,
     media_item_id: int,
     session: AsyncSession = Depends(get_session),
-    file_id: Annotated[
-        int | None, Query(description="只删这个文件时传它；不传 = 删除整部")
-    ] = None,
+    file_id: Annotated[int | None, Query(description="只删这个文件时传它；不传 = 删除整部")] = None,
 ) -> ApiResponse[ItemDeletePreviewView]:
     """只读。附加选项来自别的模块（例：下载模块的「同时删除下载任务和源文件」），默认一律不勾；
     勾选时把选项的键传给删除接口的 ``options``。"""
@@ -3248,6 +3561,7 @@ async def preview_library_delete(
             whole_item=whole,
             plan=_delete_view(plan, dry_run=True),
             linked_bytes=linked,
+            cloud=await _delete_cloud_view(session, [r.id for r in targets if r.id is not None]),
             options=[
                 DeleteOptionView(
                     key=o.key,
@@ -3301,9 +3615,7 @@ async def delete_library_item(
     keys = await _checked_options(
         _delete_request(library_id, item, rows, whole=True), "item", options
     )
-    record_deleted = await deletion_recorder(
-        session, library_id, item, rows, options=keys
-    )
+    record_deleted = await deletion_recorder(session, library_id, item, rows, options=keys)
     follow_ups: list[dict[str, str]] = []
     result = await delete_item_files(
         session,
@@ -3371,9 +3683,7 @@ async def delete_library_file(
     keys = await _checked_options(
         _delete_request(library_id, item, targets, whole=len(rows) == 1), "file", options
     )
-    record_deleted = await deletion_recorder(
-        session, library_id, item, rows, options=keys
-    )
+    record_deleted = await deletion_recorder(session, library_id, item, rows, options=keys)
     follow_ups: list[dict[str, str]] = []
     result = await delete_single_file(
         session,

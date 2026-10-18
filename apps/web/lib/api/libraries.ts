@@ -135,8 +135,54 @@ export interface MediaLibrary {
   metadata_refresh: MetadataRefreshProgress | null;
   /** 整库生成章节的作业状态（排队 / 进行中）；没在生成为 null。随库列表下发，管理页据此显示进度 */
   chapter_job: ChapterJobProgress | null;
+  /** 网盘根目录（管理员端恒为数组，成员端 null；老服务器没有这个字段） */
+  cloud_folders?: LibraryCloudFolder[] | null;
+  /** 正在上传到网盘的进度；没在传为 null */
+  cloud_upload?: CloudUpload | null;
+  /** 主根在网盘时本地也保留一份（上传后不腾空本地）；老服务器没有这个字段 */
+  keep_local?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+/** 最近一次纳管 / 复查一个网盘目录的结果 */
+export interface CloudFolderReport {
+  finished_at: string;
+  seconds: number;
+  /** 调用网盘接口的次数 */
+  calls: number;
+  videos: number;
+  identified: number;
+  /** 待认领（没认出来的） */
+  pending: number;
+  /** disc=原盘目录、iso=光盘镜像、extra=样片与花絮（一期不纳管） */
+  skipped: { disc?: number; iso?: number; extra?: number };
+  cancelled: boolean;
+}
+
+/** 库的一个网盘根目录（docs/design/cloud-storage.md §3.2） */
+export interface LibraryCloudFolder {
+  id: number;
+  account_id: number;
+  account_name: string;
+  backend: string;
+  backend_title: string;
+  remote_dir_id: string;
+  display_path: string;
+  is_primary: boolean;
+  /** 台账里在位的纳管文件数 */
+  file_count: number;
+  /** 上次纳管或复查的时间；没列过为 null */
+  listed_at: string | null;
+  report: CloudFolderReport | null;
+}
+
+/** 编辑库时提交的网盘根目录 */
+export interface CloudFolderPayload {
+  account_id: number;
+  remote_dir_id: string;
+  display_path: string;
+  is_primary?: boolean;
 }
 
 /**
@@ -417,6 +463,10 @@ export interface LibraryPayload {
   /** 库级刮削覆盖（「刮削与整理」的全部字段）；不传=不改动，空对象=清空覆盖。
    *  语言与选图这类产物挂全局条目的设置，按条目的刮削归属库生效 */
   scrape_overrides?: Record<string, unknown>;
+  /** 网盘根目录（整体覆盖）：挂上即纳管，拿掉只删台账不动网盘；不传=不改动 */
+  cloud_folders?: CloudFolderPayload[];
+  /** 主根在网盘时本地也保留一份；不传=不改动（新建时默认关） */
+  keep_local?: boolean;
 }
 
 /** 收藏范围的可选项（后端唯一真相源：类型 chips 与区域预设）。 */
@@ -1437,7 +1487,39 @@ export interface LibraryItemFile {
   playback_defaults: TrackDefaults | null;
   /** 有效章节（内嵌或按时长合成）；null=所在库没开「生成章节」或尚未探测章节 */
   chapters: LibraryChapter[] | null;
+  /** 网盘上的副本；null = 只在本地（老服务器没有这个字段） */
+  cloud?: FileCloudCopy | null;
   added_at: string;
+}
+
+/** 文件在网盘上的副本：文件区据此标「本地」「本地 + 115」「115」 */
+export interface FileCloudCopy {
+  backend_title: string;
+  account_name: string;
+  /** 网盘上的路径（成员端为 null） */
+  remote_path: string | null;
+  /** 本地也有字节 */
+  local: boolean;
+  /** imported（纳管来的）/ uploaded（我们传的） */
+  origin: string;
+  /** uploading / verified / lost / deleting / failed */
+  state: string;
+  /** 上次上传没成的原因 */
+  error?: string | null;
+}
+
+/** 主根在网盘的库正在往网盘传的进度 */
+export interface CloudUpload {
+  job_id: string;
+  /** queued / running / retry_wait / blocked / cancelling */
+  status: string;
+  processed: number;
+  total: number;
+  rapid: number;
+  failed: number;
+  /** 当前文件的进度（%） */
+  percent: number | null;
+  message: string;
 }
 
 /**
@@ -1664,6 +1746,17 @@ export interface ItemDeletePreview {
   /** 要删的文件里与别处是同一份数据（硬链接）的字节数：只删库文件不会释放这部分空间 */
   linked_bytes: number;
   options: DeleteOption[];
+  /** 也会删掉网盘上的文件；只在本地的为 null（老服务器没有这个字段） */
+  cloud?: DeleteCloud | null;
+}
+
+/** 这次删除会删掉的网盘文件 */
+export interface DeleteCloud {
+  backend_title: string;
+  files: number;
+  bytes: number;
+  /** 网盘有回收站：删的是进网盘回收站，还能在网盘里还原 */
+  recycle_bin: boolean;
 }
 
 export function getDeletePreview(

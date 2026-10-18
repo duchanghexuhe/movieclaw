@@ -115,6 +115,7 @@ private struct TargetOption: Identifiable, Hashable {
 
 /// 完整的「选择保存位置」弹窗
 struct DownloadTargetSheet: View {
+    @Environment(\.cardMetrics) private var cards
     let request: DownloadTargetRequest
     let remembered: API.DownloadTargetPrefView?
     let onSubmitted: (API.DownloadSubmitView) -> Void
@@ -276,7 +277,7 @@ struct DownloadTargetSheet: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(Theme.pagePadding)
+                .padding(cards.edge)
             }
             .background(Theme.background)
             .navigationTitle("选择保存位置")
@@ -648,7 +649,7 @@ struct DownloadConfirmSheet: View {
         .fixedSize(horizontal: false, vertical: true)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
         .frame(maxHeight: .infinity, alignment: .top)
-        .presentationDetents([.height(contentHeight)])
+        .adaptiveDetents([.height(contentHeight)])
         .task {
             guard target.kind == "smart", let identity = request.identity else { return }
             preflighting = true

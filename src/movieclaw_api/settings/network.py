@@ -37,6 +37,13 @@ BUILTIN_EGRESS_SERVICES: list[dict[str, str]] = [
     },
     {"id": "douban", "label": "豆瓣", "description": "豆瓣榜单与搜索（国内网络通常可直连）"},
     {"id": "llm", "label": "AI 模型", "description": "大语言模型供应商接口"},
+    # 默认不进 proxy_services。海外接口常常要代理，但由用户在「设置 → 网络」里自己打开。
+    {
+        "id": "web_search",
+        "label": "网页搜索",
+        "description": "智能体的网页搜索（Tavily / Exa / Brave）。"
+        "这些接口多在海外，国内网络通常需要代理",
+    },
     {
         "id": "telegram",
         "label": "Telegram 推送",
@@ -69,6 +76,11 @@ BUILTIN_EGRESS_SERVICES: list[dict[str, str]] = [
         "label": "App 推送",
         "description": "推送中继（官方 push.movieclaw.io 与公网上的自建中继）；"
         "局域网里的自建中继总是直连",
+    },
+    {
+        "id": "pypi",
+        "label": "插件依赖下载",
+        "description": "第三方插件要装的 Python 包（默认 pypi.org，可在下方换成清华镜像）",
     },
     {
         "id": "github",
@@ -114,4 +126,8 @@ class NetworkEgressSetting(SettingSchema):
     )
     douban_api_base_url: str = Field(
         default="", description="豆瓣接口反代地址覆盖；空 = 环境变量或内置默认"
+    )
+    pypi_index_url: str = Field(
+        default="",
+        description="插件依赖的包索引地址（PEP 503 simple）；空 = PyPI 官方",
     )

@@ -19,6 +19,9 @@ struct LLMSettingsView: View {
     @State private var busy = false
     @State private var selectedProvider: Int?
 
+    /// 订阅接入由服务器管理；App 只使用已配置的模型。
+    private var editablePresets: [API.LlmPresetView] { presets.filter { $0.id != "chatgpt" } }
+
     private var inProgress: Bool {
         providers?.contains { SettingsBLLMStatus.inProgress($0.status) } ?? false
     }
@@ -64,7 +67,7 @@ struct LLMSettingsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("接入模型供应商", systemImage: "plus") { editing = SettingsBLLMEditing() }
-                    .disabled(busy || presets.isEmpty)
+                    .disabled(busy || editablePresets.isEmpty)
                     .accessibilityIdentifier("llm-create")
             }
         }
@@ -89,7 +92,7 @@ struct LLMSettingsView: View {
         .sheet(item: $editing) { target in
             SettingsBLLMProviderForm(
                 provider: target.provider,
-                presets: presets,
+                presets: editablePresets,
                 // 其它实例已占用的名字：留空按供应商名保存时据此加序号，避免撞唯一名
                 takenNames: (providers ?? []).filter { $0.id != target.provider?.id }.map(\.name)
             ) {
@@ -125,7 +128,7 @@ struct LLMSettingsView: View {
                     Text("接入模型供应商").font(.body.weight(.semibold)).frame(maxWidth: .infinity)
                 }
                 .discoverProminentButton()
-                .disabled(presets.isEmpty)
+                .disabled(editablePresets.isEmpty)
                 .accessibilityIdentifier("llm-create-empty")
             }
             .frame(maxWidth: .infinity)

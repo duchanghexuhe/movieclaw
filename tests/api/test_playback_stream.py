@@ -324,6 +324,28 @@ def test_execution_backend_uses_remote_when_local_backend_is_incompatible():
     ) == ("videotoolbox", True)
 
 
+def test_profile_5_transcode_prefers_a_transcoder_whose_tonemap_reads_the_rpu():
+    """P5 的 IPT 基础层要吃 RPU：VAAPI 的映射不认、出来整片发紫，Mac 转码器在线就交给它；
+    不在线时照旧用本机（与原来相同）。不是 P5 的不受影响"""
+    def p5(dolby_vision):
+        return PlaybackPlan(
+            tier=PlaybackTier.HARDWARE_TRANSCODE,
+            file_id=1,
+            container="hls-fmp4",
+            video=VideoPlan(
+                action="transcode", codec="h264", height=1080, tone_map=True,
+                source_codec="hevc", source_bit_depth=10, dolby_vision=dolby_vision,
+            ),
+            audio=AudioPlan(action="copy"),
+        )
+
+    select = routes_playback.playback_plan.select_execution_backend
+    both = dict(available=("vaapi", "videotoolbox"), local_backends=("vaapi",))
+    assert select(p5("apply"), **both, remote_video_available=True) == ("videotoolbox", True)
+    assert select(p5("apply"), **both, remote_video_available=False) == ("vaapi", False)
+    assert select(p5(None), **both, remote_video_available=True) == ("vaapi", False)
+
+
 # ---------------------------------------------------------------------------
 # 档 0：原文件直出
 # ---------------------------------------------------------------------------
@@ -1113,6 +1135,44 @@ def test_stored_dolby_vision_files_get_their_profile_backfilled(client, tmp_path
             return [(row.dv_profile, row.dv_bl_compatible) for row in rows]
 
     assert client.portal.call(profiles) == [(5, False), (None, None), (None, None)]
+
+
+def test_mislabeled_dolby_vision_rows_are_reclassified_to_their_base_layer(
+    client, tmp_path, monkeypatch
+):
+    """入库时按杜比视界记了账、记录却与码流矛盾的旧行：启动后改按基础层记账。
+    候选只有「不兼容基础层却有色彩标注」的行——真 P5 的色彩标注为空，一个都不读"""
+    from movieclaw_api.services.library import dolby_vision_backfill as backfill
+    from movieclaw_api.services.media_probe import VideoColor
+
+    async def mark(file_id, **values):
+        async with get_database().session() as session:
+            row = await session.get(LibraryFile, file_id)
+            for key, value in values.items():
+                setattr(row, key, value)
+            await session.commit()
+
+    hybrid = seed(client, tmp_path, codec="hevc", hdr="Dolby Vision")
+    genuine = seed(client, tmp_path, codec="hevc", hdr="Dolby Vision")
+    p5 = {"dv_profile": 5, "dv_bl_compatible": False}
+    client.portal.call(partial(mark, hybrid, **p5, color_space="BT.2020"))
+    client.portal.call(partial(mark, genuine, **p5, color_space=None))
+    probed: list[str] = []
+
+    def fake_color(path, *, fallback_hdr=None):
+        probed.append(str(path))
+        return VideoColor(hdr="HDR10", dv_profile=5, dv_backward_compatible=False)
+
+    monkeypatch.setattr(backfill, "video_color_for", fake_color)
+    assert client.portal.call(backfill.backfill_dolby_vision_profiles) == 1
+    assert len(probed) == 1  # 真 P5 不读
+
+    async def labels():
+        async with get_database().session() as session:
+            rows = [await session.get(LibraryFile, i) for i in (hybrid, genuine)]
+            return [(row.hdr, row.dv_profile) for row in rows]
+
+    assert client.portal.call(labels) == [("HDR10", 5), ("Dolby Vision", 5)]
 
 
 def test_tv_app_starting_another_file_frees_its_stale_session(client, tmp_path, monkeypatch):
@@ -2046,6 +2106,64 @@ def test_disc_with_upper_case_stream_names_is_served(client, tmp_path):
     token = data["stream_url"].split("token=", 1)[1]
     response = client.get(f"{_PB}/files/{file_id}/disc/BDMV/STREAM/00001.m2ts?token={token}")
     assert response.status_code == 200 and response.content == b"M2TS" * 64
+
+
+_BLURAY_CLIPS = {**CAPABILITY, "local_tracks": True, "bluray_clips": True}
+
+
+def test_bluray_clip_player_gets_the_clip_manifest_and_clip_bytes(client, tmp_path):
+    """按剪辑清单播放的播放器（Android 统一引擎）：会话给档 0、交付方式 clips，清单里是服务端
+    选的主片——各段的取流地址、IN/OUT、CLPI 入口点表——与各轨的编号；剪辑按 Range 出原字节，
+    不建会话、不起 ffmpeg（disc-clip-play.md）。"""
+    file_id = client.portal.call(partial(_seed_disc, tmp_path))
+    data = start_session(client, file_id, capability=_BLURAY_CLIPS)
+    assert data["decision"]["tier"] == 0 and data["decision"]["disc"] == "clips"
+    assert data["decision"]["disc_playlist"] == "00001.mpls"
+    token = data["stream_url"].split("token=", 1)[1]
+
+    # 引擎的读取器不带登录凭据，只凭签名 token
+    client.cookies.clear()
+    manifest = client.get(f"{_PB}/files/{file_id}/bluray?token={token}")
+    assert manifest.status_code == 200, manifest.text
+    body = manifest.json()["data"]
+    assert body["playlist"] == "00001.mpls"
+    assert [(c["in_time"], c["out_time"]) for c in body["clips"]] == [(0, 45_000 * 300)] * 2
+    first = body["clips"][0]
+    assert len(first["entry_pts"]) == len(first["entry_spn"]) == 75
+    # EP_map 的 PTS 丢了低 8 位（约 5.7 毫秒），关键帧照样落在它之后
+    assert first["entry_pts"][0] == 0 and 0 <= 45_000 * 4 - first["entry_pts"][1] < 256
+    assert body["audio"] == [
+        {"ref": "embedded:0", "pid": None, "codec": "aac", "language": None, "channels": 2}
+    ]
+    part = client.get(first["url"], headers={"Range": "bytes=0-3"})
+    assert part.status_code == 206 and part.content == b"M2TS"
+    assert client.get(f"{_PB}/files/{file_id}/bluray/2?token={token}").status_code == 404
+    assert client.get(f"{_PB}/files/{file_id}/bluray?token=forged").status_code == 404
+
+
+def test_bluray_image_clips_are_served_from_their_extents_in_the_image(client, tmp_path):
+    """蓝光镜像：清单与原盘目录同一形态，剪辑由服务端把镜像上的区间拼成独立文件供出。"""
+    from tests.api.test_iso_source import _bluray_image
+
+    image, first, second = _bluray_image(metadata=False)
+    file_id = seed(client, tmp_path, container="iso", data=image)
+    data = start_session(client, file_id, capability=_BLURAY_CLIPS)
+    assert data["decision"]["tier"] == 0 and data["decision"]["disc"] == "clips"
+    token = data["stream_url"].split("token=", 1)[1]
+    body = client.get(f"{_PB}/files/{file_id}/bluray?token={token}").json()["data"]
+    assert body["playlist"] == "00800.mpls"
+    for clip, payload in zip(body["clips"], (first, second), strict=True):
+        whole = client.get(clip["url"])
+        assert whole.status_code == 200 and whole.content == payload
+    tail = client.get(body["clips"][0]["url"], headers={"Range": f"bytes={len(first) - 4}-"})
+    assert tail.status_code == 206 and tail.content == first[-4:]
+
+
+def test_dvd_folder_has_no_bluray_clip_manifest(client, tmp_path):
+    file_id = client.portal.call(partial(_seed_dvd_folder, tmp_path))
+    data = start_session(client, file_id, capability=_DISC_NATIVE)
+    token = data["stream_url"].split("token=", 1)[1]
+    assert client.get(f"{_PB}/files/{file_id}/bluray?token={token}").status_code == 404
 
 
 async def _seed_dvd_folder(tmp_path: Path) -> int:

@@ -339,7 +339,8 @@ class NetworkIdentityProtocolTest {
         val state = field.get(repository) as kotlinx.coroutines.flow.MutableStateFlow<io.movieclaw.android.core.session.SessionUi>
         state.value = io.movieclaw.android.core.session.SessionUi(phase = io.movieclaw.android.core.session.SessionPhase.NEEDS_LOGIN)
         val root = io.movieclaw.android.routing.RootViewModel(repository, io.movieclaw.android.core.designsystem.FeedbackBus(),
-            bus, io.movieclaw.android.core.session.SearchAccessRepository(factory, repository))
+            bus, io.movieclaw.android.core.session.SearchAccessRepository(factory, repository),
+            io.movieclaw.android.feature.update.AppUpdateController(context, repository, factory))
         root.dismissShare(link.slug)
         assertNull(bus.pendingShare.value)
         bus.publish(link)

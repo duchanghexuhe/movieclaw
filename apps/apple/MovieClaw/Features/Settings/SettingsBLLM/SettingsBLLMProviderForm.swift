@@ -111,7 +111,7 @@ struct SettingsBLLMProviderForm: View {
     }
 
     private var dirty: Bool {
-        name != (provider?.name ?? "") || providerType != (provider?.providerType ?? "bailian")
+        return name != (provider?.name ?? "") || providerType != (provider?.providerType ?? "bailian")
             || baseUrl != (provider?.baseUrl ?? "") || userAgent != (provider?.userAgent ?? "")
             || apiProtocol != (provider?.apiProtocol ?? "")
             || !apiKey.isEmpty || extraModels != (provider?.extraModels ?? [])
@@ -123,7 +123,8 @@ struct SettingsBLLMProviderForm: View {
     var body: some View {
         SubsSheetScaffold(title: provider == nil ? "接入模型供应商" : "编辑供应商", onClose: {
             if dirty { discarding = true } else { dismiss() }
-        }, confirm: SubsSheetConfirm(title: "保存并测试连接", enabled: submitHint == nil,
+        }, confirm: SubsSheetConfirm(title: "保存并测试连接",
+                                     enabled: submitHint == nil,
                                      busy: busy, identifier: "llm-form-save") {
             Task { await submit() }
         }) {

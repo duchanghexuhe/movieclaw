@@ -15,6 +15,7 @@ import SwiftUI
 /// 「回到上次位置」三种形态共用一条记录（都按作品计）；挂后台 30 分钟以上再回来算重新进入，重新询问。
 /// 排序偏好全站共用一个键（在哪个库选了「按评分」，换个库还是按评分），同 Web。
 struct LibraryDetailView: View {
+    @Environment(\.cardMetrics) private var cards
     let libraryId: Int
     /// 进来时落在哪个视图（Web `?view=collections`）
     var initialView: WallView = .items
@@ -157,7 +158,18 @@ struct LibraryDetailView: View {
         }
     }
 
+    /// 离线模式（docs/design/offline-download.md §1）：换成这个库在 iPhone 上已下载的条目
+    @State private var reachability = ServerReachability.shared
+
     var body: some View {
+        if reachability.isOffline {
+            OfflineLibraryWall(libraryId: libraryId)
+        } else {
+            onlineBody
+        }
+    }
+
+    private var onlineBody: some View {
         stateContent
         .appBackground()
         .navigationTitle(library?.name ?? "")
@@ -350,7 +362,7 @@ struct LibraryDetailView: View {
                 banner(notice, color: Theme.danger)
             }
         }
-        .padding(.horizontal, Theme.pagePadding)
+        .padding(.horizontal, cards.edge)
         .padding(.top, 4)
     }
 
@@ -447,7 +459,7 @@ struct LibraryDetailView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 64)
-        .padding(.horizontal, Theme.pagePadding)
+        .padding(.horizontal, cards.edge)
     }
 
     // MARK: 墙
@@ -468,7 +480,7 @@ struct LibraryDetailView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
                 .padding(.top, 64)
-                .padding(.horizontal, Theme.pagePadding)
+                .padding(.horizontal, cards.edge)
         } else {
             if !photoWall { filterControls }
             VStack(alignment: .leading, spacing: 0) {
@@ -493,7 +505,8 @@ struct LibraryDetailView: View {
                 }
             }
             .padding(.top, 16)
-            .padding(.trailing, effectiveSort == "title" && !galleryOn && !index.isEmpty ? 14 : 0)
+            // 给右侧 A–Z 条让位；iPad 宽窗口页边距 32 已经装得下它，不再让（让了海报就比首页横排的窄一截）
+            .padding(.trailing, !cards.isWide && effectiveSort == "title" && !galleryOn && !index.isEmpty ? 14 : 0)
         }
     }
 
@@ -510,7 +523,7 @@ struct LibraryDetailView: View {
                 onShowAllCollections: { view = .collections }
             )
         }
-        .padding(.horizontal, Theme.pagePadding)
+        .padding(.horizontal, cards.edge)
         .padding(.top, 16)
     }
 
@@ -544,18 +557,18 @@ struct LibraryDetailView: View {
 
     private func sectionTitle(_ text: String) -> some View {
         Text(text).font(.headline).foregroundStyle(.white.opacity(0.85))
-            .padding(.horizontal, Theme.pagePadding).padding(.bottom, 12)
+            .padding(.horizontal, cards.edge).padding(.bottom, 12)
     }
 
     private func grid(_ items: [API.LibraryItemView], wide: Bool, showRating: Bool) -> some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: wide ? 160 : 140), spacing: 12, alignment: .top)], alignment: .leading, spacing: 20) {
+        LazyVGrid(columns: cards.wallColumns(extra: wide ? 20 : 0), alignment: .leading, spacing: 20) {
             ForEach(items) { item in
                 LibraryInventoryCell(item: item, libraryId: libraryId, frameAspect: wide ? 16 / 9 : Theme.posterAspect,
                                      showRating: showRating, working: workingLabel(item))
             }
         }
         .scrollTargetLayout()
-        .padding(.horizontal, Theme.pagePadding)
+        .padding(.horizontal, cards.edge)
         .accessibilityIdentifier("poster-wall")
     }
 
@@ -574,14 +587,14 @@ struct LibraryDetailView: View {
                         .buttonStyle(.glass)
                 }
             }
-            .padding(.horizontal, Theme.pagePadding)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12, alignment: .top)], alignment: .leading, spacing: 20) {
+            .padding(.horizontal, cards.edge)
+            LazyVGrid(columns: cards.wallColumns(extra: 20), alignment: .leading, spacing: 20) {
                 ForEach(provisional) { item in
                     LibraryInventoryCell(item: item, libraryId: libraryId, frameAspect: 16 / 9,
                                          working: probing && item.probePendingCount > 0 ? "正在读取规格" : nil)
                 }
             }
-            .padding(.horizontal, Theme.pagePadding)
+            .padding(.horizontal, cards.edge)
         }
         .padding(.top, 32)
     }

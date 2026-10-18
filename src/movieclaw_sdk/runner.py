@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import contextvars
 import dataclasses
@@ -343,6 +344,11 @@ def _contribution(registry: str, item: Any) -> tuple[dict[str, Any], Any]:
             "connection": connection_schema(item),
             "help": item.help,
         }, item
+    if registry == "drive-backends":
+        from movieclaw_sdk.drives import backend_spec
+
+        # 后端留在本进程：宿主登记一个代理，登录与文件操作经协议调回来（cloud-storage.md §11.6）
+        return backend_spec(item), item
     if registry == "im-channels":
         from movieclaw_sdk.channels import driver_spec
 
@@ -590,6 +596,7 @@ class RemoteContext:
         self._channels: dict[str, Any] = {}
         self._participants: dict[str, Any] = {}
         self._downloaders: dict[str, Any] = {}
+        self._drives: dict[str, Any] = {}
         #: 按（登记 id, 连接配置）缓存的适配器实例：复用登录态与连接，close 时丢掉
         self._downloader_instances: dict[tuple[str, str], Any] = {}
         self._callbacks: dict[str, Callable[..., Any]] = {}
@@ -665,6 +672,8 @@ class RemoteContext:
             self._participants[id] = local
         if key.name == "downloader-adapters":
             self._downloaders[id] = local
+        if key.name == "drive-backends":
+            self._drives[id] = local
         self._runner.declare(
             "contributions",
             {
@@ -930,6 +939,7 @@ class Runner:
             "callback": self._handle_callback,
             "delete-preview": self._handle_delete_preview,
             "downloader": self._handle_downloader,
+            "drive": self._handle_drive,
         }.get(message.get("kind") or "")
         if handler is not None:
             return await handler(message)
@@ -1043,6 +1053,85 @@ class Runner:
         except Exception as exc:  # noqa: BLE001 -- 未知错误原样报给宿主
             reply.update(ok=False, error=f"{type(exc).__name__}: {exc}")
         return reply
+
+    async def _handle_drive(self, message: dict[str, Any]) -> None:
+        """宿主调网盘后端的一个方法（cloud-storage.md §11.6）。
+
+        结果一律装在信封里返回：网盘错误（限流要带等待秒数）与换了的凭据（出错时也可能已经刷新过令牌）
+        都要原样带回宿主，不走通用的失败通道。
+        """
+        from movieclaw_sdk import drives as dv
+
+        payload = message["payload"]
+        method = payload["method"]
+        args = payload.get("args") or {}
+        account = dv.account_from(payload["account"]) if payload.get("account") else None
+        before = dict(account.credentials) if account is not None else None
+        envelope: dict[str, Any] = {}
+        try:
+            assert self.ctx is not None
+            backend = self.ctx._drives[message["listener"]]
+            if method == "begin_login":
+                envelope["value"] = dv.flow_dict(await backend.begin_login(args["options"]))
+            elif method == "login_state":
+                envelope["value"] = dv.flow_dict(await backend.login_state(args["flow_id"]))
+            elif method == "cancel_login":
+                await backend.cancel_login(args["flow_id"])
+            elif method == "login_with_cookie":
+                result = await backend.login_with_cookie(args["cookie_header"])
+                envelope["value"] = dv.result_dict(result)
+            elif method == "account_info":
+                envelope["value"] = dv.info_dict(await backend.account_info(account))
+            elif method == "list_dir":
+                dirs = await backend.list_dir(account, args["dir_id"])
+                envelope["value"] = [dv.remote_dir_dict(d) for d in dirs]
+            elif method == "list_tree":
+                envelope["value"] = dv.tree_dict(await backend.list_tree(account, args["dir_id"]))
+            elif method == "changes":
+                page = await backend.changes(account, args.get("cursor"))
+                envelope["value"] = dv.change_page_dict(page)
+            elif method == "ensure_dir":
+                envelope["value"] = await backend.ensure_dir(
+                    account, args["parent_id"], args["path"]
+                )
+            elif method == "begin_upload":
+                range_data = args.get("range_data")
+                step = await backend.begin_upload(
+                    account,
+                    args["dir_id"],
+                    args["name"],
+                    dv.fingerprint_from(args["fingerprint"]),
+                    args.get("state"),
+                    base64.b64decode(range_data) if range_data is not None else None,
+                )
+                envelope["value"] = dv.upload_step_dict(step)
+            elif method == "upload_part":
+                envelope["value"] = await backend.upload_part(
+                    account, args["state"], args["index"], base64.b64decode(args["data"])
+                )
+            elif method == "finish_upload":
+                item = await backend.finish_upload(account, args["state"])
+                envelope["value"] = dv.remote_file_dict(item)
+            elif method == "delete":
+                await backend.delete(account, list(args["remote_ids"]))
+            elif method == "stat":
+                item = await backend.stat(account, args["remote_id"])
+                envelope["value"] = dv.remote_file_dict(item)
+            elif method == "direct_link":
+                link = await backend.direct_link(account, args["remote_id"], args["user_agent"])
+                envelope["value"] = dv.link_dict(link)
+            else:
+                raise ValueError(f"未知的网盘后端方法 {method}")
+        except dv.DriveError as exc:
+            envelope["error"] = dv.error_dict(exc)
+        except ValueError as exc:
+            envelope["error"] = {"kind": "ValueError", "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001 -- 未知错误按临时错误报给宿主
+            traceback.print_exc()
+            envelope["error"] = {"kind": "Transient", "message": f"{type(exc).__name__}: {exc}"}
+        if account is not None and account.credentials != before:
+            envelope["credentials"] = dict(account.credentials)
+        return {"ok": True, "result": envelope}
 
     async def _handle_callback(self, message: dict[str, Any]) -> None:
         """宿主转来一次回调请求（plugin-callbacks.md §4.3）。"""
@@ -1364,6 +1453,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--listen-fd", type=int, default=None, help="宿主绑定好的路由监听套接字")
     parser.add_argument("--uid", type=int, default=None, help="降权到这个用户（宿主是 root 时）")
     parser.add_argument("--gid", type=int, default=None)
+    parser.add_argument("--deps", default=None, help="插件包的第三方依赖目录（追加到导入路径最后）")
     args = parser.parse_args(argv)
     # 先降权（导入任何插件代码之前），再设「父进程退出即退出」：内核在 uid 变化时会清掉后者
     _drop_privileges(args.uid, args.gid)
@@ -1374,10 +1464,14 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout = sys.stderr
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
     sys.path.insert(0, args.path)
-    # 插件包随包携带的依赖（docs/design/plugin-phase3.md §2：安装时不跑 pip）
+    # 插件包随包携带的依赖（docs/design/plugin-phase3.md §2）
     vendor = Path(args.path) / "vendor"
     if vendor.is_dir():
         sys.path.insert(1, str(vendor))
+    # 批准安装的第三方依赖（plugin-dependencies.md §4）：直接追加到最后、不经 site.addsitedir，
+    # 包里的 .pth 不执行；主程序自己的包永远优先
+    if args.deps:
+        sys.path.append(args.deps)
     if args.describe:
         return describe(args)
     if args.validate:

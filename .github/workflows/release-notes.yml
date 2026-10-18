@@ -56,10 +56,22 @@ jobs:
                   # 与 windows-release.yml 同口径：正文末尾附上 CI 验证范围（含 ci-verified 标记）
                   cat "$file" apps/desktop/release/ci-verified-scope.md > "$RUNNER_TEMP/notes.md"
                   gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
+                  bash scripts/publish-release-info.sh "$tag"
                   ;;
-                *) gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$file" ;;
+                torrent-ner-v*) gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$file" ;;
+                *)
+                  gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$file"
+                  bash scripts/publish-release-info.sh "$tag"
+                  ;;
               esac
             else
               echo "跳过 $file：Release $tag 尚不存在"
             fi
           done
+
+      # 正文与 release.json 变了，让官网立刻对账：每次都会重新同步所有 changelog，按 tag 逐个通知只会
+      # 越来越长；对账只重拉内容指纹变了的记录（失败只告警，官网每天全量对账兜底）
+      - name: 通知官网
+        env:
+          CLOUD_RELEASE_SYNC_TOKEN: ${{ secrets.CLOUD_RELEASE_SYNC_TOKEN }}
+        run: bash scripts/notify-cloud.sh --all

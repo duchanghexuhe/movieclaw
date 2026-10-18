@@ -35,6 +35,8 @@ class RootViewModel @Inject constructor(
     val feedback: FeedbackBus,
     private val deepLinkBus: DeepLinkBus,
     private val searchAccess: SearchAccessRepository,
+    /** App 自身更新：登录后每天自动检查一次，有新版弹窗 */
+    val appUpdate: io.movieclaw.android.feature.update.AppUpdateController,
 ) : ViewModel() {
     val state = repository.ui
     val share = deepLinkBus.pendingShare
@@ -84,8 +86,12 @@ fun MovieClawRoot(vm: RootViewModel = hiltViewModel()) {
                     presetUsername = state.presetUsername,
                     presetServer = state.presetOrigin,
                 )
-                else -> androidx.compose.runtime.key(state.origin, state.session?.username) { AppNav() }
+                else -> {
+                    androidx.compose.runtime.key(state.origin, state.session?.username) { AppNav() }
+                    androidx.compose.runtime.LaunchedEffect(state.origin) { vm.appUpdate.autoCheck() }
+                }
             }
+            io.movieclaw.android.feature.update.AppUpdateDialog(vm.appUpdate)
             // 顶部 Toast 常驻在所有内容之上(iOS Feedback 宿主)
             FeedbackHost(
                 toasts = toasts,

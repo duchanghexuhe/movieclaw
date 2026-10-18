@@ -192,6 +192,8 @@ def test_member_session_view_carries_role_and_capabilities(client: TestClient) -
         "allow_subscribe": True,
         "allow_search": False,
         "allow_direct_download": False,
+        # 下载影片到设备：默认开（member-permissions-v2.md §3.5「家人」预设）
+        "allow_video_download": True,
     }
 
 
@@ -644,6 +646,9 @@ _MEMBER_ALLOWLIST = {
     # 原盘目录直推（disc-direct-play.md）：只凭签名 token，与原文件直出同属公开取流区
     ("GET", "/api/v1/playback/files/{file_id}/disc"),
     ("GET", "/api/v1/playback/files/{file_id}/disc/{relative_path}"),
+    # 蓝光剪辑清单（disc-clip-play.md）：同属公开取流区，只凭签名 token
+    ("GET", "/api/v1/playback/files/{file_id}/bluray"),
+    ("GET", "/api/v1/playback/files/{file_id}/bluray/{index}"),
     ("GET", "/api/v1/playback/files/{file_id}/subtitles"),
     # 预切片段（reels.md §8）：同原文件直出，只凭签名 token（按文件签发）
     ("GET", "/api/v1/reels/clips/{file_id}/{start_ms}.mp4"),
@@ -726,10 +731,25 @@ _MEMBER_ALLOWLIST = {
     ("POST", "/api/v1/tips/events/{event_id}"),
     ("POST", "/api/v1/tips/{tip_id}/displays"),
     ("POST", "/api/v1/tips/{tip_id}/invalidate"),
+    # 离线下载（docs/design/offline-download.md）：只碰成员自己可见库里的文件；
+    # 下载类另按「下载影片到设备」开关放行（默认开）
+    ("GET", "/api/v1/offline/manifest"),
+    ("POST", "/api/v1/offline/profiles"),
+    ("GET", "/api/v1/offline/files/{file_id}/content"),
+    ("POST", "/api/v1/offline/exports"),
+    ("GET", "/api/v1/offline/exports/{export_id}"),
+    ("GET", "/api/v1/offline/exports/{export_id}/content"),
+    ("DELETE", "/api/v1/offline/exports/{export_id}"),
+    # 本机播放的观看记录：只写自己的观看状态与日志（同 /playback/progress）
+    ("POST", "/api/v1/playback/viewings"),
+    # App 自身更新的服务器兜底：只读公开的发布信息、代下公开的安装包
+    ("GET", "/api/v1/app/clients/{product}/latest"),
+    ("GET", "/api/v1/app/clients/{product}/apk"),
 }
 
 # 路径参数哑值（与 test_auth.py 的匿名守护测试保持一致）
 _PATH_DUMMIES = {
+    "{product}": "x",  # 客户端更新：不存在的客户端名（422，不联网）
     "{letter_id}": "1",  # 可靠事件死信
     "{start_ms}": "0",  # 预切片段的起点
     "{task_key}": "library_reconcile",
@@ -778,6 +798,7 @@ _PATH_DUMMIES = {
     "{channel}": "weixin",
     "{channel_id}": "weixin",
     "{binding_id}": "test-binding",
+    "{login_id}": "test-login",
     "{endpoint_id}": "test-endpoint",
     "{member_id}": "1",
     "{job_id}": "job_test",
@@ -788,6 +809,8 @@ _PATH_DUMMIES = {
     "{key}": "cache.images",
     # 播放体验记录的播放编号
     "{attempt_id}": "test-attempt",
+    # 离线下载的导出号
+    "{export_id}": "no-such-export",
     # App 推送的自建中继、推送配图的签名
     "{relay_id}": "r_test",
     "{token}": "no-such-image",

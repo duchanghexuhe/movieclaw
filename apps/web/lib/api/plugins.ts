@@ -208,6 +208,42 @@ export interface PluginNotification {
   default: boolean;
 }
 
+export interface PackageDependency {
+  name: string;
+  version: string;
+  /** 这台服务器要下载的轮子大小（字节）；没有适用的轮子时为空 */
+  size: number | null;
+  /** 含本机代码（不是纯 Python） */
+  native: boolean;
+  /** 有适用于这台服务器平台的轮子 */
+  available: boolean;
+  /** 相比已安装版本：added 新增 / changed 换了版本 / null = 不变 */
+  change: "added" | "changed" | null;
+  previous_version: string | null;
+}
+
+export interface PackageDependencies {
+  /** 锁文件内容哈希：批准时原样交回表示同意这一份依赖 */
+  lock_digest: string;
+  packages: PackageDependency[];
+  total_size: number;
+  native: string[];
+  unavailable: string[];
+  removed: string[];
+  index: string;
+  index_label: string;
+  /** 锁文件与已批准的不同（或首次安装） */
+  needs_consent: boolean;
+}
+
+export interface DependencyProgress {
+  /** installing 正在安装 / failed 安装失败（可重试） */
+  phase: "installing" | "failed";
+  done: number;
+  total: number;
+  error: string | null;
+}
+
 export interface PackageRequest {
   id: string;
   title: string;
@@ -236,6 +272,10 @@ export interface PackageRequest {
   installed_version: string | null;
   /** 与随带的内置插件同 id：安装即替换它，卸载后随带版本回来；旧服务端没有这个字段 */
   replaces_builtin?: boolean;
+  /** 要下载安装的第三方包；没有依赖或旧服务端为空 */
+  dependencies?: PackageDependencies | null;
+  /** 批准后正在安装依赖时的进度 */
+  dependency_progress?: DependencyProgress | null;
 }
 
 export interface InstalledPackage {
@@ -257,6 +297,8 @@ export interface InstalledPackage {
   watching: boolean;
   /** 替换了随带的内置插件；旧服务端没有这个字段 */
   replaces_builtin?: boolean;
+  /** 批准安装的第三方依赖；progress 在安装中或安装失败时才有 */
+  dependencies?: { packages: string[]; progress: DependencyProgress | null } | null;
 }
 
 export interface PackagesOverview {
@@ -288,7 +330,7 @@ export async function uploadPackage(file: File): Promise<PackageRequest> {
 }
 
 /** 批准：宿主操作与路径须与插件申请的完全一致（显式同意），进程内运行须 allowInline，
- * 会给普通成员发通知的须 allowMemberNotifications */
+ * 会给普通成员发通知的须 allowMemberNotifications；批准页列出了依赖，批准即同意那一份锁文件 */
 export async function approvePackage(
   pending: PackageRequest,
   allowInline: boolean,
@@ -305,6 +347,7 @@ export async function approvePackage(
           paths: pending.paths,
           allow_inline: allowInline,
           allow_member_notifications: allowMemberNotifications,
+          dependencies: pending.dependencies?.lock_digest ?? null,
         }),
       },
     )
@@ -322,6 +365,16 @@ export async function rollbackPackage(id: string): Promise<PackageResult> {
   return (
     await request<ApiEnvelope<PackageResult>>(
       `/app/plugins/packages/${encodeURIComponent(id)}/rollback`,
+      { method: "POST" },
+    )
+  ).data;
+}
+
+/** 依赖没装好（启动时补装失败）：按已批准的锁文件再装一次，装好即加载 */
+export async function retryPackageDependencies(id: string): Promise<PackageResult> {
+  return (
+    await request<ApiEnvelope<PackageResult>>(
+      `/app/plugins/packages/${encodeURIComponent(id)}/dependencies/retry`,
       { method: "POST" },
     )
   ).data;

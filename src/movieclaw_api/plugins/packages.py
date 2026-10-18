@@ -16,7 +16,8 @@
     [permissions]
     operations = ["search.titles"]  # 宿主操作；危险操作必须逐个列出
 
-依赖只能随包携带（``vendor/`` 目录，运行时加入导入路径），安装时不联网、不跑 pip（§9 决策 2）。
+依赖可以随包携带（``vendor/`` 目录，运行时加入导入路径）；带本机代码的第三方包在 ``[dependencies]``
+里声明锁文件，经管理员批准后由主程序下载安装（docs/design/plugin-dependencies.md）。
 
 目录与状态::
 
@@ -160,12 +161,29 @@ class _Permissions(BaseModel):
         return value
 
 
+class _Dependencies(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lock: str
+    """包内的锁文件路径（pip requirements 格式，全部 == 钉死、每行带 --hash）。"""
+
+    @field_validator("lock")
+    @classmethod
+    def _lock(cls, value: str) -> str:
+        parts = value.split("/")
+        if not value or value.startswith("/") or any(p in ("", ".", "..") for p in parts):
+            raise ValueError("lock 须是包内的相对路径（如 requirements.lock）")
+        return value
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     plugin: _Plugin
     requires: dict[str, str] = Field(default_factory=dict)
     permissions: _Permissions = Field(default_factory=_Permissions)
+    dependencies: _Dependencies | None = None
+    """第三方依赖（plugin-dependencies.md §1）：只给独立进程运行的插件。"""
     events: list[dict[str, Any]] = Field(default_factory=list)
     """插件自己的事件（domain-events.md §7.2）：``{name, title}``，名字以插件 id 开头。"""
     notifications: list[dict[str, Any]] = Field(default_factory=list)
@@ -235,7 +253,35 @@ def read_archive(data: bytes) -> tuple[Manifest, zipfile.ZipFile]:
             raise PackageError(f"插件包只支持 {supported}，这台服务器是 {here}")
     elif f"{entry}.py" not in names and f"{entry}/__init__.py" not in names:
         raise PackageError(f"插件包里找不到入口模块 {entry}.py 或 {entry}/__init__.py")
+    if manifest.dependencies is not None:
+        read_lock(manifest, archive)
     return manifest, archive
+
+
+def read_lock(manifest: Manifest, source: zipfile.ZipFile | Path) -> Any:
+    """读出并校验插件声明的锁文件（``source`` 是压缩包或已解开的目录）；没有依赖返回 None。"""
+    from movieclaw_sdk import deps
+
+    if manifest.dependencies is None:
+        return None
+    if manifest.plugin.runtime != "process":
+        raise PackageError(
+            '只有独立进程运行（runtime = "process"）的插件能声明第三方依赖：'
+            "在主进程里运行会改动主程序自己的环境"
+        )
+    name = manifest.dependencies.lock
+    try:
+        raw = (source / name).read_bytes() if isinstance(source, Path) else source.read(name)
+    except (KeyError, FileNotFoundError) as exc:
+        raise PackageError(f"插件包里找不到锁文件 {name}（[dependencies] lock）") from exc
+    try:
+        lock = deps.parse_lock(raw.decode("utf-8"))
+        deps.check_host(lock, deps.host_packages())
+    except UnicodeDecodeError as exc:
+        raise PackageError(f"锁文件 {name} 不是 UTF-8 文本") from exc
+    except deps.LockError as exc:
+        raise PackageError(f"锁文件 {name} 不合规：{exc}") from exc
+    return lock
 
 
 def current_platform() -> str:
@@ -291,6 +337,17 @@ def check_compat(manifest: Manifest, *, reserved: set[str], operations: set[str]
             raise PackageError(f"宿主操作 {pattern} 不存在")
 
 
+def lock_record(manifest: Manifest, lock: Any) -> dict[str, Any] | None:
+    """安装记录里的依赖授权：锁文件路径、内容哈希、包与版本（升级时据此列出增删改）。"""
+    if lock is None or manifest.dependencies is None:
+        return None
+    return {
+        "lock": manifest.dependencies.lock,
+        "digest": lock.digest,
+        "packages": [{"name": p.name, "version": p.version} for p in lock.packages],
+    }
+
+
 # ---------------------------------------------------------------------- 状态
 @dataclass
 class Installed:
@@ -314,6 +371,9 @@ class Installed:
     """批准订阅的敏感事件（清单 ``[permissions] events``）。"""
     members_allowed: bool = False
     """用户批准了通知到普通成员。"""
+    dependencies: dict[str, Any] | None = None
+    """批准的第三方依赖（plugin-dependencies.md §2）：``{lock, digest, packages}``。
+    授权按锁文件内容哈希认，升级时锁文件没变就不再问。"""
     previous: dict[str, Any] | None = None
     """上一版的安装记录（version、title、entry、runtime、operations），回滚用。"""
     bad: list[str] = field(default_factory=list)
@@ -334,6 +394,7 @@ class Installed:
             "notifications": [dict(n) for n in self.notifications],
             "sensitive": list(self.sensitive),
             "members_allowed": self.members_allowed,
+            "dependencies": self.dependencies,
         }
 
 
@@ -510,6 +571,7 @@ def entry_for(settings: object, package: Installed) -> Entry:
     declare(package)
     path = version_dir(settings, package.id, package.version)
     try:
+        _bind_dependencies(settings, package)
         if package.runtime == "inline":
             plugin = _inline(path, package)
         else:
@@ -535,8 +597,27 @@ def entry_for(settings: object, package: Installed) -> Entry:
     return Entry(package.id, plugin, source=SOURCE)
 
 
+def _bind_dependencies(settings: object, package: Installed) -> None:
+    from movieclaw_api.services import plugin_deps, plugin_runtime
+
+    plugin_runtime.dependency_paths.pop(package.id, None)
+    if not package.dependencies:
+        return
+    ready = plugin_deps.ready_dir(settings, package.dependencies["digest"])
+    if ready is None:
+        raise PackageError("第三方依赖还没装好（插件页「重试安装依赖」）")
+    plugin_runtime.dependency_paths[package.id] = ready
+
+
 def load_package_entries(settings: object) -> list[Entry]:
-    packages = installed(settings)
+    """已安装的插件包 → 内核条目；依赖还没就绪的跳过，由 ``plugin_deps.resume`` 装好后挂载。"""
+    from movieclaw_api.services import plugin_deps
+
+    packages = {
+        k: p
+        for k, p in installed(settings).items()
+        if not p.dependencies or plugin_deps.ready_dir(settings, p.dependencies["digest"])
+    }
     if not packages:
         return []
     entries = [entry_for(settings, p) for p in packages.values()]

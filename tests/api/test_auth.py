@@ -178,6 +178,7 @@ _ADMIN_VIEW_EXTRAS = {
         "allow_subscribe": True,
         "allow_search": True,
         "allow_direct_download": True,
+        "allow_video_download": True,
     },
     # 登录 / 建号的响应不带当前设备（客户端要看就调 /auth/me）
     "device": None,
@@ -293,6 +294,9 @@ _PUBLIC_ALLOWLIST = {
     # 只凭查询参数里的签名 token，引擎的读取器不带登录凭据
     ("GET", "/api/v1/playback/files/{file_id}/disc"),
     ("GET", "/api/v1/playback/files/{file_id}/disc/{relative_path}"),
+    # 蓝光剪辑清单（disc-clip-play.md）：Android 统一引擎的读取器同样只凭签名 token
+    ("GET", "/api/v1/playback/files/{file_id}/bluray"),
+    ("GET", "/api/v1/playback/files/{file_id}/bluray/{index}"),
     ("GET", "/api/v1/playback/files/{file_id}/subtitles"),
     # 预切片段（reels.md §8）：系统播放器按 Range 取，同原文件直出只凭签名 token
     ("GET", "/api/v1/reels/clips/{file_id}/{start_ms}.mp4"),
@@ -347,7 +351,9 @@ def fill_path_params(path: str) -> str:
     设备授权的全路由扫描（tests/api/test_device_auth.py）也复用这一份。
     """
     return (
-        path.replace("{site_id}", "mteam")
+        # 客户端更新：不存在的客户端名（参数校验 422，不会真去 GitHub 查发布、下安装包）
+        path.replace("{product}", "x")
+        .replace("{site_id}", "mteam")
         .replace("{history_id}", "1")
         .replace("{backdrop_id}", "f" * 32)
         .replace("{attachment_id}", "f" * 32)
@@ -387,6 +393,7 @@ def fill_path_params(path: str) -> str:
         .replace("{channel}", "weixin")
         .replace("{channel_id}", "weixin")
         .replace("{binding_id}", "test-binding")
+        .replace("{login_id}", "test-login")
         .replace("{endpoint_id}", "test-endpoint")
         .replace("{username}", "family")
         .replace("{member_id}", "1")
@@ -400,6 +407,7 @@ def fill_path_params(path: str) -> str:
         .replace("{share_id}", "1")
         .replace("{key}", "cache.images")  # 缓存管理的登记目录 key
         .replace("{attempt_id}", "test-attempt")  # 播放体验记录的播放编号
+        .replace("{export_id}", "no-such-export")  # 离线下载的导出号
         .replace("{relay_id}", "r_test")  # App 推送的自建中继
         .replace("{token}", "no-such-image")  # 推送配图的签名
         .replace("{item_id}", "1")  # 推送「这部剧不再提醒」的条目

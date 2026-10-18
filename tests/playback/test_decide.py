@@ -1334,8 +1334,8 @@ def test_capped_transcode_uses_hardware_and_keeps_lossy_audio():
 
 
 def test_capped_transcode_reencodes_heavy_audio_and_maps_hdr():
-    """TrueHD 7.1 装不下码率上限：转 E-AC-3 并降到 5.1；HDR 源必带 tone-map。
-    点选的音轨优先于默认轨。"""
+    """TrueHD 7.1 装不下码率上限：转 E-AC-3 并降到 5.1（由 -ac 折叠，不走立体声降混——
+    挂了降混就是立体声装进 5.1，中置环绕全哑）；HDR 源必带 tone-map。点选的音轨优先于默认轨。"""
     from movieclaw_playback.decide import plan_capped_transcode
 
     flac_stereo = AudioTrack(ref="embedded:2", codec="flac", channels=2)
@@ -1345,7 +1345,7 @@ def test_capped_transcode_reencodes_heavy_audio_and_maps_hdr():
     assert decision.video.tone_map is True
     assert decision.audio.action == "transcode"
     assert decision.audio.codec == "eac3" and decision.audio.channels == 6
-    assert decision.audio.downmix is True
+    assert decision.audio.downmix is False
     assert "E-AC3" not in decision.reason and "EAC3" in decision.reason
 
     chosen = plan_capped_transcode(profile, WITH_GPU, preferred_audio="embedded:2")
@@ -1503,6 +1503,145 @@ def test_declared_container_skips_keyframe_probe():
     assert not needs_keyframe_probe(media(keyframe_interval_s=None), EXOPLAYER, WITH_GPU)
 
 
+#: Android 的真实申报：TrueHD 也在里面（ExoPlayer 能解或直通功放），声道上限一律报 8
+ANDROID_TRUEHD = ClientCapability(
+    **{
+        **vars(EXOPLAYER),
+        "audio": tuple(AudioSupport(c, 8) for c in ("aac", "ac3", "eac3", "dts", "truehd")),
+    }
+)
+DV_TRUEHD = media(
+    video_codec="hevc", hdr="Dolby Vision", dv_profile=8, dv_bl_compatible=True,
+    color_space="BT.2020", bit_depth=10,
+    audio_tracks=(AudioTrack(ref="embedded:0", codec="truehd", channels=8, language="eng",
+                             is_default=True),),
+)
+
+
+def test_declared_truehd_direct_plays_the_original_file():
+    """申报了 TrueHD 的播放器直连原文件时照旧原样放 TrueHD（#884 的修复不碰档 0）。"""
+    sdr = media(video_codec="hevc", audio_tracks=DV_TRUEHD.audio_tracks)
+    decision = decide_playback(sdr, ANDROID_TRUEHD, WITH_GPU)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.audio.action == "copy" and decision.audio.codec == "truehd"
+
+
+def test_declared_truehd_is_not_copied_into_hls_segments():
+    """#884：杜比视界片在不支持的电视上要转码，申报了 TrueHD 也不能原样复制——档 1 起输出是
+    fMP4，TrueHD 封不进（ffmpeg 写头报「Experimental feature」退出码 88）。转 E-AC-3，
+    7.1 降到 5.1（ffmpeg 的 eac3 编码器最多 6 声道），交给 -ac 折叠、不走立体声降混。"""
+    decision = decide_playback(DV_TRUEHD, ANDROID_TRUEHD, WITH_GPU)
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    assert decision.audio.action == "transcode"
+    assert (decision.audio.codec, decision.audio.channels) == ("eac3", 6)
+    assert decision.audio.downmix is False
+    assert "封装不进 HLS 分片" in decision.reason
+
+    # 换封装档同理：视频照旧 copy，音频转码
+    remux = decide_playback(media(container="m2ts", audio_tracks=DV_TRUEHD.audio_tracks),
+                            ANDROID_TRUEHD, WITH_GPU)
+    assert remux.tier is PlaybackTier.AUDIO_TRANSCODE
+    assert remux.audio.action == "transcode" and remux.audio.codec == "eac3"
+    assert needs_keyframe_probe(
+        media(container="m2ts", audio_tracks=DV_TRUEHD.audio_tracks, keyframe_interval_s=None),
+        ANDROID_TRUEHD, WITH_GPU,
+    )
+
+
+def test_truehd_switches_to_its_ac3_core_before_transcoding():
+    """同语言有能封进 fMP4 的轨（蓝光 TrueHD 拆出的 AC-3 核心）：换轨直通优于转码；
+    用户自己点选了 TrueHD 就转它，不替他换轨。"""
+    core = AudioTrack(ref="embedded:1", codec="ac3", channels=6, language="eng")
+    profile = media(**{**vars(DV_TRUEHD), "audio_tracks": (*DV_TRUEHD.audio_tracks, core)})
+    decision = decide_playback(profile, ANDROID_TRUEHD, WITH_GPU)
+    assert decision.audio.action == "copy" and decision.audio.track_ref == "embedded:1"
+
+    picked = decide_playback(profile, ANDROID_TRUEHD, WITH_GPU, preferred_audio="embedded:0")
+    assert picked.audio.action == "transcode" and picked.audio.track_ref == "embedded:0"
+
+
+def test_eac3_never_asks_for_more_than_six_channels():
+    """播放器申报能解 8 声道 E-AC-3，编码器却只到 5.1：7.1 源只转到 6 声道。"""
+    decision = decide_playback(
+        media(video_codec="hevc", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU
+    )
+    assert (decision.audio.codec, decision.audio.channels) == ("eac3", 6)
+
+
+BLURAY_EXO = ClientCapability(
+    **{
+        **vars(EXOPLAYER),
+        "audio": (AudioSupport("aac"), AudioSupport("ac3"), AudioSupport("truehd")),
+        "bluray_clips": True,
+    }
+)
+BLURAY_TRUEHD = AudioTrack(ref="embedded:0", codec="truehd", channels=6, is_default=True)
+
+
+@pytest.mark.parametrize("container", ["bluray", "iso"])
+def test_bluray_clip_player_direct_plays_the_main_title(container):
+    """能按剪辑清单播放的播放器（Android 统一引擎）：蓝光原盘目录与蓝光镜像都给档 0、交付方式
+    clips，带上服务端选的主播放列表——NAS 不起 ffmpeg（disc-clip-play.md）。"""
+    disc = media(
+        container=container, disc_clips=3, disc_playlist="00800.mpls", disc_format="bluray",
+        audio_tracks=(BLURAY_TRUEHD,),
+    )
+    decision = decide_playback(disc, BLURAY_EXO, WITH_GPU)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.disc == "clips" and decision.disc_playlist == "00800.mpls"
+
+
+def test_bluray_clips_still_check_codecs_and_leave_dvd_and_old_players_alone():
+    """剪辑清单只替换「怎么供字节」：解不了的编码照旧换封装 / 转码；DVD 镜像不走它；
+    没申报的播放器维持服务端换封装。"""
+    bluray = media(
+        container="bluray", disc_clips=2, disc_format="bluray", audio_tracks=(BLURAY_TRUEHD,)
+    )
+    vc1 = decide_playback(media(**{**vars(bluray), "video_codec": "vc1"}), BLURAY_EXO, WITH_GPU)
+    assert vc1.tier is PlaybackTier.HARDWARE_TRANSCODE and vc1.disc is None
+    dvd = media(container="iso", video_codec="mpeg2video", disc_clips=1, disc_format="dvd")
+    assert decide_playback(dvd, BLURAY_EXO, WITH_GPU).disc is None
+    old = ClientCapability(**{**vars(BLURAY_EXO), "bluray_clips": False})
+    remuxed = decide_playback(bluray, old, WITH_GPU)
+    assert remuxed.tier is not PlaybackTier.DIRECT_PLAY and remuxed.disc is None
+
+
+BLURAY_LPCM = AudioTrack(ref="embedded:0", codec="pcm_bluray", channels=6, is_default=True)
+
+
+def test_bluray_clips_skip_vc1_even_when_the_player_decodes_it():
+    """有 VC-1 硬解的盒子：剪辑解复用器读不了 VC-1，直推只有声音——仍交给服务端。"""
+    vc1_video = (*BLURAY_EXO.video, VideoSupport("vc1"))
+    vc1_box = ClientCapability(**{**vars(BLURAY_EXO), "video": vc1_video})
+    disc = media(
+        container="bluray", video_codec="vc1", disc_clips=2, disc_format="bluray",
+        audio_tracks=(BLURAY_TRUEHD,),
+    )
+    decision = decide_playback(disc, vc1_box, WITH_GPU)
+    assert decision.disc is None
+
+
+def test_bluray_lpcm_plays_only_through_clips():
+    """LPCM 只有剪辑解复用器读得了：剪辑直推时直通；其余档（不认剪辑的播放器、烧录 PGS）
+    一律转音频——原样复制进 fMP4 封不进去。"""
+    disc = media(
+        container="bluray", disc_clips=2, disc_format="bluray", audio_tracks=(BLURAY_LPCM,),
+        subtitle_tracks=(
+            SubtitleTrack(ref="embedded:1", codec="hdmv_pgs_subtitle", language="chi"),
+        ),
+    )
+    clips = decide_playback(disc, BLURAY_EXO, WITH_GPU)
+    assert clips.tier is PlaybackTier.DIRECT_PLAY and clips.disc == "clips"
+    assert clips.audio.action == "copy" and clips.audio.codec == "pcm_bluray"
+
+    old = ClientCapability(**{**vars(BLURAY_EXO), "bluray_clips": False})
+    remuxed = decide_playback(disc, old, WITH_GPU)
+    assert remuxed.disc is None and remuxed.audio.action == "transcode"
+
+    burned = decide_playback(disc, BLURAY_EXO, WITH_GPU, preferred_subtitle="embedded:1")
+    assert burned.disc is None and burned.audio.action == "transcode"
+
+
 def test_hdr_without_free_hardware_says_busy_when_the_remote_transcoder_is_full():
     """远程转码器在线但名额占满：不说「未检测到硬件」（会把人支去查一台好好的转码器），
     说正忙、稍候或停掉别的转码。"""
@@ -1585,3 +1724,93 @@ def test_unknown_profile_and_old_clients_keep_transcoding():
     assert decide_playback(dv(None, None), DV_TV, WITH_GPU).tier is transcode
     old_client = _replace(EXOPLAYER, hdr_passthrough=True)
     assert decide_playback(dv(8, True), old_client, WITH_GPU).tier is transcode
+
+
+# ---------------------------------------------------------------------------
+# 杜比视界记录与画面不符（P5 RPU 注进 HDR10 基础层，media_probe._dv_record_contradicted）：
+# 探测认定为 HDR10，原文件里的记录还在——照记录解就是整片偏色
+# ---------------------------------------------------------------------------
+
+#: 老版本 App 的自研引擎申报（PlayerCapability.native，没有核对记录的能力）
+APP_ENGINE = ClientCapability(
+    video=(VideoSupport("h264"), VideoSupport("hevc")),
+    audio=(AudioSupport("aac"), AudioSupport("ac3"), AudioSupport("eac3")),
+    containers=frozenset({"mp4", "hls-fmp4", "mkv", "ts"}),
+    hdr_passthrough=True,
+    universal=True,
+    disc_image=True,
+    disc_folder=True,
+)
+APP_ENGINE_AUDITING = _replace(APP_ENGINE, dolby_vision_record_audit=True)
+
+
+def mislabeled_dv(**kwargs):
+    base = {
+        "video_codec": "hevc",
+        "resolution": "2160p",
+        "hdr": "HDR10",
+        "dv_profile": 5,
+        "dv_bl_compatible": False,
+        "color_space": "BT.2020",
+        "audio_tracks": (AudioTrack(ref="embedded:0", codec="eac3", channels=6, is_default=True),),
+    }
+    base.update(kwargs)
+    return media(**base)
+
+
+def test_mislabeled_dolby_vision_is_recognised_only_with_a_record_and_another_label():
+    assert mislabeled_dv().dolby_vision_ignored
+    assert not dv(5, False).dolby_vision_ignored
+    # 早期探测的行 hdr 为空：杜比视界状态未知，不算
+    assert not mislabeled_dv(hdr=None).dolby_vision_ignored
+    assert not media(hdr="HDR10").dolby_vision_ignored
+
+
+def test_engine_that_audits_the_record_still_plays_the_original_file():
+    decision = decide_playback(mislabeled_dv(), APP_ENGINE_AUDITING, WITH_GPU)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_old_app_engine_gets_a_remux_that_carries_only_the_base_layer():
+    """老版本 App 照记录按 P5 还原：不给原文件，换封装的流不带记录（hvc1）"""
+    decision = decide_playback(mislabeled_dv(), APP_ENGINE, WITH_GPU)
+    assert decision.tier is PlaybackTier.REMUX, decision.reason
+    assert decision.video.action == "copy"
+    assert decision.video.dolby_vision is None
+    assert "杜比视界记录与画面不符" in decision.reason
+    assert needs_keyframe_probe(mislabeled_dv(), APP_ENGINE, WITH_GPU)
+
+
+def test_exoplayer_with_a_dolby_vision_decoder_does_not_read_the_original_record():
+    """ExoPlayer 认 MKV 的杜比视界记录，设备有 P5 解码器就照记录解 → 只给换封装"""
+    decision = decide_playback(mislabeled_dv(audio_tracks=(AAC_51,)), DV_TV, WITH_GPU)
+    assert decision.tier is PlaybackTier.REMUX, decision.reason
+    assert decision.video.dolby_vision is None
+
+
+def test_mislabeled_dolby_vision_transcodes_without_the_rpu():
+    decision = decide_playback(mislabeled_dv(), SDR_TV, WITH_GPU)
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    assert decision.video.tone_map is True
+    assert decision.video.dolby_vision == "ignore"
+
+
+def test_profile_5_transcode_must_apply_the_rpu():
+    decision = decide_playback(dv(5, False), HDR10_TV, WITH_GPU)
+    assert decision.video.dolby_vision == "apply"
+    # profile 未知按 P5 保守算；P8 的基础层就是 HDR10，交给滤镜默认
+    assert decide_playback(dv(None, None), DV_TV, WITH_GPU).video.dolby_vision == "apply"
+    assert decide_playback(dv(8, True), SDR_TV, WITH_GPU).video.dolby_vision is None
+
+
+def test_remux_for_a_dolby_vision_decoder_keeps_the_record():
+    """音轨要转码时视频照样 copy，但换封装要保住杜比视界记录，否则 P5 被当 HDR10 解"""
+    profile = _replace(dv(5, False), audio_tracks=(DTS_51,))
+    decision = decide_playback(profile, DV_TV, WITH_GPU)
+    assert decision.tier is PlaybackTier.AUDIO_TRANSCODE, decision.reason
+    assert decision.video.dolby_vision == "keep"
+    # 原文件直出带着记录，不用标
+    assert decide_playback(dv(5, False), DV_TV, WITH_GPU).video.dolby_vision is None
+    # 设备解不了杜比视界、只放基础层的不保留记录
+    p8 = _replace(dv(8, True), audio_tracks=(DTS_51,))
+    assert decide_playback(p8, HDR10_TV, WITH_GPU).video.dolby_vision is None

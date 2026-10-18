@@ -323,12 +323,20 @@ jobs:
             echo "::error::缺少 $asset，拒绝转正"
             exit 1
           fi
-          # 官网下载页只列 Mac 版与转码器；脚本校验包与 tag 是同一个产品、同一个版本
-          if [ "$PRODUCT" != ios ]; then
-            bash scripts/publish-download-manifest.sh "$RELEASE_TAG"
-          fi
+          # 脚本校验包与 tag 是同一个产品、同一个版本
+          bash scripts/publish-download-manifest.sh "$RELEASE_TAG"
+
+      # 官网更新日志读它：产品、版本与按语言拆好的说明（Apple TV 也要）
+      - name: 生成官网版本信息
+        run: bash scripts/publish-release-info.sh "$RELEASE_TAG"
 
       - name: 发布 Release（不标 latest）
         run: |
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
           echo "已发布：https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # 让官网立刻同步这个版本（失败只告警，官网每天全量对账兜底）
+      - name: 通知官网
+        env:
+          CLOUD_RELEASE_SYNC_TOKEN: ${{ secrets.CLOUD_RELEASE_SYNC_TOKEN }}
+        run: bash scripts/notify-cloud.sh "$RELEASE_TAG"

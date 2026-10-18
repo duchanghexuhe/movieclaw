@@ -8,6 +8,8 @@ description: 用户想让 MovieClaw 拥有它现在没有的能力或对接时�
 你要帮用户写一个 MovieClaw 插件，并在这台服务器上把它装起来、验证、必要时卸载。
 插件是一个目录：一份清单 `movieclaw-plugin.toml` + Python 代码，打包成 `.mcplugin`（zip）后安装。
 装上后默认在**独立的低权限进程**里运行，崩溃只伤它自己；装、升级、回滚、卸载都**不用重启**。
+第三方插件和商店元数据（`store.json`）在 <https://github.com/movieclaw/movieclaw-plugins>，写法见该仓库 `example/GUIDE.md`。
+本仓库不收新的第三方插件；`store.json` 不要写进清单（多一个字段上传会被拒），打进 zip 也会被解出后忽略。
 
 本文件是判断、流程与规范，**读完再动手**；第 2 节告诉你动手前还必须读哪份参考（路径以本技能目录为锚）。
 
@@ -41,13 +43,13 @@ description: 用户想让 MovieClaw 拥有它现在没有的能力或对接时�
 | 插件能做 | 靠什么 |
 |---|---|
 | 某件事发生后自动做点什么：下载完成、入库完成、删片 / 删文件 / 回收站、订阅新建 / 删除 / 开始下载 / 收齐 / 状态变化 | 可靠事件 |
-| 改变系统的判断：订阅搜索词、淘汰或重排候选种子、选下载器、否决删种 | 决策钩子 |
-| 加一种新实现：IM 通道（含只推送的，如 Bark）、站点类 / 站点数据包、定时任务（可整段替换内置的）、后台任务、入库流水线步骤 | 注册表 |
+| 改变系统的判断：订阅搜索词、淘汰或重排候选种子、选下载器、否决删种、网盘挂载文件给播放器换直链（302） | 决策钩子 |
+| 加一种新实现：IM 通道（含只推送的，如 Bark）、下载器（Deluge、Aria2……）、站点类 / 站点数据包、定时任务（可整段替换内置的）、后台任务、入库流水线步骤 | 注册表 |
 | 给 AI 助手加一个能力（查天气、查某个外部服务）、给外部系统开接口 | 插件接口：自动成为 mclaw 命令，AI 助手直接能调 |
 | 接收外部平台推过来的消息（企业微信自建应用回调、GitHub / Slack 推送、Telegram Webhook） | 回调端点：宿主发地址，请求原样交给插件，插件自己验签 |
 | 做事与存东西：调用系统操作（与 mclaw 同一份）、存状态、读写批准的目录、报告健康 | 服务 |
 
-**做不到的**：给网页 / App 加界面、按钮或设置页（包括播放器里的按钮、首页卡片）、新的下载器类型、新的元数据来源、
+**做不到的**：给网页 / App 加界面、按钮或设置页（包括播放器里的按钮、首页卡片）、新的元数据来源、
 新的 Webhook 格式、新的站点认证方式、替换播放 / 转码 / 媒体库扫描 / 刮削主流程、改 AI 助手本身。
 **遇到要直说做不到**，并给替代办法：先给用户能直接用的现成功能（上表），再给插件能做的部分
 （`references/extension-points.md` 第 5 节），不要先答应再做到一半。
@@ -95,7 +97,7 @@ CI 会把它们真实装进应用、跑完用户场景，写法可以照抄。�
 | 开接口（含给 AI 助手加能力）、读写文件 | `references/recipes.md` 第 5、8、10 节、`templates/starter/`、`references/examples/cloud_strm.py` |
 | 插件需要用户填的配置或凭据（账号、地址、Key） | `references/recipes.md` 第 13 节 |
 | 站点 | `references/recipes.md` 第 12 节、`references/examples/site_pack/` |
-| 一个插件里放好几件事、替换内置的东西 | `references/composition.md`（替换随带通道：把 `$SRC/movieclaw_plugins/<名>/` 复制到 `plugins/channel.<名>/` 再改） |
+| 一个插件里放好几件事、替换内置的东西 | `references/composition.md`（替换随带通道：把 `$SRC/movieclaw_plugins/<名>/` 复制到 `plugins/<同 id>/` 再改，id 不含点） |
 | 写清单、申请权限 | `references/manifest.md` |
 | 用户问「插件是什么、为什么要批准、会不会搞坏」 | `references/explaining-to-users.md` |
 | 装不上、起不来、没反应 | `references/troubleshooting.md` |
@@ -154,7 +156,10 @@ CI 会把它们真实装进应用、跑完用户场景，写法可以照抄。�
 10. **正式安装**（用户要长期使用时）：清单里定好正式 `version`，然后
     `plugin pack plugins/<id>` → `app plugins packages upload --file <生成的 .mcplugin>` →
     `app plugins packages approve <id> --version <版本> --operations-json '<与清单一致>' --paths-json '<与清单一致>' --yes`。
-11. **卸载**：`app plugins packages uninstall <id> --yes`（默认保留插件数据；用户要求清干净才加 `--purge-data`）。卸载后再查一次 `app plugins list`，确认条目已消失；替换内置插件的包卸载后内置版本自动回来。
+    带第三方依赖（清单 `[dependencies]`）的：上传结果的 `dependencies` 列出要下载的包、大小、是否含本机代码；
+    `needs_consent` 为真时**先把这份清单原样告诉用户、得到同意**，再加 `--dependencies <dependencies.lock_digest>` 批准。
+    锁文件没变的升级不用再加。
+11. **卸载**：`app plugins packages uninstall <id> --yes`（默认保留插件数据；用户要求清数据才加 `--purge-data`，它只删 `plugin_data` 里该 id 的行，不删设置文件和私有目录）。卸载后再查一次 `app plugins list`，确认条目已消失；替换内置插件的包卸载后内置版本自动回来。
     回到上一版：`app plugins packages rollback <id> --yes`。
 12. **停用 / 官方插件**：插件包与官方插件（随应用提供的，如通道、下载器、网盘规格预探）都能临时停用：
     `app plugins switch <id> --enabled=false`（启用：`--enabled=true`；布尔参数必须带 `=`），运行中生效、重启后保持，
@@ -186,7 +191,8 @@ CI 会把它们真实装进应用、跑完用户场景，写法可以照抄。�
 - 持久状态存插件数据（`PLUGIN_DATA`），读写文件走文件接口（`PLUGIN_FILES`）并在清单 `paths` 里申请。
 - 连外网走用户的代理设置：`httpx.AsyncClient(transport=movieclaw_sdk.net.http_transport("<服务名>"))`，清单写 `network = true`。
 - 主程序自带的库可以直接 import（如 `httpx`、`websockets`、`pydantic`、`fastapi`、`cryptography`、`parsel`、`pyyaml`）；
-  别的依赖只能随包放进插件目录的 `vendor/`（纯 Python）；安装时不联网、不跑 pip。
+  纯 Python 的依赖随包放进插件目录的 `vendor/`；带本机代码的第三方包写进 `[dependencies]` 锁文件，批准安装时由
+  服务器下载（`references/manifest.md`「第三方依赖」）。
 - 日志用 `ctx.logger`，中文，带上关键 id。
 - 按关键词匹配种子 / 发布名时：英文短词（TC、TS、CAM 这类）必须按**词边界**匹配，
   如 `re.compile(r"(?<![A-Za-z0-9])TC(?![A-Za-z0-9])", re.I)`，否则 `ts` 会命中 Hits、`cam` 会命中 Cameron；

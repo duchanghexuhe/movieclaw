@@ -34,6 +34,7 @@ from movieclaw_api.services.subscription.smart_profiles import read_policy
 from movieclaw_api.services.subscription.twins import ambiguous_verdict, ensure_twins
 from movieclaw_db.models import (
     ActivityType,
+    MediaEpisode,
     MediaItem,
     MediaMetadata,
     MediaSeason,
@@ -231,6 +232,20 @@ async def media_identity(
             select(MediaMetadata.runtime_minutes).where(MediaMetadata.media_item_id == item.id)
         )
     ).scalar_one_or_none()
+    # 已播集：与包种子声明的「全 N 集」对照，识破同名的另一部剧
+    aired_episodes = tuple(
+        (
+            await session.execute(
+                select(MediaEpisode.season_number, MediaEpisode.air_date).where(
+                    MediaEpisode.media_item_id == item.id,
+                    MediaEpisode.season_number != 0,
+                    MediaEpisode.air_date.is_not(None),  # type: ignore[union-attr]
+                )
+            )
+        )
+        .tuples()
+        .all()
+    )
     return MediaIdentity(
         kind=item.kind,
         year=item.year,
@@ -240,6 +255,7 @@ async def media_identity(
         season_numbers=season_numbers,
         season_titles=season_titles,
         runtime_minutes=runtime_minutes,
+        aired_episodes=aired_episodes,
     )
 
 
@@ -541,7 +557,7 @@ def _id_conflict_verdict(match: IdentityMatch) -> RuleVerdict:
         accepted=False,
         reason_code="identity_id_conflict",
         reason_text=(
-            f"站点标注的影片编号与本条目不符（{match.id_conflict}）；"
+            f"站点信息与本条目不符（{match.id_conflict}）；"
             "若确认是站点标错，可在搜索页手动选种投递"
         ),
     )
@@ -613,6 +629,12 @@ def covered_units(
         total = match.declared_total
         return w.air_date is None and total is not None and 0 < w.episode_number <= total
 
+    def _beyond_declared(w: WantedItem) -> bool:
+        # 「全 N 集」也是上限：包里不可能有第 N+1 集。真实教训：全 8 集的同名剧
+        # 整季包被展开到 13 集的纪录片订阅上，E09~E13 永远选不到文件、对账空转
+        total = match.declared_total
+        return total is not None and total > 0 and w.episode_number > total
+
     if match.is_complete_series:
         # 全集包不承诺特别篇（season 0 的具体集）：市面上的"全集/合集"几乎
         # 从不收录 SP/短剧集，赌它包含的代价是工单挂上一个永远等不来的种子
@@ -625,6 +647,7 @@ def covered_units(
             w
             for w in open_units.values()
             if not (w.season_number == 0 and w.episode_number > 0)
+            and not (single_season and _beyond_declared(w))
             and (
                 _airable(w, require_dated=True)
                 or (single_season and w.season_number != 0 and _declared(w))
@@ -642,6 +665,7 @@ def covered_units(
             for (season, _), w in open_units.items()
             if season in match.pack_seasons
             and w not in result
+            and not (single_pack and _beyond_declared(w))
             and (_airable(w, require_dated=True) or (single_pack and _declared(w)))
         )
     return result
