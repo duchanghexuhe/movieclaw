@@ -310,7 +310,7 @@ export function LibraryRecycleBin({ onCountChange }: { onCountChange?: (total: n
   return (
     <>
       {failed && (
-        <div className="mx-6 mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub text-amber-200 max-md:mx-4">
+        <div className="mx-6 mt-4 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub text-[var(--warn)] max-md:mx-4">
           与后端通信失败，正在自动重试；下方显示的是最近一次成功加载的数据
         </div>
       )}

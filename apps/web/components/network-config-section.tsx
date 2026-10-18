@@ -472,11 +472,7 @@ function ServiceRow({
       {pending && <span className="text-sub text-[var(--text-faint)]">测试中…</span>}
       {result && (
         <Tooltip content={result.message} placement="top">
-          <span
-            className={`flex items-center gap-1.5 text-sub ${
-              result.ok ? "text-[var(--ok)]" : "text-[var(--danger)]"
-            }`}
-          >
+          <span className="flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
             <span
               className={`size-1.5 rounded-full ${result.ok ? "bg-[var(--ok)]" : "bg-[var(--danger)]"}`}
             />

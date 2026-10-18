@@ -443,10 +443,12 @@ export function SessionCard({
           )}
           <span
             className={`flex shrink-0 items-center gap-1 font-medium ${
-              session.paused ? "text-white/55" : "text-[var(--ok)]"
+              session.paused ? "text-white/55" : "text-[var(--text-muted)]"
             }`}
           >
-            {!session.paused && <PlayIcon className="size-2.5" />}
+            {!session.paused && (
+              <span className="size-1.5 shrink-0 rounded-full bg-[var(--ok)]" />
+            )}
             {session.paused ? "已暂停" : "播放中"}
           </span>
           {percent != null && <span className="text-white/55">· {percent}%</span>}
@@ -464,6 +466,14 @@ export function SessionCard({
           <OverflowText lines={2} className="text-caption leading-5 text-white/35">
             {detail}
           </OverflowText>
+        )}
+        {/* 卡顿迹象来自服务端对等片/拉流速率的推断，不是播放器实测；警示点与
+            「播放中」绿点同一形态，只占一个小点（全站语义色纪律：不染整句） */}
+        {session.stall && (
+          <p className="flex items-center gap-1.5 text-caption leading-5 text-white/45">
+            <span className="size-1.5 shrink-0 rounded-full bg-[var(--warn)]" aria-hidden />
+            {session.stall.reason}
+          </p>
         )}
         {percent != null && (
           <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/[0.08]">
@@ -489,10 +499,19 @@ export function SessionCard({
   );
 }
 
-/** 正在播放（Netflix 主题）：原有版式，不随银玻璃改版。 */
+/**
+ * 正在播放（Netflix 主题）：原有版式，不随银玻璃改版。
+ *
+ * 播放方式小标与转码细节跟银玻璃版同一套（lib/activity-overview.ts 的
+ * deliveryColor / deliveryDetail，docs/design/activity.md）：直连 / 转码 +
+ * 「输出规格 · 在哪转」是用户问得最多的问题，两版都得出。
+ */
 function NfSessionCard({ session, onEnd, onRevoke, busy }: SessionCardProps) {
   const media = session.media;
   const percent = session.progress_percent;
+  const delivery = session.delivery ?? null;
+  const detail = delivery ? deliveryDetail(delivery) : null;
+  const tone = delivery ? deliveryColor(delivery) : null;
   const specParts = [
     session.file?.resolution,
     session.file?.video_codec?.toUpperCase(),
@@ -517,6 +536,11 @@ function NfSessionCard({ session, onEnd, onRevoke, busy }: SessionCardProps) {
               onEnd={onEnd}
               onRevoke={session.revocable ? onRevoke : undefined}
               busy={busy}
+              header={
+                delivery?.reason
+                  ? { title: `为什么是${delivery.label}`, body: delivery.reason }
+                  : null
+              }
             />
           </div>
         </div>
@@ -528,6 +552,15 @@ function NfSessionCard({ session, onEnd, onRevoke, busy }: SessionCardProps) {
           ]}
         />
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-caption text-white/40">
+          {delivery && tone && (
+            <span
+              aria-label={`播放方式：${delivery.label}`}
+              className="shrink-0 rounded-full px-1.5 py-px font-semibold"
+              style={{ color: tone, backgroundColor: `color-mix(in srgb, ${tone} 16%, transparent)` }}
+            >
+              {delivery.label}
+            </span>
+          )}
           {session.play_method === "local" ? (
             <>
               {session.rate_bytes_per_second != null && session.rate_bytes_per_second > 0 ? (
@@ -550,6 +583,17 @@ function NfSessionCard({ session, onEnd, onRevoke, busy }: SessionCardProps) {
             <span className="text-white/35 max-md:hidden">{specParts.join(" · ")}</span>
           )}
         </div>
+        {detail && (
+          <OverflowText lines={2} className="text-caption leading-5 text-white/35">
+            {detail}
+          </OverflowText>
+        )}
+        {session.stall && (
+          <p className="flex items-center gap-1.5 text-caption leading-5 text-white/45">
+            <span className="size-1.5 shrink-0 rounded-full bg-[var(--warn)]" aria-hidden />
+            {session.stall.reason}
+          </p>
+        )}
         <ClockLine
           percent={percent}
           positionMs={session.position_ms}
@@ -849,7 +893,7 @@ export function MediaActivityPanel({
       </WatchToolbar>
 
       {error && (
-        <p className="mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-6 text-amber-100">
+        <p className="mt-4 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub leading-6 text-[var(--warn)]">
           {error}
         </p>
       )}
@@ -1120,7 +1164,7 @@ function RevokeDeviceDialog({
             type="button"
             onClick={onConfirm}
             disabled={busy}
-            className="rounded-lg bg-red-500/85 px-4 py-2 text-ui font-medium text-white transition hover:bg-red-500 disabled:opacity-40"
+            className="rounded-lg bg-[var(--danger-solid)] px-4 py-2 text-ui font-medium text-white transition hover:bg-[var(--danger-solid-hover)] disabled:opacity-40"
           >
             {busy ? "正在注销…" : "注销设备"}
           </button>

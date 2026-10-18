@@ -228,7 +228,7 @@ export function ImportWatchSection() {
 
 const ENTRY_TABS: { status: IngestEntryStatus; label: string; tone: string }[] = [
   { status: "pending", label: "待处理", tone: "text-[var(--warn)]" },
-  { status: "failed", label: "失败", tone: "text-red-300" },
+  { status: "failed", label: "失败", tone: "text-[var(--danger)]" },
   { status: "imported", label: "已入库", tone: "text-[var(--text-muted)]" },
   { status: "ignored", label: "已忽略", tone: "text-[var(--text-muted)]" },
 ];
@@ -484,7 +484,7 @@ function EntryRow({
           })}
         </ul>
       )}
-      {error && <p className="mt-1 text-caption text-red-300">{error}</p>}
+      {error && <p className="mt-1 text-caption text-[var(--danger)]">{error}</p>}
 
       {panel?.view === "search" && (
         <ClaimSearchPanel

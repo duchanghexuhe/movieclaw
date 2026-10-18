@@ -427,8 +427,8 @@ export function SubscribeDialog({
     <div className="min-w-0 flex-1">
       <p className="line-clamp-2 text-title-sm font-semibold text-white">{media?.title ?? target.title}</p>
       <p className="mt-1 text-sub text-[var(--text-muted)]">{[media?.year ?? target.year, kind === "movie" ? "电影" : "剧集"].filter(Boolean).join(" · ")}</p>
-      {showsForm && prepared?.movie_owned && <p className="mt-1.5 flex items-center gap-1 text-caption text-[var(--ok)]">
-        <CheckIcon className="size-3.5 shrink-0" />
+      {showsForm && prepared?.movie_owned && <p className="mt-1.5 flex items-center gap-1 text-caption text-[var(--text-muted)]">
+        <CheckIcon className="size-3.5 shrink-0 text-[var(--ok)]" />
         {upgradeMode ? "媒体库已有，将按需洗版" : "媒体库已有，不会重复下载"}
       </p>}
     </div>
@@ -710,7 +710,7 @@ export function SubscribeDialog({
             </div>
           )}
           {error && (
-            <p className="mt-4 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-ui leading-6 text-red-200">
+            <p className="mt-4 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-ui leading-6 text-[var(--danger)]">
               {error}
             </p>
           )}
@@ -790,7 +790,7 @@ export function SubscribeDialog({
                   type="button"
                   disabled={busy}
                   onClick={unsubscribe}
-                  className="h-9 rounded-full border border-red-400/30 bg-red-500/10 px-4 text-ui font-medium text-red-200 transition hover:bg-red-500/20 disabled:opacity-50"
+                  className="h-9 rounded-full border border-[var(--danger)]/30 bg-[var(--danger)]/10 px-4 text-ui font-medium text-[var(--danger)] transition hover:bg-[var(--danger)]/20 disabled:opacity-50"
                 >
                   取消订阅
                 </button>
@@ -918,5 +918,5 @@ export function SeasonChoiceRow({
 /** 入库配置有问题时直接提示，不把下载路径放进日常订阅表单。 */
 function DispatchPreviewNote({ preview }: { preview: DispatchPreview }) {
   if (preview.ok || !preview.warning) return null;
-  return <p role="alert" className="rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-caption leading-relaxed text-amber-200">{preview.warning}</p>;
+  return <p role="alert" className="rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3 py-2 text-caption leading-relaxed text-[var(--warn)]">{preview.warning}</p>;
 }

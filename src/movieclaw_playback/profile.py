@@ -59,6 +59,7 @@ def media_profile_from_file(
         dv_bl_compatible=file.dv_bl_compatible,
         color_space=file.color_space,
         bit_depth=file.bit_depth,
+        bit_rate_bps=file.bit_rate,
         duration_ms=(file.duration_seconds * 1000) if file.duration_seconds else None,
         audio_tracks=_audio_tracks(file, audio_choice),
         subtitle_tracks=_subtitle_tracks(file, subtitle_choice),

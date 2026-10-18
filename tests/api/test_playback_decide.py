@@ -33,6 +33,14 @@ CHROME = ClientCapability(
     containers=frozenset({"mp4", "hls-fmp4"}),
 )
 
+# HEVC 也能解的浏览器（iPhone / 带 HEVC 硬解的 Chrome）：预转省流档（HEVC）对它
+# 只需重封装不重编码——这是外网降档时产物能胜出的前提
+HEVC_OK = ClientCapability(
+    video=(VideoSupport("h264"), VideoSupport("hevc")),
+    audio=(AudioSupport("aac"),),
+    containers=frozenset({"mp4", "hls-fmp4"}),
+)
+
 
 def test_capability_from_request_preserves_native_hls_flag():
     capability = playback_plan.capability_from_request(ClientCapabilityIn(native_hls=True))
@@ -67,7 +75,14 @@ def stub_probes(monkeypatch):
     monkeypatch.setattr(playback_plan, "hardware_available", lambda: False)
 
 
-def _file(library_id: int, item_id: int, *, codec: str, resolution: str) -> LibraryFile:
+def _file(
+    library_id: int,
+    item_id: int,
+    *,
+    codec: str,
+    resolution: str,
+    bit_rate: int | None = None,
+) -> LibraryFile:
     return LibraryFile(
         library_id=library_id,
         media_item_id=item_id,
@@ -81,6 +96,7 @@ def _file(library_id: int, item_id: int, *, codec: str, resolution: str) -> Libr
         video_codec=codec,
         resolution=resolution,
         duration_seconds=5400,
+        bit_rate=bit_rate,
         audio_streams=[{"codec": "aac", "channels": 6, "default": True}],
     )
 
@@ -107,6 +123,45 @@ async def test_prefers_direct_playable_version_over_higher_resolution(db):
     assert isinstance(decision, PlaybackPlan)
     assert decision.tier is PlaybackTier.REMUX
     assert decision.file_id == hd.id
+
+
+async def test_uplink_step_down_lets_preload_artifact_win(db):
+    """外网降档把原片压到转码档（要现场重编码）时，装得下家宽上行的预转省流档
+    以重封装档（不重编码）胜出——外网用户自动拿到预转产物，不用等现场转。
+    产物在候选集里本来就是一行普通台账（state=in_place），不用专门接线。"""
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=["/movies"]
+        )
+        item = MediaItem(kind="movie", tmdb_id=2, title="大片", original_title="Blockbuster")
+        session.add(item)
+        await session.flush()
+        original = _file(
+            library.id, item.id, codec="hevc", resolution="2160p", bit_rate=54_000_000
+        )
+        artifact = _file(
+            library.id, item.id, codec="hevc", resolution="1080p", bit_rate=1_500_000
+        )
+        session.add_all([original, artifact])
+        await session.commit()
+        await session.refresh(artifact)
+
+        wan = await playback_plan.decide_for_files(
+            [original, artifact], HEVC_OK, can_self_enable=True, uplink_bps=30_000_000
+        )
+        lan = await playback_plan.decide_for_files(
+            [original, artifact], HEVC_OK, can_self_enable=True
+        )
+
+    # 外网：原片超上行被强制转码（档 4，桩固定无硬件），省流档重封装（档 1）胜出
+    assert isinstance(wan, PlaybackPlan)
+    assert wan.tier is PlaybackTier.REMUX
+    assert wan.file_id == artifact.id
+    # 内网：没有上行预算，原片重封装档与产物同档、分辨率更高——4K 原片赢，
+    # 省流档绝不劫持局域网画质
+    assert isinstance(lan, PlaybackPlan)
+    assert lan.tier is PlaybackTier.REMUX
+    assert lan.file_id == original.id
 
 
 async def test_file_outside_visible_libraries_is_not_found(db):
@@ -256,11 +311,11 @@ def test_best_prefers_higher_resolution_at_equal_tier():
         )
 
     # 1080p 在前、4K 在后：不看高度的话会取到先来的 1080p
-    picked = _best([(plan(1), 1080), (plan(2), 2160)])
+    picked = _best([(plan(1), 1080, None), (plan(2), 2160, None)])
     assert picked.file_id == 2
 
     # 高度未知的候选排最后，结果保持确定
-    picked = _best([(plan(3), None), (plan(4), 1080)])
+    picked = _best([(plan(3), None, None), (plan(4), 1080, None)])
     assert picked.file_id == 4
 
     # 档位仍然优先于分辨率：能直通的 1080p 胜过要转码的 4K
@@ -271,7 +326,7 @@ def test_best_prefers_higher_resolution_at_equal_tier():
         video=VideoPlan(action="transcode", codec="h264"),
         audio=AudioPlan(action="copy"),
     )
-    picked = _best([(transcode_4k, 2160), (plan(6), 1080)])
+    picked = _best([(transcode_4k, 2160, None), (plan(6), 1080, None)])
     assert picked.file_id == 6
 
 

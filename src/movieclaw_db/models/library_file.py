@@ -167,6 +167,16 @@ class LibraryFile(TimestampMixin, table=True):
         return cls.state == FileState.IN_PLACE
 
     @classmethod
+    def native(cls):
+        """**原生文件**口径：排除预转码产物等派生行。
+
+        洗版比较、重复检测、"这部片有几个版本"的质量判断只看原生文件——
+        便携版本是派生物，把 4K 和它的 1080p 便携版判成重复/待洗是错的；
+        播放枚举与详情页文件列表**不**用这一条（版本选择要能看到便携版）。
+        """
+        return cls.derives_from_file_id.is_(None)  # type: ignore[union-attr]
+
+    @classmethod
     def on_shelf(cls):
         """**在架**口径：没进回收站的行都算（在位 + 失联）。
 
@@ -455,6 +465,28 @@ class LibraryFile(TimestampMixin, table=True):
         default=None,
         sa_column=Column(_NullableJson, nullable=True),
         description="待识别文件的 TMDB 候选清单；NULL=没有候选可选",
+    )
+
+    # -- 派生资产身份（docs/design/preload-transcode.md §6）------------------
+    # 预转码产物登记为独立的 library_file 行（播放版本枚举/详情页零改动），
+    # 靠这三列识别"这是哪个源派生的便携版本"。源行删除时 ondelete=CASCADE
+    # 级联删产物行，删产物文件由服务层在删行前处理。
+    derives_from_file_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("library_file.id", ondelete="CASCADE"),
+            nullable=True,
+            index=True,
+        ),
+        description="派生来源文件 id；NULL=原生文件（非派生）",
+    )
+    # 派生说明 JSON：{"kind": "preload", "preset_id": "portable_1080p",
+    # "task_id": 12, "generated_at": ...}。NULL=非派生行
+    derivation: dict | None = Field(
+        default=None,
+        sa_column=Column(_NullableJson, nullable=True),
+        description="派生元数据 {kind,preset_id,task_id}；NULL=原生文件",
     )
 
     # -- 身份对账（识别器升级后的存量复核）----------------------------------

@@ -511,15 +511,16 @@ def test_nvenc_with_probed_tonemap_stays_on_gpu(probed_nvenc_tonemap):
     assert vf.count("bt709") >= 3  # 三件套一项都不能少（issue #331）
     assert pair(argv, "-hwaccel") == "cuda"
     assert pair(argv, "-hwaccel_output_format") == "cuda"  # 全程硬件帧
-    assert "scale_cuda=format=yuv420p:w=-2:h=1080" in vf
+    assert "scale_cuda=format=yuv420p" in vf
+    assert "h=min(1080" in vf  # T3 后宽度走 min(4096,…) 表达式（NVENC 宽上限）
 
 
 @pytest.mark.parametrize(
     "backend, expected",
     [
-        ("vaapi", "scale_vaapi=format=nv12:w=-2:h=1080"),
-        ("qsv", "scale_qsv=format=nv12:w=-2:h=1080"),
-        ("nvenc", "scale_cuda=format=yuv420p:w=-2:h=1080"),
+        ("vaapi", "scale_vaapi=format=nv12:w=min(4096"),
+        ("qsv", "scale_qsv=format=nv12:w=min(4096"),
+        ("nvenc", "scale_cuda=format=yuv420p:w=min(4096"),
     ],
 )
 def test_hardware_scale_pins_eight_bit_output(backend, expected):
@@ -717,6 +718,29 @@ def test_output_color_tags_only_when_certain(name, video_kw, tagged):
     assert (pair(argv, "-color_range") == "tv") is tagged, name
 
 
+@pytest.mark.parametrize("backend", ["vaapi", "qsv"])
+def test_hw_frame_tonemap_chain_gets_no_output_color_tags(backend):
+    """VAAPI/QSV 硬件帧链不写输出侧色彩三件套。
+
+    ffmpeg 7.1 在首帧发现源色彩属性（BT.2020/PQ）与声明输出不符时重建滤镜
+    图，重建插入的软件 auto_scale 接不上硬件帧，整链以
+    「Impossible to convert between the formats …」即刻崩掉（4K HDR10 + VAAPI
+    低功耗真机复现，2026-10-15）。输出色彩由滤镜内的原生 tone-map 声明
+    （tonemap_vaapi 的 format/t/m/p、vpp_qsv 的 out_color_*），不靠输出标签。
+    """
+    video = VideoPlan(
+        action="transcode", codec="hevc", height=2160,
+        tone_map=True, source_color="BT.2020", source_bit_depth=10,
+    )
+    argv = argv_of(plan(PlaybackTier.HARDWARE_TRANSCODE, video=video), hw_backend=backend)
+    for flag in ("-colorspace", "-color_primaries", "-color_trc", "-color_range"):
+        assert flag not in argv
+    # 软件档同一计划不受影响：帧在系统内存里，标签照写
+    soft_argv = argv_of(plan(PlaybackTier.SOFTWARE_TRANSCODE, video=video))
+    assert pair(soft_argv, "-colorspace") == "bt709"
+    assert pair(soft_argv, "-color_range") == "tv"
+
+
 def test_copy_path_gets_no_color_tags():
     """直通/重封装不解码画面，写色彩标签既没依据也可能覆盖源的正确标签。"""
     argv = argv_of(plan(PlaybackTier.REMUX))
@@ -855,6 +879,27 @@ def test_videotoolbox_transcode_lets_encoder_choose_level_for_4k():
     assert pair(argv, "-pix_fmt") == "yuv420p"
 
 
+def test_nvenc_transcode_lets_encoder_choose_level():
+    """NVENC 与 VideoToolbox 同罪：level 4.1 对宽银幕是硬校验。
+
+    level 4.1 上限 8192 宏块；宽银幕缩到 1080p 高后宽出界（坠落2 3828×2058
+    → 2010×1080 = 8568 宏块），NVENC 在 InitializeEncoder 直接以
+    "Invalid Level" 拒绝创建编码器，整部片起不了播（2026-10-15 真机）。
+    level 交给编码器按实际分辨率选（1080p 宽银幕 4.2、4K 5.1），profile 仍钉死。
+    """
+    argv = argv_of(
+        plan(
+            PlaybackTier.HARDWARE_TRANSCODE,
+            video=VideoPlan(action="transcode", codec="h264", height=1080),
+        ),
+        hw_backend="nvenc",
+    )
+
+    assert pair(argv, "-profile:v") == "high"
+    assert "-level:v" not in argv
+    assert pair(argv, "-c:v") == "h264_nvenc"
+
+
 def test_software_h264_transcode_keeps_level_4_1():
     argv = argv_of(
         plan(
@@ -986,7 +1031,8 @@ def test_no_burn_keeps_plain_vf_path():
     )
     assert "-filter_complex" not in argv
     assert "0:v:0" in [argv[i + 1] for i, a in enumerate(argv) if a == "-map"]
-    assert "scale_vaapi=format=nv12:w=-2:h=720" in " ".join(argv)
+    assert "scale_vaapi=format=nv12:w=min(4096" in " ".join(argv)
+    assert "h=min(720" in " ".join(argv)
 
 
 # ---------------------------------------------------------------------------

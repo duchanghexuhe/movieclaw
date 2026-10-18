@@ -1814,3 +1814,180 @@ def test_remux_for_a_dolby_vision_decoder_keeps_the_record():
     # 设备解不了杜比视界、只放基础层的不保留记录
     p8 = _replace(dv(8, True), audio_tracks=(DTS_51,))
     assert decide_playback(p8, HDR10_TV, WITH_GPU).video.dolby_vision is None
+
+
+# ---------------------------------------------------------------------------
+# 外网前置降档：家宽上行装不下源片码率 → 起播前直接转码（不弹提示，用户拍板）
+# ---------------------------------------------------------------------------
+
+
+def test_uplink_too_small_forces_transcode():
+    """外网会话源片码率超出家宽上行：直通档换成转码并透出 uplink_forced（网页端弹窗确认用）。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=5_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan), f"期望出计划，实际 {decision}"
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    assert decision.video.action == "transcode"
+    assert "家宽上行" in decision.reason, decision.reason
+    assert decision.uplink_forced is True
+
+
+def test_wide_uplink_still_hits_external_ceiling():
+    """上行再宽也有天花板：几十 G 的原盘不原样推给手机（先爆的是流量费不是线路）。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=100_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    assert "最高 1080p" in decision.reason, decision.reason
+    assert decision.uplink_forced is True
+    # 视频计划目标不超过 1080p 档
+    assert (decision.video.height or 0) <= 1080
+
+
+def test_source_within_ceiling_keeps_direct_play():
+    """源片码率本来就在天花板内（≤6M）：直连——转码不会更省流量还白烧 CPU。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=5_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=100_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.uplink_forced is False
+
+
+def test_below_floor_does_not_step_down():
+    """上行窄到连 480p（1.5M）都装不下：降档不参与——给了也必卡，交给卡顿提示兜底。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=1_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.uplink_forced is False
+
+
+def test_uplink_that_fits_keeps_direct_play():
+    """源片码率装得下：照常直通——不因为「在外网」就降档。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=6_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=30_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_no_uplink_budget_keeps_direct_play():
+    """内网 / 未配置上行（预算 None）：行为与从前完全一致。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_unknown_source_bitrate_keeps_direct_play():
+    """源片码率未知（老台账没探到）：无从比较，按「不降档」诚实处理。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=None), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=30_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_uplink_forces_transcode_over_audio_only_tier():
+    """HEVC 可直通、音频要单转的片：上行装不下时视频也不再 copy——
+    音频单转省下的带宽远不如视频降档，两件事不混。"""
+    decision = decide_playback(
+        media(video_codec="hevc", audio_tracks=(TRUEHD_71,), bit_rate_bps=54_000_000),
+        SAFARI_MAC, WITH_GPU, uplink_bps=30_000_000,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+
+
+def test_upline_budget_skips_keyframe_probe():
+    """上行把直通档前置换成转码后，视频不再 copy——关键帧采样（慢存储 IO）直接跳过。"""
+    # MKV 常规走 remux（视频仍 copy，要采样）；上行装不下时视频被强制转码，采样跳过
+    assert not needs_keyframe_probe(
+        media(bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        uplink_bps=30_000_000,
+    )
+    # 没有上行预算时照旧要采样
+    assert needs_keyframe_probe(
+        media(bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 外网音轨省流量：外网 + 视频转码 → 音轨固定 AAC 双声道（2026-10-17 外网
+# 480p 卡顿治理：E-AC-3 直通 448-640 kbps 在丢包线路上是纯负担，转 AAC 后
+# 总码率从 2.0M 降到 ~1.76M，给 4.7M 实测管道留出余量）
+# ---------------------------------------------------------------------------
+
+
+def test_external_transcode_pins_heavy_audio_to_aac_stereo():
+    """外网 + 视频转码：可直通的多声道音轨固定转 AAC-LC 双声道。"""
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+        external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.video.action == "transcode"
+    assert decision.audio.action == "transcode"
+    assert decision.audio.codec == "aac"
+    assert decision.audio.channels == 2
+    assert decision.audio.downmix is True
+    assert "外网" in decision.reason, decision.reason
+
+
+def test_external_capped_480p_also_pins_audio():
+    """手选画质上限的外网会话同样生效——恰是最需要省流量的组合。
+
+    手选上限时上行预算不传（max_height 优先），外网标识必须独立生效。
+    """
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+        max_height=480, external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.codec == "aac"
+    assert decision.audio.channels == 2
+
+
+def test_lan_transcode_keeps_multichannel_audio():
+    """内网会话不受影响：同样的片，转码时多声道照旧保留（TrueHD 转 E-AC-3）。"""
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.codec == "eac3"
+    assert (decision.audio.channels or 2) > 2
+
+
+def test_external_video_copy_keeps_audio_plan_untouched():
+    """外网但视频能直通（remux / 音频单转档）：音轨计划不因外网改写——
+    省流量规则只在视频本来就要转码的会话生效。"""
+    decision = decide_playback(
+        media(video_codec="hevc", audio_tracks=(TRUEHD_71,)), SAFARI_MAC, WITH_GPU,
+        external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.video.action == "copy"
+    assert decision.audio.codec == "eac3"
+
+
+def test_external_multichannel_aac_also_pins_to_stereo():
+    """外网 + 转码时 AAC 5.1 也降双声道：声道数是负担，编码不是。"""
+    decision = decide_playback(
+        media(video_codec="vc1", audio_tracks=(AAC_51,)), CHROME_NO_HEVC, WITH_GPU,
+        external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.codec == "aac"
+    assert decision.audio.channels == 2
+    assert decision.audio.downmix is True

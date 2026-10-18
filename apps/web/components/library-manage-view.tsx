@@ -526,7 +526,7 @@ export function LibraryManageView() {
       {tab === "shares" && <LibraryShares onCountChange={setShareCount} />}
 
       {tab === "libraries" && failed && libraries !== null && (
-        <div className={`page-inset-mx mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub text-amber-200`}>
+        <div className={`page-inset-mx mt-4 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub text-[var(--warn)]`}>
           与后端通信失败，正在自动重试；下方显示的是最近一次成功加载的数据
         </div>
       )}
@@ -612,7 +612,7 @@ export function LibraryManageView() {
           {warnings.map((w) => (
             <div
               key={w}
-              className={`page-inset-mx mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-relaxed text-amber-200`}
+              className={`page-inset-mx mt-4 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub leading-relaxed text-[var(--warn)]`}
             >
               {w}
             </div>

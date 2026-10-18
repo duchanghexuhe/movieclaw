@@ -104,6 +104,25 @@ def is_identifiable(host: str) -> bool:
     return text not in default_gateways()
 
 
+def is_lan_address(host: str) -> bool:
+    """这个来源是不是内网（RFC1918 / 环回 / 链路本地 / IPv6 站内段）。
+
+    「外网前置降档」的判据：内网来源走的是局域网速度，永远直通、不做线路
+    适配；公网来源才按家宽上行收码率。用标准库的 ``is_private``（Python 3.12
+    实测：CGNAT 段如 Tailscale 的 100.64/10 算公网，按外网降档处理——Tailscale
+    中继时本来就慢，直连够快时误降的代价也只是画质，方向可接受）。
+    """
+    text = host.strip()
+    if not text:
+        return False
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        # 不是合法 IP（Unix socket 之类）就没法拿来判内外网
+        return False
+    return address.is_private
+
+
 def client_address(request: Request) -> str:
     """返回可用于区分设备的客户端地址；判定为不可信时返回空串。
 
@@ -118,4 +137,4 @@ def client_address(request: Request) -> str:
     return host if is_identifiable(host) else ""
 
 
-__all__ = ["client_address", "default_gateways", "is_identifiable"]
+__all__ = ["client_address", "default_gateways", "is_identifiable", "is_lan_address"]

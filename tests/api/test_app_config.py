@@ -393,3 +393,37 @@ def test_rejected_port_is_surfaced_and_cleared_on_save(client, managed, no_resta
     client.put("/api/v1/app/port", json={"port": 9000})
     assert not rejected.exists()
     assert client.get("/api/v1/app/config").json()["data"]["web_port_rejected"] is None
+
+
+# ---------------------------------------------------------------------------
+# 家宽上行带宽（外网前置降档的预算）
+# ---------------------------------------------------------------------------
+
+
+def test_uplink_mbps_roundtrip(client):
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 30})
+    assert resp.status_code == 200
+    assert resp.json()["data"]["uplink_mbps"] == 30
+    assert client.get("/api/v1/app/config").json()["data"]["uplink_mbps"] == 30
+
+
+def test_uplink_mbps_cleared_by_explicit_null(client):
+    client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 30})
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": None})
+    assert resp.status_code == 200
+    assert resp.json()["data"]["uplink_mbps"] is None
+
+
+def test_uplink_mbps_rejects_out_of_range(client):
+    for bad in (0, -5, 10_001):
+        resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": bad})
+        assert resp.status_code == 422, bad
+
+
+def test_url_only_save_overwrites_uplink_per_whole_replace_semantics(client):
+    """配置域是整体覆盖语义：只传 external_url 的调用按默认值处理——前端保存时
+    必须把没动的字段带回当前值（external-access-section 的 commit）。"""
+    client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 30})
+    resp = client.put("/api/v1/app/config", json={"external_url": "http://192.168.1.10:3000"})
+    assert resp.status_code == 200
+    assert resp.json()["data"]["uplink_mbps"] is None

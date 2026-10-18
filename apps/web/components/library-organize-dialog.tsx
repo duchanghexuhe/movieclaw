@@ -201,7 +201,7 @@ export function LibraryOrganizeDialog({
         )}
         {phase === "failed" && (
           <div className="flex flex-col items-center gap-4 px-6 py-14">
-            <p className="max-w-md text-center text-ui leading-6 text-red-200">{error}</p>
+            <p className="max-w-md text-center text-ui leading-6 text-[var(--danger)]">{error}</p>
             <button type="button" onClick={onClose} className="btn-glass px-4 py-2 text-ui font-medium">
               关闭
             </button>
@@ -337,7 +337,7 @@ export function LibraryOrganizeDialog({
             {/* —— 确认区 —— */}
             <div className="border-t border-white/[0.08] px-6 py-4">
               {error && (
-                <p className="mb-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2 text-sub text-red-200">
+                <p className="mb-3 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2 text-sub text-[var(--danger)]">
                   {error}
                 </p>
               )}

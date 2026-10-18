@@ -235,25 +235,12 @@ def test_native_workers_config_and_real_playback(remote_stack, tmp_path):
     status_url = "/api/v1/transcode-worker/status"
     status = client.get(status_url).json()["data"]
     first = next(w for w in status["workers"] if w["worker_id"] == "e2e-mac-0")
-    endpoint = f"/api/v1/transcode-worker/devices/{first['device_id']}/config"
 
-    def core_limit():
-        for line in reversed((tmp_path / "worker-0.log").read_text().splitlines()):
-            if line.startswith('{"status":'):
-                return json.loads(line)["status"]["_0"]["maxJobs"]
-        return None
-
+    # v2 统一调度：并发只在 Worker 本机配置，服务端不再保存/下发任何上限
+    #（旧版这里会 PUT devices/{id}/config 并断言 device_limits 回读）
     assert first["hardware"]["cpu_cores"] > 0
     assert first["hardware"]["memory_bytes"] > 0
-    assert client.put(endpoint, json={"max_jobs": 3}).status_code == 200
-    wait_for(lambda: core_limit() == 3)
-    workers[0].stdin.write('{"setMaxJobs":{"_0":2}}\n')
-    workers[0].stdin.flush()
-    wait_for(
-        lambda: (
-            client.get(status_url).json()["data"]["device_limits"][f"ld-{first['device_id']}"] == 2
-        )
-    )
+    assert "device_limits" not in status
     wait_for(
         lambda: all(w["load"] is not None for w in client.get(status_url).json()["data"]["workers"])
     )
@@ -342,9 +329,8 @@ def test_native_workers_config_and_real_playback(remote_stack, tmp_path):
             owners.append(diagnostics["worker_id"])
         assert len(set(owners)) == 2, owners
         assert owners.count("e2e-mac-0") == 2, owners
-        # 三位观众占满 2+1 个槽位；网页调低上限不能停止已接的两路任务。
-        assert client.put(endpoint, json={"max_jobs": 1}).status_code == 200
-        wait_for(lambda: core_limit() == 1)
+        # 三位观众占满 2+1 个槽位；v2 起并发只在 Worker 本机配置，
+        # 服务端不再保存/下发任何上限（旧版在此 PUT devices config）。
         lowered = client.get(status_url).json()["data"]["workers"]
         assert next(w for w in lowered if w["worker_id"] == "e2e-mac-0")["active_jobs"] == 2
         for data in sessions:
@@ -374,8 +360,6 @@ def test_native_workers_config_and_real_playback(remote_stack, tmp_path):
                 .status_code
                 == 200
             )
-        assert client.put(endpoint, json={"max_jobs": 2}).status_code == 200
-        wait_for(lambda: core_limit() == 2)
         print(f"real native VideoToolbox E2E session creation ms: {startup}")
     finally:
         for data in sessions:
@@ -388,14 +372,15 @@ def test_native_workers_config_and_real_playback(remote_stack, tmp_path):
     wait_for(
         lambda: all(w["active_jobs"] == 0 for w in client.get(status_url).json()["data"]["workers"])
     )
-    # 服务端重启后，内核自动重连并重新取得持久化设置。
+    # 服务端重启后，内核自动重连；并发上限以 Worker 本机配置为准，服务端
+    # 不再有 device_limits 一说
     server.terminate()
     server.wait(timeout=10)
     start_server()
     wait_for(lambda: len(client.get(status_url).json()["data"]["workers"]) == 2)
     status = client.get(status_url).json()["data"]
-    assert status["device_limits"][f"ld-{first['device_id']}"] == 2
-    assert next(w for w in status["workers"] if w["worker_id"] == "e2e-mac-0")["max_jobs"] == 2
+    assert "device_limits" not in status
+    assert next(w for w in status["workers"] if w["worker_id"] == "e2e-mac-0")["max_jobs"] > 0
 
 
 def test_real_videotoolbox_paths_compare(tmp_path):

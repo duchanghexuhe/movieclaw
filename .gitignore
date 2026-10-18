@@ -72,3 +72,17 @@ cli/LICENSE
 # CI 都现场导出；本地缺失时服务端从代码现算，编译 Go CLI 前跑一次该脚本。
 src/movieclaw_api/data/spec.json
 cli/internal/spec/data/spec.json
+worker/preload_worker.json
+worker/caps.json
+worker/work/
+# 本机开发/联调的运行期产物：remote_worker(.py/.json/.caps) 是旧草稿与本地
+# Worker 配置（json 含设备 token，绝不入库），s7.json 是接口调试转储。
+worker/remote_worker.json
+worker/remote_caps.json
+worker/remote_worker.py
+worker/realtime-cli.log
+apps/web/s7.json
+
+# worker 运行期日志
+worker/*.err.log
+worker/*.log

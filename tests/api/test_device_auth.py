@@ -417,6 +417,12 @@ def test_transcoder_token_is_rejected_by_every_business_route(client: TestClient
     allowed = _PUBLIC_ALLOWLIST | {
         ("GET", "/api/v1/auth/devices/current"),
         ("DELETE", "/api/v1/auth/devices/current"),
+        # 预转码 Worker 控制面（preload-transcode.md §7）：与实时转码的
+        # /transcode-worker/ws 同构，本来就是转码凭证专属端点
+        ("POST", "/api/v1/preload-worker/claim"),
+        ("POST", "/api/v1/preload-worker/tasks/{task_id}/progress"),
+        ("POST", "/api/v1/preload-worker/tasks/{task_id}/complete"),
+        ("POST", "/api/v1/preload-worker/tasks/{task_id}/fail"),
     }
     # 同 test_auth.py：spec 直接取自应用，不依赖 /openapi.json 是否对外开放（生产默认关闭）
     openapi = client.app.openapi()
@@ -740,104 +746,72 @@ def test_worker_messages_refresh_last_seen(client: TestClient) -> None:
     assert not device["last_seen_at"].startswith(stale.isoformat()[:16])
 
 
-def test_worker_limits_sync_web_and_mac_persist_across_rename_and_reconnect(client):
-    """HTTP 网页修改 → WS 推送；Mac 修改 → HTTP 读取；重连不让本机旧值覆盖。"""
+def test_worker_declared_concurrency_is_taken_as_is(client, monkeypatch):
+    """v2：并发只在 Worker 本机配置——hello 报多少注册表就记多少，服务端不再保存/下发上限。"""
     from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
-    from movieclaw_api.settings.remote_transcode import WorkerLimitsSetting
-    from movieclaw_api.settings.store import get_setting_store
 
     token = _pair(client, client_type="worker", name="mac")
-    device_id = int(_paired_devices(client)[0]["id"].removeprefix("ld-"))
-    endpoint = f"/api/v1/transcode-worker/devices/{device_id}/config"
     assert client.put("/api/v1/transcode-worker/config", json={"enabled": True}).status_code == 200
 
-    def hello(name, maximum):
+    def hello(name, maximum, roles):
         return {
             "type": "worker.hello",
-            "protocol_version": 1,
+            "protocol_version": 2,
             "worker_id": name,
             "capabilities": {
                 "server_config": True,
                 "max_jobs": maximum,
+                "roles": roles,
                 "backends": ["videotoolbox"],
                 "encoders": ["h264_videotoolbox"],
             },
         }
 
     with client.websocket_connect("/api/v1/transcode-worker/ws", headers=_bearer(token)) as ws:
-        ws.send_json(hello("mac", 3))
-        assert ws.receive_json()["max_jobs"] == 3
-        # 保留正在执行的槽位：降低上限不能打断播放。
-        registry = get_remote_worker_registry()
-        registry.reserve("running-a", backend="videotoolbox")
-        registry.reserve("running-b", backend="videotoolbox")
-        assert client.put(endpoint, json={"max_jobs": 1}).status_code == 200
-        assert ws.receive_json() == {"type": "worker.config", "max_jobs": 1}
+        ws.send_json(hello("mac", 3, ["realtime", "preload"]))
+        accepted = ws.receive_json()
+        assert accepted["type"] == "worker.accepted"
+        assert accepted["max_jobs"] == 3  # 照单全收，不再钳到服务端存的上限
         status = client.get("/api/v1/transcode-worker/status").json()["data"]
-        assert status["workers"][0]["active_jobs"] == 2
-        assert status["workers"][0]["max_jobs"] == 1
-        ws.send_json({"type": "worker.configure", "max_jobs": 4})
-        assert ws.receive_json() == {"type": "worker.config", "max_jobs": 4}
-        assert (
-            client.get("/api/v1/transcode-worker/status").json()["data"]["device_limits"][
-                f"ld-{device_id}"
-            ]
-            == 4
+        worker = status["workers"][0]
+        assert worker["max_jobs"] == 3
+        assert worker["roles"] == ["preload", "realtime"]
+        assert "device_limits" not in status  # 服务端并发配置整条链已废弃
+
+        # 旧版 Worker 上行的 worker.configure 消息被静默丢弃（不写库、不回错误）
+        from movieclaw_api.settings.store import get_setting_store
+
+        async def unexpected_write(_):
+            pytest.fail("v2 起服务端不再保存任何并发配置")
+
+        monkeypatch.setattr(get_setting_store(), "set", unexpected_write)
+        registry = get_remote_worker_registry()
+        connection = registry._workers.get("mac")
+        client.portal.call(
+            registry.handle_message,
+            connection,
+            {"type": "worker.configure", "max_jobs": 4},
         )
-        ws.send_json({"type": "worker.configure", "max_jobs": 99})
-        assert ws.receive_json()["type"] == "worker.config.error"
-        registry.release_job("running-a")
-        registry.release_job("running-b")
-
-    # 失效缓存后从数据库重读，确认不是只更新了运行时状态。
-    get_setting_store().invalidate("playback.worker_limits")
-    stored = client.portal.call(get_setting_store().get, WorkerLimitsSetting)
-    assert stored.limits[str(device_id)] == 4
-    with client.websocket_connect("/api/v1/transcode-worker/ws", headers=_bearer(token)) as ws:
-        ws.send_json(hello("renamed-mac", 1))
-        assert ws.receive_json()["max_jobs"] == 4
-    # 离线修改；下次连接同步服务器新值。
-    assert client.put(endpoint, json={"max_jobs": 2}).status_code == 200
-    with client.websocket_connect("/api/v1/transcode-worker/ws", headers=_bearer(token)) as ws:
-        ws.send_json(hello("renamed-mac", 1))
-        assert ws.receive_json()["max_jobs"] == 2
+        status_after = client.get("/api/v1/transcode-worker/status").json()["data"]
+        assert status_after["workers"][0]["max_jobs"] == 3  # 原值不动
 
 
-def test_worker_config_is_scoped_and_telemetry_does_not_write_settings(client, monkeypatch):
+def test_worker_telemetry_does_not_write_settings(client, monkeypatch):
+    """v2 收编原「配置隔离」测试仍有效的部分：心跳遥测不写配置数据库。"""
     from movieclaw_api.settings.store import get_setting_store
 
-    tokens = [_pair(client, client_type="worker", name=f"mac-{i}") for i in range(2)]
-    devices = _paired_devices(client)
-    ids = [
-        int(next(d["id"] for d in devices if d["name"] == f"mac-{i}").removeprefix("ld-"))
-        for i in range(2)
-    ]
+    token = _pair(client, client_type="worker", name="mac-0")
     assert client.put("/api/v1/transcode-worker/config", json={"enabled": True}).status_code == 200
-    with client.websocket_connect("/api/v1/transcode-worker/ws", headers=_bearer(tokens[0])) as ws:
+    with client.websocket_connect("/api/v1/transcode-worker/ws", headers=_bearer(token)) as ws:
         ws.send_json(
             {
                 "type": "worker.hello",
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "worker_id": "mac-0",
                 "capabilities": {"server_config": True, "max_jobs": 1},
             }
         )
         assert ws.receive_json()["type"] == "worker.accepted"
-        # 转码凭证不能通过管理员 HTTP 接口修改其他设备。
-        cookies = dict(client.cookies)
-        client.cookies.clear()
-        response = client.put(
-            f"/api/v1/transcode-worker/devices/{ids[1]}/config",
-            headers=_bearer(tokens[0]),
-            json={"max_jobs": 4},
-        )
-        client.cookies.update(cookies)
-        assert response.status_code in (401, 403)
-        ws.send_json({"type": "worker.configure", "device_id": ids[1], "max_jobs": 2})
-        assert ws.receive_json()["max_jobs"] == 2
-        limits = client.get("/api/v1/transcode-worker/status").json()["data"]["device_limits"]
-        assert limits[f"ld-{ids[0]}"] == 2
-        assert f"ld-{ids[1]}" not in limits
 
         async def unexpected_write(_):
             pytest.fail("统计上报不应写配置数据库")
@@ -859,16 +833,3 @@ def test_worker_config_is_scoped_and_telemetry_does_not_write_settings(client, m
         worker = client.get("/api/v1/transcode-worker/status").json()["data"]["workers"][0]
         assert worker["load"]["cpu"] == pytest.approx(0.3)
         assert worker["load"]["memory_used_bytes"] == 1024
-
-
-@pytest.mark.parametrize("value", [0, 5, True, "2", 1.5])
-def test_worker_limit_http_rejects_invalid_values(client, value):
-    token = _pair(client, client_type="worker", name="mac")
-    assert token
-    device_id = int(_paired_devices(client)[0]["id"].removeprefix("ld-"))
-    assert (
-        client.put(
-            f"/api/v1/transcode-worker/devices/{device_id}/config", json={"max_jobs": value}
-        ).status_code
-        == 422
-    )

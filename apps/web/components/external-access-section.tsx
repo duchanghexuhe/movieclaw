@@ -28,6 +28,7 @@ import {
  * 网络相关的配置（代理 / 镜像 / 外部访问）从此只有一个家：
  *   - 外部访问地址：从网络上能访问到本应用的完整地址，保存即生效（纯落库数据，
  *     供生成通知链接等绝对 URL 的场景使用）；
+ *   - 家宽上行带宽：外网播放的前置降档预算（选填），失焦即存；
  *   - 对外端口：前端实际监听的端口，改它要全量重启，且改完当前页面的地址多半
  *     就打不开了——因此它是本组唯一不走「失焦即存」的字段。
  *
@@ -50,6 +51,7 @@ export function ExternalAccessSection() {
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [urlError, setUrlError] = useState<string | null>(null);
+  const [uplinkError, setUplinkError] = useState<string | null>(null);
   // 输入框草稿是否为空：有输入时收起框内的「使用」按钮，避免误点覆盖手填内容
   const [draftEmpty, setDraftEmpty] = useState(true);
   const [portPhase, setPortPhase] = useState<PortPhase>("idle");
@@ -79,12 +81,14 @@ export function ExternalAccessSection() {
 
   /** 落库一份完整配置（失焦触发），错误信息中文回显在对应字段下方。 */
   const commit = useCallback(
-    (patch: Partial<Pick<AppConfigView, "external_url">>) => {
+    (patch: Partial<Pick<AppConfigView, "external_url" | "uplink_mbps">>) => {
       if (!view) return;
       setSaveState("saving");
       setSaveError(null);
       saveAppConfig({
         external_url: patch.external_url ?? view.external_url,
+        // 整体覆盖语义：没动的字段要带回当前值，显式传 null（in 判断）才是清除
+        uplink_mbps: "uplink_mbps" in patch ? (patch.uplink_mbps ?? null) : (view.uplink_mbps ?? null),
       })
         .then((v) => {
           setView(v);
@@ -108,6 +112,21 @@ export function ExternalAccessSection() {
     }
     setUrlError(null);
     commit({ external_url: url });
+  };
+
+  const handleUplinkBlur = (raw: string) => {
+    const text = raw.trim();
+    if (!text) {
+      setUplinkError(null);
+      commit({ uplink_mbps: null });
+      return;
+    }
+    if (!/^\d+$/.test(text) || Number(text) < 1 || Number(text) > 10000) {
+      setUplinkError("需是 1~10000 的整数（Mbps），清空 = 不启用");
+      return;
+    }
+    setUplinkError(null);
+    commit({ uplink_mbps: Number(text) });
   };
 
   /** 校验端口草稿并进入二次确认（真正提交在 doSavePort）。 */
@@ -244,6 +263,35 @@ export function ExternalAccessSection() {
               </button>
             )}
           </div>
+        </SettingsRow>
+
+        {/* 家宽上行带宽：外网播放的前置降档预算。这个数只有用户知道（服务端
+            测不出来），留空 = 不启用，行为照旧（卡顿后由播放器提示换低画质） */}
+        <SettingsRow
+          label="家宽上行带宽"
+          description={
+            view.uplink_mbps
+              ? `外网设备播放时，源片码率超过 ${view.uplink_mbps} Mbps（或外网上限 1080p）会在起播前询问是否切换到装得下的画质；内网播放不受影响`
+              : "选填。填宽带套餐的真实上行（如 30）。填了之后，外网设备播放码率超过它的片源会在起播前询问是否切换到装得下的画质，不等卡顿"
+          }
+          error={uplinkError}
+        >
+          <input
+            // key 随已保存值变化：清除/保存后靠重挂载同步显示最新落库值
+            key={view.uplink_mbps ?? "unset"}
+            type="text"
+            inputMode="numeric"
+            defaultValue={
+              view.uplink_mbps === null || view.uplink_mbps === undefined
+                ? ""
+                : String(view.uplink_mbps)
+            }
+            onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+            onBlur={(e) => handleUplinkBlur(e.target.value)}
+            placeholder="如 30"
+            aria-label="家宽上行带宽（Mbps）"
+            className={`${SETTINGS_INPUT_CLASS} w-24 font-mono`}
+          />
         </SettingsRow>
 
         {/* 对外端口：唯一需要重启的字段，故不走失焦即存，改动要过二次确认。

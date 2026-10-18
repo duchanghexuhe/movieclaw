@@ -263,7 +263,8 @@ export function McpSection() {
       >
         {!status.enabled && status.endpoints.length > 0 && (
           <div className="mb-3">
-            <Banner tone="warn">
+            {/* 「已关闭」是用户自己的意图，不是系统异常——中性灰，不占状态色 */}
+            <Banner tone="neutral">
               服务已关闭，下面所有端点一律返回 404。配置与令牌都保留着，打开开关即恢复。
             </Banner>
           </div>

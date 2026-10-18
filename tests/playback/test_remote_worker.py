@@ -596,7 +596,7 @@ def test_observed_base_url_is_empty_without_host_header():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("principal", "enabled", "hint"),
-    [(None, True, "重新配对"), (object(), False, "打开开关")],
+    [(None, True, "重新配对"), (object(), False, "打开远程转码开关")],
     ids=["凭证无效", "开关没开"],
 )
 async def test_handshake_rejection_reason_reaches_the_worker(monkeypatch, principal, enabled, hint):
@@ -817,3 +817,31 @@ def test_registry_reads_read_options_capability():
     caps = parse({**base, "read_options": ["multiple_requests", "initial_request_size"]})
     assert caps.video_caps.read_options == frozenset({"multiple_requests", "initial_request_size"})
     assert parse(base).video_caps.read_options == frozenset()
+
+@pytest.mark.asyncio
+async def test_worker_disconnect_does_not_delete_foreign_registration():
+    """撤销只动自己写入的值：断开时注册表里已不是 hello 写入的那份（例如
+    本机探测刚重跑过），就原样保留。"""
+    from movieclaw_api.services.playback.ffmpeg_args import (
+        NVENC_TONEMAP,
+        register_native_tonemap,
+        registered_native_tonemap,
+    )
+
+    registry = RemoteWorkerRegistry()
+    connection = await registry.register(
+        FakeWebSocket(),
+        {
+            "worker_id": "win-nvenc-c",
+            "capabilities": {
+                "backends": ["nvenc"],
+                "encoders": ["h264_nvenc"],
+                "filters": ["scale_cuda", "tonemap_cuda"],
+            },
+        },
+    )
+    assert registered_native_tonemap("nvenc") == NVENC_TONEMAP
+    # 本机「重新探测」写入了别的结论（比如探到不可用 → 清空）
+    register_native_tonemap("nvenc", None)
+    await registry.unregister(connection)
+    assert registered_native_tonemap("nvenc") is None  # 探测的结论原样保留

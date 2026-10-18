@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from sqlalchemy import select, tuple_
@@ -23,6 +24,7 @@ from movieclaw_api.schemas.playback import (
     MediaActivityView,
     PlaybackDeliveryView,
     PlaybackFileSpec,
+    PlaybackStallHintView,
 )
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.services import login_devices
@@ -316,6 +318,86 @@ def _delivery_view(transcode, *, streaming: bool) -> PlaybackDeliveryView | None
     return PlaybackDeliveryView(mode="remux", label="重封装", executor="NAS", reason=reason)
 
 
+# —— 卡顿迹象的判据（服务端看不到播放器缓冲，只能推迹象，不能替播放器下结论）——
+#: 播放器等一片等过这么久：等的是转码产出，缓冲迟早耗尽
+_STALL_PENDING_S = 4.0
+_STALL_SEGMENT_WAIT_MS = 4000
+#: 客户端在拉流但速率低于码率这么多：线路吃不下
+_STALL_RATE_RATIO = 0.9
+
+
+def _mbps(bps: float) -> str:
+    return f"{bps / 1_000_000:.1f} Mbps"
+
+
+def _remote_job_speed(transcode) -> float | None:
+    """远程 job 当前的 ffmpeg 倍速（「1.8x」→ 1.8）；没有或解析不了为 None。
+
+    只对远程会话有意义：本地 ffmpeg 没有实时测速，供不上片由分片等待暴露。
+    """
+    if not transcode.remote or not transcode.remote_job_id:
+        return None
+    from movieclaw_api.services.playback.remote_worker import get_remote_worker_registry
+
+    state = get_remote_worker_registry().job_state(transcode.remote_job_id)
+    speed = state.get("speed") if state else None
+    if not isinstance(speed, str):
+        return None
+    try:
+        return float(speed.rstrip("x"))
+    except ValueError:
+        return None
+
+
+def _stall_hint(transcode, *, meters: list, file, paused: bool) -> PlaybackStallHintView | None:
+    """服务端视角推断这场播放会不会卡、卡在哪（活动页的卡顿迹象）。
+
+    服务端看不到播放器的缓冲，两条判据都是**迹象不是实测**，措辞按「推断」写：
+
+    - 解码（转码端）：有分片正在被播放器等着且已等了很久——等的是转码产出，
+      转码端供不上片，缓冲耗尽就是卡顿；远程转码速度跟不上实时同理。
+      seek 后的头几秒等片是正常现象，这个瞬间的误报下一轮轮询即消；
+    - 带宽（线路）：客户端正在拉流但速率低于码率——线路吃不下，缓冲迟早耗尽。
+      缓冲已攒满时播放器停止拉流（速率为 0），不在此列。
+
+    已暂停的会话两端都不算（没有拉流也没有等片）；网盘直链没有转码也没有
+    取流，两条都够不着，返回 None。
+    """
+    if paused:
+        return None
+    if transcode is not None:
+        speed = _remote_job_speed(transcode)
+        if speed is not None and speed < 1.0:
+            return PlaybackStallHintView(
+                cause="decode",
+                reason=f"远程转码速度 {speed:.1f}x 跟不上实时播放，缓冲耗尽后会卡顿",
+            )
+        pending_wait = max(
+            (time.monotonic() - since for since in transcode.pending_since.values()),
+            default=0.0,
+        )
+        last_wait_ms = transcode.last_segment_wait_ms or 0
+        if pending_wait >= _STALL_PENDING_S or last_wait_ms >= _STALL_SEGMENT_WAIT_MS:
+            waited = pending_wait if pending_wait >= _STALL_PENDING_S else last_wait_ms / 1000
+            return PlaybackStallHintView(
+                cause="decode",
+                reason=f"转码可能供不上片，播放器等分片已等 {waited:.0f} 秒",
+            )
+    bitrate = None
+    if transcode is not None and transcode.plan.video.action == "transcode":
+        bitrate = transcode.plan.video.bitrate_cap_bps
+    elif file is not None:
+        bitrate = file.bit_rate
+    # 速率是字节/秒，码率是比特/秒：×8 换算后比较
+    rate = sum(m.rate_bytes_per_second() for m in meters) * 8
+    if bitrate and rate > 0 and rate < bitrate * _STALL_RATE_RATIO:
+        return PlaybackStallHintView(
+            cause="bandwidth",
+            reason=f"拉流速率 {_mbps(rate)} 低于码率 {_mbps(bitrate)}，缓冲可能耗尽",
+        )
+    return None
+
+
 def _transcodes_by_device() -> dict[str, list]:
     """设备 → 它在服务端在跑的会话（排除已失败 / 已停止的）。"""
     by_device: dict[str, list] = {}
@@ -449,6 +531,9 @@ async def media_activity_overview(
                 connections=len(device_meters),
                 file=_file_spec(ctx.file),
                 delivery=_delivery_view(transcode, streaming=streaming),
+                stall=_stall_hint(
+                    transcode, meters=device_meters, file=ctx.file, paused=play.paused
+                ),
                 started_at=play.started_at,
                 last_report_at=play.last_report_at,
             )

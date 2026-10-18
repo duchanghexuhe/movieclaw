@@ -42,6 +42,12 @@ MAX_KEYFRAME_INTERVAL_S = 15.0
 #: 能被 ``<video src>`` 直接消费的容器。其余（mkv/ts/m2ts…）都要 remux。
 DIRECT_PLAY_CONTAINERS = frozenset({"mp4", "m4v", "mov"})
 
+#: 外网播放的画质天花板：1080p 档的码率（≈2.7 GB/小时）。与上行无关的硬上限
+#: ——上行再宽也不把几十 G 的原盘原样推给手机，先爆的是流量费不是线路。
+EXTERNAL_VIDEO_CAP_BPS = 6_000_000
+#: 外网阶梯的地板：上行窄到 480p 档都装不下时，降档不参与（给了也必卡）。
+EXTERNAL_FLOOR_BPS = 1_500_000
+
 #: 归一化分辨率标签 → 高度。media_probe 只落标签不落 width/height。
 _RESOLUTION_HEIGHT = {
     "4320p": 4320, "2160p": 2160, "1440p": 1440,
@@ -142,6 +148,10 @@ class MediaProfile:
     #: 插不插色彩空间转换——只看 hdr 是不够的。
     color_space: str | None = None
     bit_depth: int | None = None
+    #: 源片总码率（bps，台账 bit_rate 真值）。外网前置降档拿它和家宽上行比：
+    #  直通档发出去的就是这条码率，装不下就得在起播前转码——不等卡了再让
+    #  用户手动换。未知时无从比较，按「不降档」处理。
+    bit_rate_bps: int | None = None
     duration_ms: int | None = None
     audio_tracks: tuple[AudioTrack, ...] = ()
     subtitle_tracks: tuple[SubtitleTrack, ...] = ()
@@ -291,6 +301,10 @@ class PlaybackPlan:
     disc: str | None = None
     #: 目录直推时服务端选中的主播放列表文件名
     disc_playlist: str | None = None
+    #: 该计划是外网线路降档的结果（源码率超出上行/外网上限）。网页端拿它拦
+    #: 一下起播、弹窗让用户确认「降档播还是原画质播」；不认这个字段的客户端
+    #: （App）拿到计划直接播，等于维持自动降档。
+    uplink_forced: bool = False
 
 
 @dataclass(frozen=True)
@@ -331,6 +345,8 @@ def decide_playback(
     preferred_audio: str | None = None,
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
+    external: bool = False,
 ) -> PlaybackDecision:
     """按 web-player.md §3.3 的判定顺序算出最优播放计划。
 
@@ -348,6 +364,15 @@ def decide_playback(
     直通是无损的，比转出来的同分辨率画质更好也更省资源；超了才强制转码降
     到该高度。None = 自动（不限制）。universal 分支与未探测到规格的 strm
     不受它影响：前者是全解码客户端自己拉流，后者无从判断、只能乐观直连。
+
+    ``uplink_bps`` 是外网会话的家宽上行预算（bps；内网 / 未配置为 None，同 max_height 一样不参与判定）。源片码率超出
+    min(上行, 外网天花板 1080p 档) 时直通档换成转码——但**不自动生效**：计划带
+    ``uplink_forced`` 透出，网页端拦下起播弹窗让用户确认。与 max_height 互斥地
+    生效：手选了画质上限就不传上行，用户的选择优先。universal 分支同样不受影响。
+
+    ``external`` 是会话是否来自外网（按连接来源判定，与 uplink_mbps 配置无关）。
+    为 True 且视频已判转码时，音轨强制 AAC-LC 双声道（省流量；见 _judge_audio），
+    不影响直连 / 重封装档。
 
     ``preferred_subtitle`` 是**用户选中的字幕轨**（None/"off" 与文本轨都是
     no-op）。只有当它指向本文件的**内封 PGS 轨**时才改变决策：视频强制转码、
@@ -471,7 +496,10 @@ def decide_playback(
         )
 
     # 3–5. 视频、HDR、音频三项判定，各自算出「能不能 copy」。
-    video_verdict = _judge_video(media, capability, policy, max_height)
+    video_verdict = _judge_video(media, capability, policy, max_height, uplink_bps)
+    # 外网省流量只在视频本来就要转码的会话生效：直连 / 重封装档的音轨
+    # copy 是零成本，改转码反而把无损档抬成有损档
+    force_stereo_aac = external and not video_verdict.can_copy
 
     # 用户显式选中内封 PGS → 烧录：视频不再允许 copy（硬边界 1 唯一例外）。
     # blocked（如 HDR 无 GPU）原样保留——烧录也救不了放不出来的画面。
@@ -484,7 +512,13 @@ def decide_playback(
     # 音轨放在视频之后判：剪辑直推能不能成，要看视频最终能不能 copy
     # 6–7. 综合定档（音轨能不能 copy 还取决于落在哪一档，见 _judge_audio_and_tier）。
     audio_verdict, (tier, container, reason, degraded_from) = _judge_audio_and_tier(
-        media, video_verdict, capability, policy, failed_tiers, preferred_audio
+        media,
+        video_verdict,
+        capability,
+        policy,
+        failed_tiers,
+        preferred_audio,
+        force_stereo_aac=force_stereo_aac,
     )
     if isinstance(tier, PlaybackRejected):
         return tier
@@ -522,6 +556,7 @@ def decide_playback(
         audio_tracks=media.audio_tracks,
         reason=reason,
         degraded_from=degraded_from,
+        uplink_forced=video_verdict.uplink_forced,
         **(
             {"disc": "clips", "disc_playlist": media.disc_playlist}
             if tier is PlaybackTier.DIRECT_PLAY and _plays_bluray_clips(media, capability)
@@ -575,6 +610,7 @@ def _judge_audio_and_tier(
     preferred_audio: str | None,
     *,
     enforce_keyframe_gate: bool = True,
+    force_stereo_aac: bool = False,
 ) -> tuple[_AudioVerdict, tuple[PlaybackTier | PlaybackRejected, str, str, PlaybackTier | None]]:
     """判音轨并定档。
 
@@ -585,7 +621,9 @@ def _judge_audio_and_tier(
     核心）或转码。重判只会让音轨从 copy 变成转码，档位不会因此回到档 0。
     """
     audio_capability = _clip_audio_capability(media, capability, video_verdict)
-    audio = _judge_audio(media, audio_capability, preferred_audio)
+    audio = _judge_audio(
+        media, audio_capability, preferred_audio, force_stereo_aac=force_stereo_aac
+    )
     resolved = _resolve_tier(
         media,
         video_verdict,
@@ -607,7 +645,9 @@ def _judge_audio_and_tier(
         audio_capability,
         audio=tuple(a for a in audio_capability.audio if a.codec in FMP4_COPY_AUDIO_CODECS),
     )
-    audio = _judge_audio(media, fmp4_capability, preferred_audio)
+    audio = _judge_audio(
+        media, fmp4_capability, preferred_audio, force_stereo_aac=force_stereo_aac
+    )
     if not audio.can_copy:
         label = _track_label(audio.track) if audio.track else "未知"
         audio = replace(
@@ -643,6 +683,8 @@ class _VideoVerdict:
     reason: str
     #: 无法直通且连转码也不该做（如 HDR 需 tone-map 但没有 GPU）
     blocked: str | None = None
+    #: 是否因外网线路（上行/外网上限）放弃直通——随计划透出，供前端弹窗确认
+    uplink_forced: bool = False
 
 
 @dataclass(frozen=True)
@@ -683,8 +725,16 @@ def _judge_video(
     capability: ClientCapability,
     policy: PlaybackPolicy,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
 ) -> _VideoVerdict:
-    """视频编码 + HDR + 用户画质上限，三项判定（§3.3 步骤 3–4）。"""
+    """视频编码 + HDR + 用户画质上限 + 外网上行，判定（§3.3 步骤 3–4）。
+
+    ``uplink_bps`` 是外网会话的家宽上行预算（内网 / 未配置时为 None，不参与
+    判定——调用方负责收口，本函数不知道「外网」这个概念）。只对直通判定
+    生效：装不下源片码率就强制转码，目标高度交给 ``_build_video_plan`` 按
+    常规阶梯取。放在所有硬性判定之后——编码/分辨率/HDR 命中时归因给它们
+    （那是硬性的，线路只是偏好）。
+    """
     support = capability.video_support(media.video_codec)
     codec_label = (media.video_codec or "未知").upper()
 
@@ -779,6 +829,27 @@ def _judge_video(
             )
         return _VideoVerdict(can_copy=False, reason=f"{media.hdr} 已转换为 SDR 显示")
 
+    # 外网画质阶梯：先问「装不装得下」，也问「该不该给」。天花板 1080p 档
+    # （6 Mbps ≈ 2.7 GB/小时）跟上行无关——上行再宽也不把几十 G 的原盘原样
+    # 推给手机，流量费先爆的是用户账单不是线路；源片本身 ≤ 天花板时直连，
+    # 转码不会更省流量还白烧 CPU。上行窄到连 480p（1.5M）都装不下时不参与
+    # 降档，照旧直连交给卡顿后提示兜底——给了也必卡。触发后不自动生效：
+    # 随计划透出 uplink_forced，网页端弹窗让用户确认（App 不认就直接播）。
+    if uplink_bps is not None and media.bit_rate_bps:
+        limit = min(uplink_bps, EXTERNAL_VIDEO_CAP_BPS)
+        if media.bit_rate_bps > limit and limit >= EXTERNAL_FLOOR_BPS:
+            if uplink_bps <= EXTERNAL_VIDEO_CAP_BPS:
+                reason = (
+                    f"外网线路：源码率 {media.bit_rate_bps / 1_000_000:.1f} Mbps 超出"
+                    f"家宽上行 {uplink_bps / 1_000_000:g} Mbps，已转码降码率"
+                )
+            else:
+                reason = (
+                    f"外网线路：外网播放最高 1080p（6 Mbps），源码率 "
+                    f"{media.bit_rate_bps / 1_000_000:.1f} Mbps，已转码降码率"
+                )
+            return _VideoVerdict(can_copy=False, reason=reason, uplink_forced=True)
+
     hdr_note = f"（{media.hdr} 直通）" if media.hdr else ""
     return _VideoVerdict(can_copy=True, reason=f"视频编码 {codec_label} 可直通{hdr_note}")
 
@@ -787,12 +858,19 @@ def _judge_audio(
     media: MediaProfile,
     capability: ClientCapability,
     preferred_audio: str | None = None,
+    *,
+    force_stereo_aac: bool = False,
 ) -> _AudioVerdict:
     """音轨判定（§3.3 步骤 5）：先找能直通的轨，找不到才转。
 
     ``preferred_audio`` 是**用户在播放器里点选的轨**。给了就认它，不再自动
     换轨——自动换轨是「用户没表态时帮他找一条能放的」，用户表了态还替他改
     等于点了没用。它放不了就转它，也不去动别的轨。
+
+    ``force_stereo_aac`` 是外网会话的省流量规则（调用方在视频已判转码时才
+    置位）：能直通的音轨也固定转 AAC-LC 双声道——E-AC-3 5.1 直通要 448-640
+    kbps，转 AAC 后总码率给丢包线路留出余量；与原生 HLS 分支的固定 AAC 同
+    一先例，只对外网生效，局域网多声道体验不变。
     """
     tracks = media.audio_tracks
     if not tracks:
@@ -802,6 +880,19 @@ def _judge_audio(
     # 直出时浏览器放的那条（容器默认轨）：放的不是它就得重封装（needs_remap）
     container_default = _container_default_audio(tracks)
     chosen = next((t for t in tracks if t.ref == preferred_audio), None)
+
+    def _stereo_aac_verdict(track: AudioTrack) -> _AudioVerdict | None:
+        if not force_stereo_aac:
+            return None
+        channels = track.channels or 2
+        if (track.codec or "").lower() == "aac" and channels <= 2:
+            return None  # 已是目标格式，直通
+        return _transcode_audio(
+            track,
+            capability,
+            prefix=f"外网播放，音轨 {_track_label(track)}",
+            force_aac=True,
+        )
 
     # 原生 HLS（AVPlayer）的解码链比 MSE/hls.js 更挑剔：即使能力探测报告
     # E-AC-3 或多声道 AAC 可用，放进 fMP4 后仍可能在 init/首片阶段直接报
@@ -832,6 +923,9 @@ def _judge_audio(
         support = capability.audio_support(chosen.codec)
         channels = chosen.channels or 2
         label = _track_label(chosen)
+        stereo_aac = _stereo_aac_verdict(chosen)
+        if stereo_aac is not None:
+            return stereo_aac
         if support is not None and channels <= support.max_channels:
             return _AudioVerdict(
                 can_copy=True,
@@ -846,6 +940,9 @@ def _judge_audio(
     # 而音频转码本来就便宜；换过去的轨还会被当成记忆带到别的设备上。都没标语言的轨视为同一种。
     alternatives = (t for t in tracks if _same_language(t, default))
     for track, is_preferred in ((default, True), *((t, False) for t in alternatives)):
+        stereo_aac = _stereo_aac_verdict(track)
+        if stereo_aac is not None:
+            return stereo_aac
         support = capability.audio_support(track.codec)
         if support is None:
             continue
@@ -1199,6 +1296,7 @@ def needs_keyframe_probe(
     preferred_audio: str | None = None,
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
 ) -> bool:
     """判断当前候选是否需要读取源片关键帧密度。
 
@@ -1210,7 +1308,7 @@ def needs_keyframe_probe(
     if _unprobed_strm(media) or _takes_universal_shortcut(media, capability):
         return False
 
-    video_verdict = _judge_video(media, capability, policy, max_height)
+    video_verdict = _judge_video(media, capability, policy, max_height, uplink_bps)
     burn_track = _burn_target(media, preferred_subtitle)
     if burn_track is not None and video_verdict.blocked is None:
         video_verdict = _VideoVerdict(

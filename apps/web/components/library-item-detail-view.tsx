@@ -30,6 +30,7 @@ import {
   HeartIcon,
   MoreIcon,
   PlayIcon,
+  SparklesIcon,
   TrashIcon,
 } from "@/components/icons";
 import { useConfirm, useToast } from "@/components/feedback";
@@ -66,6 +67,17 @@ import {
   restoreLibraryFile,
   transferLibraryItem,
 } from "@/lib/api/libraries";
+import {
+  PRELOAD_STATUS_LABELS,
+  type PreloadPreset,
+  type PreloadTaskView,
+  cancelPreloadTask,
+  createPreloadTask,
+  estimatePreload,
+  getPreloadPresets,
+  listPreloadTasks,
+  retryPreloadTask,
+} from "@/lib/api/preload";
 import {
   type PlaybackUnit,
   type PlaybackWatchState,
@@ -206,6 +218,11 @@ export function LibraryItemDetailView({
   // 在页面内改写了观看状态（对勾）之后让分集区静默重拉：分集卡的绿色对勾
   // 与 Hero 的「已看完」必须同步，但不能重置当前选中的集
   const [episodesVersion, setEpisodesVersion] = useState(0);
+  // 预转码（preload-transcode.md §3）：本条目相关的任务（按源文件 id 索引）。
+  // 文件区的「预转码」按钮据此显示状态；进入页面拉一次，动作后局部刷新
+  const [preloadTasks, setPreloadTasks] = useState<PreloadTaskView[]>([]);
+  // 「预转码」选版本弹窗（§8 标题行显眼入口）
+  const [preloadDialogOpen, setPreloadDialogOpen] = useState(false);
 
   /**
    * 播放入口指向的播放单元（media_item + 季集三元组，与播放器同一套约定）。
@@ -474,6 +491,112 @@ export function LibraryItemDetailView({
       }
     },
     [confirm, libraryId, mediaItemId, reload, toast],
+  );
+
+  // -- 预转码（preload-transcode.md §3）------------------------------------
+  // 进入页面拉一次任务列表（只留本条目的）；下单时先查体积预估弹确认
+  const refreshPreloadTasks = useCallback(() => {
+    listPreloadTasks()
+      .then((tasks) =>
+        setPreloadTasks(tasks.filter((t) => t.target_file_id && detail?.files.some((f) => f.id === t.target_file_id))),
+      )
+      .catch(() => {});
+  }, [detail?.files]);
+  useEffect(() => {
+    refreshPreloadTasks();
+  }, [refreshPreloadTasks]);
+  // 任务在 Worker 侧推进，设置页/任务中心各自轮询；本页是下单主路径，
+  // 同节奏跟随（转码是分钟级任务，15 秒足够），页面隐藏时自动暂停
+  useVisiblePolling(refreshPreloadTasks, 15_000);
+  const handlePreloadCreate = useCallback(
+    async (file: LibraryItemFile, presetId?: string) => {
+      try {
+        const est = await estimatePreload(file.id, presetId);
+        const sizeNote =
+          est.estimated_bytes > 0
+            ? `约多占 ${(est.estimated_bytes / 1024 ** 3).toFixed(1)} GB`
+            : "占用体积未知（源缺少时长信息）";
+        const ok = await confirm({
+          title: `把「${file.file_name}」预转码？`,
+          description: `${sizeNote}（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由 Worker 在后台闲时完成，完成后文件区会出现一个低码率的可选版本。`,
+          confirmLabel: "加入转码队列",
+          cancelLabel: "先不",
+        });
+        if (!ok) return;
+        const task = await createPreloadTask(file.id, presetId);
+        toast.success(`已加入转码队列（任务 #${task.id}），等 Worker 领取`);
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "下单失败，请稍后重试");
+      }
+    },
+    [confirm, refreshPreloadTasks, toast],
+  );
+  // 整季批量下单：合并预估一次确认，逐单串行排队（配额预检在服务端逐单做，
+  // 并行会互相抢份额）；部分失败时报成功数与首条原因——原盘/已是便携档的
+  // 文件由服务端拒绝，不阻塞其余下单
+  const handlePreloadCreateMany = useCallback(
+    async (files: LibraryItemFile[], presetId?: string) => {
+      if (files.length === 0) return;
+      try {
+        const estimates = await Promise.all(
+          files.map((f) => estimatePreload(f.id, presetId)),
+        );
+        const totalBytes = estimates.reduce((sum, e) => sum + e.estimated_bytes, 0);
+        const freeBytes = estimates[0]?.free_bytes ?? 0;
+        const sizeNote =
+          totalBytes > 0
+            ? `约多占 ${(totalBytes / 1024 ** 3).toFixed(1)} GB`
+            : "占用体积未知（源缺少时长信息）";
+        const ok = await confirm({
+          title: `把这一季的 ${files.length} 个文件预转码？`,
+          description: `${sizeNote}（当前剩余 ${(freeBytes / 1024 ** 3).toFixed(1)} GB）。转码由 Worker 在后台闲时完成，完成后各集文件区会出现低码率的可选版本。`,
+          confirmLabel: "加入转码队列",
+          cancelLabel: "先不",
+        });
+        if (!ok) return;
+        let done = 0;
+        let firstError: string | null = null;
+        for (const f of files) {
+          try {
+            await createPreloadTask(f.id, presetId);
+            done += 1;
+          } catch (e) {
+            firstError = firstError ?? (e instanceof Error ? e.message : "下单失败");
+          }
+        }
+        if (done > 0) toast.success(`已加入转码队列 ${done} 个，等 Worker 领取`);
+        if (firstError) toast.error(`${files.length - done} 个未能下单：${firstError}`);
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "下单失败，请稍后重试");
+      }
+    },
+    [confirm, refreshPreloadTasks, toast],
+  );
+  const handlePreloadCancel = useCallback(
+    async (task: PreloadTaskView) => {
+      try {
+        await cancelPreloadTask(task.id);
+        toast.success("任务已取消");
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "取消失败，请稍后重试");
+      }
+    },
+    [refreshPreloadTasks, toast],
+  );
+  const handlePreloadRetry = useCallback(
+    async (task: PreloadTaskView) => {
+      try {
+        await retryPreloadTask(task.id);
+        toast.success("已重新排队");
+        refreshPreloadTasks();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "重试失败，请稍后重试");
+      }
+    },
+    [refreshPreloadTasks, toast],
   );
 
   usePageTitle(detail?.title);
@@ -958,6 +1081,11 @@ export function LibraryItemDetailView({
               marking={marking}
               onToggleFavorite={toggleFavorite}
               onTogglePlayed={togglePlayed}
+              // 预转码圆键与文件区标题行按钮同一落点（§8 显眼入口）：播放排
+              // 是详情页动作的主门面，比藏在底部文件区更容易被看到
+              onOpenPreloadDialog={
+                canManageLibraries ? () => setPreloadDialogOpen(true) : undefined
+              }
               onPlay={() => {
                 // 退出播放要回到用户离开的这一屏（含季集查询参数）。导航
                 // 状态不进播放页地址（§6.10 地址就是分享凭证），走
@@ -975,6 +1103,9 @@ export function LibraryItemDetailView({
                       !isMovie && selectedSeriesEpisode
                         ? selectedSeriesEpisode.episode.episode_number
                         : undefined,
+                    // 用户在版本选择器里明确选过：播放页锁定这个文件起播，
+                    // 不做多版本自动择优（否则 720p 测试直出会压过 4K 转码）
+                    fileId: selectedTrackFile?.id,
                   }) as Route,
                 );
               }}
@@ -999,7 +1130,7 @@ export function LibraryItemDetailView({
           {/* 元数据刷新的失败提示（识别相关的结论都在「修正识别结果」弹窗里给） */}
           {refreshError && (
             // solid-card：Netflix 卡面钩子接管材质并关 blur（银玻璃零变化）；
-            // 字色保留 #ff9f9f 浅红字面量——:root --danger=#ff6b6b 与之不同值，
+            // 字色保留 #ff9f9f 浅红字面量——:root --danger=var(--danger) 与之不同值，
             // 收口会让银玻璃可见变化，待设计决策
             <div className="solid-card mt-4 max-w-2xl rounded-xl border border-white/[0.1] bg-[rgba(14,16,22,0.6)] px-4 py-3 text-sub leading-6 text-[#ff9f9f] backdrop-blur-md">
               {refreshError}
@@ -1096,9 +1227,26 @@ export function LibraryItemDetailView({
               onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
               onRestoreFile={canManageLibraries ? restoreTrashedFile : undefined}
               onPurgeFile={canManageLibraries ? purgeTrashedFile : undefined}
+              preloadTasks={preloadTasks}
+              onPreloadCancel={canManageLibraries ? handlePreloadCancel : undefined}
+              onPreloadRetry={canManageLibraries ? handlePreloadRetry : undefined}
             />
           );
         })()}
+
+        {/* 「预转码」选版本弹窗（§8，下单唯一门面）：电影列全部版本；剧集列全季
+            分集——按季分组、整季一键下单、逐集可单转（§3 逐部/逐季/逐集） */}
+        <PreloadDialog
+          open={preloadDialogOpen}
+          onClose={() => setPreloadDialogOpen(false)}
+          title={detail.title}
+          files={detail.files.filter((f) => f.state === "in_place" && !f.derivation)}
+          tasks={preloadTasks}
+          onPreload={canManageLibraries ? handlePreloadCreate : undefined}
+          onPreloadMany={canManageLibraries ? handlePreloadCreateMany : undefined}
+          onPreloadCancel={canManageLibraries ? handlePreloadCancel : undefined}
+          onPreloadRetry={canManageLibraries ? handlePreloadRetry : undefined}
+        />
 
         {/* 外部词条像友情链接一样固定在文件区之后，继续使用原有的新窗口跳转；
             豆瓣在移动端沿用 App 唤起逻辑。 */}
@@ -1283,6 +1431,7 @@ export function PlayAction({
   marking = false,
   onToggleFavorite,
   onTogglePlayed,
+  onOpenPreloadDialog,
 }: {
   watched: PlaybackWatchState | null;
   onPlay: () => void;
@@ -1294,6 +1443,8 @@ export function PlayAction({
   marking?: boolean;
   onToggleFavorite?: () => void;
   onTogglePlayed?: () => void;
+  /** 打开「预转码」选版本弹窗（§8 显眼入口的第二落点）；未传不渲染 */
+  onOpenPreloadDialog?: () => void;
 }) {
   const positionMs = watched?.position_ms ?? 0;
   const durationMs = watched?.duration_ms ?? null;
@@ -1389,6 +1540,23 @@ export function PlayAction({
                 <span className="text-ui font-medium md:hidden">
                   {finished ? "已看完" : "标为已看"}
                 </span>
+              </button>
+            </Tooltip>
+          )}
+          {onOpenPreloadDialog && (
+            <Tooltip
+              content="预转码：提前转好省流版本，外网播放不用等"
+              dismissOnReferencePress
+              disabled={isMobile}
+            >
+              <button
+                type="button"
+                onClick={onOpenPreloadDialog}
+                aria-label="预转码"
+                className={MARK_BUTTON_CLASS}
+              >
+                <SparklesIcon className="size-4.5" />
+                <span className="text-ui font-medium md:hidden">预转码</span>
               </button>
             </Tooltip>
           )}
@@ -2370,6 +2538,251 @@ function fileDirectory(filePath: string): string {
 }
 
 /**
+ * 「预转码」选版本弹窗（preload-transcode.md §8 显眼入口）：下单的唯一门面。
+ * 电影列全部版本；剧集列全季分集，按季分组——每季一个「整季下单」批量入口，
+ * 逐集仍可单转（§3 逐部/逐季/逐集）。档位切换在弹窗顶部（省流=默认，手机外网；
+ * 高清=局域网大屏），任务状态与预估逐行可见，多版本条目（4K + 1080p 并存）
+ * 在这里一次看清。
+ */
+function PreloadDialog({
+  open,
+  onClose,
+  title,
+  files,
+  tasks,
+  onPreload,
+  onPreloadMany,
+  onPreloadCancel,
+  onPreloadRetry,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  /** 只收在位且非派生的原生文件（弹窗是下单入口，产物行不进来）；剧集是全季分集 */
+  files: LibraryItemFile[];
+  tasks: PreloadTaskView[];
+  onPreload?: (file: LibraryItemFile, presetId?: string) => void;
+  /** 整季批量下单：按季分组时每季一个入口；只收没有活跃任务的可转文件 */
+  onPreloadMany?: (files: LibraryItemFile[], presetId?: string) => void;
+  onPreloadCancel?: (task: PreloadTaskView) => void;
+  onPreloadRetry?: (task: PreloadTaskView) => void;
+}) {
+  const [presets, setPresets] = useState<PreloadPreset[] | null>(null);
+  const [presetId, setPresetId] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    getPreloadPresets()
+      .then((list) => {
+        if (!alive) return;
+        setPresets(list);
+        setPresetId((current) => current ?? list[0]?.id);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [open]);
+
+  const selectedPreset = presetId ?? presets?.[0]?.id;
+  // 任务状态跟所选档位走：高清档已有任务不挡省流档下单（反之亦然）
+  const taskFor = (file: LibraryItemFile) =>
+    tasks.find(
+      (t) => t.target_file_id === file.id && t.preset_id === selectedPreset,
+    ) ?? null;
+  // 整季下单只收这季里还没有活跃任务的文件；一个都不剩时按钮不可点
+  const ACTIVE_STATUSES = ["queued", "claimed", "running"];
+  const activeFor = (file: LibraryItemFile) =>
+    tasks.find(
+      (t) =>
+        t.target_file_id === file.id &&
+        t.preset_id === selectedPreset &&
+        ACTIVE_STATUSES.includes(t.status),
+    ) ?? null;
+  // 剧集按季分组（电影无季号走平铺）：每季一个「整季下单」，逐集仍可单转
+  const hasSeasons = files.some((f) => f.season_number > 0);
+  const seasonGroups: [number, LibraryItemFile[]][] = [];
+  if (hasSeasons) {
+    const bySeason = new Map<number, LibraryItemFile[]>();
+    for (const f of files) {
+      const list = bySeason.get(f.season_number) ?? [];
+      list.push(f);
+      bySeason.set(f.season_number, list);
+    }
+    seasonGroups.push(...[...bySeason.entries()].sort(([a], [b]) => a - b));
+  }
+  const rowProps = {
+    presetId: selectedPreset,
+    onPreload,
+    onPreloadCancel,
+    onPreloadRetry,
+  };
+  return (
+    <Modal open={open} onClose={onClose} label="预转码" width="lg">
+      <div className="p-6">
+        <h3 className="flex items-center gap-2 text-title-sm font-semibold text-[var(--text)]">
+          <SparklesIcon className="size-4.5 text-[var(--accent-2)]" />
+          「{title}」的预转码
+        </h3>
+        <p className="mt-2 text-sub leading-6 text-[var(--text-muted)]">
+          提前转好的 <span className="text-white/80">低码率版本</span>：外网播放直接发小文件，
+          NAS 不用实时转码。由转码 Worker 在后台闲时完成（设置 → 转码），完成后文件区多出一个可选版本。
+        </p>
+        {presets && presets.length > 1 && (
+          // 胶囊底材与发现页 SourceSwitcher 逐类一致；选中态白系语言原样
+          <div className="mt-4 inline-flex rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl">
+            {presets.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                aria-pressed={selectedPreset === preset.id}
+                title={preset.title}
+                onClick={() => setPresetId(preset.id)}
+                className={`rounded-full px-2.5 py-1.5 text-sub font-semibold transition ${
+                  selectedPreset === preset.id
+                    ? "bg-white/15 text-white shadow-sm"
+                    : "text-[var(--text-muted)] hover:text-white"
+                }`}
+              >
+                {preset.short}
+              </button>
+            ))}
+          </div>
+        )}
+        {files.length === 0 ? (
+          <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
+            <p className="px-4 py-6 text-center text-sub text-[var(--text-faint)]">
+              这个条目没有可转的原始版本。
+            </p>
+          </div>
+        ) : hasSeasons ? (
+          <div className="mt-4 overflow-hidden rounded-xl border border-white/[0.06]">
+            {seasonGroups.map(([season, seasonFiles]) => {
+              const eligible = seasonFiles.filter((f) => !activeFor(f));
+              return (
+                <div key={season} className="border-b border-white/[0.05] last:border-b-0">
+                  <div className="flex items-center justify-between gap-3 bg-white/[0.03] px-4 py-2">
+                    <span className="text-caption font-medium text-[var(--text-muted)]">
+                      {seasonLabel(season, true)} · {seasonFiles.length} 集
+                    </span>
+                    {onPreloadMany && (
+                      <button
+                        type="button"
+                        disabled={eligible.length === 0}
+                        onClick={() => onPreloadMany(eligible, selectedPreset)}
+                        className={`shrink-0 rounded-full border px-3 py-1 text-caption font-medium transition ${
+                          eligible.length > 0
+                            ? "border-white/[0.14] text-[var(--text)] hover:border-white/[0.25]"
+                            : "border-white/[0.06] text-[var(--text-faint)]"
+                        }`}
+                      >
+                        {eligible.length > 0
+                          ? `整季下单 · ${eligible.length} 集`
+                          : "整季已在队列"}
+                      </button>
+                    )}
+                  </div>
+                  <div className="divide-y divide-white/[0.05]">
+                    {seasonFiles.map((file) => (
+                      <PreloadFileRow
+                        key={file.id}
+                        file={file}
+                        task={taskFor(file)}
+                        {...rowProps}
+                      />
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
+            {files.map((file) => (
+              <PreloadFileRow key={file.id} file={file} task={taskFor(file)} {...rowProps} />
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/** 弹窗里的一行文件：规格摘要、任务状态徽章、取消/重试/下单。 */
+function PreloadFileRow({
+  file,
+  task,
+  presetId,
+  onPreload,
+  onPreloadCancel,
+  onPreloadRetry,
+}: {
+  file: LibraryItemFile;
+  task: PreloadTaskView | null;
+  presetId?: string;
+  onPreload?: (file: LibraryItemFile, presetId?: string) => void;
+  onPreloadCancel?: (task: PreloadTaskView) => void;
+  onPreloadRetry?: (task: PreloadTaskView) => void;
+}) {
+  return (
+    <div className="flex items-center gap-3 bg-white/[0.015] px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sub text-[var(--text)]">{file.file_name}</div>
+        <div className="mt-0.5 text-caption text-[var(--text-faint)]">
+          {[
+            file.resolution ? formatVideoResolution(file.resolution) : null,
+            file.hdr,
+            formatBytes(file.size_bytes),
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </div>
+      </div>
+      {task && (
+        <span
+          className={`shrink-0 rounded border px-1.5 py-px text-micro ${
+            task.status === "failed"
+              ? "border-[var(--warn)]/40 text-[var(--warn)]"
+              : "border-white/15 text-[var(--text-muted)]"
+          }`}
+        >
+          {PRELOAD_STATUS_LABELS[task.status]}
+        </span>
+      )}
+      {task && ["queued", "claimed", "running"].includes(task.status) && onPreloadCancel && (
+        <button
+          type="button"
+          onClick={() => onPreloadCancel(task)}
+          className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+        >
+          取消
+        </button>
+      )}
+      {task?.status === "failed" && onPreloadRetry && (
+        <button
+          type="button"
+          onClick={() => onPreloadRetry(task)}
+          className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+        >
+          重试
+        </button>
+      )}
+      {/* 终态（完成/取消/失败/失效）允许再下单：后端幂等只拦活跃态 */}
+      {(!task || !["queued", "claimed", "running"].includes(task.status)) && onPreload && (
+        <button
+          type="button"
+          onClick={() => onPreload(file, presetId)}
+          className="shrink-0 rounded-full border border-white/[0.14] px-3 py-1 text-caption font-medium text-[var(--text)] transition hover:border-white/[0.25]"
+        >
+          转码
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
  * 文件区：详情正文的最后一块。电影与剧集当前集完全共用一套弱化样式，
  * 默认只露出文件名，点击后按物理文件展开尺寸、视频与码率。
  */
@@ -2381,6 +2794,9 @@ function FileSection({
   onDeleteFile,
   onRestoreFile,
   onPurgeFile,
+  preloadTasks,
+  onPreloadCancel,
+  onPreloadRetry,
 }: {
   files: LibraryItemFile[];
   title: string;
@@ -2391,6 +2807,10 @@ function FileSection({
   /** 待回收行的恢复/立即清理（library-file-recycle.md §7）；未传则只读展示 */
   onRestoreFile?: (file: LibraryItemFile) => void;
   onPurgeFile?: (file: LibraryItemFile) => void;
+  /** 预转码任务（preload-transcode.md §3）：按 target_file_id 对应文件行展示状态 */
+  preloadTasks?: PreloadTaskView[];
+  onPreloadCancel?: (task: PreloadTaskView) => void;
+  onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
   return (
     <section>
@@ -2411,15 +2831,30 @@ function FileSection({
         )}
       </h2>
       <div className="overflow-hidden rounded-xl border border-white/[0.04] bg-white/[0.015]">
-        {files.map((file) => (
-          <FileRow
-            key={file.id}
-            file={file}
-            onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
-            onRestore={onRestoreFile ? () => onRestoreFile(file) : undefined}
-            onPurge={onPurgeFile ? () => onPurgeFile(file) : undefined}
-          />
-        ))}
+        {files.map((file) => {
+          // 一个源文件可能同时有多个档位的任务：活跃态优先展示，否则取最近一单
+          //——状态徽章永远跟最相关的一单走，而不是被任意一单顶掉
+          const fileTasks =
+            preloadTasks?.filter((t) => t.target_file_id === file.id) ?? [];
+          const task =
+            fileTasks.find((t) =>
+              ["queued", "claimed", "running"].includes(t.status),
+            ) ??
+            fileTasks[0] ??
+            null;
+          return (
+            <FileRow
+              key={file.id}
+              file={file}
+              preloadTask={task}
+              onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
+              onRestore={onRestoreFile ? () => onRestoreFile(file) : undefined}
+              onPurge={onPurgeFile ? () => onPurgeFile(file) : undefined}
+              onPreloadCancel={onPreloadCancel}
+              onPreloadRetry={onPreloadRetry}
+            />
+          );
+        })}
       </div>
     </section>
   );
@@ -2448,14 +2883,21 @@ function purgeCountdown(purgeAfter: string | null): string {
 
 function FileRow({
   file,
+  preloadTask,
   onDelete,
   onRestore,
   onPurge,
+  onPreloadCancel,
+  onPreloadRetry,
 }: {
   file: LibraryItemFile;
+  /** 这个源文件对应的预转码任务；null = 没下过单（或产物已是独立版本行） */
+  preloadTask?: PreloadTaskView | null;
   onDelete?: () => void;
   onRestore?: () => void;
   onPurge?: () => void;
+  onPreloadCancel?: (task: PreloadTaskView) => void;
+  onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
   // 每个物理文件独立展开，多版本无需再维护额外的版本切换状态。
   const [expanded, setExpanded] = useState(false);
@@ -2529,6 +2971,49 @@ function FileRow({
             待回收
           </span>
         )}
+        {file.derivation?.kind === "preload" && (
+          <span className="shrink-0 rounded border border-[var(--text-faint)]/25 px-1.5 py-px text-micro text-[var(--text-muted)]">
+            预转码
+          </span>
+        )}
+        {/* 预转码：本行下过单时展示状态；下单入口只保留顶部操作排（§8 显眼入口） */}
+        {preloadTask && file.state !== "trashed" && (
+          <span
+            className={`shrink-0 rounded border px-1.5 py-px text-micro ${
+              preloadTask.status === "failed"
+                ? "border-[var(--warn)]/40 text-[var(--warn)]"
+                : "border-[var(--text-faint)]/25 text-[var(--text-muted)]"
+            }`}
+          >
+            {preloadTask.status === "queued" && "转码排队中"}
+            {preloadTask.status === "claimed" && "转码已领取"}
+            {preloadTask.status === "running" && "转码进行中"}
+            {preloadTask.status === "failed" && "转码失败"}
+            {preloadTask.status === "completed" && "转码完成"}
+            {preloadTask.status === "cancelled" && "已取消"}
+            {preloadTask.status === "invalidated" && "已失效"}
+          </span>
+        )}
+        {preloadTask?.status === "failed" && onPreloadRetry && (
+          <button
+            type="button"
+            onClick={() => onPreloadRetry(preloadTask)}
+            className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+          >
+            重试
+          </button>
+        )}
+        {preloadTask &&
+          ["queued", "claimed", "running"].includes(preloadTask.status) &&
+          onPreloadCancel && (
+            <button
+              type="button"
+              onClick={() => onPreloadCancel(preloadTask)}
+              className="touch-target shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+            >
+              取消
+            </button>
+          )}
         {file.state === "trashed" && onRestore && (
           <button
             type="button"
@@ -2925,7 +3410,7 @@ function TransferPlanPreview({
   return (
     <div className="mt-4 space-y-3">
       {preview.blocked.length > 0 && (
-        <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/[0.08] px-4 py-3 text-sub leading-6 text-[#ffb4b4]">
+        <div className="rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/[0.08] px-4 py-3 text-sub leading-6 text-[#ffb4b4]">
           {preview.blocked.map((b) => (
             <p key={b}>{b}</p>
           ))}
@@ -3134,7 +3619,7 @@ function DeleteDialog({
                 type="checkbox"
                 checked={confirmed}
                 onChange={(e) => setConfirmed(e.target.checked)}
-                className="mt-1 size-4 accent-[#ff6b6b]"
+                className="mt-1 size-4 accent-[var(--danger)]"
               />
               我已明白：以上目录及其中全部文件将被永久删除，无法恢复。
             </label>
@@ -3318,7 +3803,7 @@ function DeleteFileDialog({
                 type="checkbox"
                 checked={confirmed}
                 onChange={(e) => setConfirmed(e.target.checked)}
-                className="mt-1 size-4 accent-[#ff6b6b]"
+                className="mt-1 size-4 accent-[var(--danger)]"
               />
               我已明白：{isLast ? "整个条目目录及其中全部文件" : "该文件及其同名附属文件"}
               将被永久删除，无法恢复。

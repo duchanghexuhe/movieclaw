@@ -100,7 +100,7 @@ export function MediaSourceAnnotationDialog({
 
       <div className="scroll-thin min-h-0 flex-1 overflow-y-auto p-6 max-md:p-5">
         {error && (
-          <p className="mt-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-sub leading-6 text-red-200">
+          <p className="mt-3 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--danger)]">
             {error}
           </p>
         )}
@@ -151,14 +151,14 @@ export function MediaSourceAnnotationDialog({
                 className={`flex w-full items-baseline gap-2.5 rounded-xl border px-4 py-2.5 text-left transition disabled:opacity-50 ${
                   active
                     ? o.destructive
-                      ? "border-amber-300/40 bg-amber-400/[0.08]"
+                      ? "border-[var(--warn)]/40 bg-[var(--warn)]/[0.08]"
                       : "border-[#2dd4bf]/40 bg-[#2dd4bf]/[0.08]"
                     : "border-white/[0.08] bg-white/[0.03] hover:bg-white/[0.07]"
                 }`}
               >
                 <span
                   className={`shrink-0 text-ui font-medium ${
-                    o.destructive ? "text-amber-100/90" : "text-white/90"
+                    o.destructive ? "text-[var(--warn)]/90" : "text-white/90"
                   }`}
                 >
                   {o.label}

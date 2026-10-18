@@ -131,7 +131,7 @@ function OptionRow({
           checked={checked && option.available}
           disabled={!usable}
           onChange={onToggle}
-          className="mt-1 size-4 accent-[#ff6b6b] disabled:opacity-40"
+          className="mt-1 size-4 accent-[var(--danger)] disabled:opacity-40"
         />
         <span className="min-w-0">
           <span className="font-medium">{option.label}</span>

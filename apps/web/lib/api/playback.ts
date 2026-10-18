@@ -230,6 +230,17 @@ export interface PlaybackDelivery {
   reason: string | null;
 }
 
+/**
+ * 服务端视角推断的卡顿迹象（后端 schemas/playback.py 的 PlaybackStallHintView）：
+ * 服务端看不到播放器的缓冲，这是迹象不是实测，怎么推的在 reason 里。
+ */
+export interface PlaybackStallHint {
+  /** decode=转码端供不上片；bandwidth=客户端拉流低于码率 */
+  cause: string;
+  /** 中文一句话，说清依据（含读数） */
+  reason: string;
+}
+
 export interface ActivePlaybackSession {
   device_id: string;
   /** 能否「注销此设备」：Jellyfin 播放器与登录设备（新的网页会话、App）可以；升级前的旧网页会话不行。 */
@@ -251,6 +262,8 @@ export interface ActivePlaybackSession {
   file: PlaybackFileSpec | null;
   /** 播放方式；旧版服务端没有这个字段 */
   delivery?: PlaybackDelivery | null;
+  /** 卡顿迹象；旧版服务端没有这个字段 */
+  stall?: PlaybackStallHint | null;
   started_at: string;
   last_report_at: string;
 }
@@ -585,6 +598,9 @@ export interface PlaybackDecision {
   setting_key: string | null;
   reason: string;
   suggestion: string | null;
+  /** 计划是外网线路降档的结果：网页端拦下起播、弹窗确认「降档播还是原画质播」。
+   *  推荐档就是计划本身的 video.height；不认这个字段的客户端直接播＝自动降档 */
+  uplink_step_down?: boolean;
 }
 
 /** 源文件的客观规格（台账真值），诊断面板「源 → 处理」层次的左半边 */
@@ -806,13 +822,14 @@ export async function fetchPlaybackDiagnostics(
 export async function pingPlaybackSession(
   sessionId: string,
   scope: PlaybackApiScope = DEFAULT_PLAYBACK_SCOPE,
-): Promise<boolean | "failed" | null> {
+): Promise<boolean | "failed" | "worker_lost" | null> {
   try {
-    const res = await request<ApiEnvelope<{ failed?: boolean }>>(
+    const res = await request<ApiEnvelope<{ failed?: boolean; worker_lost?: boolean }>>(
       `${scope.base}/sessions/${encodeURIComponent(sessionId)}/ping`,
       { method: "POST" },
     );
-    return res.data?.failed ? "failed" : true;
+    if (res.data?.failed) return "failed";
+    return res.data?.worker_lost ? "worker_lost" : true;
   } catch (error) {
     return error instanceof HttpError && error.status === 404 ? false : null;
   }

@@ -125,7 +125,7 @@ function SourceLine({ children }: { children: React.ReactNode }) {
 /** 处理行：→ 开头，弱一档的颜色——读的顺序就是数据流的方向。 */
 function ActionLine({ children, alert }: { children: React.ReactNode; alert?: boolean }) {
   return (
-    <p className={alert ? "text-red-300" : "text-white/75"}>
+    <p className={alert ? "text-[var(--danger)]" : "text-white/75"}>
       <span className="mr-1 text-white/40">→</span>
       {children}
     </p>
@@ -355,6 +355,8 @@ export function DiagnosticsPanel({
             </ActionLine>
           ) : null}
           {diagnostics?.worker_id ? (
+            // worker_version 不并入这行：Windows Worker 把它写死成主机名风格
+            // 的占位串，显示出来会被读成第二个 Worker（worker/engine.py 握手）
             <ActionLine>
               Worker：<span className="break-all">{diagnostics.worker_id}</span>
               {diagnostics.worker_online === true
@@ -362,13 +364,7 @@ export function DiagnosticsPanel({
                 : diagnostics.worker_online === false
                   ? " · 离线"
                   : " · 切换中"}
-            </ActionLine>
-          ) : null}
-          {diagnostics?.worker_version || diagnostics?.ffmpeg_version ? (
-            <ActionLine>
-              {diagnostics.worker_version ? `Worker ${diagnostics.worker_version}` : null}
-              {diagnostics.worker_version && diagnostics.ffmpeg_version ? " · " : null}
-              {diagnostics.ffmpeg_version ? `ffmpeg ${diagnostics.ffmpeg_version}` : null}
+              {diagnostics.ffmpeg_version ? ` · ffmpeg ${diagnostics.ffmpeg_version}` : null}
             </ActionLine>
           ) : null}
           {diagnostics?.worker_platform || diagnostics?.worker_arch ? (
@@ -409,7 +405,7 @@ export function DiagnosticsPanel({
           {videoSource ? <SourceLine>{videoSource}</SourceLine> : null}
           {videoAction ? <ActionLine>{videoAction}</ActionLine> : null}
           {decision.video?.burn_subtitle ? <ActionLine>字幕压制进画面</ActionLine> : null}
-          <div className={dropRatio > DROP_ALERT_RATIO ? "text-red-300" : "text-white/75"}>
+          <div className={dropRatio > DROP_ALERT_RATIO ? "text-[var(--danger)]" : "text-white/75"}>
             掉帧{" "}
             <span className="tnum">
               {stats?.droppedFrames != null

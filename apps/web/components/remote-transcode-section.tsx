@@ -20,7 +20,6 @@ import {
   getRemoteTranscodeConfig,
   getRemoteTranscodeStatus,
   saveRemoteTranscodeConfig,
-  saveWorkerLimit,
 } from "@/lib/api/transcode-worker";
 
 const BYTES_PER_MIB = 1024 * 1024;
@@ -48,8 +47,9 @@ export interface RemoteTranscodeSectionProps {
  * 「播放」分区的远程转码设置（原「应用 → 远程转码」标签，设置页按功能重组后
  * 迁入「媒体库」组）。
  *
- * 在这里启用远程转码，并调整每台设备的并发上限。开关、并发上限改完即存；
- * 覆盖地址是单个文本值，失焦或回车提交。
+ * 在这里启用远程转码；覆盖地址是单个文本值，失焦或回车提交。并发上限在
+ * Worker 本机配置（v2 起服务端不再保存或下发它），这一页只展示 Worker
+ * 申报的值。
  *
  * Worker 用哪个地址连过来，是在 Mac 那侧填的；服务端下发任务时用的取源地址和
  * 产物回传地址，默认直接取用那条控制连接自报的地址（remote_worker.py 的
@@ -70,7 +70,6 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
   const discardRef = useRef(false);
   const toast = useToast();
   const [status, setStatus] = useState<RemoteTranscodeStatus | null>(null);
-  const [savingLimit, setSavingLimit] = useState<number | null>(null);
   // 已授权的 Worker：「设备」里 scope=transcode 的那些（配对出来的转码器，以及
   // 给命令行模式转码器用的「仅限转码」手工令牌）。运行时注册表在断线时会把
   // Worker 整个摘掉（remote_worker.py 的 unregister），所以只看 status.workers
@@ -80,36 +79,6 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
   // 待批准的请求这里看不到了：服务端不再列出待批准请求（只能按配对码查），
   // 转码器发起配对时会直接打开带码的批准页（docs/design/login-devices.md §4）。
   const [authorizedWorkers, setAuthorizedWorkers] = useState<LoginDeviceView[]>([]);
-
-  async function updateLimit(deviceID: number, value: number) {
-    setSavingLimit(deviceID);
-    setError(null);
-    try {
-      await saveWorkerLimit(deviceID, value);
-      setStatus(await getRemoteTranscodeStatus());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "并发上限保存失败");
-    } finally {
-      setSavingLimit(null);
-    }
-  }
-
-  function limitControl(name: string, deviceID: number, value: number, supported = true) {
-    return (
-      <label className="flex items-center gap-2 text-caption text-[var(--text-muted)]">
-        {savingLimit === deviceID ? "正在保存…" : "同时转码"}
-        <select
-          aria-label={`${name} 最大并发任务数`}
-          className={SETTINGS_INPUT_CLASS}
-          value={value}
-          disabled={savingLimit !== null || !supported}
-          onChange={(event) => void updateLimit(deviceID, Number(event.target.value))}
-        >
-          {[1, 2, 3, 4].map((limit) => <option key={limit} value={limit}>{limit} 路</option>)}
-        </select>
-      </label>
-    );
-  }
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -249,11 +218,13 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
       : onlineWorkers.length > 0
         ? `已就绪，${onlineWorkers.length} 个 Worker 在线`
         : "配置已就绪，但还没有 Worker 连上来";
-  const statusClass = !config.enabled
-    ? "text-[var(--text-muted)]"
+  // 状态信号走小色点，文字保持中性——Netflix 主题下大段绿字/橙字与品牌红
+  // 同屏发土，色点既保留信号又不参与撞色（与 Banner「图标上色、正文中性」同理）。
+  const statusDotClass = !config.enabled
+    ? null
     : config.ready && onlineWorkers.length > 0
-      ? "text-emerald-300"
-      : "text-amber-200";
+      ? "bg-[var(--ok)]"
+      : "bg-[var(--warn)]";
   // 「设备」页入口：这一页只回答「现在连着吗、在干什么」；「批准新的、授权还在
   // 不在、要不要注销」是设备页的事，两页各管一段，互相指路。
   const devicesLink = onOpenDevices && (
@@ -269,7 +240,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
     <>
       <SettingsSection
         title="远程转码"
-        description="只把需要远程硬件能力的转码任务交给兼容 Worker。NAS 仍负责鉴权、播放会话和 HLS 缓存；修改后立即生效，不需要重启应用。当前可用的 Worker 实现为 macOS Apple Silicon 版本。"
+        description="只把需要远程硬件能力的转码任务交给兼容 Worker。NAS 仍负责鉴权、播放会话和 HLS 缓存；修改后立即生效，不需要重启应用。当前可用的 Worker 实现是 macOS Apple Silicon 转码器与 Windows Worker（预转码 + NVENC 实时转码）。"
       >
         <div className="space-y-3">
           {error && <ErrorBanner>{error}</ErrorBanner>}
@@ -298,17 +269,23 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                 onChange={(next) => void toggleEnabled(next)}
               />
             </SettingsRow>
+            {/* 「远程优先」开关已随自动调度定案移除：HDR / 4K 片由远程 Worker
+                执行、普通 SDR ≤1080p 由 NAS 本地执行（plan.select_execution_backend），
+                不再需要人工偏好。 */}
             <SettingsRow
               label="当前状态"
               description={
                 config.issues.length > 0 && (
-                  <ul className="space-y-0.5 text-amber-200/90">
+                  <ul className="space-y-0.5 text-[var(--warn)]/90">
                     {config.issues.map((issue) => <li key={issue}>· {issue}</li>)}
                   </ul>
                 )
               }
             >
-              <span className={`max-w-[18rem] text-right text-sub ${statusClass}`}>{statusText}</span>
+              <span className="flex max-w-[18rem] items-center justify-end gap-1.5 text-right text-sub text-[var(--text-muted)]">
+                {statusDotClass && <span className={`size-1.5 shrink-0 rounded-full ${statusDotClass}`} />}
+                {statusText}
+              </span>
             </SettingsRow>
           </SettingsList>
         </div>
@@ -320,7 +297,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
         footnote={
           hasAnyWorker && (
             <>
-              同时转码的路数改完即存，并同步到转码器。{devicesLink}
+              同时转码的路数在 Worker 本机配置，这里只展示它申报的值。{devicesLink}
             </>
           )
         }
@@ -330,11 +307,17 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
               合法）挡着。做成横幅而不是替换整块内容：已授权的设备该照常列出来，
               用户需要同时看到「我配过哪几台」和「现在为什么连不上」。 */}
           {!config.ready && (
-            <Banner tone="warn">
-              {!config.enabled
-                ? "远程转码还没开启，Worker 现在连不上来。打开上面的开关即可。"
-                : "「高级」里填的覆盖地址不合法，Worker 现在连不上来。改正或清空它即可。"}
-            </Banner>
+            !config.enabled ? (
+              // 「还没开启」是关闭态不是异常——按全站规范不占状态色，用中性灰
+              //（与 cloud 分区「已断开」横幅同一档）；warn 只留给上面那种「想开但配错」。
+              <Banner tone="neutral">
+                远程转码还没开启，Worker 现在连不上来。打开上面的开关即可。
+              </Banner>
+            ) : (
+              <Banner tone="warn">
+                「高级」里填的覆盖地址不合法，Worker 现在连不上来。改正或清空它即可。
+              </Banner>
+            )
           )}
 
           {status == null ? (
@@ -347,15 +330,16 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                   label={
                     <span className="flex items-center gap-2">
                       <span className="truncate">{worker.worker_id}</span>
-                      <span
-                        className={`shrink-0 text-caption font-normal ${
-                          worker.online
-                            ? worker.draining
-                              ? "text-amber-200"
-                              : "text-emerald-300"
-                            : "text-[var(--text-faint)]"
-                        }`}
-                      >
+                      {/* 在线信号走色点不走彩字：与「当前状态」行同一形态，
+                          避免 Netflix 主题下绿字与品牌红同屏撞色 */}
+                      {worker.online && (
+                        <span
+                          className={`size-1.5 shrink-0 rounded-full ${
+                            worker.draining ? "bg-[var(--warn)]" : "bg-[var(--ok)]"
+                          }`}
+                        />
+                      )}
+                      <span className="shrink-0 text-caption font-normal text-[var(--text-faint)]">
                         {worker.online ? (worker.draining ? "暂停接单" : "在线") : "已离线"}
                       </span>
                     </span>
@@ -370,6 +354,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                         worker.hardware.memory_bytes ? `${Math.round(worker.hardware.memory_bytes / 1024 ** 3)} GB` : null,
                         worker.ffmpeg_version ? `ffmpeg ${worker.ffmpeg_version}` : null,
                         worker.backends.length > 0 ? worker.backends.join("/") : null,
+                        worker.roles.length > 0 ? worker.roles.join("/") : null,
                         `任务 ${worker.active_jobs}/${worker.max_jobs}`,
                         `${Math.round(worker.last_seen_seconds)} 秒前活跃`,
                       ]
@@ -381,15 +366,9 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                           {worker.load.thermal_state >= 2 ? " · 正在降温" : ""}
                         </span>
                       )}
-                      {!worker.server_config && (
-                        <span className="block">更新转码器后可同步设置并发上限</span>
-                      )}
                     </>
                   }
-                >
-                  {worker.device_id != null && limitControl(worker.worker_id, worker.device_id,
-                    status.device_limits[`ld-${worker.device_id}`] ?? worker.max_jobs, worker.server_config)}
-                </SettingsRow>
+                />
               ))}
               {/* 已授权但没连上来的。它们在运行时注册表里不存在，但授权还在，
                   用户也确实配过——不显示的话，Mac 一关机这台就凭空消失，
@@ -408,9 +387,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                   description={`已授权 · 最近活跃 ${relativeTime(device.last_seen_at)}${
                     config.ready ? " · Mac 没开机或没联网时属正常" : ""
                   }`}
-                >
-                  {limitControl(device.name, Number(device.id.replace("ld-", "")), status.device_limits[device.id] ?? 1)}
-                </SettingsRow>
+                />
               ))}
             </SettingsList>
           ) : config.ready ? (

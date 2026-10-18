@@ -134,7 +134,7 @@ export function EpisodeFloorDialog({
       </div>
       <div className="space-y-1.5 p-6 max-md:p-5">
         {error && (
-          <p className="mb-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-sub leading-6 text-red-200">
+          <p className="mb-3 rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--danger)]">
             {error}
           </p>
         )}
@@ -229,15 +229,15 @@ export function EpisodeHintBanner({
       {hints.map((hint) => (
         <section
           key={hint.season_number}
-          className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-xl border border-amber-400/25 bg-amber-500/[0.08] px-4 py-3"
+          className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/[0.08] px-4 py-3"
         >
           <div className="min-w-0 flex-1 basis-64">
-            <p className="text-ui font-semibold text-amber-100">
+            <p className="text-ui font-semibold text-[var(--warn)]">
               第 {hint.season_number} 季可能还没收齐
             </p>
-            <p className="mt-0.5 text-sub leading-6 text-amber-100/75">{hintReason(hint)}</p>
+            <p className="mt-0.5 text-sub leading-6 text-[var(--warn)]/75">{hintReason(hint)}</p>
             {hint.site_title && hint.site_episode && hint.site_episode >= (hint.douban_count ?? 0) && (
-              <p className="truncate text-caption text-amber-100/50" title={hint.site_title}>
+              <p className="truncate text-caption text-[var(--warn)]/50" title={hint.site_title}>
                 {hint.site_title}
               </p>
             )}

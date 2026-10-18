@@ -93,7 +93,7 @@ function CallbackAddress({ binding }: { binding: ChannelBinding }) {
 /** 错误条：两种 body 共用。 */
 function ErrorBanner({ message }: { message: string }) {
   return (
-    <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]">
+    <div className="rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/10 px-4 py-3 text-body text-[var(--danger)]">
       {message}
     </div>
   );

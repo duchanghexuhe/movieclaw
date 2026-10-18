@@ -357,6 +357,9 @@ actor WorkerClient {
                 "encoders": capabilities.encoders,
                 "backends": capabilities.backends,
                 "max_jobs": configuration.maxJobs,
+                // v2 统一调度：申报执行角色。Mac 转码器只接实时播放任务，
+                // 不做预转码（预转码推送派单只发给声明了 preload 的 Worker）
+                "roles": ["realtime"],
                 "server_config": true,
                 "hardware": WorkerTelemetry.hardware(),
                 // 旧版服务端忽略这个字段；新版只把 TS 分片任务派给声明了 mpegts 的 Worker
@@ -464,7 +467,7 @@ actor WorkerClient {
             // 旧版服务端在 accept 之前就关连接，uvicorn 只回一个空的 403、理由丢了：
             // 凭证失效和开关没开分不出来，两种都得说
             return NASRejectionError(
-                reason: "NAS 拒绝了连接（HTTP 403）：请确认网页「应用 → 远程转码」已经打开；"
+                reason: "NAS 拒绝了连接（HTTP 403）：请确认网页设置「转码」页的远程转码开关已经打开；"
                     + "已经打开的话，说明这台 Mac 的授权已失效，请在网页「设置 → 设备」重新配对"
             )
         case 404:
@@ -525,6 +528,16 @@ actor WorkerClient {
         case "worker.config.error":
             publish(state, message: "并发设置未保存", error: message["error"] as? String)
         case "job.start":
+            // v2 统一调度：预转码推送任务不会派给这台（roles 只报 realtime），
+            // 但旧版/异常服务端仍可能派来——明确拒绝而不是误当实时任务执行
+            if (message["class"] as? String) == "preload" {
+                if let taskID = message["task_id"] {
+                    send(["type": "job.failed", "job_id": "preload-\(taskID)",
+                          "class": "preload", "task_id": taskID,
+                          "error": "Mac 转码器不支持预转码任务"])
+                }
+                return
+            }
             await startJob(message)
         case "job.stop":
             if let jobID = message["job_id"] as? String {

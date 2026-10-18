@@ -18,6 +18,7 @@ import { useMemo } from "react";
 
 import type { DownloadTask } from "@/lib/api/downloaders";
 import type { JobView } from "@/lib/api/jobs";
+import type { PreloadTaskView } from "@/lib/api/preload";
 // 单条下载任务 / 单条 Job 的档位判定分别放在 download-attention 与
 // job-attention（无 React、可单测）；本模块只做跨领域的分组与计数。
 import {
@@ -32,6 +33,7 @@ import {
   jobNeedsAttention,
 } from "@/lib/job-attention";
 import { useJobs } from "@/lib/jobs";
+import { usePreloadTasks } from "@/lib/preload-tasks";
 
 export {
   contentMissingLabel,
@@ -51,6 +53,11 @@ export interface TaskActivity {
   standaloneAttentionJobs: JobView[];
   standaloneActiveJobs: JobView[];
   standaloneHistoricalJobs: JobView[];
+  /** 预转码任务（独立小状态机，见 docs/design/preload-transcode.md）：失败=需要
+   * 处理，排队/已领取/转码中=进行中，其余落历史。 */
+  preloadAttention: PreloadTaskView[];
+  preloadActive: PreloadTaskView[];
+  preloadHistorical: PreloadTaskView[];
   /** 需要处理的条数（下载过程按作品合并后计一条）。 */
   attentionTotal: number;
   /** 进行中的条数。 */
@@ -65,6 +72,7 @@ export interface TaskActivity {
 export function useTaskActivity(): TaskActivity {
   const { jobs } = useJobs();
   const { tasks: downloadTasks } = useDownloadTasks();
+  const { tasks: preloadTasks } = usePreloadTasks();
 
   const ingestJobsByHash = useMemo(() => {
     const linked = new Map<string, JobView>();
@@ -125,6 +133,21 @@ export function useTaskActivity(): TaskActivity {
     [jobs, linkedIngestJobIds],
   );
 
+  // 预转码的三段切分：只有 failed 需要"你来看看"；排队/已领取/转码中都是进行中
+  //（claimed 可能 Worker 已失联，但租约到期会自动回队，不是要人处理的事）。
+  const preloadAttention = useMemo(
+    () => preloadTasks.filter((task) => task.status === "failed"),
+    [preloadTasks],
+  );
+  const preloadActive = useMemo(
+    () => preloadTasks.filter((task) => ACTIVE_PRELOAD_STATUSES.has(task.status)),
+    [preloadTasks],
+  );
+  const preloadHistorical = useMemo(
+    () => preloadTasks.filter((task) => !ACTIVE_PRELOAD_STATUSES.has(task.status) && task.status !== "failed"),
+    [preloadTasks],
+  );
+
   return {
     ingestJobsByHash,
     attentionDownloadGroups,
@@ -133,11 +156,18 @@ export function useTaskActivity(): TaskActivity {
     standaloneAttentionJobs,
     standaloneActiveJobs,
     standaloneHistoricalJobs,
-    attentionTotal: attentionDownloadGroups.length + standaloneAttentionJobs.length,
-    activeTotal: activeDownloadGroups.length + standaloneActiveJobs.length,
-    historyTotal: standaloneHistoricalJobs.length,
+    preloadAttention,
+    preloadActive,
+    preloadHistorical,
+    attentionTotal:
+      attentionDownloadGroups.length + standaloneAttentionJobs.length + preloadAttention.length,
+    activeTotal: activeDownloadGroups.length + standaloneActiveJobs.length + preloadActive.length,
+    historyTotal: standaloneHistoricalJobs.length + preloadHistorical.length,
   };
 }
+
+/** 预转码任务的进行中集合（claimed 只是 Worker 还没报第一段进度，不算异常）。 */
+const ACTIVE_PRELOAD_STATUSES = new Set<PreloadTaskView["status"]>(["queued", "claimed", "running"]);
 
 /**
  * 提醒角标的展示模型：**只表达当前最该被看见的那件事**，并给出点进去

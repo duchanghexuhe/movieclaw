@@ -1080,7 +1080,7 @@ function HeroCopy({ item, fullBleed }: { item: MediaItem; fullBleed: boolean }) 
         {item.genres.length > 0 && <span>{item.genres.join(" / ")}</span>}
         {item.extent && <span>{item.extent}</span>}
         {item.libraryStatus && (
-          <span className="flex items-center gap-1.5 text-emerald-300/90">
+          <span className="flex items-center gap-1.5 text-[var(--text-muted)]">
             <span className="size-1.5 rounded-full bg-[var(--ok)]" />
             在库
           </span>

@@ -52,10 +52,12 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     SEGMENT_SECONDS,
     TranscodeCommand,
     build_hls_command,
+    effective_hw_backend,
     segment_pattern,
     segment_type,
 )
 from movieclaw_api.services.playback.limits import auto_quota_bytes
+from movieclaw_api.services.playback import backend_health
 from movieclaw_api.services.playback.qoe import note_transcode_session
 from movieclaw_api.services.playback.remote_signing import issue_remote_grant
 from movieclaw_api.services.playback.remote_worker import (
@@ -63,6 +65,7 @@ from movieclaw_api.services.playback.remote_worker import (
     WorkerConnection,
     effective_remote_transcode_config,
     get_remote_worker_registry,
+    remote_worker_available,
 )
 from movieclaw_db.models.base import utcnow
 from movieclaw_events import new_ulid
@@ -92,6 +95,8 @@ logger = logging.getLogger("movieclaw_api.playback.session")
 #: 网页播放器另有兜底：心跳收到 404 会带着当前位置原地重开会话
 #: （components/player/video-player.tsx 的「掉线自愈」）。
 SESSION_IDLE_TIMEOUT_S = 180.0
+#: 心跳空闲超过这个秒数、且取流也断开过的会话提前回收（页签直接关闭的场景）。
+STREAM_DISCONNECT_REAP_S = 20.0
 #: 回收巡检间隔。
 REAP_INTERVAL_S = 15.0
 #: 等 playlist 出现的上限。playlist 先行——会话起来后 ffmpeg 立刻写出
@@ -332,6 +337,10 @@ class TranscodeSession:
     process: asyncio.subprocess.Process | None = None
     state: str = "spawning"  # spawning | ready | failed | stopped
     last_ping: float = field(default_factory=time.monotonic)
+    #: 最近一次取流响应「中途断开」的时刻（页签直接关闭、播放器被杀）。
+    #: None = 没发生过；心跳巡检据此把「无心跳且取流也断」的会话提前回收——
+    #: 不然 ffmpeg 会对着没人看的片转满整个空闲超时（GPU 空转数分钟）。
+    last_stream_disconnect_at: float | None = None
     created_at: float = field(default_factory=time.monotonic)
     error: str | None = None
     stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=_STDERR_KEEP_LINES))
@@ -896,6 +905,12 @@ class TranscodeSessionManager:
             return
         self._signal_group(session, signal.SIGCONT)
 
+    def note_stream_disconnect(self, session_id: str) -> None:
+        """取流响应中途断开（客户端没了）。只记账；回收判定在 reap。"""
+        session = self._sessions.get(session_id)
+        if session is not None:
+            session.last_stream_disconnect_at = time.monotonic()
+
     async def reap(self) -> int:
         """回收超时无心跳的会话，返回回收数量。顺带跑一遍磁盘水位哨兵，并把
         活跃会话的台账刷一遍（进程崩了也只丢最近十几秒的登记）。"""
@@ -904,16 +919,29 @@ class TranscodeSessionManager:
             if session.manifest is not None:
                 await asyncio.to_thread(self._save_manifest, session)
         now = time.monotonic()
-        stale = [
-            sid
-            for sid, s in self._sessions.items()
-            if now - s.last_ping > SESSION_IDLE_TIMEOUT_S
-        ]
-        for sid in stale:
-            await self.stop(
-                sid,
-                reason=f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）",
-            )
+        stale: list[tuple[str, str]] = []
+        for sid, s in self._sessions.items():
+            idle = now - s.last_ping
+            if idle > SESSION_IDLE_TIMEOUT_S:
+                stale.append(
+                    (sid, f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）")
+                )
+            elif (
+                idle > STREAM_DISCONNECT_REAP_S
+                and s.last_stream_disconnect_at is not None
+                and now - s.last_stream_disconnect_at > STREAM_DISCONNECT_REAP_S
+            ):
+                # 页签被直接关闭时 DELETE 发不出来：心跳与取流同时消失。
+                # 心跳空闲刚过 20 秒且取流也断开过，就没有任何人在看了——
+                # 提前回收，别让 ffmpeg 对着空会话转满整个空闲超时。
+                stale.append(
+                    (
+                        sid,
+                        f"无心跳 {idle:.0f} 秒且取流已断开（播放器直接关闭），提前回收",
+                    )
+                )
+        for sid, reason in stale:
+            await self.stop(sid, reason=reason)
         return len(stale)
 
     # -- 会话操作 ---------------------------------------------------------
@@ -1234,9 +1262,11 @@ class TranscodeSessionManager:
         await self._evict_export_for_remote(session)
         # 先占位再拼 URL：得先知道是谁接单，才能用它连上来的地址拼。
         try:
+            if not session.hw_backend:
+                raise SessionStartError("远程会话缺少执行后端（决策层未给出）")
             connection = registry.reserve(
                 job_id,
-                backend=session.hw_backend or "videotoolbox",
+                backend=session.hw_backend,
                 segment_type=segment_type(session.plan),
                 attempt_id=job_id,
                 disc=session.concat_list is not None,
@@ -1305,6 +1335,53 @@ class TranscodeSessionManager:
             raise SessionStartError(f"远程转码不可用：{exc}") from exc
         finally:
             registry.remove_job_waiter(job_id)
+
+    async def _switch_to_remote(self, session: TranscodeSession) -> bool:
+        """本地写者起步即死后，把会话原地切到在线远程 Worker 上。
+
+        只在「一段都没产出」的起步死亡后调用：会话没有任何本地产物要衔接，
+        换写者不存在断点问题；切过去之后 seek 重启走远程路径（``remote`` 已
+        置位），会话结束的清理也按远程任务走。取源/回传地址不覆盖——用接单
+        Worker 自己连上来的地址，与常规远程会话的默认一致。
+
+        返回是否切换成功；失败时已把现场退回本地（决策层重选会因熔断跳过
+        坏后端，但那要等下一次会话，本会话由调用方按原路径判失败）。
+        """
+        assert not session.remote
+        disc = session.concat_list is not None
+        for name in ("videotoolbox", "nvenc"):
+            if not remote_worker_available(name, segment_type(session.plan), disc=disc):
+                continue
+            if effective_hw_backend(session.plan, name) is None:
+                continue
+            old_backend = session.hw_backend
+            session.hw_backend = name
+            session.remote = True
+            session.error = None
+            try:
+                await self._spawn_remote(session, "")
+            except Exception as exc:
+                # 占位的槽位必须归还：任务从未被 Worker 接受，留着就是死占
+                if session.remote_job_id is not None:
+                    get_remote_worker_registry().release_job(session.remote_job_id)
+                    session.remote_job_id = None
+                session.remote = False
+                session.hw_backend = old_backend
+                logger.warning(
+                    "本地起步失败后切换远程 Worker 未成功：session=%s backend=%s：%s",
+                    session.id,
+                    name,
+                    exc,
+                )
+                return False
+            logger.info(
+                "本地后端起步即死，会话已切到远程 Worker：session=%s（%s）backend=%s",
+                session.id,
+                session.display_name or "-",
+                name,
+            )
+            return True
+        return False
 
     async def _wait_for_remote_playlist(
         self, session: TranscodeSession, job_id: str
@@ -2030,17 +2107,24 @@ class TranscodeSessionManager:
                     session.unreachable_segments.add(wanted)
                     if not session.remote and not session.completed_segments:
                         # 本会话一段都没产出过：不是源短，是这条命令在这台机器上就起不来
-                        # （issue #763：VAAPI 链路起步即退出）。判会话失败，init/分片
-                        # 立即 404、诊断带上原因，播放器才能走降档换一档，而不是对着
-                        # 一个死会话一直缓冲
+                        # （issue #763：VAAPI 链路起步即退出）。先把这个后端记进熔断
+                        # （决策层的静态兼容性判断被真机证伪了，证据要喂回去），再尝试
+                        # 把会话原地切到在线的远程 Worker 上——2026-10-15 的 4K HDR10
+                        # 事件里，本地链秒崩的同时远程 Worker 正在线上干瞪眼。切换
+                        # 失败才判会话失败：init/分片立即 404、诊断带上原因，播放器
+                        # 走降档换一档，而不是对着一个死会话一直缓冲。
+                        stderr_reason = " / ".join(dict.fromkeys(session.stderr_tail))
+                        if session.hw_backend:
+                            backend_health.demote(
+                                session.hw_backend, reason=stderr_reason[:200]
+                            )
+                        if session.hw_backend and await self._switch_to_remote(session):
+                            return
                         self._mark_failed(
                             session,
                             "转码进程起步即退出、一段都没产出："
                             # 两轮进程报的是同一套错：去重，免得一条原因念两遍
-                            + (
-                                " / ".join(dict.fromkeys(session.stderr_tail))
-                                or "（ffmpeg 无输出）"
-                            ),
+                            + (stderr_reason or "（ffmpeg 无输出）"),
                         )
                         return
                     logger.warning(
@@ -2188,7 +2272,7 @@ class TranscodeSessionManager:
                 await self._evict_export_for_remote(session)
                 connection = registry.reserve(
                     job_id,
-                    backend=session.hw_backend or "videotoolbox",
+                    backend=session.hw_backend,  # type: ignore[arg-type]  # 首次下发已校验非空
                     segment_type=segment_type(session.plan),
                     attempt_id=job_id,
                     disc=session.concat_list is not None,
@@ -2566,6 +2650,13 @@ class TranscodeSessionManager:
         first_signal = signal.SIGTERM if graceful else signal.SIGKILL
         try:
             os.killpg(os.getpgid(process.pid), first_signal)
+        except AttributeError:
+            # Windows 没有进程组：直接杀单个进程（本机开发/测试环境）
+            with contextlib.suppress(ProcessLookupError):
+                if graceful:
+                    process.terminate()
+                else:
+                    process.kill()
         except (ProcessLookupError, PermissionError):
             with contextlib.suppress(ProcessLookupError):
                 if graceful:

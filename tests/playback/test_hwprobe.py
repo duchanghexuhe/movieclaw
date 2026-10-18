@@ -304,12 +304,12 @@ def test_result_is_cached_until_forced(monkeypatch):
 
 
 def test_local_available_backends_excludes_remote_overlay(monkeypatch):
-    """远程 Worker 的 VideoToolbox 能力不能变成本地 ffmpeg 参数。"""
+    """远程 Worker 的硬件能力不能变成本地 ffmpeg 参数。"""
     monkeypatch.setattr(hwprobe.shutil, "which", lambda _n: "/usr/bin/ffmpeg")
     monkeypatch.setattr(hwprobe, "_list_encoders", lambda: frozenset())
     monkeypatch.setattr(hwprobe, "remote_worker_available", lambda _backend: True)
 
-    assert hwprobe.available_backends() == ("videotoolbox",)
+    assert hwprobe.available_backends() == ("nvenc", "videotoolbox")
     assert hwprobe.available_local_backends() == ()
 
 

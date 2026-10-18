@@ -227,7 +227,7 @@ function ClearLibraryHistoryDialog({
           <button
             type="submit"
             disabled={selected === null || busy}
-            className="rounded-lg bg-red-500/85 px-4 py-2 text-ui font-medium text-white transition hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-lg bg-[var(--danger-solid)] px-4 py-2 text-ui font-medium text-white transition hover:bg-[var(--danger-solid-hover)] disabled:cursor-not-allowed disabled:opacity-50"
           >
             {busy ? "清空中…" : selected ? `清空「${selected.name}」` : "清空"}
           </button>

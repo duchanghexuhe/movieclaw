@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.services.media_probe import probe_keyframe_interval
+from movieclaw_api.services.playback import backend_health
 from movieclaw_api.services.playback.disc_source import disc_source_for_file
 from movieclaw_api.services.playback.ffmpeg_args import (
     effective_hw_backend,
@@ -24,7 +26,10 @@ from movieclaw_api.services.playback.ffmpeg_args import (
 from movieclaw_api.services.playback.hwprobe import hardware_available
 from movieclaw_api.services.playback.iso_source import iso_disc_source
 from movieclaw_api.services.playback.limits import MAX_TRANSCODE_HEIGHT
-from movieclaw_api.services.playback.remote_worker import remote_worker_busy
+from movieclaw_api.services.playback.remote_worker import (
+    remote_worker_available,
+    remote_worker_busy,
+)
 from movieclaw_api.services.playback.strm_probe import ensure_strm_spec
 from movieclaw_api.services.playback.track_context import track_contexts
 from movieclaw_api.settings import PlaybackPolicySetting
@@ -60,6 +65,8 @@ async def decide_for_file(
     preferred_audio: str | None = None,
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
+    external: bool = False,
     visible_library_ids: set[int] | None = None,
 ) -> PlaybackDecision | None:
     """对一个台账文件出播放决策；文件不存在或当前账号不可见时返回 None。
@@ -79,6 +86,8 @@ async def decide_for_file(
         preferred_audio=preferred_audio,
         preferred_subtitle=preferred_subtitle,
         max_height=max_height,
+        uplink_bps=uplink_bps,
+        external=external,
         contexts=await track_contexts(session, [file]),
     )
 
@@ -92,6 +101,8 @@ async def decide_for_files(
     preferred_audio: str | None = None,
     preferred_subtitle: str | None = None,
     max_height: int | None = None,
+    uplink_bps: int | None = None,
+    external: bool = False,
     contexts: dict[int, TrackContext] | None = None,
 ) -> PlaybackDecision | None:
     """多候选择优（§3.5）：同一条目常有 1080p/2160p 两个版本，能直通的
@@ -108,6 +119,23 @@ async def decide_for_files(
     policy = await load_policy()
     decisions = []
     for file in files:
+        # T3 高度上限随执行者：片属性命中远程分流（HDR/4K）且 nvenc Worker
+        # 在线时，这一部的转码上限放到 2160——只有远程才装得出 4K 的速度
+        # （NAS 核显 4K 只有 1.8×）。执行后端随后在 select_execution_backend
+        # 按同一分流规则把这类片优先交给远程；远程中途掉线走既有「硬件落空
+        # →重决策」路径，按 1080 本地重判，不会卡住播放。
+        file_policy = policy
+        if (
+            policy.max_transcode_height < REMOTE_TRANSCODE_HEIGHT
+            and prefers_remote_execution(file)
+            and remote_worker_available("nvenc")
+            # 外网会话不提 4K：天花板是 1080p 档（流量），远程 2160 档（16M，
+            # ≈7 GB/小时）会把它顶穿。HDR/4K 片在外网落到 1080p 转码或省流档。
+            and uplink_bps is None
+        ):
+            file_policy = replace(
+                policy, max_transcode_height=REMOTE_TRANSCODE_HEIGHT
+            )
         # 网盘（strm）条目扫库时不探规格，第一次播放在这里现探并落库（strm_probe）：
         # 有了真实编码，才能和本地文件一样选直出 / 换封装 / 转码
         await ensure_strm_spec(file)
@@ -146,11 +174,12 @@ async def decide_for_files(
         elif not is_iso and needs_keyframe_probe(
             profile,
             capability,
-            policy,
+            file_policy,
             failed_tiers=failed_tiers,
             preferred_audio=preferred_audio,
             preferred_subtitle=preferred_subtitle,
             max_height=max_height,
+            uplink_bps=uplink_bps,
         ):
             probe_started = time.perf_counter()
             interval = await asyncio.to_thread(
@@ -174,14 +203,17 @@ async def decide_for_files(
                 decide_playback(
                     profile,
                     capability,
-                    policy,
+                    file_policy,
                     can_self_enable=can_self_enable,
                     failed_tiers=failed_tiers,
                     preferred_audio=preferred_audio,
                     preferred_subtitle=preferred_subtitle,
                     max_height=max_height,
+                    uplink_bps=uplink_bps,
+                    external=external,
                 ),
                 profile.height,
+                profile.bit_rate_bps,
             )
         )
     return _best(decisions)
@@ -199,9 +231,29 @@ async def load_policy() -> PlaybackPolicy:
     return PlaybackPolicy(
         software_transcode_enabled=stored.software_transcode_enabled,
         hardware_available=available,
-        hardware_busy=not available and remote_worker_busy("videotoolbox"),
+        # 本机无硬件但远程有（Mac 或 Windows GPU），提示「忙」而不是「没有」；
+        # 名单要覆盖 _with_remote_backend 叠加的每个远程后端
+        hardware_busy=not available
+        and any(remote_worker_busy(name) for name in ("videotoolbox", "nvenc")),
         max_transcode_height=MAX_TRANSCODE_HEIGHT,
     )
+
+
+#: 远程执行者的高度上限（T3）：NAS 虚拟核显编 4K 只有 1.8×（真片实测），
+#: 2070S 的全 GPU 链有 4.7×——4K 输出只对远程放开。
+REMOTE_TRANSCODE_HEIGHT = 2160
+
+
+def prefers_remote_execution(file: LibraryFile) -> bool:
+    """T3 分流规则：这部片该不该由远程 Worker 执行转码（按片属性，不按负载）。
+
+    HDR 或 ≥4K 源走远程——核显的 tone-map/CUDA 链在这种片上与本地差一个
+    数量级（2070S 省流档 12.7× vs NAS 4K HDR 1.8×）；普通 SDR ≤1080p 本地
+    跑得又快又省（远程供片天生 +4 秒延迟，见 git log 5ef5f5c3/0d55051b）。
+    """
+    if file.hdr:
+        return True
+    return (file.resolution or "") == "2160p"
 
 
 def select_execution_backend(
@@ -211,13 +263,20 @@ def select_execution_backend(
     local_backends: tuple[str, ...],
     remote_video_available: bool,
 ) -> tuple[str | None, bool]:
-    """为当前播放计划选择真正能执行的后端。
+    """为当前播放计划选择真正能执行的后端（自动调度，无人工偏好开关）。
 
     ``available`` 是给决策层用的合并能力快照，``local_backends`` 则只包含
     NAS 本机实际探测通过的后端。两者不能按列表首项直接使用：列表顺序是
-    全局优先级，不代表该计划（尤其是 PGS 烧录）的滤镜链兼容性。先选能在
-    NAS 执行当前计划的后端；只有本地都不兼容时，才把在线 VideoToolbox
-    Worker 作为候选。返回值的第二项明确标出是否需要远程会话。
+    全局优先级，不代表该计划（尤其是 PGS 烧录）的滤镜链兼容性。
+
+    调度规则（T3 定案，替代原「远程优先」偏好开关）：
+    - SDR ≤1080p 的普通转码本地优先——远程供片天生多 1~4 秒延迟；
+    - HDR 或高分辨率（>1080，即高度上限已随执行者放开）的计划优先远程
+      ——这两类片远程快一个数量级（2070S 12.7×/4.7× vs NAS 核显 1.8×），
+      本地优先反而选了个跑不动的；
+    - 杜比视界 P5（``dolby_vision == "apply"``，色调映射必须吃 RPU）：本机后端的映射
+      不认 RPU（VAAPI / QSV）时，只要有远程转码器在线就交给它，名额满也不退回本机；
+    - 选择的远程不可用（离线/满员/不兼容）自动落回本地。
 
     网页播放器与 Jellyfin 兼容层的转码入口共用这一个函数——两条链路起的是
     同一种会话，执行后端的选法不能有两套。
@@ -225,35 +284,79 @@ def select_execution_backend(
     if decision.tier is not Tier.HARDWARE_TRANSCODE or decision.video.action != "transcode":
         return None, False
 
-    remote_ok = (
-        remote_video_available
-        and "videotoolbox" in available
-        and effective_hw_backend(decision, "videotoolbox") is not None
+    # 远程候选在进入顺序比较前先过两道闸：兼容性（滤镜链）与忙闲（名额
+    # 全满的 Worker 选了也会在 reserve 时 503，而明明还有本机能放——忙者
+    # 跳过，让本地兜底接住）。谁在 ``available`` 里由 hwprobe._with_remote_backend
+    # 按在线状态叠加。``remote_online`` 是只过了兼容性这道闸的在线者，杜比视界
+    # 规则要用（见下）。
+    remote_online = tuple(
+        backend
+        for backend in ("videotoolbox", "nvenc")
+        if (
+            remote_video_available
+            and backend in available
+            and effective_hw_backend(decision, backend) is not None
+        )
     )
+    remote_candidates = tuple(b for b in remote_online if not remote_worker_busy(b))
+    # HDR / 超高分辨率这类本地执行不了的片属性：远程有候选时直接给远程
+    #（命名避开已删除的 prefer_remote 配置项，防误读）
+    force_remote = (
+        decision.video.tone_map or (decision.video.height or 0) > MAX_TRANSCODE_HEIGHT
+    )
+    if force_remote and remote_candidates:
+        return remote_candidates[0], True
+
     usable = [b for b in local_backends if effective_hw_backend(decision, b) is not None]
-    if decision.video.dolby_vision == "apply" and remote_ok:
+    if decision.video.dolby_vision == "apply" and remote_online:
         # P5 的 IPT 基础层只有吃 RPU 才出得了对的颜色。本机只有 VAAPI / QSV（硬件色调映射
-        # 不认 RPU，整片发紫）而 Mac 转码器在线时，交给它
+        # 不认 RPU，整片发紫）而远程转码器在线时，交给它——名额满了也不退回本机：
+        # 排队或 503 好过一片紫，所以这里不看忙闲
         usable = [b for b in usable if tonemap_reads_dolby_vision(b)]
-    if usable:
-        return usable[0], False
-    if remote_ok:
-        return "videotoolbox", True
+        if not usable:
+            return (remote_candidates or remote_online)[0], True
+
+    # 本地执行不了才轮到远程 Worker。远程后端按优先级排：videotoolbox 在前
+    # （先接单的跑得久，速度画像更厚），nvenc（Windows GPU）兜底。
+    # 熔过的本地后端先跳过（起步即死刚发生过，证据见 backend_health）；
+    # 若全都被熔且远程也没有，末位兜底仍按原顺序试——熔断表达的是优先级
+    # 降低，不是绝对禁用，没有替代者时把片子判死比再试一次坏后端更糟。
+    demoted = backend_health.demoted_backends()
+    for backend in usable:
+        if backend not in demoted:
+            return backend, False
+    for backend in remote_candidates:
+        return backend, True
+    for backend in usable:
+        return backend, False
     return None, False
 
 
-def _best(decisions: list[tuple[PlaybackDecision, int | None]]) -> PlaybackDecision:
-    """择优：能出计划的按档位取最小，**同档位取更高分辨率**；全都出不了计划
-    时，优先把「要用户同意」这种可挽救的结果交给前端，而不是直接报拒绝。
+def _best(
+    decisions: list[tuple[PlaybackDecision, int | None, int | None]],
+) -> PlaybackDecision:
+    """择优：能出计划的按档位取最小，**同档位取更高分辨率**，同高再取更高
+    码率；全都出不了计划时，优先把「要用户同意」这种可挽救的结果交给前端，
+    而不是直接报拒绝。
 
     同档位决胜为什么必须有：直通判定放开后（§12.15），1080p 与 2160p 版本
     经常**同时**落在档 0/1，此时播哪个取决于数据库返回顺序——同一部片今天
     4K 明天 1080p。既然同档位代价相同（都不重编码），当然给用户画质最好的
-    那份；高度未知的候选排最后（None 当 0），至少保证结果确定。"""
-    plans = [(d, height) for d, height in decisions if isinstance(d, PlaybackPlan)]
+    那份；高度未知的候选排最后（None 当 0），至少保证结果确定。
+
+    同高再比码率：预转码的省流/高清（HEVC 格式下）同为 1080p 且都直通时，
+    取码率更高的高清档——零转码的前提下质量优先，与上一条同一哲学。"""
+    plans = [
+        (d, height, bitrate)
+        for d, height, bitrate in decisions
+        if isinstance(d, PlaybackPlan)
+    ]
     if plans:
-        return min(plans, key=lambda pair: (pair[0].tier, -(pair[1] or 0)))[0]
-    consents = [d for d, _ in decisions if isinstance(d, ConsentRequired)]
+        return min(
+            plans,
+            key=lambda pair: (pair[0].tier, -(pair[1] or 0), -(pair[2] or 0)),
+        )[0]
+    consents = [d for d, _, _ in decisions if isinstance(d, ConsentRequired)]
     return consents[0] if consents else decisions[0][0]
 
 
@@ -327,6 +430,7 @@ def to_view(decision: PlaybackDecision) -> PlaybackDecisionView:
             reason=decision.reason,
             disc=decision.disc,
             disc_playlist=decision.disc_playlist,
+            uplink_step_down=decision.uplink_forced,
         )
     if isinstance(decision, ConsentRequired):
         return PlaybackDecisionView(

@@ -81,8 +81,8 @@ const LEVEL_STYLE: Record<LogLevel, { badge: string; text: string; row: string }
     row: "bg-[var(--danger)]/[0.05]",
   },
   WARNING: {
-    badge: "bg-amber-400/10 text-amber-300/90",
-    text: "text-amber-100/80",
+    badge: "bg-[var(--warn)]/10 text-[var(--warn)]/90",
+    text: "text-[var(--warn)]/80",
     row: "",
   },
   INFO: {

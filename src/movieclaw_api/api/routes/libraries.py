@@ -2861,6 +2861,7 @@ def _file_view(
         purge_after=row.purge_after,
         trash_note=_trash_note(row),
         origin=FileOriginView(**origin_of(row, origins or {})),
+        derivation=row.derivation,
         kept_at=row.kept_at,
         audio_streams=(
             None

@@ -65,6 +65,9 @@ export interface RemoteTranscodeWorker {
   platform: string | null;
   ffmpeg_version: string | null;
   backends: string[];
+  /** Worker 在 hello 里申报的执行角色（v2）：实时转码 / 预转码推送派单。 */
+  roles: string[];
+  /** Worker 本机配置的最大同时转码数（v2 起服务端不再保存/下发并发上限）。 */
   max_jobs: number;
   active_jobs: number;
   draining: boolean;
@@ -82,14 +85,6 @@ export interface RemoteTranscodeStatus {
   base_url_configured: boolean;
   ready: boolean;
   workers: RemoteTranscodeWorker[];
-  device_limits: Record<string, number>;
-}
-
-export function saveWorkerLimit(deviceID: number, maxJobs: number): Promise<{ max_jobs: number }> {
-  return unwrap(request<ApiEnvelope<{ max_jobs: number }>>(`/transcode-worker/devices/${deviceID}/config`, {
-    method: "PUT",
-    body: JSON.stringify({ max_jobs: maxJobs }),
-  }));
 }
 
 /**

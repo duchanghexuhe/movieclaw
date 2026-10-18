@@ -399,8 +399,8 @@ export function SettingsSaveStatus({
     <span className="shrink-0 text-sub">
       {state === "saving" && <span className="text-[var(--text-faint)]">保存中…</span>}
       {state === "saved" && (
-        <span className="flex items-center gap-1 text-[var(--ok)]">
-          <CheckIcon className="size-3.5" />
+        <span className="flex items-center gap-1 text-[var(--text-muted)]">
+          <CheckIcon className="size-3.5 text-[var(--ok)]" />
           {savedLabel}
         </span>
       )}

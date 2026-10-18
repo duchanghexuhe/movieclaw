@@ -99,3 +99,31 @@ def test_default_gateways_is_empty_when_route_table_is_absent():
     路由表已由 autouse fixture 指向一个不存在的路径。
     """
     assert module.default_gateways() == frozenset()
+
+
+def test_lan_sources_are_lan():
+    """RFC1918 / 环回 / 链路本地都是内网来源：外网前置降档对它们永不生效。"""
+    for host in ("192.168.31.5", "10.0.0.7", "172.16.5.1", "127.0.0.1", "::1", "fe80::1"):
+        assert module.is_lan_address(host), host
+
+
+def test_public_sources_are_not_lan():
+    # 用真实公网地址：203.0.113.0/24 之类 RFC 5737 文档段被标准库 is_private
+    # 归为私有（IANA 特殊用途注册表），当不了「公网」的测试替身
+    for host in ("8.8.8.8", "1.2.3.4", "2606:4700:4700::1111"):
+        assert not module.is_lan_address(host), host
+
+
+def test_cgnat_range_is_not_lan():
+    """Tailscale 等 CGNAT 段（100.64/10）按公网处理：中继时慢是真慢，直连够快时
+    误降的代价也只是画质——方向可接受。"""
+    assert not module.is_lan_address("100.64.0.1")
+
+
+def test_hostname_or_empty_is_not_lan():
+    """拿不到 IP（主机名 / Unix socket / 空串）就没法判内外网，按外网降档的判据
+    必须收口成「不降档」——is_lan_address 返回 False 之外，调用方还要把
+    client_address 的空串也挡住。"""
+    assert not module.is_lan_address("movie.example.com")
+    assert not module.is_lan_address("testclient")
+    assert not module.is_lan_address("")

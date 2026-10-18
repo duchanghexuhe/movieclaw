@@ -652,6 +652,22 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/playback/files/{file_id}/subtitles"),
     # 预切片段（reels.md §8）：同原文件直出，只凭签名 token（按文件签发）
     ("GET", "/api/v1/reels/clips/{file_id}/{start_ms}.mp4"),
+    # 预转码 Worker 数据面（preload-transcode.md §7）：凭任务级签名 token +
+    # 设备凭证（路由内判定），与实时转码数据面同构；无 token 一律 404
+    ("PUT", "/api/v1/preload-worker/tasks/{task_id}/artifacts/{name}"),
+    ("GET", "/api/v1/preload-worker/preload-source/{task_id}"),
+    # 预转码用户面（preload-transcode.md §3）：逐部/逐集手动下单便携版本，
+    # 详情页按钮是成员使用面（配额预检是机制行为，下单不涉及管理权）
+    ("GET", "/api/v1/preload/presets"),
+    ("GET", "/api/v1/preload/overview"),
+    ("POST", "/api/v1/preload/estimate"),
+    ("POST", "/api/v1/preload/tasks"),
+    ("GET", "/api/v1/preload/tasks"),
+    ("GET", "/api/v1/preload/tasks/{task_id}"),
+    ("POST", "/api/v1/preload/tasks/{task_id}/cancel"),
+    ("POST", "/api/v1/preload/tasks/{task_id}/retry"),
+    ("DELETE", "/api/v1/preload/files/{file_id}"),
+    ("POST", "/api/v1/preload/cleanup-stale"),
     ("GET", "/api/v1/playback/files/{file_id}/fonts"),
     ("GET", "/api/v1/playback/files/{file_id}/fonts/{name}"),
     ("GET", "/api/v1/playback/files/{file_id}/trickplay"),
@@ -750,6 +766,7 @@ _MEMBER_ALLOWLIST = {
 # 路径参数哑值（与 test_auth.py 的匿名守护测试保持一致）
 _PATH_DUMMIES = {
     "{product}": "x",  # 客户端更新：不存在的客户端名（422，不联网）
+    "{task_id}": "1",  # 预转码任务号
     "{letter_id}": "1",  # 可靠事件死信
     "{start_ms}": "0",  # 预切片段的起点
     "{task_key}": "library_reconcile",

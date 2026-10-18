@@ -540,7 +540,7 @@ function DialogContent({
           </p>
         )}
           {error && (
-            <p className="rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-ui leading-6 text-red-200">
+            <p className="rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-ui leading-6 text-[var(--danger)]">
               {error}
             </p>
           )}
@@ -573,12 +573,12 @@ function DialogContent({
                 </div>
               )}
               {!loadingTarget && canResolve && manualTarget === null && (
-                <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
+                <p className="rounded-lg border border-[var(--warn)]/20 bg-[var(--warn)]/10 px-3.5 py-2.5 text-caption leading-relaxed text-[var(--warn)]">
                   自动识别暂不可用；为避免投错库请手选保存目录后再下载。
                 </p>
               )}
               {!loadingTarget && manualTarget?.status === "ready" && !manualTarget.ok && (
-                <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
+                <p className="rounded-lg border border-[var(--warn)]/20 bg-[var(--warn)]/10 px-3.5 py-2.5 text-caption leading-relaxed text-[var(--warn)]">
                   已识别资源，但当前不能自动入库：{manualTarget.warning ?? "请检查媒体库和自动入库配置。"}
                 </p>
               )}
@@ -604,7 +604,7 @@ function DialogContent({
                       </span>
                     )}
                     {option.warning && (
-                      <span className="mt-1 block rounded-md bg-amber-500/10 px-2 py-1 text-caption leading-relaxed text-amber-200">
+                      <span className="mt-1 block rounded-md bg-[var(--warn)]/10 px-2 py-1 text-caption leading-relaxed text-[var(--warn)]">
                         {option.warning}
                       </span>
                     )}
@@ -798,7 +798,7 @@ function MemberDialogContent({
 
       <div className="scroll-thin min-h-0 flex-1 space-y-2 overflow-y-auto px-6 py-4">
         {error && (
-          <p className="rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-ui leading-6 text-red-200">
+          <p className="rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-ui leading-6 text-[var(--danger)]">
             {error}
           </p>
         )}
@@ -911,7 +911,7 @@ function CandidatePicker({
     if (q) onSearch(q);
   };
   return (
-    <div className="space-y-2.5 rounded-xl border border-amber-400/20 bg-amber-500/[0.06] px-3.5 py-3">
+    <div className="space-y-2.5 rounded-xl border border-[var(--warn)]/20 bg-[var(--warn)]/[0.06] px-3.5 py-3">
       <div>
         <p className="text-ui font-medium text-[var(--text)]">这是哪部作品？</p>
         <p className="mt-0.5 text-caption leading-relaxed text-[var(--text-faint)]">{caption}</p>

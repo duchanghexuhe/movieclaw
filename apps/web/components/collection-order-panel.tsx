@@ -145,7 +145,7 @@ export function CollectionOrderPanel({
                 aria-label={`移出 ${row.title}`}
                 disabled={busy}
                 onClick={() => void drop(row.media_item_id)}
-                className="size-7 shrink-0 rounded text-white/40 transition hover:bg-white/10 hover:text-[var(--danger,#ff6b6b)] disabled:opacity-20"
+                className="size-7 shrink-0 rounded text-white/40 transition hover:bg-white/10 hover:text-[var(--danger)] disabled:opacity-20"
               >
                 ✕
               </button>

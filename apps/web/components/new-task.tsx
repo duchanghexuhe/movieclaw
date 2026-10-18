@@ -120,7 +120,7 @@ export function NewTask({ flat = false }: { flat?: boolean } = {}) {
       />
       {locked && <LlmSetupNotice />}
       {error && (
-        <p className="notice-surface mt-3 rounded-xl border border-[#ff6b6b]/35 px-3.5 py-2.5 text-ui leading-5 text-[#ff6b6b]">
+        <p className="notice-surface mt-3 rounded-xl border border-[var(--danger)]/35 px-3.5 py-2.5 text-ui leading-5 text-[var(--danger)]">
           创建会话失败：{error}
         </p>
       )}

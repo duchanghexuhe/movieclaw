@@ -206,7 +206,7 @@ export function SheetRow({
       {chevron && <ChevronRightIcon aria-hidden className="size-3.5 shrink-0 text-white/30" />}
     </>
   );
-  const tone = destructive ? "text-[#ff8b8b]" : "text-white/90";
+  const tone = destructive ? "text-[var(--danger)]" : "text-white/90";
   if (!onClick) return <div className={`${ROW_CLS} ${tone}`}>{body}</div>;
   return (
     <button type="button" disabled={disabled} onClick={onClick} className={`${ROW_CLS} ${PRESSABLE_CLS} ${tone}`}>
@@ -421,7 +421,7 @@ export function SheetNotice({
   children: ReactNode;
 }) {
   const color =
-    tone === "error" ? "text-red-200" : tone === "warn" ? "text-amber-200" : "text-white/85";
+    tone === "error" ? "text-[var(--danger)]" : tone === "warn" ? "text-[var(--warn)]" : "text-white/85";
   return (
     <SheetSection>
       <div role={tone === "error" ? "alert" : undefined} className={`px-4 py-3 text-sub leading-6 ${color}`}>

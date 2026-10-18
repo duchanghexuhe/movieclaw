@@ -443,6 +443,14 @@ def native_tonemap_filter(backend: HwBackend) -> str | None:
     return _PROBED_TONEMAP.get(backend.name, backend.tonemap_filter)
 
 
+def registered_native_tonemap(backend: str) -> str | None:
+    """某个后端当前已注册的原生 tone-map 滤镜；None=没注册。
+
+    给远程 Worker 的注册/撤销配对用：断开时只有当注册值仍是自己写入的那份
+    才撤销，避免盖掉本机探测的结论。"""
+    return _PROBED_TONEMAP.get(backend)
+
+
 #: VAAPI 的低功耗编码（Intel VDEnc 定长电路）。Intel 自 11/12 代起主推这条路；issue #763 的
 #: SR-IOV 虚拟核显（12 代，黑群晖跑在虚拟机里）上，默认的普通编码一跑真实片子就让 GPU 挂死
 #: 重置，换低功耗整条链（硬解 → tonemap_vaapi → scale_vaapi → 编码）正常。老核显不支持它，
@@ -719,7 +727,13 @@ def build_hls_command(
             f"{output_base_url.rstrip('/')}/{playlist.name}{output_url_suffix}"
         )
     else:
-        argv.append(str(playlist))
+        # ffmpeg 的 HLS muxer 按播放列表路径解析 init 段的目录。Windows 反斜杠
+        # 路径下它解析不出目录，把 init.mp4 写进**进程工作目录**而不是会话目录
+        # ——init 等待随之超时 404，本地转码起播全挂（仓库根的散落 init.mp4 即
+        # 此症状）。正斜杠路径 ffmpeg 照常接受，playlist 里的 init 引用也保持
+        # 相对文件名（客户端按播放列表自身的 URL 解析）；分片文件名是显式绝对
+        # 路径，不受影响。
+        argv.append(str(playlist).replace("\\", "/"))
     return TranscodeCommand(
         argv=argv, playlist_path=playlist, init_path=session_dir / INIT_NAME
     )
@@ -852,11 +866,15 @@ def _video_args(
     elif backend is not None:
         args += ["-c:v", backend.encoder, *encoder_options(backend)]
         # iOS 原生 HLS 对 10-bit/High 10 的硬件编码结果兼容性很差，统一锁
-        # 到 High profile + 8-bit yuv420p。VideoToolbox 不能在 4K 输出时强制
-        # 使用 High@4.1（会以 kVTParameterErr=-12902 拒绝创建编码器），因此
-        # 交给它按实际分辨率选择合法 level（2160p 通常为 5.1）。
+        # 到 High profile + 8-bit yuv420p。level 4.1 与**实际编码尺寸**是硬校验
+        #（H.264 level 4.1 上限 8192 宏块）：宽银幕缩到 1080p 高后宽出界——
+        # 坠落2 3828×2058 → 2010×1080 = 8568 宏块——VideoToolbox 以
+        # kVTParameterErr=-12902、NVENC 以 "Invalid Level" 在 InitializeEncoder
+        # 拒绝创建编码器，整部片起不了播（libx264 只是告警并自动抬高 level，
+        # Intel 驱动静默钳制，所以软编与 VAAPI/QSV 可以继续钉）。这两家交给
+        # 编码器按实际分辨率选合法 level（2160p 通常 5.1、宽银幕 1080p 4.2）。
         args += ["-profile:v", "high"]
-        if backend.name != "videotoolbox":
+        if backend.name not in ("videotoolbox", "nvenc"):
             args += ["-level:v", "4.1"]
         if backend.name == "videotoolbox" and vt_mode != VT_GPU:
             # GPU 链路的帧是硬件帧、已是 8-bit NV12；再要 yuv420p 会逼 ffmpeg 插一个
@@ -900,7 +918,20 @@ def _video_args(
     args += ["-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})"]
     # 输出侧的色彩标签放在最后、且不依赖滤镜链的属性传递：滤镜漏设（VAAPI 与
     # QSV 都漏过）或不同 ffmpeg 版本的协商差异，都会在这里被兜住。
-    if _outputs_bt709(plan):
+    #
+    # 例外：帧不落回软件的 VAAPI/QSV 链不能写 colorspace/primaries/trc——
+    # ffmpeg 7.1 在首帧到达、发现源色彩属性（BT.2020/PQ）与声明输出不符时会
+    # 重建滤镜图，重建插入的软件 auto_scale 接不上硬件帧，整链以
+    # 「Impossible to convert between the formats … / Function not implemented」
+    # 即刻崩掉（4K HDR10 + VAAPI 低功耗真机复现，2026-10-15，二分到这组标签）。
+    # 这两家的原生 tone-map 滤镜本来就在滤镜内声明了全套输出色彩
+    # （tonemap_vaapi 的 format/t/m/p、vpp_qsv 的 out_color_*），流标签不受影响。
+    hw_frames = (
+        backend is not None
+        and not software_filters
+        and backend.name in ("vaapi", "qsv")
+    )
+    if _outputs_bt709(plan) and not hw_frames:
         args += _BT709_OUTPUT_TAGS
     return args
 
@@ -991,7 +1022,17 @@ def _filter_chain(
         if backend is not None and backend.scale_filter and not software_filters:
             # format 必须写在硬件 scale 上：10-bit 源的硬件帧不会自己变成
             # 8-bit，而 H.264 的硬件编码器只吃 8-bit（见 scale_format）。
-            opts = f"w=-2:h={height}"
+            # 宽度不写 -2（等比放大）：NVENC 的 H.264 编码上限是 4096 宽，
+            # 宽银幕 4K 源（如 3840x1604）按 2160 高度放大后宽约 5172，
+            # h264_nvenc 直接打不开（2026-10-15 2070S 实测）。表达式让
+            # 宽度越界时改按 4096 收、高度随比例同收；16:9 4K（3840 宽）
+            # 不触发。VAPI/QSV 的 scale 上限远高于此，但统一走同一表达式
+            # 无害（现代编码器都认 min/trunc）。逗号要用反斜杠转义——
+            # 滤镜选项里的逗号是选项分隔符。
+            opts = (
+                f"w=min(4096\\,trunc(iw*{height}/ih/2)*2)"
+                f":h=min({height}\\,trunc(ih*4096/iw/2)*2)"
+            )
             if backend.scale_format:
                 opts = f"format={backend.scale_format}:{opts}"
             parts.append(f"{backend.scale_filter}={opts}")

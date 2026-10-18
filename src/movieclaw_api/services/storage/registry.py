@@ -119,6 +119,11 @@ def _orphans_by_id(model_name: str) -> EntryProbe:
     return probe
 
 
+async def _preload_orphans(entries: list[Path]) -> set[Path]:
+    """预转码孤儿：目录名的整数 ∉ preload_task 主键（上传中断的半成品）。"""
+    return {e for e in entries if (i := _leading_int(e.name)) is not None and i not in await _existing_ids("PreloadTask")}
+
+
 async def _unused_profile_tiers(entries: list[Path]) -> set[Path]:
     """头像目录第一层是档位（original / h632 / …）：全局与各库覆盖都不用的档位整层算孤儿。"""
     from sqlmodel import select
@@ -355,6 +360,26 @@ DATA_DIRS: tuple[DataDir, ...] = (
         rebuild_cost=RebuildCost.CHEAP,
         clearable=True,
         busy=_active_transcode_sessions,
+    ),
+    DataDir(
+        key="preload",
+        title="预转码产物",
+        summary="Worker 转出的便携版本（库文件的可选版本，长期保存）",
+        description=(
+            "预转码 Worker（docs/design/preload-transcode.md）上传的便携版本，"
+            "登记为对应影片的可选文件版本，删除后该版本不可播（可在网页端"
+            "重新下单转码）。这里**不是缓存**：全部清理等于删掉所有预转码"
+            "版本。日常清理请用设置里的「清理冷数据」（按 N 天未播）而不是"
+            "这里的全部清空。"
+        ),
+        default="data/preload",
+        resolve=lambda s: Path(s.preload_dir),
+        group=Group.CACHE,
+        rebuild_cost=RebuildCost.EXPENSIVE,
+        clearable=False,
+        # 「清理孤儿」= 没有 PreloadTask 台账行的任务目录（Worker 上传中断
+        # 留下的半成品）；「全部清空」不开放——每个产物都是库上的版本
+        orphans=_preload_orphans,
     ),
     DataDir(
         key="metadata.covers",

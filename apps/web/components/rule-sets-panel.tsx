@@ -907,7 +907,7 @@ export function RuleSetEditorDialog({
           所有条件都可以留空 = 不限该维度；条件之间是「且」的关系。
         </p>
         {ruleSet !== null && ruleSet.reference_count > 0 && (
-          <p className="mt-2 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3.5 py-2.5 text-sub leading-6 text-amber-200">
+          <p className="mt-2 rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--warn)]">
             此组正被 {ruleSet.reference_count} 个订阅使用，保存后对它们之后的资源评估立即生效
             （已下载的内容不受影响）。
           </p>
@@ -1311,7 +1311,7 @@ export function RuleSetEditorDialog({
                     </>
                   )}
                   {platformNotLast && (
-                    <p className="mt-1.5 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-caption leading-relaxed text-amber-200">
+                    <p className="mt-1.5 rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-3 py-2 text-caption leading-relaxed text-[var(--warn)]">
                       很多资源的标题里根本没写平台。把平台排在前面，等于要求「先比平台
                       再比别的」——没写平台的资源就全都分不出高低，洗版会大面积停住。
                       建议把平台放到最后一位。
@@ -1339,7 +1339,7 @@ export function RuleSetEditorDialog({
           </div>
 
           {error && (
-            <p className="rounded-lg border border-red-400/25 bg-red-500/10 px-3.5 py-2.5 text-sub leading-6 text-red-200">
+            <p className="rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3.5 py-2.5 text-sub leading-6 text-[var(--danger)]">
               {error}
             </p>
           )}
@@ -1578,7 +1578,7 @@ function TriChip({
     state === "include"
       ? "border-white/25 bg-white/[0.14] text-white"
       : state === "exclude"
-        ? "border-red-400/35 bg-red-500/12 text-red-200"
+        ? "border-[var(--danger)]/35 bg-[var(--danger)]/12 text-[var(--danger)]"
         : "border-white/[0.08] bg-white/[0.03] text-[var(--text-muted)] hover:bg-white/[0.07]";
   return (
     <button

@@ -823,7 +823,7 @@ function LlmProviderForm({
                 />
                 <p
                   className={`mt-1.5 text-caption leading-relaxed ${
-                    userAgentValid ? "text-[var(--text-faint)]" : "text-[#ff6b6b]"
+                    userAgentValid ? "text-[var(--text-faint)]" : "text-[var(--danger)]"
                   }`}
                 >
                   {userAgentValid

@@ -355,7 +355,7 @@ export function LibraryCustomizeView() {
         </div>
 
         {loadFailed && (
-          <p className="mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub text-amber-200">
+          <p className="mt-4 rounded-xl border border-[var(--warn)]/25 bg-[var(--warn)]/10 px-4 py-3 text-sub text-[var(--warn)]">
             读取媒体库与合集失败，行清单可能不完整；刷新页面重试。
           </p>
         )}

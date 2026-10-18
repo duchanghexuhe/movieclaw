@@ -7,6 +7,7 @@ import { ChevronLeftIcon, LockIcon, PlayIcon, XIcon } from "@/components/icons";
 
 import { ConsentDialog } from "@/components/player/consent-dialog";
 import { DiagnosticsPanel } from "@/components/player/diagnostics-panel";
+import { UplinkDialog } from "@/components/player/uplink-dialog";
 import { PlayerCenterControls, PlayerControls } from "@/components/player/player-controls";
 import { SubtitleLayer, useVideoContentBox } from "@/components/player/subtitle-layer";
 import {
@@ -189,6 +190,11 @@ export interface VideoPlayerProps {
    * undefined = 不覆盖：start_ms 不发，服务端接续播点（看完的从头播）。
    */
   startMsOverride?: number;
+  /**
+   * 详情页版本选择器带来的 `?file=`（锁定的源文件）。只对第一个单元生效：
+   * 切下一集回到「服务端多版本自动择优」。undefined = 没锁。
+   */
+  lockedFileId?: number;
   /**
    * 下一集；没有（电影 / 本季最后一集）为 null。`label` 是一行的「S01E02 · 集名」（系统媒体控制用），
    * 「即将播放」卡片用分开的 `code`（第 2 集）/ `name` / `stillUrl`（剧照，没有为 null）
@@ -403,6 +409,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     episodeLabel,
     posterUrl,
     startMsOverride,
+    lockedFileId,
     next,
     prev,
     onPlayNext,
@@ -488,6 +495,18 @@ export function VideoPlayer(props: VideoPlayerProps) {
   const suggestionRef = useRef(new QualitySuggestion());
   const [qualityOffer, setQualityOffer] = useState<QualityOffer | null>(null);
   const qualityOfferTimerRef = useRef<number | null>(null);
+  /**
+   * 外网画质确认（弹窗而不是自动降档）：服务端判定源码率超出上行/外网上限后，
+   * 装得下的低档会话照常返回并带 uplink_step_down 标记——拦在这里问一次。
+   * 「就这样播」直接认领这份会话（零等待）；「仍用原画质」置 uplinkOriginalRef
+   * 后重开（带画质上限=跳过上行判定，服务端顺带停掉这路转码）。
+   */
+  const [uplinkChoice, setUplinkChoice] = useState<{
+    session: PlaybackSession;
+    recommendedHeight: number | null;
+    reason: string;
+  } | null>(null);
+  const uplinkOriginalRef = useRef(false);
   /** 「已沿用上次的选择」只在打开播放器后的第一集判一次（切到下一集不再提示，与 iOS 一致） */
   const rememberedNoticeDoneRef = useRef(false);
   /** 每秒循环的计数：每 10 秒刷新一次「正在播放」标记（异常退出补报用） */
@@ -1241,6 +1260,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
     suggestionRef.current = new QualitySuggestion();
     bandwidthRestartedRef.current = false;
     dismissQualityOffer();
+    // 外网画质弹窗按播放单元算：换集/换片清掉挂着的弹窗与「选了原画质」标记
+    uplinkOriginalRef.current = false;
+    setUplinkChoice(null);
     // 画质按片记：影片分享的访客不读不写（与 iOS 的分享场景一致）
     const remembered = apiRef.current.telemetry ? loadQualityFor(unit.media_item_id) : null;
     qualityFromMemoryRef.current = remembered !== null;
@@ -1288,7 +1310,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
     // 指纹必须覆盖**全部**会影响请求参数的依赖（quality 也在内）：漏一项的
     // 后果是该项单独变化时 effect 重跑却撞上相同指纹被去重跳过，而上一次
     // 在途请求已被 cancelled——响应回来没人认领，起播就永远停在转圈里。
-    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}`;
+    // uplinkOriginalRef 是「外网弹窗里选了原画质」的一次性标记：带上它重开
+    // 时请求会带画质上限（跳过上行判定），指纹不含它的话重开会被去重跳过。
+    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}|${lockedFileId ?? ""}|${uplinkOriginalRef.current ? "orig" : ""}`;
     if (startedKeyRef.current === key) return;
     startedKeyRef.current = key;
 
@@ -1304,11 +1328,17 @@ export function VideoPlayer(props: VideoPlayerProps) {
         const session = await startPlaybackSession(
           {
             ...unit,
+            // 详情页版本选择器带来的 `?file=`：锁定这个文件起播，服务端跳过
+            // 多版本自动择优（undefined = 没锁，照旧择优）
+            file_id: lockedFileId ?? undefined,
             capability: capabilityRef.current,
             failed_tiers: state.failedTiers,
+            // null = 服务端接续播点；显式值（seek 重开 / 换轨 / ?t=）原样发。
             // null = 服务端接续播点；显式值（seek 重开 / 换轨 / ?t=）原样发
             start_ms: state.startMs ?? undefined,
-            max_height: quality ?? undefined,
+            // 外网弹窗选了「仍用原画质」时带 2160：非 None 画质上限让服务端
+            // 跳过上行判定，源片照常直连——这是用户对外网弹窗的显式回答
+            max_height: quality ?? (uplinkOriginalRef.current ? 2160 : undefined),
             audio_track: requestedAudio ?? undefined,
             subtitle_track: requestedSubtitle ?? undefined,
             // 上一路引擎量到的线路速度：服务端据此压转码码率（§C）。首次
@@ -1362,6 +1392,22 @@ export function VideoPlayer(props: VideoPlayerProps) {
         }
         // 观看状态随响应带回：时间轴兜底片长、字幕记忆轨都从这里来
         if (session.watch) setResume(session.watch);
+        if (
+          session.decision.uplink_step_down &&
+          quality === null &&
+          !uplinkOriginalRef.current
+        ) {
+          // 外网画质弹窗：拦下起播让用户选。会话先不认领——「就这样播」直接
+          // 认领这份（服务端已备好低档转码，零等待）；「仍用原画质」置标记后
+          // restart 重开（请求带画质上限、服务端跳过上行判定并停掉这路转码）。
+          // 手选过画质（quality 非 null）说明用户已表过态，不弹。
+          setUplinkChoice({
+            session,
+            recommendedHeight: session.decision.video?.height ?? null,
+            reason: session.decision.reason,
+          });
+          return;
+        }
         dispatch({ type: "session", session });
       } catch (error) {
         if (cancelled) return;
@@ -1404,6 +1450,22 @@ export function VideoPlayer(props: VideoPlayerProps) {
     requestedSubtitle,
     quality,
   ]);
+
+  /**
+   * 外网弹窗挂着时这份会话没人认领：弹窗收起（选了哪边）或组件卸载（弹窗还
+   * 挂着就退出了播放器）都停掉它——转码名额不能空烧到服务端超时回收。选了
+   * 「就这样播」的已认领会话不停（uplinkClaimedRef），后续播放还要用它。
+   */
+  const uplinkClaimedRef = useRef(false);
+  useEffect(() => {
+    if (!uplinkChoice) return;
+    uplinkClaimedRef.current = false;
+    const parked = uplinkChoice.session;
+    return () => {
+      if (uplinkClaimedRef.current || !parked.session_id) return;
+      void stopPlaybackSession(parked.session_id, apiRef.current).catch(() => undefined);
+    };
+  }, [uplinkChoice]);
 
   /**
    * 自动播放：试一次，被拒绝了按原因决定重试还是降级。
@@ -2477,8 +2539,12 @@ export function VideoPlayer(props: VideoPlayerProps) {
           }
           return;
         }
+        // worker_lost：远程 Worker 中途掉线把会话判死了。走下面的同档重开——
+        // 新会话的决策层会自动落到还活着的执行者（NAS 本地）；不能按 failed
+        // 降档，这一档本身没有失败，只是执行者没了。不等它的话，hls.js 要把
+        // 分钟级的分片重试烧完才会自己重开，播放器在用户眼里就是卡死。
         // null = 这次请求本身失败（断网/5xx），不能据此判定会话没了
-        if (alive !== false) return;
+        if (alive !== false && alive !== "worker_lost") return;
         // 探活途中会话已经换了（换字幕烧录/换音轨/换画质重开）：这个 404
         // 说的是上一个会话，拿它去 restart 会让服务端 stop_for_file 把刚
         // 起好的新会话一起杀掉（见 sessionIdRef 的注释）
@@ -2503,7 +2569,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
         pendingFileMsRef.current = positionRef.current;
         // 会话被回收也是一种断线：重开请求要是撞上服务端还没好，按退避再试而不是直接落错误页
         reconnectingRef.current = true;
-        recordRef.current?.beginReconnect("会话已被服务端回收");
+        recordRef.current?.beginReconnect(
+          alive === "worker_lost" ? "远程转码 Worker 已离线" : "会话已被服务端回收",
+        );
         dispatch({ type: "restart", startMs: positionRef.current });
       } finally {
         probing = false;
@@ -4752,6 +4820,27 @@ export function VideoPlayer(props: VideoPlayerProps) {
               dispatch({ type: "consent-granted" });
             }}
             onCancel={onExit}
+          />
+        ) : null}
+
+        {uplinkChoice ? (
+          <UplinkDialog
+            recommendedHeight={uplinkChoice.recommendedHeight}
+            reason={uplinkChoice.reason}
+            onUseRecommended={() => {
+              // 推荐档的会话在弹窗期间已就绪：直接认领，不重开（零等待）
+              uplinkClaimedRef.current = true;
+              const chosen = uplinkChoice;
+              setUplinkChoice(null);
+              dispatch({ type: "session", session: chosen.session });
+            }}
+            onUseOriginal={() => {
+              // 带画质上限重开拿原画质；弹窗收起时未认领的转码会话由上面的
+              // 清理停掉，重开请求的 stop_for_file 也会再兜一层
+              uplinkOriginalRef.current = true;
+              setUplinkChoice(null);
+              dispatch({ type: "restart", startMs: pendingFileMsRef.current });
+            }}
           />
         ) : null}
 

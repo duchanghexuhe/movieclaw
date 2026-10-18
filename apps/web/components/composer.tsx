@@ -197,7 +197,7 @@ export function Composer({
             </span>
           )}
           {uploadError && (
-            <span role="status" className="text-caption text-[#ff6b6b]">
+            <span role="status" className="text-caption text-[var(--danger)]">
               {uploadError}
             </span>
           )}

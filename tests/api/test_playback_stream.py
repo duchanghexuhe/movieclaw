@@ -324,16 +324,16 @@ def test_execution_backend_uses_remote_when_local_backend_is_incompatible():
     ) == ("videotoolbox", True)
 
 
-def test_profile_5_transcode_prefers_a_transcoder_whose_tonemap_reads_the_rpu():
+def test_profile_5_transcode_prefers_a_transcoder_whose_tonemap_reads_the_rpu(monkeypatch):
     """P5 的 IPT 基础层要吃 RPU：VAAPI 的映射不认、出来整片发紫，Mac 转码器在线就交给它；
     不在线时照旧用本机（与原来相同）。不是 P5 的不受影响"""
-    def p5(dolby_vision):
+    def p5(dolby_vision, tone_map=True):
         return PlaybackPlan(
             tier=PlaybackTier.HARDWARE_TRANSCODE,
             file_id=1,
             container="hls-fmp4",
             video=VideoPlan(
-                action="transcode", codec="h264", height=1080, tone_map=True,
+                action="transcode", codec="h264", height=1080, tone_map=tone_map,
                 source_codec="hevc", source_bit_depth=10, dolby_vision=dolby_vision,
             ),
             audio=AudioPlan(action="copy"),
@@ -343,7 +343,103 @@ def test_profile_5_transcode_prefers_a_transcoder_whose_tonemap_reads_the_rpu():
     both = dict(available=("vaapi", "videotoolbox"), local_backends=("vaapi",))
     assert select(p5("apply"), **both, remote_video_available=True) == ("videotoolbox", True)
     assert select(p5("apply"), **both, remote_video_available=False) == ("vaapi", False)
+    # 不是 P5 的不受影响：这里不带 tone_map，免得 HDR 分流抢先把片子送去远程
+    assert select(p5(None, tone_map=False), **both, remote_video_available=True) == (
+        "vaapi",
+        False,
+    )
+
+    # Mac 转码器在线但名额满：P5 也不退回本机出一片紫（排队或 503 好过一片紫）；
+    # 普通 HDR 才会跳过忙者，让本机兜底
+    monkeypatch.setattr(
+        routes_playback.playback_plan, "remote_worker_busy", lambda backend: True
+    )
+    assert select(p5("apply"), **both, remote_video_available=True) == ("videotoolbox", True)
     assert select(p5(None), **both, remote_video_available=True) == ("vaapi", False)
+
+
+def _hw_decision() -> PlaybackPlan:
+    """本地与远程都兼容的普通硬件转码计划（无烧录、无 tone-map）。"""
+    return PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, source_bit_depth=8),
+        audio=AudioPlan(action="copy"),
+    )
+
+
+def test_execution_backend_hdr_remote_route_falls_back_to_local_when_offline():
+    """HDR 分流但 Worker 离线：照常走本地，不因规则放不了片。"""
+    from movieclaw_playback.decide import VideoPlan
+
+    hdr = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True),
+        audio=AudioPlan(action="copy"),
+    )
+    assert routes_playback.playback_plan.select_execution_backend(
+        hdr,
+        available=("vaapi",),
+        local_backends=("vaapi",),
+        remote_video_available=False,
+    ) == ("vaapi", False)
+
+
+def test_execution_backend_skips_busy_remote_on_routed_plans(monkeypatch):
+    """HDR 分流但唯一 Worker 名额全满：跳过它用本地，而不是 reserve 时 503。"""
+    from movieclaw_playback.decide import VideoPlan
+
+    monkeypatch.setattr(
+        routes_playback.playback_plan, "remote_worker_busy", lambda backend: True
+    )
+    hdr = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True),
+        audio=AudioPlan(action="copy"),
+    )
+    assert routes_playback.playback_plan.select_execution_backend(
+        hdr,
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+    ) == ("vaapi", False)
+
+
+def test_execution_backend_skips_demoted_local_backend():
+    """本地后端起步即死被熔断后，让位给在线远程 Worker。"""
+    from movieclaw_api.services.playback import backend_health
+
+    backend_health.demote("vaapi")
+    try:
+        assert routes_playback.playback_plan.select_execution_backend(
+            _hw_decision(),
+            available=("vaapi", "nvenc"),
+            local_backends=("vaapi",),
+            remote_video_available=True,
+        ) == ("nvenc", True)
+    finally:
+        backend_health.reset()
+
+
+def test_execution_backend_still_uses_demoted_backend_without_alternative():
+    """熔断是降级不是拉黑：没有替代者时仍用被熔的后端，片子不能因此判死。"""
+    from movieclaw_api.services.playback import backend_health
+
+    backend_health.demote("vaapi")
+    try:
+        assert routes_playback.playback_plan.select_execution_backend(
+            _hw_decision(),
+            available=("vaapi",),
+            local_backends=("vaapi",),
+            remote_video_available=False,
+        ) == ("vaapi", False)
+    finally:
+        backend_health.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -620,17 +716,20 @@ def test_session_lifecycle_playlist_segment_ping_stop(client, tmp_path):
     assert client.post(f"{_PB}/sessions/{session_id}/ping").status_code == 404
 
 
-def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(client, tmp_path):
+def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(
+    client, tmp_path, monkeypatch
+):
     """回归 issue #763：本机转码起步即退出、会话被判死后，心跳要把「失败」告诉客户端，
     并且 init.mp4 不再每次干等 15 秒——否则播放器对着死会话缓冲好几分钟也不降档。
-    远程 Worker 断线不算本机失败：那是连接问题，照旧交给客户端同档重连。"""
+    远程会话判死不报 failed（那一档没失败，降档是白降），改报 worker_lost：播放中
+    Worker 掉线时客户端立刻同档重开、由决策层落到本地，不等 hls.js 烧完分钟级重试。"""
     file_id = seed(client, tmp_path, container="mkv")
     data = start_session(client, file_id)
     session_id = data["session_id"]
     token = data["stream_url"].split("token=")[1]
 
     healthy = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
-    assert healthy == {"alive": True, "failed": False, "error": None}
+    assert healthy == {"alive": True, "failed": False, "worker_lost": False, "error": None}
 
     session = get_session_manager().get(session_id)
     (session.directory / "init.mp4").unlink(missing_ok=True)
@@ -639,6 +738,7 @@ def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(client, 
     failed = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
     assert failed["alive"] is True
     assert failed["failed"] is True
+    assert failed["worker_lost"] is False
     assert "Function not implemented" in failed["error"]
 
     started = time.monotonic()
@@ -647,8 +747,18 @@ def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(client, 
     assert time.monotonic() - started < 2.0
 
     session.remote = True
-    remote = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
-    assert remote["failed"] is False
+    lost = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+    # 远程会话判死、Worker 指不到在线连接（含从未派单成功）：报 worker_lost 而非 failed
+    assert lost["failed"] is False
+    assert lost["worker_lost"] is True
+    assert "Function not implemented" in lost["error"]
+    # Worker 还在线时不报：远程 seek/补片重启自己能续上，重启换流白黑一屏
+    monkeypatch.setattr(
+        type(get_remote_worker_registry()), "worker_online", lambda self, worker_id: True
+    )
+    online = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+    assert online["worker_lost"] is False
+    assert online["error"] is None
     session.remote = False
 
 
@@ -1978,6 +2088,25 @@ def test_remote_artifact_upload_maps_disk_quota_to_507(
     assert session.remote_uploads[-1].status == 500
 
 
+def test_remote_transcode_config_ignores_removed_prefer_remote(client):
+    """prefer_remote 已随自动调度定案移除：视图里没有这个字段，旧客户端带它
+    保存也不炸（pydantic 默认忽略未知字段）。"""
+    url = "/api/v1/transcode-worker/config"
+    view = client.get(url).json()["data"]
+    assert "prefer_remote" not in view
+
+    saved = client.put(
+        url,
+        json={
+            "enabled": False,
+            "prefer_remote": True,  # 旧前端残留字段
+            "max_artifact_bytes": 512 * 1024 * 1024,
+        },
+    ).json()["data"]
+    assert saved["enabled"] is False
+    assert "prefer_remote" not in saved
+
+
 def test_remote_artifact_upload_rejects_oversized_body(client, tmp_path):
     file_id = seed(client, tmp_path, container="mkv")
     grants = _install_remote_session(client, tmp_path, file_id)
@@ -2320,7 +2449,7 @@ def test_disc_session_feeds_ffmpeg_a_concat_list(client, tmp_path, monkeypatch):
     assert data["session_id"]
     call = calls[-1]
     assert call.get("input_format") == "concat"
-    assert call["source_path"].endswith("/source.concat")
+    assert Path(call["source_path"]).name == "source.concat"
     text = Path(call["source_path"]).read_text(encoding="utf-8")
     assert text.count("\nfile '") == 2 and "inpoint 0.000000" in text
     # CLPI 关键帧表可用 → VOD 预生成分片，时间轴是播放列表（文件）绝对时间
@@ -2339,7 +2468,7 @@ def _progressive_session(client: TestClient, tmp_path: Path) -> tuple[dict[str, 
     session.progressive = True
     grants["file_id"] = str(file_id)
     endpoint = f"/api/v1/transcode-worker/sessions/{grants['session_id']}/artifacts/seg00003.m4s"
-    return grants, Path(endpoint)
+    return grants, endpoint
 
 
 def test_progressive_parts_append_in_order_and_land_atomically(client, tmp_path):
@@ -2465,9 +2594,19 @@ async def test_partial_segment_response_follows_growth_until_complete(tmp_path):
     segment.size = 10
     segment.notify()
     await asyncio.sleep(0.05)
-    path.rename(tmp_path / "seg00001.m4s")  # 收齐改名：打开着的文件照样读
-    segment.done = True
-    segment.notify()
+    # 收齐改名：打开着的文件照样读（POSIX）。Windows 下读句柄没释放时
+    # rename 必然 PermissionError——先收尾响应、句柄释放后再改名，内容
+    # 断言不受影响
+    try:
+        path.rename(tmp_path / "seg00001.m4s")
+    except PermissionError:
+        segment.done = True
+        segment.notify()
+        await asyncio.wait_for(task, 2)
+        path.rename(tmp_path / "seg00001.m4s")
+    else:
+        segment.done = True
+        segment.notify()
     await asyncio.wait_for(task, 2)
 
     headers = dict(sent[0]["headers"])
@@ -2568,3 +2707,66 @@ def test_diagnostic_encoder_marks_vaapi_low_power():
         assert routes_playback._diagnostic_encoder(session) == "h264_vaapi（低功耗）"
     finally:
         register_encoder_options("vaapi", ())
+
+
+def test_execution_backend_routes_hdr_to_remote_even_without_preference():
+    """T3 分流：HDR 片即使没开「远程优先」也交给远程 Worker——核显的
+    tone-map 与远程 GPU 差一个数量级，本地优先反而选了个跑不动的。"""
+    from movieclaw_playback.decide import VideoPlan
+
+    hdr = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True),
+        audio=AudioPlan(action="copy"),
+    )
+    assert routes_playback.playback_plan.select_execution_backend(
+        hdr,
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+    ) == ("nvenc", True)
+
+
+def test_execution_backend_routes_4k_plan_to_remote():
+    """T3 分流：高分辨率计划（>1080，即高度上限已随执行者放开）走远程。"""
+    from movieclaw_playback.decide import VideoPlan
+
+    uhd = PlaybackPlan(
+        tier=PlaybackTier.HARDWARE_TRANSCODE,
+        file_id=1,
+        container="hls-fmp4",
+        video=VideoPlan(action="transcode", codec="h264", height=2160),
+        audio=AudioPlan(action="copy"),
+    )
+    assert routes_playback.playback_plan.select_execution_backend(
+        uhd,
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+    ) == ("nvenc", True)
+
+
+def test_execution_backend_keeps_sdr_1080p_local_without_preference():
+    """T3 分流不越界：普通 SDR ≤1080p 计划维持本地优先（省掉远程供片的
+    天生 1~4 秒延迟）。"""
+    assert routes_playback.playback_plan.select_execution_backend(
+        _hw_decision(),
+        available=("vaapi", "nvenc"),
+        local_backends=("vaapi",),
+        remote_video_available=True,
+    ) == ("vaapi", False)
+
+
+def test_prefers_remote_execution_by_media_attributes():
+    """分流规则本身：HDR 或 2160p 源命中，其余不命中。"""
+    from movieclaw_api.services.playback.plan import prefers_remote_execution
+
+    def file(**kw):
+        return SimpleNamespace(hdr=kw.get("hdr"), resolution=kw.get("resolution"))
+
+    assert prefers_remote_execution(file(hdr="HDR10", resolution="1080p"))
+    assert prefers_remote_execution(file(hdr=None, resolution="2160p"))
+    assert not prefers_remote_execution(file(hdr=None, resolution="1080p"))
+    assert not prefers_remote_execution(file(hdr=None, resolution=None))

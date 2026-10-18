@@ -143,7 +143,7 @@ export function AccountSwitcherDialog({ open, onClose }: { open: boolean; onClos
         </div>
 
         {error && (
-          <div className="mt-4 rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]">
+          <div className="mt-4 rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/10 px-4 py-3 text-body text-[var(--danger)]">
             {error}
           </div>
         )}

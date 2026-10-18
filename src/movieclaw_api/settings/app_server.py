@@ -1,11 +1,12 @@
 """应用服务配置域（「设置 → 应用设置」页的数据模型）。
 
-当前只有一个字段——外部访问地址（``external_url``）：从网络上能访问到本应用
+当前两个字段——外部访问地址（``external_url``）：从网络上能访问到本应用
 的完整地址（如 ``http://192.168.1.10:3000`` 或反代后的
 ``https://movie.example.com``），供生成通知链接、回调地址等绝对 URL 的场景
-使用（Agent 系统提示词的环境段也注入它来拼页面链接）。Docker 桥接部署下，
-Jellyfin 兼容层的 UDP 自动发现探测到容器内网 IP 时也改用它应答（见
-``movieclaw_jellyfin/udp.py``）。
+使用（Agent 系统提示词的环境段也注入它来拼页面链接）；家宽上行带宽
+（``uplink_mbps``）：外网播放的前置降档预算。Docker 桥接部署下，
+Jellyfin 兼容层的 UDP 自动发现探测到容器内网 IP 时也改用 ``external_url``
+应答（见 ``movieclaw_jellyfin/udp.py``）。
 
 为什么端口不在这个配置域里：对外端口（前端监听口）确实可以在应用内改，但它
 的事实源是 data 卷上的端口文件而不是数据库——真正读它的是 entrypoint 与
@@ -26,7 +27,7 @@ APP_SERVER_NAMESPACE = "app.server"
 
 @register_setting(namespace=APP_SERVER_NAMESPACE, title="应用设置")
 class AppServerSetting(SettingSchema):
-    """应用服务配置：外部访问地址。
+    """应用服务配置：外部访问地址与家宽上行带宽。
 
     历史字段说明：早期版本曾有 ``port``（后端监听端口）字段，后因「改后端
     端口对外部访问没有意义」而移除；基类 ``extra="ignore"`` 保证带旧字段的
@@ -36,4 +37,15 @@ class AppServerSetting(SettingSchema):
     external_url: str = Field(
         default="",
         description="网络可访问到本应用的完整地址（http/https），供生成绝对链接使用；空 = 未配置",
+    )
+    uplink_mbps: int | None = Field(
+        default=None,
+        ge=1,
+        le=10_000,
+        description=(
+            "家宽上行带宽（Mbps），填套餐真实值。外网设备播放时，源片码率超过"
+            "它（或外网上限 1080p 档）就在起播前询问是否切换到装得下的画质；"
+            "内网播放不受影响。这个数只有用户知道（服务端测不出来），"
+            "留空 = 不做外网降档"
+        ),
     )

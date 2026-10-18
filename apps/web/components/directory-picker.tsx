@@ -177,7 +177,7 @@ export function DirectoryPicker({
           )}
 
           {error && (
-            <p className="rounded-lg border border-red-400/25 bg-red-500/10 px-3 py-2 text-sub leading-5 text-red-200">
+            <p className="rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-3 py-2 text-sub leading-5 text-[var(--danger)]">
               {error}
             </p>
           )}

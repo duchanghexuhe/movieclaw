@@ -7,6 +7,17 @@ import { HScroller } from "@/components/h-scroller";
 import { PosterCard, type PosterCardAction } from "@/components/poster-card";
 import type { MediaItem, MediaRowData } from "@/lib/media-types";
 
+/** 行内卡片的 React key：同 id 条目（同一部片的两条库存记录，id 是 tmdb_id
+ *  字符串）第二个起追加序号消歧——重复 key 会让 React 更新行为未定义。 */
+function rowItemKeys(row: MediaRowData): string[] {
+  const seen = new Map<string, number>();
+  return row.items.map((item) => {
+    const nth = (seen.get(item.id) ?? 0) + 1;
+    seen.set(item.id, nth);
+    return nth > 1 ? `${row.id}-${item.id}-${nth}` : `${row.id}-${item.id}`;
+  });
+}
+
 /**
  * 横滚海报行（Netflix 式分类行）：标题栏 + 横滚容器（HScroller 提供隐藏
  * 滚动条与左右翻页钮）。所有行的卡片同一规格——榜单行不再有加宽的排名变体。
@@ -46,6 +57,7 @@ export function MediaRow({
    */
   insetClassName?: string;
 }) {
+  const keys = rowItemKeys(row);
   return (
     // content-visibility：视口外的整行（标题 + 几十张海报卡）跳过布局与绘制，
     // 发现页 16 行 / 库首页多行「最近添加」的首帧与滚动成本只与可见行相关；
@@ -74,9 +86,9 @@ export function MediaRow({
           overflow-x-auto 会连带裁纵向溢出，pt-1 只有 4px，上浮时卡片顶部的
           圆角会被削掉一截 */}
       <HScroller className={`m-row gap-4 pb-1 pt-2 max-md:gap-3 ${insetClassName}`}>
-        {row.items.map((item) => (
+        {row.items.map((item, i) => (
           <div
-            key={`${row.id}-${item.id}`}
+            key={keys[i]}
             className="w-[152px] shrink-0 max-md:w-[126px] xl:w-[164px]"
           >
             <PosterCard

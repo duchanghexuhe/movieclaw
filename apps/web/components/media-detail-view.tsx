@@ -522,8 +522,8 @@ export function MediaDetailView({
           {/* 在库是详情状态，不与外部词条链接混在一起；每个链接保持后端给出的库顺序。 */}
           {libraryLinks.length > 0 && (
             <div className="mt-4 max-w-full max-md:mt-3">
-              <div className="inline-flex max-w-full flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-emerald-300/20 bg-emerald-400/[0.08] px-3.5 py-2.5 text-sub text-emerald-100/90 max-md:px-3">
-                <span className="flex shrink-0 items-center gap-1.5 font-medium text-emerald-200">
+              <div className="inline-flex max-w-full flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-[var(--ok)]/20 bg-[var(--ok)]/[0.08] px-3.5 py-2.5 text-sub text-[var(--ok)]/90 max-md:px-3">
+                <span className="flex shrink-0 items-center gap-1.5 font-medium text-[var(--ok)]">
                   <FolderIcon className="size-4" />
                   在库
                 </span>
@@ -531,7 +531,7 @@ export function MediaDetailView({
                   <Link
                     key={`${libraryLink.libraryId}:${libraryLink.mediaItemId}`}
                     href={`/library/${libraryLink.libraryId}/item/${libraryLink.mediaItemId}?returnTo=${encodeURIComponent(libraryReturnTo)}` as Route}
-                    className="min-w-0 max-w-full break-words font-medium text-emerald-100 underline decoration-emerald-200/45 underline-offset-4 transition-colors hover:text-white hover:decoration-emerald-100"
+                    className="min-w-0 max-w-full break-words font-medium text-[var(--ok)] underline decoration-[var(--ok)]/45 underline-offset-4 transition-colors hover:text-white hover:decoration-[var(--ok)]"
                   >
                     {libraryLink.libraryName}
                   </Link>
