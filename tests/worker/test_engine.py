@@ -321,3 +321,136 @@ def test_recv_json_timeout_is_not_disconnect():
     finally:
         a.close()
         b.close()
+
+
+def _client_ws(sock):
+    """只带 socket 的 _WebSocket 替身（同 test_recv_json_timeout_is_not_disconnect 的构造）。"""
+    import engine as rw
+
+    ws = rw._WebSocket.__new__(rw._WebSocket)
+    ws._sock = sock
+    ws._closed = False
+    ws._lock = threading.Lock()
+    ws._buffer = b""
+    return ws
+
+
+def test_server_close_frame_carries_code_and_reason():
+    """服务端带理由关闭（1008）：拿到关闭码与理由，回一个关闭帧，再真正断开 socket。
+
+    回归锚点：曾经只抛 OSError("服务端关闭了连接")，服务端「尚未启用远程转码」之类的理由
+    整句丢掉，NAS 日志与 Worker 界面都看不出为什么连不上。
+    """
+    import socket as _socket
+
+    import engine as rw
+
+    a, b = _socket.socketpair()
+    try:
+        ws = _client_ws(a)
+        reason = "服务端尚未启用远程转码，请在网页设置「转码」页打开远程转码开关"
+        payload = (1008).to_bytes(2, "big") + reason.encode()
+        b.sendall(bytes([0x88, len(payload)]) + payload)  # 服务端→客户端不掩码
+        with pytest.raises(rw.ServerClosed) as caught:
+            ws.recv_json(timeout=1.0)
+        assert caught.value.code == 1008
+        assert caught.value.reason == reason
+        assert "1008" in str(caught.value) and reason in str(caught.value)
+        # 回的关闭帧：客户端→服务端必须掩码（opcode 0x8，掩码位 0x80）
+        echoed = b.recv(16)
+        assert echoed[0] == 0x88 and echoed[1] & 0x80
+        # 不是只标记：socket 真的关了，对端读到 EOF
+        assert b.recv(16) == b""
+    finally:
+        a.close()
+        b.close()
+
+
+@pytest.mark.parametrize(
+    ("reason", "kind"),
+    [
+        ("凭证无效或已被吊销，请在网页「设置 → 设备」重新配对", "auth"),
+        ("转码器凭证已被注销，请重新配对", "auth"),
+        ("服务端尚未启用远程转码，请在网页设置「转码」页打开远程转码开关", "remote_disabled"),
+        ("Worker 协议版本（1）与服务端（2）不一致，请把 Worker 与服务端更新到同一版本", "other"),
+        ("", "other"),
+    ],
+)
+def test_rejection_reason_classification(reason, kind):
+    """1008 理由的三类划分与 Mac 转码器的 NASRejection 一致（改服务端文案两边一起看）。"""
+    from engine import rejection_kind
+
+    assert rejection_kind(reason) == kind
+
+
+@pytest.mark.parametrize(
+    ("reason", "retry_seconds"),
+    [
+        ("凭证无效或已被吊销，请在网页「设置 → 设备」重新配对", 300.0),
+        ("服务端尚未启用远程转码，请在网页设置「转码」页打开远程转码开关", 60.0),
+    ],
+)
+def test_run_forever_reports_rejection_and_waits_by_class(reason, retry_seconds):
+    """服务端 1008 拒绝：状态事件带真实理由，重试间隔按分类定（不走指数退避）。"""
+    from engine import RealtimeClient, ServerClosed
+
+    client = RealtimeClient(
+        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={}
+    )
+    events: list[tuple[str, dict]] = []
+
+    def status(kind, **fields):
+        events.append((kind, fields))
+        client.stop()  # 只看一轮：stop 之后 wait 立即返回，run_forever 随即退出
+
+    def refuse():
+        raise ServerClosed(1008, reason)
+
+    client.status = status
+    client._connect_once = refuse
+    client.run_forever()
+    assert events == [
+        (
+            "offline",
+            {"reason": f"服务端关闭了连接（1008）：{reason}", "retry_seconds": retry_seconds},
+        )
+    ]
+
+
+def test_connect_reports_connecting_then_online(monkeypatch):
+    """连接状态来自真实握手：发起连接时报 connecting，收到 worker.accepted 才报 online。"""
+    import engine as rw
+    from engine import RealtimeClient
+
+    sent: list[dict] = []
+
+    class FakeSocket:
+        def __init__(self, host, port, path, token, timeout=10.0):
+            self.inbox = [{"type": "worker.accepted", "max_jobs": 1}]
+
+        def send_json(self, payload):
+            sent.append(payload)
+
+        def recv_json(self, timeout):
+            return self.inbox.pop(0) if self.inbox else None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(rw, "_WebSocket", FakeSocket)
+    client = RealtimeClient(
+        server="http://nas:3000", token="t", worker_id="DESKTOP-1", ffmpeg="ffmpeg", caps={}
+    )
+    events: list[tuple[str, dict]] = []
+
+    def status(kind, **fields):
+        events.append((kind, fields))
+        if kind == "online":
+            client.stop()
+
+    client.status = status
+    client._connect_once()
+    assert [kind for kind, _ in events] == ["connecting", "online"]
+    assert events[1][1] == {"server": "http://nas:3000"}
+    # hello 用的就是 runtime 交进来的 worker_id（服务端据此登记，不再是带空格的显示名）
+    assert sent[0]["type"] == "worker.hello" and sent[0]["worker_id"] == "DESKTOP-1"

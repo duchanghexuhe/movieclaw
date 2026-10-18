@@ -73,6 +73,8 @@ cli/LICENSE
 src/movieclaw_api/data/spec.json
 cli/internal/spec/data/spec.json
 worker/preload_worker.json
+# Windows Worker 的配置（json 含设备令牌，绝不入库）
+worker/worker.json
 worker/caps.json
 worker/work/
 # 本机开发/联调的运行期产物：remote_worker(.py/.json/.caps) 是旧草稿与本地

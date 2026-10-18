@@ -870,6 +870,34 @@ class _SocketIdle(Exception):
 _FRAME_GRACE_S = 5.0
 
 
+class ServerClosed(OSError):
+    """服务端发来关闭帧（RFC 6455）。code/reason 是服务端写好的理由：1008 就是「不接受你」。"""
+
+    def __init__(self, code: int, reason: str) -> None:
+        self.code = code
+        self.reason = reason
+        text = f"服务端关闭了连接（{code}）"
+        super().__init__(f"{text}：{reason}" if reason else text)
+
+
+def rejection_kind(reason: str) -> str:
+    """1008 关闭理由分三类：auth（凭证失效）/ remote_disabled（远程转码没开）/ other。
+
+    文字与 macOS 转码器的 NASRejection 一致（服务端 transcode_worker.py 写死的几句，以及
+    注销转码器时 login_devices 断开连接的那句）：改服务端文案时两边一起看。
+    """
+    if any(word in reason for word in ("凭证", "吊销", "注销")):
+        return "auth"
+    if "尚未启用远程转码" in reason:
+        return "remote_disabled"
+    return "other"
+
+
+#: 1008 拒绝后的重试间隔（秒）：凭证失效慢慢试（NAS 从备份恢复后凭证可能重新有效），
+#: 开关没开每分钟问一次，其他原因也每分钟一次——与 Mac 转码器一致，不走指数退避
+_REJECT_RETRY_S = {"auth": 300.0, "remote_disabled": 60.0, "other": 60.0}
+
+
 class _WebSocket:
     """RFC6455 客户端的最小实现（文本帧收发 + 心跳），够本协议使用。"""
 
@@ -954,9 +982,11 @@ class _WebSocket:
                 raise OSError("连接已关闭")
             if mask:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-            if opcode == 0x8:  # close
-                self._closed = True
-                raise OSError("服务端关闭了连接")
+            if opcode == 0x8:  # close：载荷 = 2 字节状态码 + UTF-8 理由（都可省略）
+                code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else 1005
+                reason = payload[2:].decode("utf-8", errors="replace")
+                self.close()  # RFC 6455：收到关闭帧要回一个再断开，服务端才好收尾
+                raise ServerClosed(code, reason)
             if opcode == 0x9:  # ping → pong
                 with self._lock:
                     self._sock.sendall(self._frame(0xA, payload))
@@ -996,14 +1026,11 @@ class _WebSocket:
         return chunks
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            with self._lock:
+        # 对端先发来关闭帧时也要走到 socket.close()：只标记不关，fd 会挂到 GC 才放
+        if not self._closed:
+            self._closed = True
+            with contextlib.suppress(OSError), self._lock:
                 self._sock.sendall(self._frame(0x8, b""))
-        except OSError:
-            pass
         with contextlib.suppress(OSError):
             self._sock.close()
 
@@ -1433,7 +1460,8 @@ class RealtimeClient:
 
     状态消息（accepted/progress/finished/…）经 ``_outbox`` 交给持有当前
     WebSocket 的读循环线程发送——任务线程不直接碰 socket，避免发到已被
-    重连替换的旧连接上。
+    重连替换的旧连接上。连接状态（connecting / online / offline）经 ``status``
+    回调交出去，GUI 据此显示真实的连接情况。
     """
 
     def __init__(
@@ -1447,6 +1475,7 @@ class RealtimeClient:
         max_jobs: int = 1,
         log: Callable[[str], None] | None = None,
         preload: Callable[[dict], bool] | None = None,
+        status: Callable[..., None] | None = None,
     ) -> None:
         self.server = server.rstrip("/")
         self.token = token
@@ -1455,6 +1484,7 @@ class RealtimeClient:
         self.caps = caps
         self.max_jobs = max_jobs
         self.log = log or (lambda _msg: None)
+        self.status = status or (lambda _kind, **_fields: None)
         # 预转码执行器（worker.process_task 的包装）：None=本客户端
         # 只报 realtime 角色，收到 class=preload 的 job.start 直接拒掉
         self.preload = preload
@@ -1474,14 +1504,21 @@ class RealtimeClient:
             started = time.time()
             try:
                 self._connect_once()
-                backoff = 2.0
             except OSError as exc:
                 self.last_problem = str(exc)
                 self.log(f"实时连接断开：{exc}")
-            # 刚连上就断的按退避等，长连过的立即重连
-            if time.time() - started < 30:
-                self.stop_event.wait(backoff)
-                backoff = min(backoff * 2, 30.0)
+                if isinstance(exc, ServerClosed) and exc.code == 1008:
+                    # 服务端明确拒绝：按理由定间隔，不走退避
+                    wait = _REJECT_RETRY_S[rejection_kind(exc.reason)]
+                elif time.time() - started < 30:
+                    # 刚连上就断的按退避等，长连过的立即重连
+                    wait, backoff = backoff, min(backoff * 2, 30.0)
+                else:
+                    wait = 0.0
+                self.status("offline", reason=self.last_problem, retry_seconds=wait)
+                self.stop_event.wait(wait)
+            else:
+                backoff = 2.0
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1494,6 +1531,7 @@ class RealtimeClient:
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = parsed.path.rstrip("/") + "/api/v1/transcode-worker/ws"
+        self.status("connecting", server=self.server)
         ws = _WebSocket(host, port, path, self.token)
         self.log("实时通道已连上，握手中…")
         last_seen_box = [time.time()]
@@ -1581,6 +1619,7 @@ class RealtimeClient:
                 self.max_jobs = limit
             self.last_problem = None
             self.log("实时通道握手完成，可以接单")
+            self.status("online", server=self.server)
         elif message_type == "job.start":
             # v2 统一调度：同一连接里实时与预转码任务按 class 分流
             if message.get("class") == "preload":
