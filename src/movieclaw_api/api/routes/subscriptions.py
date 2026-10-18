@@ -29,6 +29,7 @@ from movieclaw_api.schemas.subscription import (
     EpisodeHintDismissPayload,
     EpisodeHintView,
     EpisodeSeasonView,
+    EpisodeWindowView,
     GrabPayload,
     GrabResultView,
     MediaBrief,
@@ -66,6 +67,11 @@ from movieclaw_api.services.subscription import (
     SubscriptionService,
     forecast_refresh_pending,
     recent_arrivals,
+)
+from movieclaw_api.services.subscription.episode_cap import (
+    caps_of,
+    season_episode_max_many,
+    windows_of,
 )
 from movieclaw_api.services.subscription.episode_floor import (
     floors_of,
@@ -213,13 +219,18 @@ async def _detail_view(
         # 占位集（超出 TMDB 的）在追踪明细里如实标出
         known_max = await season_episode_max(session, item.id)
         floors = floors_of(sub)
+        caps = caps_of(sub)
         view.episode_seasons = [
             EpisodeSeasonView(
-                season_number=season, tmdb_count=known_max.get(season, 0), floor=floors.get(season)
+                season_number=season,
+                tmdb_count=known_max.get(season, 0),
+                floor=floors.get(season),
+                cap=caps.get(season),
             )
             for season in sorted(set(known_max) | set(floors))
             if season != 0 and tracks_season(sub, season)
         ]
+        view.episode_windows = _window_views(sub, known_max)
         view.episode_hints = [
             EpisodeHintView(
                 season_number=hint.season_number,
@@ -251,6 +262,15 @@ async def _detail_view(
         if policy is None:
             view.smart_policy = None
     return view
+
+
+def _window_views(sub: Subscription, known_max: dict[int, int]) -> list[EpisodeWindowView] | None:
+    """被订阅上限截断的季；没有被截断的季返回 None（与「没设上限」同一形态）。"""
+    windows = windows_of(sub, known_max)
+    return [
+        EpisodeWindowView(season_number=w.season_number, cap=w.cap, total=w.total)
+        for w in windows
+    ] or None
 
 
 def _can_manage(principal: Principal, sub: Subscription) -> bool:
@@ -491,6 +511,7 @@ async def create_subscription(
         selection_mode=payload.selection_mode,
         smart_profile_revision=payload.smart_profile_revision,
         episode_floors=payload.episode_floors,
+        episode_caps=payload.episode_caps,
     )
     assert subscription.id is not None
     if kind is MediaKind.TV:
@@ -631,6 +652,18 @@ async def list_subscriptions(
     )
     for view in views:
         view.progress.upgrading = upgrading.get(view.id, 0)
+    # 订阅上限截断的季：只有设了上限的订阅才查，没设的（绝大多数）零开销
+    capped = [(sub, item) for sub, item, _counts in rows if sub.episode_caps]
+    if capped:
+        known_max_by_item = await season_episode_max_many(
+            session, [item.id for _sub, item in capped if item.id is not None]
+        )
+        windows_by_sub = {
+            sub.id: _window_views(sub, known_max_by_item.get(item.id or -1, {}))
+            for sub, item in capped
+        }
+        for view in views:
+            view.episode_windows = windows_by_sub.get(view.id)
     # 稳定排序：缺口优先于纯洗版；同组保留仓储的最近活动时间 / id 顺序。
     views.sort(key=lambda view: view.list_priority)
     return ok(views)
@@ -861,6 +894,7 @@ async def update_subscription(
             payload.library_id if admin and "library_id" in payload.model_fields_set else ...
         ),
         episode_floors=payload.episode_floors,
+        episode_caps=payload.episode_caps,
     )
     sub, item, wanted = await service.detail(subscription_id)
     resource_timings = await service.resource_timings(subscription_id)
