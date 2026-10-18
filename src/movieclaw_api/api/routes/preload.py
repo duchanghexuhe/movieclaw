@@ -346,6 +346,7 @@ async def retry_task(
     "/files/{file_id}",
     summary="删除预转码产物版本",
     operation_id="preload.file.delete",
+    openapi_extra={"x-cli-dangerous": "destructive"},
 )
 async def delete_preload_file(
     file_id: int,
