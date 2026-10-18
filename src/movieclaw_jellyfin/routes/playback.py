@@ -33,6 +33,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from sqlalchemy import select
 
+from movieclaw_api.api.client_address import client_address, is_lan_address
 from movieclaw_api.api.routes.playback import get_session_segment
 from movieclaw_api.exceptions import NotFoundException
 from movieclaw_api.services.library import skip_segments
@@ -74,7 +75,11 @@ from movieclaw_api.services.playback.session import (
 from movieclaw_api.services.playback.signing import issue_stream_token, verify_stream_token
 from movieclaw_api.services.playback.strm_direct import mounted_redirect
 from movieclaw_api.services.playback.strm_probe import ensure_strm_spec
-from movieclaw_api.services.playback.track_context import files_with_contexts, track_context
+from movieclaw_api.services.playback.track_context import (
+    files_with_contexts,
+    metadata_owner,
+    track_context,
+)
 from movieclaw_api.settings import PlaybackPolicySetting
 from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.engine import get_database
@@ -323,7 +328,11 @@ async def playback_info(
         await ensure_strm_spec(f)
     # 播放协商是唯一现读 strm 的场景：直链多带时效签名，须现读现用；
     # 解析失败的版本剔除，全部失败按"无可播源"应答
-    pairs = [(f, s) for f in selected if (s := media_source_dto(f, resolve_strm=True))]
+    pairs = [
+        (f, s)
+        for f in selected
+        if (s := media_source_dto(f, resolve_strm=True, owner=_owner_of(f, contexts)))
+    ]
     if not pairs:
         return JSONResponse({"MediaSources": [], "ErrorCode": "NoCompatibleStream"})
 
@@ -355,14 +364,37 @@ async def playback_info(
             )
         elif policy is not None:
             _apply_transcode_negotiation(
-                source, f, ref, identity.device.token, play_session_id, negotiation, policy
+                source, f, ref, identity.device.token, play_session_id, negotiation, policy,
+                owner=context.metadata_owner,
             )
+    if _is_external(request):
+        # 外网：便携版排首位（客户端默认就播它，不看上行设置）；其余保持原顺序。内网不动
+        pairs.sort(key=lambda pair: pair[0].derives_from_file_id is None)
     return JSONResponse(
         {
             "MediaSources": [s for _, s in pairs],
             "PlaySessionId": play_session_id,
         }
     )
+
+
+def _is_external(request: Request) -> bool:
+    """会话是否来自外网（按连接来源判定，与网页端同一口径：拿不到真实地址按内网处理）。"""
+    host = client_address(request)
+    return bool(host) and not is_lan_address(host)
+
+
+def _owner_of(f: LibraryFile, contexts: dict[int, TrackContext]) -> LibraryFile | None:
+    """便携版借用的外挂字幕归属行（源文件）；普通文件为 None（见 ``metadata_owner``）。"""
+    return contexts.get(f.id or 0, NO_CONTEXT).metadata_owner
+
+
+async def _metadata_owner_for(f: LibraryFile) -> LibraryFile:
+    """取流端点用：按台账行现取外挂字幕的归属行（便携版 → 源文件；其余就是自己）。"""
+    if f.derives_from_file_id is None:
+        return f
+    async with get_database().session() as session:
+        return await metadata_owner(session, f)
 
 
 async def _load_policy_for(segment_container: str) -> PlaybackPolicy:
@@ -418,12 +450,14 @@ def _apply_disc_transcoding(
     source["TranscodingUrl"] = f"/Videos/{_unit_item_guid(ref)}/master.m3u8?{query}"
 
 
-def _audio_index_for_ref(f: LibraryFile, track_ref: str | None) -> int | None:
-    """中性音轨引用 → 协议合成编号（外挂字幕置前：外挂数 + 1 + k）。"""
+def _audio_index_for_ref(
+    f: LibraryFile, track_ref: str | None, owner: LibraryFile | None = None
+) -> int | None:
+    """中性音轨引用 → 协议合成编号（外挂字幕置前：外挂数 + 1 + k；外挂按 ``owner`` 数）。"""
     k = parse_embedded_track(track_ref) if track_ref else None
     if k is None:
         return None
-    return len(f.external_subtitles or []) + 1 + k
+    return len((owner or f).external_subtitles or []) + 1 + k
 
 
 def _apply_transcode_negotiation(
@@ -434,6 +468,8 @@ def _apply_transcode_negotiation(
     play_session_id: str,
     negotiation: Negotiation,
     policy,
+    *,
+    owner: LibraryFile | None = None,
 ) -> None:
     """普通本地文件的码率协商（docs/design/jellyfin-transcode.md §3）。
 
@@ -454,10 +490,14 @@ def _apply_transcode_negotiation(
         return
     direct_ok = direct_play_allowed(f.bit_rate, negotiation)
     requested_index = negotiation.audio_stream_index
-    audio_ref = audio_track_for_index(f, requested_index) if requested_index is not None else None
+    audio_ref = (
+        audio_track_for_index(f, requested_index, owner) if requested_index is not None else None
+    )
     if audio_ref is None:
         default_index = source.get("DefaultAudioStreamIndex")
-        audio_ref = audio_track_for_index(f, default_index) if default_index is not None else None
+        audio_ref = (
+            audio_track_for_index(f, default_index, owner) if default_index is not None else None
+        )
     decision = plan_capped_transcode(
         media_profile_from_file(f),
         policy,
@@ -486,7 +526,7 @@ def _apply_transcode_negotiation(
         and f.bit_rate is not None
         and f.bit_rate > negotiation.max_bitrate_bps
     )
-    audio_index = _audio_index_for_ref(f, decision.audio.track_ref)
+    audio_index = _audio_index_for_ref(f, decision.audio.track_ref, owner)
     source["SupportsDirectPlay"] = False
     source["SupportsDirectStream"] = False
     # 分片容器按播放器转码档的申报回（Infuse = ts）：TranscodingContainer 与
@@ -642,16 +682,19 @@ def _apply_default_tracks(
       记忆有效 → 其 Index；无记忆/失效 → 默认轨策略（库语言，看将要放的音轨）；策略也不开 →
       不输出字段（客户端默认不开字幕）。
     """
+    owner = context.metadata_owner
     audio = resolve_audio(f, audio_mem, context)
     if audio.index is not None:
-        # Jellyfin 把外挂流置前，video/audio 的协议编号随外挂数量整体后移。
-        source["DefaultAudioStreamIndex"] = len(f.external_subtitles or []) + 1 + audio.index
+        # Jellyfin 把外挂流置前，video/audio 的协议编号随外挂数量整体后移（外挂按归属行数）。
+        source["DefaultAudioStreamIndex"] = (
+            len((owner or f).external_subtitles or []) + 1 + audio.index
+        )
 
     track = resolve_subtitle(f, subtitle_mem, context, audio.ref).ref
     if track == SUBTITLE_OFF:
         source["DefaultSubtitleStreamIndex"] = -1
     elif track is not None:
-        index = index_for_subtitle_track(f, track)
+        index = index_for_subtitle_track(f, track, owner)
         if index is not None:
             source["DefaultSubtitleStreamIndex"] = index
 
@@ -1016,7 +1059,8 @@ async def subtitle_stream(
         raise not_found()
     f = selected[0]
 
-    track = subtitle_track_for_index(f, stream_index)
+    owner = await _metadata_owner_for(f)
+    track = subtitle_track_for_index(f, stream_index, owner)
     if track is None:
         logger.warning(
             "字幕请求的流序号不存在（可能条目已重扫、编号已变化）：%s #%d",
@@ -1024,7 +1068,7 @@ async def subtitle_stream(
             stream_index,
         )
         raise not_found()
-    sub_ref = resolve_external_subtitle(f, track)
+    sub_ref = resolve_external_subtitle(owner, track)
     if sub_ref is None:
         # 内封轨：转码时容器里的字幕进不了 HLS，按需抽出旁挂（首次通读容器，
         # 之后走与网页播放器共用的缓存）；直连播放器自行解封装，不会来请求
@@ -1254,7 +1298,7 @@ async def _capped_transcode_spec(f: LibraryFile, params: TranscodeParams) -> _Se
     """
     policy = await _load_policy_for(params.segment_container)
     audio_ref = (
-        audio_track_for_index(f, params.audio_stream_index)
+        audio_track_for_index(f, params.audio_stream_index, await _metadata_owner_for(f))
         if params.audio_stream_index is not None
         else None
     )

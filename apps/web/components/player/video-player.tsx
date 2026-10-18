@@ -507,6 +507,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
     reason: string;
   } | null>(null);
   const uplinkOriginalRef = useRef(false);
+  /**
+   * 「切到原画」：放的是便携版时，用户要原片。带着原片的文件 id 重开会话——服务端只按这个文件
+   * 判定（配了上行照常问降档，与直接放原片一样）。只对当前这一集生效，换集回到服务端自动择优。
+   */
+  const [originalFileId, setOriginalFileId] = useState<number | null>(null);
   /** 「已沿用上次的选择」只在打开播放器后的第一集判一次（切到下一集不再提示，与 iOS 一致） */
   const rememberedNoticeDoneRef = useRef(false);
   /** 每秒循环的计数：每 10 秒刷新一次「正在播放」标记（异常退出补报用） */
@@ -1263,6 +1268,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     // 外网画质弹窗按播放单元算：换集/换片清掉挂着的弹窗与「选了原画质」标记
     uplinkOriginalRef.current = false;
     setUplinkChoice(null);
+    setOriginalFileId(null);
     // 画质按片记：影片分享的访客不读不写（与 iOS 的分享场景一致）
     const remembered = apiRef.current.telemetry ? loadQualityFor(unit.media_item_id) : null;
     qualityFromMemoryRef.current = remembered !== null;
@@ -1312,7 +1318,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     // 在途请求已被 cancelled——响应回来没人认领，起播就永远停在转圈里。
     // uplinkOriginalRef 是「外网弹窗里选了原画质」的一次性标记：带上它重开
     // 时请求会带画质上限（跳过上行判定），指纹不含它的话重开会被去重跳过。
-    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}|${lockedFileId ?? ""}|${uplinkOriginalRef.current ? "orig" : ""}`;
+    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}|${lockedFileId ?? ""}|${uplinkOriginalRef.current ? "orig" : ""}|${originalFileId ?? ""}`;
     if (startedKeyRef.current === key) return;
     startedKeyRef.current = key;
 
@@ -1329,8 +1335,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
           {
             ...unit,
             // 详情页版本选择器带来的 `?file=`：锁定这个文件起播，服务端跳过
-            // 多版本自动择优（undefined = 没锁，照旧择优）
-            file_id: lockedFileId ?? undefined,
+            // 多版本自动择优（undefined = 没锁，照旧择优）。「切到原画」选定的原片优先于它
+            file_id: originalFileId ?? lockedFileId ?? undefined,
             capability: capabilityRef.current,
             failed_tiers: state.failedTiers,
             // null = 服务端接续播点；显式值（seek 重开 / 换轨 / ?t=）原样发。
@@ -1449,6 +1455,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     requestedAudio,
     requestedSubtitle,
     quality,
+    originalFileId,
   ]);
 
   /**
@@ -4331,6 +4338,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
   const overrideMs =
     seekPreview && !seekPreview.leaving ? seekPreview.targetMs : pendingSeekMs;
 
+  /** 当前放的是便携版时它的源文件 id（顶栏的「切到原画」用）；放的是原片为 null */
+  const portableSourceId = state.session?.decision.portable_source_file_id ?? null;
+
   return (
     <div
       ref={containerRef}
@@ -4489,6 +4499,32 @@ export function VideoPlayer(props: VideoPlayerProps) {
             <h1 className="truncate text-[17px] font-semibold text-white drop-shadow">{title}</h1>
             {episodeLabel ? (
               <p className="truncate text-[13px] text-white/65">{episodeLabel}</p>
+            ) : null}
+            {/* 便携版（预转码的省流副本）：标明放的是哪一版，并给一键切回原画。
+                切回是带原片文件 id 重开会话，走原片的判定（配了上行照常问降档）。 */}
+            {portableSourceId !== null ? (
+              <div
+                className={`mt-1.5 flex items-center gap-2 whitespace-nowrap text-[12px] ${
+                  chromeVisible ? "pointer-events-auto" : "pointer-events-none"
+                }`}
+              >
+                <span className="rounded-full bg-white/[0.12] px-2 py-0.5 text-white/85">
+                  便携版
+                  {state.session?.decision.portable_resolution
+                    ? ` · ${state.session.decision.portable_resolution}`
+                    : null}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOriginalFileId(portableSourceId);
+                    dispatch({ type: "restart", startMs: pendingFileMsRef.current });
+                  }}
+                  className="rounded-full px-2 py-0.5 text-white/80 underline-offset-4 transition hover:text-white hover:underline pointer-coarse:px-3 pointer-coarse:py-2"
+                >
+                  切到原画
+                </button>
+              </div>
             ) : null}
           </div>
 

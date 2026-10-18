@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.services.library.subtitles import LANGUAGE_TOKENS
-from movieclaw_api.services.playback.track_context import unit_files_with_contexts
+from movieclaw_api.services.playback.track_context import track_context, unit_files_with_contexts
 from movieclaw_db.models import FileState, LibraryFile, PlaybackState
 from movieclaw_playback.subtitles import (
     SUBTITLE_OFF,
@@ -96,12 +96,14 @@ def translate_subtitle(
     target: LibraryFile,
     context: TrackContext = NO_CONTEXT,
     source_audio: str | None = None,
+    target_context: TrackContext = NO_CONTEXT,
 ) -> str | None:
     """上一集用户换过的字幕 → 本集同语言、同类型的字幕；用户关掉的照旧关闭。
 
     用的就是那一集的默认字幕、或那一集本来就不开字幕（「关闭」只是默认状态）时不沿用。
     ``context`` 是上一集文件的默认轨策略上下文，``source_audio`` 是那一集放的音轨
-    （记着的；没有即默认音轨）——默认字幕要看放的是哪种语言的音轨。
+    （记着的；没有即默认音轨）——默认字幕要看放的是哪种语言的音轨。``target_context`` 是本集的：
+    便携版借用源文件的外挂字幕，本集的外挂候选要看归属行（``metadata_owner``）。
     """
     default_ref = default_subtitle(source, context, source_audio).ref
     if ref is None or ref == default_ref:
@@ -120,7 +122,7 @@ def translate_subtitle(
         title = wanted.get("title")
     else:
         filename = parse_external_track(ref)
-        externals = source.external_subtitles or []
+        externals = (context.metadata_owner or source).external_subtitles or []
         entry = next((e for e in externals if e.get("filename") == filename), None)
         if entry is None:
             return None
@@ -144,7 +146,7 @@ def translate_subtitle(
         )
         if best is None or score > best[0]:
             best = (score, f"embedded:{j}")
-    for entry in target.external_subtitles or []:
+    for entry in (target_context.metadata_owner or target).external_subtitles or []:
         if _language(entry.get("language")) != language or not entry.get("filename"):
             continue
         entry_bitmap = str(entry.get("format") or "").lower() in {"sup", "sub", "idx"}
@@ -208,6 +210,7 @@ def inherit_tracks(
     *,
     need_audio: bool,
     need_subtitle: bool,
+    target_context: TrackContext = NO_CONTEXT,
 ) -> tuple[str | None, str | None]:
     """上一集（``source`` 文件、``source_row`` 记忆）的选择按语言换算到本集的 ``target`` 文件。"""
     audio = (
@@ -215,7 +218,12 @@ def inherit_tracks(
     )
     subtitle = (
         translate_subtitle(
-            source_row.subtitle_track, source, target, context, source_row.audio_track
+            source_row.subtitle_track,
+            source,
+            target,
+            context,
+            source_row.audio_track,
+            target_context,
         )
         if need_subtitle
         else None
@@ -251,4 +259,5 @@ async def series_track_memory(
         contexts.get(source.id or 0, NO_CONTEXT),
         need_audio=need_audio,
         need_subtitle=need_subtitle,
+        target_context=await track_context(session, target),
     )

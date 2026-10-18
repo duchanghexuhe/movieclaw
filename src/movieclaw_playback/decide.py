@@ -305,6 +305,10 @@ class PlaybackPlan:
     #: 一下起播、弹窗让用户确认「降档播还是原画质播」；不认这个字段的客户端
     #: （App）拿到计划直接播，等于维持自动降档。
     uplink_forced: bool = False
+    #: 所放的文件是预转码便携版时，它的源文件 id 与分辨率标签（网页端据此标「便携版 · 720p」，
+    #: 并提供「切到原画」带源文件 id 重开）。由择优层（plan.decide_for_files）打上；引擎不认派生关系
+    portable_source_file_id: int | None = None
+    portable_resolution: str | None = None
 
 
 @dataclass(frozen=True)

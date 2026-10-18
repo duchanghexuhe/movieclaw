@@ -307,7 +307,9 @@ async def serve_subtitle_async(
 # -- 默认字幕轨选择 ---------------------------------------------------------
 
 
-def pick_default_subtitle(file: LibraryFile) -> str | None:
+def pick_default_subtitle(
+    file: LibraryFile, metadata_owner: LibraryFile | None = None
+) -> str | None:
     """默认字幕轨（Jellyfin Default 模式在通配语言下的化简，全端共用）。
 
     候选排序：外挂 ↓ →（外挂内部）AI 生成 ↓ → default 旗标 ↓ → 非 forced ↓ →
@@ -316,6 +318,8 @@ def pick_default_subtitle(file: LibraryFile) -> str | None:
     AI 生成的字幕优先选它（产品拍板 2026-08-25：AI 字幕是为这部片现生成的，
     比随片源顺来的外挂更可能是用户想看的那条）；没有外挂则尊重内封 default
     旗标，仅当只有 forced 轨可选时才选 forced。
+
+    ``metadata_owner`` 是外挂字幕的归属行（便携版是源文件，见 ``track_context``），None = 文件自己。
 
     现在是默认字幕的**旧规则**（2026-09-29 默认轨策略改造）：全端的默认字幕只经
     ``movieclaw_playback.track_policy`` 算（按媒体库语言、看将要放的音轨），它在没有
@@ -329,7 +333,7 @@ def pick_default_subtitle(file: LibraryFile) -> str | None:
             (False, False, bool(raw.get("default")), bool(raw.get("forced")), order, track)
         )
         order += 1
-    for entry in file.external_subtitles or []:
+    for entry in (metadata_owner or file).external_subtitles or []:
         filename = entry.get("filename")
         if not filename:
             continue
@@ -353,14 +357,16 @@ def pick_default_subtitle(file: LibraryFile) -> str | None:
     return eligible[0][5]
 
 
-def subtitle_track_exists(file: LibraryFile, track: str) -> bool:
-    """中性引用当前是否仍有效（重扫/换文件后可能悬空）。"""
+def subtitle_track_exists(
+    file: LibraryFile, track: str, metadata_owner: LibraryFile | None = None
+) -> bool:
+    """中性引用当前是否仍有效（重扫/换文件后可能悬空）。外挂部分看 ``metadata_owner``。"""
     k = parse_embedded_track(track)
     if k is not None:
         return k < len(file.subtitle_streams or [])
     filename = parse_external_track(track)
     if filename is not None:
         return any(
-            e.get("filename") == filename for e in file.external_subtitles or []
+            e.get("filename") == filename for e in (metadata_owner or file).external_subtitles or []
         )
     return False

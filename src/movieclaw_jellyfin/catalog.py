@@ -303,6 +303,8 @@ def _list_load_columns(
                 LibraryFile.audio_streams,
                 LibraryFile.subtitle_streams,
                 LibraryFile.external_subtitles,
+                # 便携版的版本名与外挂字幕归属行（源文件 id）；列表查询按需取，不读派生说明 JSON
+                LibraryFile.derives_from_file_id,
             ]
         )
     elif options.has("Path"):
@@ -1507,7 +1509,8 @@ def movie_dto(ctx: DtoContext, bundle: ItemBundle, options: DtoOptions) -> dict[
         if files:
             dto["DateCreated"] = format_datetime(min(f.created_at for f in files))
     if options.has("MediaSources") or options.has("MediaStreams"):
-        sources = [s for f in bundle.files.get((0, 0), []) if (s := media_source_dto(f))]
+        files = bundle.files.get((0, 0), [])
+        sources = [s for f in files if (s := media_source_dto(f, owner=_owner_in(f, files)))]
         if options.has("MediaSources"):
             dto["MediaSources"] = sources
         if options.has("MediaStreams") and sources:
@@ -1673,7 +1676,8 @@ def episode_dto(
         if files:
             dto["DateCreated"] = format_datetime(min(f.created_at for f in files))
     if options.has("MediaSources") or options.has("MediaStreams"):
-        sources = [s for f in bundle.files.get((season, episode), []) if (s := media_source_dto(f))]
+        files = bundle.files.get((season, episode), [])
+        sources = [s for f in files if (s := media_source_dto(f, owner=_owner_in(f, files)))]
         if options.has("MediaSources"):
             dto["MediaSources"] = sources
         if options.has("MediaStreams") and sources:
@@ -2051,17 +2055,21 @@ def _external_subtitle_stream(entry: dict, index: int, media_dir: Path) -> dict[
     return stream
 
 
-def media_streams_dto(f: LibraryFile) -> list[dict[str, Any]]:
+def media_streams_dto(f: LibraryFile, owner: LibraryFile | None = None) -> list[dict[str, Any]]:
     """合成流编号是 Jellyfin 方言、唯一产地在本层（jellyfin-subtitle.md §4.1）：
     **外挂字幕置前**（台账数组序），再接 video、audio、内封字幕。此顺序
     对齐 Jellyfin master；VidHub 会按官方布局识别外挂流，不能假设只要
     Index 在单次响应内自洽就协议等价。
     编号↔中性轨引用的换算（subtitle_track_for_index 等）必须与本函数同源。
+
+    ``owner`` 是外挂字幕的归属行（便携版借用源文件的，见 ``track_context.metadata_owner``）：
+    外挂流与它们的目录取自 owner，视频、音轨、内封字幕仍是 ``f`` 自己的。
     """
     streams: list[dict[str, Any]] = []
     index = 0
-    media_dir = Path(f.file_path).parent
-    for entry in f.external_subtitles or []:
+    externals_of = owner or f
+    media_dir = Path(externals_of.file_path).parent
+    for entry in externals_of.external_subtitles or []:
         streams.append(_external_subtitle_stream(entry, index, media_dir))
         index += 1
     streams.append(_video_stream(f, index))
@@ -2078,11 +2086,13 @@ def media_streams_dto(f: LibraryFile) -> list[dict[str, Any]]:
 # -- 合成编号 ↔ 中性轨引用（协议层 ↔ 领域层的翻译，§4.1） --------------------
 
 
-def subtitle_track_for_index(f: LibraryFile, index: int) -> str | None:
-    """合成 Index → 字幕的中性轨引用；不在字幕区间返回 None。"""
+def subtitle_track_for_index(
+    f: LibraryFile, index: int, owner: LibraryFile | None = None
+) -> str | None:
+    """合成 Index → 字幕的中性轨引用；不在字幕区间返回 None。外挂区间按 ``owner`` 算。"""
     from movieclaw_playback.subtitles import embedded_track, external_track
 
-    externals = f.external_subtitles or []
+    externals = (owner or f).external_subtitles or []
     if 0 <= index < len(externals):
         filename = externals[index].get("filename")
         return external_track(filename) if filename else None
@@ -2093,11 +2103,13 @@ def subtitle_track_for_index(f: LibraryFile, index: int) -> str | None:
     return None
 
 
-def index_for_subtitle_track(f: LibraryFile, track: str) -> int | None:
-    """中性轨引用 → 合成 Index；引用悬空（轨已不在）返回 None。"""
+def index_for_subtitle_track(
+    f: LibraryFile, track: str, owner: LibraryFile | None = None
+) -> int | None:
+    """中性轨引用 → 合成 Index；引用悬空（轨已不在）返回 None。外挂区间按 ``owner`` 算。"""
     from movieclaw_playback.subtitles import parse_embedded_track, parse_external_track
 
-    externals = f.external_subtitles or []
+    externals = (owner or f).external_subtitles or []
     embedded_base = len(externals) + 1 + len(f.audio_streams or [])
     n_embedded = len(f.subtitle_streams or [])
     k = parse_embedded_track(track)
@@ -2111,19 +2123,31 @@ def index_for_subtitle_track(f: LibraryFile, track: str) -> int | None:
     return None
 
 
-def audio_track_for_index(f: LibraryFile, index: int) -> str | None:
-    """合成 Index → 音轨的中性轨引用；不在音轨区间返回 None。"""
+def audio_track_for_index(
+    f: LibraryFile, index: int, owner: LibraryFile | None = None
+) -> str | None:
+    """合成 Index → 音轨的中性轨引用；不在音轨区间返回 None。外挂字幕占的编号按 ``owner`` 算。"""
     from movieclaw_playback.subtitles import embedded_track
 
-    audio_base = len(f.external_subtitles or []) + 1
+    audio_base = len((owner or f).external_subtitles or []) + 1
     if audio_base <= index < audio_base + len(f.audio_streams or []):
         return embedded_track(index - audio_base)
     return None
 
 
+def _owner_in(f: LibraryFile, rows: list[LibraryFile]) -> LibraryFile | None:
+    """便携版的外挂字幕归属行（源文件）若在同一单元的行里，取它；不在位或不是便携版为 None。
+    与 PlaybackInfo 取到的归属行同一个口径（见 ``track_context.metadata_owner``）。"""
+    if f.derives_from_file_id is None:
+        return None
+    return next((r for r in rows if r.id == f.derives_from_file_id), None)
+
+
 def version_name(f: LibraryFile) -> str:
     parts = [p for p in (f.resolution, (f.video_codec or "").upper() or None, f.hdr) if p]
-    return " ".join(parts) or Path(f.file_path).stem
+    name = " ".join(parts) or Path(f.file_path).stem
+    # 便携版在版本列表里标明身份：外网默认就是它（见 PlaybackInfo 的排序）
+    return f"便携版 · {name}" if f.derives_from_file_id is not None else name
 
 
 def _apply_disc_source(source: dict[str, Any], disc: DiscSource) -> None:
@@ -2148,7 +2172,9 @@ def _apply_disc_source(source: dict[str, Any], disc: DiscSource) -> None:
     source["TranscodingSubProtocol"] = "hls"
 
 
-def media_source_dto(f: LibraryFile, *, resolve_strm: bool = False) -> dict[str, Any] | None:
+def media_source_dto(
+    f: LibraryFile, *, resolve_strm: bool = False, owner: LibraryFile | None = None
+) -> dict[str, Any] | None:
     """单个文件版本 → MediaSourceInfo（含 v1.1 核实的 8 个恒输出字段）。
 
     strm 条目：Protocol=Http、IsRemote=true——客户端 DirectPlay 直连云端，
@@ -2165,7 +2191,7 @@ def media_source_dto(f: LibraryFile, *, resolve_strm: bool = False) -> dict[str,
     from movieclaw_playback.streaming import local_strm_container, strm_needs_relay
     from movieclaw_playback.streaming import resolve_strm as read_strm
 
-    streams = media_streams_dto(f)
+    streams = media_streams_dto(f, owner)
     audio_streams = [s for s in streams if s["Type"] == "Audio"]
     audio_index = next(
         (s["Index"] for s in audio_streams if s.get("IsDefault")),

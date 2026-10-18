@@ -41,6 +41,7 @@ from movieclaw_playback.decide import (
     PlaybackDecision,
     PlaybackPlan,
     PlaybackPolicy,
+    PlaybackRejected,
     decide_playback,
     needs_keyframe_probe,
 )
@@ -113,12 +114,18 @@ async def decide_for_files(
 
     ``contexts`` 是各文件的默认轨策略上下文（随取文件的 SQL 一起取出，见 ``track_context``）：
     用户没表态时放哪条音轨、开哪条字幕按它算；不给则按旧规则（容器默认旗标）。
+
+    便携版（预转码派生行，``derivation`` 非空，docs/design/preload-transcode.md）的参与规则：
+    外网会话有便携版就默认用便携版，不看家宽上行设置——能直通或重封装的那份优先，
+    都要转码时也从便携版转（成本比从 4K 原片转低一个数量级）；便携版一个计划也出不了
+    才回落原片。内网会话便携版不参与择优（省流档绝不劫持局域网画质），只有原片不可播放
+    （全部直接拒绝）或根本没有原片时才参与。手选某一版（只给了它的 file_id）不经过这里。
     """
     if not files:
         return None
     policy = await load_policy()
-    decisions = []
-    for file in files:
+
+    async def score(file: LibraryFile) -> tuple[PlaybackDecision, int | None, int | None]:
         # T3 高度上限随执行者：片属性命中远程分流（HDR/4K）且 nvenc Worker
         # 在线时，这一部的转码上限放到 2160——只有远程才装得出 4K 的速度
         # （NAS 核显 4K 只有 1.8×）。执行后端随后在 select_execution_backend
@@ -198,25 +205,37 @@ async def decide_for_files(
                 file, keyframe_interval_s=interval, disc_clips=disc_clips,
                 context=context, preferred_audio=preferred_audio,
             )
-        decisions.append(
-            (
-                decide_playback(
-                    profile,
-                    capability,
-                    file_policy,
-                    can_self_enable=can_self_enable,
-                    failed_tiers=failed_tiers,
-                    preferred_audio=preferred_audio,
-                    preferred_subtitle=preferred_subtitle,
-                    max_height=max_height,
-                    uplink_bps=uplink_bps,
-                    external=external,
-                ),
-                profile.height,
-                profile.bit_rate_bps,
-            )
+        decision = decide_playback(
+            profile,
+            capability,
+            file_policy,
+            can_self_enable=can_self_enable,
+            failed_tiers=failed_tiers,
+            preferred_audio=preferred_audio,
+            preferred_subtitle=preferred_subtitle,
+            max_height=max_height,
+            uplink_bps=uplink_bps,
+            external=external,
         )
-    return _best(decisions)
+        if file.derivation is not None and isinstance(decision, PlaybackPlan):
+            decision = replace(
+                decision,
+                portable_source_file_id=file.derives_from_file_id,
+                portable_resolution=file.resolution,
+            )
+        return decision, profile.height, profile.bit_rate_bps
+
+    originals = [f for f in files if f.derivation is None]
+    portables = [f for f in files if f.derivation is not None]
+    if external and portables:
+        scored = [await score(f) for f in portables]
+        if not any(isinstance(d, PlaybackPlan) for d, _, _ in scored):
+            scored += [await score(f) for f in originals]
+        return _best(scored)
+    scored = [await score(f) for f in originals]
+    if portables and all(isinstance(d, PlaybackRejected) for d, _, _ in scored):
+        scored += [await score(f) for f in portables]
+    return _best(scored)
 
 
 async def load_policy() -> PlaybackPolicy:
@@ -431,6 +450,8 @@ def to_view(decision: PlaybackDecision) -> PlaybackDecisionView:
             disc=decision.disc,
             disc_playlist=decision.disc_playlist,
             uplink_step_down=decision.uplink_forced,
+            portable_source_file_id=decision.portable_source_file_id,
+            portable_resolution=decision.portable_resolution,
         )
     if isinstance(decision, ConsentRequired):
         return PlaybackDecisionView(

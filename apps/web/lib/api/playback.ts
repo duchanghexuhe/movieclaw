@@ -601,6 +601,10 @@ export interface PlaybackDecision {
   /** 计划是外网线路降档的结果：网页端拦下起播、弹窗确认「降档播还是原画质播」。
    *  推荐档就是计划本身的 video.height；不认这个字段的客户端直接播＝自动降档 */
   uplink_step_down?: boolean;
+  /** 所放的是预转码便携版：源文件 id（「切到原画」带它重开会话）；放的是原片为 null */
+  portable_source_file_id?: number | null;
+  /** 便携版的分辨率标签（如 720p），与 portable_source_file_id 同时出现 */
+  portable_resolution?: string | null;
 }
 
 /** 源文件的客观规格（台账真值），诊断面板「源 → 处理」层次的左半边 */
