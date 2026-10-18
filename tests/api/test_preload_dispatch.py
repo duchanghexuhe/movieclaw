@@ -2,7 +2,7 @@
 
 覆盖推送派单主链路：
 1. 带 preload 角色的 Worker 上线 → 排队任务被推送（不再依赖 REST claim）；
-2. 预算：max_concurrency=1 的 Worker 不接预转码；=2 的接 1 个；
+2. 预算（播放优先）：空闲时整个并发都能转预转码；有实时任务在跑时为 0；
 3. complete 触发下一个排队任务的派发；
 4. job.start 载荷与 claim 时代同构（argv/断点/签名地址）；
 5. 推送失败当场回队（无 Worker 时下单不失败，Worker 上线后补派）。
@@ -114,19 +114,17 @@ def test_ordering_after_create_triggers_dispatch(client, tmp_path):
         assert message["task_id"] == created["id"]
 
 
-def test_single_concurrency_worker_gets_no_preload(client, tmp_path):
-    """预算 = max_concurrency − 1：并发 1 的机器只服务实时，预转码任务留在队列。"""
+def test_single_concurrency_idle_worker_gets_preload(client, tmp_path):
+    """空闲时整个并发都能转预转码：并发 1 的机器也接（播放来了再让位）。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
     token = _pair_worker(client)
     created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
     with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
         ws.send_json(_hello("win-c", max_jobs=1, roles=["realtime", "preload"]))
         assert ws.receive_json()["type"] == "worker.accepted"
-        # 没有任务可派：发个心跳确认连接还活着且没有 job.start 插队
-        ws.send_json({"type": "worker.heartbeat", "load": {}})
-        ack = ws.receive_json()
-        assert ack["type"] == "worker.heartbeat.ack"
-    assert created["id"] in _queued_task_ids(client)
+        message = ws.receive_json()
+        assert message["type"] == "job.start" and message["task_id"] == created["id"]
+    assert created["id"] not in _queued_task_ids(client)
 
 
 def test_realtime_only_worker_is_not_a_preload_candidate(client, tmp_path):
@@ -143,22 +141,22 @@ def test_realtime_only_worker_is_not_a_preload_candidate(client, tmp_path):
 
 
 def test_realtime_jobs_reduce_preload_budget(client, tmp_path):
-    """并发 2 的机器：1 个实时任务在跑 → 预算 0，预转码不派。"""
+    """并发 2 的机器：空闲时先推 1 个；此后有实时任务在跑 → 预算 0，新预转码不派。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
     token = _pair_worker(client)
     client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
     with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
         ws.send_json(_hello("win-d", max_jobs=2, roles=["realtime", "preload"]))
         assert ws.receive_json()["type"] == "worker.accepted"
-        # 连接触发派发了第一个任务（预算 1 用掉）
+        # 连接触发派发了第一个任务（并发 2 的一个位）
         first = ws.receive_json()
         assert first["type"] == "job.start" and first["class"] == "preload"
-        # 一个实时任务占住并发位（模拟播放会话 reserve）
+        # 一个实时任务开始在跑（模拟播放会话 reserve）
         registry = get_remote_worker_registry()
         connection = registry._workers["win-d"]
         with registry._lock:
             connection.jobs.add("job-rt-1")
-        # 此时再下单：预算 = 2-1-1 = 0，新任务留在队列
+        # 此时再下单：有实时任务在跑，预算 0，新任务留在队列
         file2 = _seed_file(client, tmp_path, hdr="HDR10", resolution="1080p")
         second = client.post(f"{_PRELOAD}/tasks", json={"file_id": file2}).json()["data"]
         ws.send_json({"type": "worker.heartbeat", "load": {}})
@@ -168,57 +166,20 @@ def test_realtime_jobs_reduce_preload_budget(client, tmp_path):
             connection.jobs.discard("job-rt-1")
 
 
-def test_preempt_for_realtime_returns_task_and_sends_stop(client, tmp_path):
-    """实时抢占（v2：接线在 reserve 全员满员时）：
-    记账释放 + Worker 收到 class=preload 的 job.stop。"""
-    file_id = _seed_file(client, tmp_path, hdr="HDR10")
-    token = _pair_worker(client)
-    created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
-    task_id = created["id"]
-    with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
-        ws.send_json(_hello("win-e", max_jobs=2, roles=["realtime", "preload"]))
-        assert ws.receive_json()["type"] == "worker.accepted"
-        message = ws.receive_json()
-        assert message["type"] == "job.start" and message["task_id"] == task_id
-        registry = get_remote_worker_registry()
-        connection = registry._workers["win-e"]
-        assert registry.preload_capacity(connection) == 0  # 预算 1 已被推送占用
-        # 模拟实时任务把并发位占满，然后从实时路径请求抢占
-        with registry._lock:
-            connection.jobs.add("job-rt-1")
-            connection.jobs.add("job-rt-2")
-        victim = client.portal.call(
-            lambda: registry._preempt_preload_for_realtime("nvenc", "fmp4", disc=False)
-        )
-        assert victim is connection
-        stop = ws.receive_json()
-        assert stop["type"] == "job.stop"
-        assert stop["class"] == "preload"
-        assert stop["task_id"] == task_id
-        # 记账当场释放：实时任务退光后预转码预算立刻回到 1
-        assert connection.preload_jobs == {}
-        with registry._lock:
-            connection.jobs.clear()
-        assert registry.preload_capacity(connection) == 1
-
-
 def test_push_accounting_bounds_queue_dispatch(client, tmp_path):
-    """队列深于预算时只推预算内数量：不会把整条队列一口气推给同一台 Worker。"""
+    """队列深于余量时只推余量内数量：不会把整条队列一口气推给同一台 Worker。"""
     file_ids = [_seed_file(client, tmp_path, hdr="HDR10") for _ in range(3)]
     token = _pair_worker(client)
     for file_id in file_ids:
         client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
-    pushed = []
     with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
         ws.send_json(_hello("win-f", max_jobs=2, roles=["realtime", "preload"]))
         assert ws.receive_json()["type"] == "worker.accepted"
-        # 预算 = 2-1 = 1：只推第一个；第二条 job.start 永远不会来——
-        # 队列里剩两个任务但记账已满，这正是要防的「整条队列一口气推」
-        first = ws.receive_json()
-        assert first["type"] == "job.start" and first.get("class") == "preload"
-        pushed.append(first["task_id"])
-        assert len(_queued_task_ids(client)) == 2
-        assert pushed[0] not in _queued_task_ids(client)
+        # 余量 = 并发 2 − 在途 0 = 2：推两个；第三个留在队列，不会有第三条 job.start
+        pushed = [ws.receive_json(), ws.receive_json()]
+        assert all(m["type"] == "job.start" and m.get("class") == "preload" for m in pushed)
+        assert len(_queued_task_ids(client)) == 1
+        assert not {m["task_id"] for m in pushed} & _queued_task_ids(client)
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +230,8 @@ def test_local_executor_picks_up_when_no_worker_online(client, tmp_path, monkeyp
     assert ran == [created["id"]]
 
 
-def test_full_worker_leaves_task_to_local(client, tmp_path, monkeypatch):
-    """Worker 在线但满员（预算 0）：任务落回本地槽，Worker 不收到 job.start。"""
+def test_busy_worker_leaves_task_to_local(client, tmp_path, monkeypatch):
+    """Worker 在线但有播放在跑（预算 0）：任务落回本地槽，Worker 不收到 job.start。"""
     import movieclaw_api.services.preload.dispatcher as dispatcher
 
     monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
@@ -285,13 +246,19 @@ def test_full_worker_leaves_task_to_local(client, tmp_path, monkeypatch):
     with client.websocket_connect(_WS, headers=_worker_headers(token)) as ws:
         ws.send_json(_hello("win-full", max_jobs=1, roles=["realtime", "preload"]))
         assert ws.receive_json()["type"] == "worker.accepted"
+        # 一个播放正在这台 Worker 上转码：预算 0，预转码不推给它
+        registry = get_remote_worker_registry()
+        with registry._lock:
+            registry._workers["win-full"].jobs.add("job-rt-1")
         created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
-        # 预算 = max_jobs−1 = 0：不会有 job.start；心跳确认连接正常
+        # 心跳确认连接正常，且中间没有 job.start 插队
         ws.send_json({"type": "worker.heartbeat", "load": {}})
         assert ws.receive_json()["type"] == "worker.heartbeat.ack"
         # create 触发的派单是后台任务，这里同步补一轮再断言
         client.portal.call(dispatcher.dispatch_queued_tasks)
         assert ran == [created["id"]]
+        with registry._lock:
+            registry._workers["win-full"].jobs.discard("job-rt-1")
 
 
 def test_local_video_copy_never_reaches_queue(client, tmp_path, monkeypatch):

@@ -273,17 +273,52 @@ def test_preload_job_start_runs_executor():
 
 
 def test_preload_stop_routes_to_registered_stopper():
-    """job.stop(class=preload) 只停对应 task_id 的预转码，不碰实时任务表。"""
+    """job.stop(class=preload) 只停对应 task_id 的预转码，不碰实时任务表。
+
+    reason=cancel 才告诉执行器要删本地半成品；没有 reason 的（让位类）原样保留。
+    """
     from engine import RealtimeClient
 
     client = RealtimeClient(
         server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},
         preload=lambda message: True,
     )
-    stopped: list[object] = []
-    client.preload_stop = stopped.append
+    stopped: list[tuple[object, bool]] = []
+    client.preload_stop = lambda task_id, cancel=False: stopped.append((task_id, cancel))
     client._handle(None, {"type": "job.stop", "class": "preload", "task_id": 42})
-    assert stopped == [42]
+    client._handle(
+        None, {"type": "job.stop", "class": "preload", "task_id": 43, "reason": "cancel"}
+    )
+    assert stopped == [(42, False), (43, True)]
+
+
+def test_realtime_start_yields_every_preload_slot():
+    """播放优先：实时任务一进来，本机在跑的预转码全部让位（keep=0）。"""
+    from engine import RealtimeClient
+
+    client = RealtimeClient(
+        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},
+        preload=lambda message: True,
+    )
+    keeps: list[int] = []
+    client.preload_yield = keeps.append
+    ws = object()
+    client._current_ws = ws
+    # 无 ffmpeg_args：job 线程立刻以「任务缺少 ffmpeg_args」收尾，只关心让位钩子
+    client._start_job(ws, {"job_id": "rt-1", "attempt_id": "a1"})
+    assert keeps == [0]
+
+
+def test_send_preload_yielded_queues_the_message():
+    """让位要告诉服务端：task_id 随 preload.yielded 上行（服务端据此当场回队）。"""
+    from engine import RealtimeClient
+
+    client = RealtimeClient(
+        server="http://nas", token="t", worker_id="w1", ffmpeg="ffmpeg", caps={},
+        preload=lambda message: True,
+    )
+    client.send_preload_yielded(7)
+    assert client._outbox == [{"type": "preload.yielded", "task_id": 7}]
 
 
 def test_recv_json_timeout_is_not_disconnect():

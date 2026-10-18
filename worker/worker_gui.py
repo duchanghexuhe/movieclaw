@@ -305,7 +305,7 @@ class WorkerGUI:
         ttk.Spinbox(config, from_=1, to=8, width=5, textvariable=self.var_concurrency).grid(
             row=2, column=1, sticky=tk.W)
         ttk.Label(
-            config, text="（播放转码优先，预转码占并发−1）",
+            config, text="（播放优先：有人播放时预转码暂停，空闲时用满并发）",
             foreground="#666",
         ).grid(row=2, column=1, sticky=tk.W, padx=(52, 0))
         self.var_ac_only = tk.BooleanVar(value=False)

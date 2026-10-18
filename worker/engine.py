@@ -1712,11 +1712,10 @@ class RealtimeClient:
         job = RealtimeJob(job_id, message, self.ffmpeg, self)
         with self.jobs_lock:
             self.jobs[job_id] = job
-        # 实时优先（T2）：本机预转码占用超出「并发 −1 − 实时任务数」的部分
-        # 立即让位——预算公式与服务端 preload_capacity 同一口径
+        # 播放优先：实时任务一进来，本机在跑的预转码全部让位（断点保留，服务端当场回队）
         yield_slots = getattr(self, "preload_yield", None)
         if yield_slots is not None:
-            yield_slots(max(0, self.max_jobs - 1 - len(self.jobs)))
+            yield_slots(0)
         threading.Thread(
             target=job.run, args=(message,), name=f"job-{job_id[-6:]}", daemon=True
         ).start()
@@ -1753,9 +1752,14 @@ class RealtimeClient:
         self.log(f"预转码单 {task_id} {'完成' if ok else '失败/中断'}：{display}")
 
     def _stop_preload(self, message: dict) -> None:
-        """服务端抢占预转码任务（实时优先）：停掉对应任务的分段 ffmpeg。"""
+        """服务端取消预转码任务：停掉对应任务的分段 ffmpeg，并删掉本地半成品。"""
         task_id = message.get("task_id")
         stopper = getattr(self, "preload_stop", None)
         if stopper is not None and task_id is not None:
-            self.log(f"预转码 {task_id} 停止（让位播放/取消，断点保留）")
-            stopper(task_id)
+            cancel = message.get("reason") == "cancel"
+            self.log(f"预转码 {task_id} 停止（{'取消，删除本地半成品' if cancel else '断点保留'}）")
+            stopper(task_id, cancel=cancel)
+
+    def send_preload_yielded(self, task_id) -> None:
+        """本机为播放让位停掉了预转码：告诉服务端，它当场退回队列（断点台账保留）。"""
+        self._send_safe({"type": "preload.yielded", "task_id": task_id})

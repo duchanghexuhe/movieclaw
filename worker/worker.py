@@ -47,6 +47,8 @@ _LEGACY_CONFIG_FILE = Path(__file__).with_name("preload_worker.json")
 CONFIG_FILE = (
     _LEGACY_CONFIG_FILE if _LEGACY_CONFIG_FILE.exists() else Path(__file__).with_name("worker.json")
 )
+#: 预转码的本地工作目录（源文件与分段）：取消时整目录删掉，让位时原样保留
+WORK_DIR = Path(__file__).with_name("work")
 PROGRESS_SECONDS = 60
 PART_BYTES_DEFAULT = 64 * 1024 * 1024
 # ffmpeg 子进程不弹控制台窗：pythonw 启动时子进程无可继承的控制台，
@@ -641,11 +643,12 @@ class WorkerRuntime:
         # 在跑任务的进度台账（task_id -> process_task 原地更新的 dict）：
         # progress_view() 给 GUI 状态栏轮询
         self._progress: dict[int, dict] = {}
-        # 预转码并发闸：同时在跑的分段转码数。注意这是**本机**闸（电源/停止
-        # 之外的唯一本地限制）——服务端按 max_concurrency−1 派单，这里再拦
-        # 一道防派单与断线重连交错时短暂超发
-        self._preload_slots = threading.Semaphore(max(1, self.concurrency - 1) or 1)
+        # 预转码并发闸：同时在跑的分段转码数，空闲时用满并发。播放优先——实时任务一进来
+        # 在跑的预转码全部让位（不占这里的位）；服务端按余量派单，这里再拦一道防竞态
+        self._preload_slots = threading.Semaphore(self.concurrency)
         self._preload_stop: dict[int, threading.Event] = {}
+        # 服务端取消（job.stop reason=cancel）的任务：收尾时删掉本地工作目录
+        self._preload_cancelled: set[int] = set()
         # 在跑分段 ffmpeg 的句柄（task_id → 最近一段的进程）：停止/退出路径
         # 用来立即杀进程，不等 600s 的段自然跑完
         self._preload_procs: dict[int, subprocess.Popen] = {}
@@ -724,6 +727,10 @@ class WorkerRuntime:
         with self._tasks_lock:
             if self.tasks:
                 return True
+        return self._realtime_busy()
+
+    def _realtime_busy(self) -> bool:
+        """本机有实时任务（播放转码、离线导出）在跑：预转码此刻一个都不该跑。"""
         client = self._realtime_client
         if client is None:
             return False
@@ -775,7 +782,12 @@ class WorkerRuntime:
             # 后自动回队。本地记一条，GUI 能看到为什么没在转
             self.log(f"[{task_id}] 使用电池中，跳过执行（任务将回队）")
             return False
-        # 停止钩子**先注册再等槽位**：等槽位期间服务端抢占/取消经
+        if self._realtime_busy():
+            # 播放优先：推送与播放抢位的竞态（推送时还没看到这台在播）——当场让位回队
+            self.log(f"[{task_id}] 播放中，预转码让位（回队）")
+            self._realtime_client.send_preload_yielded(task_id)
+            return False
+        # 停止钩子**先注册再等槽位**：等槽位期间服务端取消/让位经
         # _stop_preload_task 才找得到这个任务（查不到的叫停会被静默丢掉）
         stop = threading.Event()
         with self._tasks_lock:
@@ -795,6 +807,11 @@ class WorkerRuntime:
                 if self._preload_stop.get(task_id) is stop:
                     self._preload_stop.pop(task_id, None)
                 self._preload_procs.pop(task_id, None)
+                cancelled = task_id in self._preload_cancelled
+                self._preload_cancelled.discard(task_id)
+            if cancelled:
+                # 服务端取消：源文件与分段（几十 GB）一并删掉。让位不走这里，断点原样留着
+                shutil.rmtree(WORK_DIR / str(task_id), ignore_errors=True)
 
     def _run_preload_locked(self, task: dict, task_id: int, stop: threading.Event) -> bool:
         with self._preload_slots:
@@ -815,7 +832,7 @@ class WorkerRuntime:
                 # 停止看门狗立即杀掉在跑的分段，断点台账在服务端，重派自动续转
                 ok = process_task(
                     self.api, self.ffmpeg, task,
-                    Path(__file__).parent / "work" / str(task_id),
+                    WORK_DIR / str(task_id),
                     stop=stop,
                     register=_register_proc,
                     progress=progress,
@@ -834,11 +851,13 @@ class WorkerRuntime:
                     )
                 return False
 
-    def _stop_preload_task(self, task_id) -> None:
-        """服务端抢占/取消时停掉对应任务：置位停止钩子并杀掉在跑的分段。"""
+    def _stop_preload_task(self, task_id, cancel: bool = False) -> None:
+        """停掉对应预转码：置位停止钩子并杀掉在跑的分段。``cancel`` 时收尾删本地半成品。"""
         with self._tasks_lock:
             stop = self._preload_stop.get(task_id)
             proc = self._preload_procs.get(task_id)
+            if cancel and stop is not None:
+                self._preload_cancelled.add(task_id)
         if stop is not None:
             stop.set()
         if proc is not None:
@@ -846,13 +865,18 @@ class WorkerRuntime:
                 proc.kill()
 
     def _yield_preload_slots(self, keep: int) -> None:
-        """实时任务进入时让位：预转码占用超出 keep 的部分（按开始先后）停掉。"""
+        """实时任务进入时让位：预转码占用超出 keep 的部分（按开始先后）停掉，并告诉服务端。
+
+        服务端收到 preload.yielded 后任务当场回队；本地工作目录保留，播放结束后续转。
+        """
         with self._tasks_lock:
             running = list(self._preload_stop)
             over = running[: max(0, len(running) - keep)]
         for task_id in over:
-            self.log(f"[实时优先] 预转码 {task_id} 让出并发位（断点保留，稍后续转）")
+            self.log(f"[播放优先] 预转码 {task_id} 让位（断点保留，播放结束后续转）")
             self._stop_preload_task(task_id)
+            if self._realtime_client is not None:
+                self._realtime_client.send_preload_yielded(task_id)
 
     def progress_view(self) -> list[tuple[str, dict]]:
         """GUI 状态栏轮询：在跑任务的 [(显示名, 进度快照)]，按接单先后。

@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -164,3 +165,68 @@ def test_check_ffmpeg_reports_missing_and_broken_binaries(tmp_path):
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="需要 PATH 里有 ffmpeg")
 def test_check_ffmpeg_accepts_working_binary():
     assert worker_mod.check_ffmpeg(shutil.which("ffmpeg")) is None
+
+
+class _BusyClient:
+    """有一个实时任务在跑的 RealtimeClient 替身：记下让位回报。"""
+
+    def __init__(self) -> None:
+        self.jobs = {"rt-1": object()}
+        self.jobs_lock = threading.Lock()
+        self.yielded: list[int] = []
+
+    def send_preload_yielded(self, task_id) -> None:
+        self.yielded.append(task_id)
+
+
+def test_preload_slots_follow_concurrency_when_idle():
+    """空闲时并发位用满：并发 2 的 Worker 能同时跑两段预转码（不再是并发−1）。"""
+    rt = WorkerRuntime(server="http://nas", token="t", ffmpeg="ffmpeg", concurrency=2)
+    assert rt._preload_slots.acquire(blocking=False)
+    assert rt._preload_slots.acquire(blocking=False)
+    assert not rt._preload_slots.acquire(blocking=False)
+
+
+def test_preload_yields_back_when_playback_is_running(monkeypatch):
+    """推送与播放抢位的竞态：这台在播，预转码不开跑，当场让位回报服务端。"""
+    rt = WorkerRuntime(server="http://nas", token="t", ffmpeg="ffmpeg")
+    rt.api = object()
+    client = _BusyClient()
+    rt._realtime_client = client
+    ran: list[int] = []
+    monkeypatch.setattr(worker_mod, "process_task", lambda *a, **k: ran.append(1) or True)
+    assert rt._run_preload({"task_id": 7, "display_name": "a.mkv"}) is False
+    assert client.yielded == [7] and ran == []
+
+
+def _run_until_stopped(rt, task_id: int, *, cancel: bool) -> None:
+    """让 _run_preload 跑起来，等它登记停止钩子后按 cancel 叫停，并等它收尾。"""
+    thread = threading.Thread(
+        target=rt._run_preload, args=({"task_id": task_id, "display_name": "a.mkv"},),
+        daemon=True,
+    )
+    thread.start()
+    deadline = time.monotonic() + 5
+    while task_id not in rt._preload_stop and time.monotonic() < deadline:
+        time.sleep(0.01)
+    rt._stop_preload_task(task_id, cancel=cancel)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_yield_keeps_local_work_but_cancel_removes_it(monkeypatch, tmp_path):
+    """让位保留本地源文件与分段（回来接着用）；服务端取消才删掉整个工作目录。"""
+    monkeypatch.setattr(worker_mod, "WORK_DIR", tmp_path / "work")
+
+    def fake_process_task(api, ffmpeg, task, workdir, *, stop=None, register=None, progress=None):
+        workdir.mkdir(parents=True, exist_ok=True)
+        (workdir / "source.mkv").write_bytes(b"x")
+        stop.wait(5)  # 等停止钩子（让位或取消）
+        return False
+
+    monkeypatch.setattr(worker_mod, "process_task", fake_process_task)
+    for task_id, cancel, kept in ((11, False, True), (12, True, False)):
+        rt = WorkerRuntime(server="http://nas", token="t", ffmpeg="ffmpeg")
+        rt.api = object()
+        _run_until_stopped(rt, task_id, cancel=cancel)
+        assert (tmp_path / "work" / str(task_id) / "source.mkv").exists() is kept
