@@ -299,6 +299,13 @@ def build_preload_command(
             "当前 Worker 的 ffmpeg 不含它；请给 Worker 换 jellyfin-ffmpeg "
             "的 Windows build 后重试"
         )
+    # HEVC 只有 NVENC 一条链：软编回退恒为 libx264，产物编码对不上档位，会在整片转完后
+    # 被登记闸拒收。装不出就在这里说清，本地派单器据此转远程
+    if unusable_reason is None and preset.get("video_codec") == "hevc" and not use_nvenc:
+        unusable_reason = (
+            "HEVC 格式需要 NVENC 硬件编码（hevc_nvenc + scale_cuda），当前执行端没有；"
+            "请交给带 NVENC 的 Worker，或在设置里改用 H.264"
+        )
     # 硬解可用性：解码器在 Worker 上报的 hw_decoders 里（缺省视为可硬解——
     # ffmpeg 自己会回退软解，不作为整条链的开关）
     hw_decodable = bool(caps.get("hw_decoders")) and src_codec in caps["hw_decoders"]

@@ -3323,6 +3323,9 @@ async def delete_item_files(
     foreign: dict[Path, bool] = {}
 
     for row in files:
+        if row.derivation is not None:
+            # 预转码产物：不在库根之内，随源行的 invalidate_for_source 一并清（§6）
+            continue
         path = Path(row.file_path)
         if row.state == FileState.MISSING or _virtual_cloud_row(row):
             continue  # 无磁盘实体（缺失、纳管来的只在网盘上的文件），最后统一清账
@@ -3434,6 +3437,24 @@ async def delete_item_files(
     return result
 
 
+async def _delete_derived_row(
+    session: AsyncSession, library: Library, row: LibraryFile, *, dry_run: bool
+) -> DeleteResult:
+    """预转码产物行的单文件删除：产物在 data/preload/ 下、不在库根之内，不走库根边界与
+    整条目逻辑。产物可再生，直接删（不进回收站），挂着它的已完成任务转「已失效」。
+    """
+    from movieclaw_api.services.preload.service import delete_derived_file
+
+    result = DeleteResult(rows_deleted=1, freed_bytes=row.size_bytes or 0)
+    if dry_run:
+        result.removed_paths.append(str(row.file_path))
+        return result
+    assert row.id is not None
+    result.removed_paths.append(await delete_derived_file(session, row.id))
+    await LibraryRepository(session).refresh_stats([library.id])
+    return result
+
+
 async def delete_single_file(
     session: AsyncSession,
     library: Library,
@@ -3457,7 +3478,10 @@ async def delete_single_file(
     磁盘回收同样是两段式的，见 ``delete_item_files`` 与 ``_TrashStaging``。
     """
     assert row.media_item_id is not None
-    if len(item_rows) == 1:
+    if row.derivation is not None:
+        return await _delete_derived_row(session, library, row, dry_run=dry_run)
+    if sum(1 for r in item_rows if r.derivation is None) == 1:
+        # 原生文件只剩这一个：升级为整条目删除（派生行随源一起清，不算「还剩几个文件」）
         return await delete_item_files(
             session,
             library,
@@ -3481,6 +3505,10 @@ async def delete_single_file(
             result.errors.append(cloud_error)
             return result
     if no_disk_entity:
+        from movieclaw_api.services.preload.service import invalidate_for_source
+
+        assert row.id is not None
+        await invalidate_for_source(session, row.id)
         await session.delete(row)
         result.rows_deleted = 1
         if before_commit is not None:
@@ -3514,9 +3542,13 @@ async def delete_single_file(
     staging = _TrashStaging(roots)
     ok = await asyncio.to_thread(_discard_file_with_sidecars, path, staging, result)
     if ok:
+        from movieclaw_api.services.preload.service import invalidate_for_source
+
         result.rows_deleted = 1
         result.freed_bytes = row.size_bytes
         result.pending_purge = staging.dirs
+        # 源文件没了，它的预转码产物一并清（§6），与整条目删除同规则
+        await invalidate_for_source(session, row.id)
         await session.delete(row)
         if before_commit is not None:
             assert row.id is not None

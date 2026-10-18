@@ -98,7 +98,8 @@ async def _dispatch_round() -> None:
     # 本地兜底：Worker 没吃掉的（离线/满员）由本地槽消化（每轮重读容量）
     while _local_capacity() > 0:
         async with get_database().session() as session:
-            claimed = await _claim_for(session, device_id=None)
+            # 本机软编吃不了 HEVC（只有 NVENC 一条链）：HEVC 单留给远程硬件 Worker
+            claimed = await _claim_for(session, device_id=None, accept_hevc=False)
             if claimed is None:
                 break
             task, file = claimed
@@ -117,22 +118,28 @@ async def _dispatch_round() -> None:
 
 
 async def _dispatch_one_remote(session: AsyncSession) -> int | None:
-    """挑一台有余量的 Worker 派一个任务；没得派返回 None。"""
+    """挑一台有余量、且领得走队首单的 Worker 派一个任务；没得派返回 None。
+
+    按能力过滤（HEVC 单只派给有 hevc_nvenc 的 Worker）：这台没有可领的单就换下一台，
+    不能就此停——否则一台 CPU Worker 会挡住后面的 NVENC Worker。
+    """
     registry = get_remote_worker_registry()
-    workers = registry.preload_workers()
-    if not workers:
-        return None
-    for worker in workers:
+    for worker in registry.preload_workers():
         if registry.preload_capacity(worker) <= 0:
             continue
-        claimed = await _claim_for(session, device_id=worker.login_device_id)
+        caps = _preload_caps(worker)
+        claimed = await _claim_for(
+            session,
+            device_id=worker.login_device_id,
+            accept_hevc=preload_service.caps_accept_hevc(caps),
+        )
         if claimed is None:
-            return None  # 队列空了
+            continue  # 这台没有可领的单（队列空，或剩下的只有它做不了的 HEVC）
         task, file = claimed
         # 硬编能力从 hello 申报取（与实时同源），软编回落；凭据绑定认领者，
         # 任务被回收重派后旧 Worker 的长凭据写不进产物
         payload = await _payload_for(
-            session, task, file, _preload_caps(worker), device_id=worker.login_device_id
+            session, task, file, caps, device_id=worker.login_device_id
         )
         ok = await registry.send_preload_job(worker, payload)
         if ok:
@@ -159,12 +166,14 @@ def _preload_caps(worker: WorkerConnection) -> dict:
     }
 
 
-async def _claim_for(session: AsyncSession, *, device_id: int | None):
+async def _claim_for(session: AsyncSession, *, device_id: int | None, accept_hevc: bool = True):
     """抢占下一个排队任务（沿用 claim_next_task 的原子抢占）。
 
     ``device_id=None`` 表示本地执行器抢占（worker_device_id 写 NULL）。
     """
-    return await preload_service.claim_next_task(session, device_id=device_id)
+    return await preload_service.claim_next_task(
+        session, device_id=device_id, accept_hevc=accept_hevc
+    )
 
 
 async def _payload_for(

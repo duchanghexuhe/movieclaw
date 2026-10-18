@@ -37,6 +37,16 @@ function formatGB(bytes: number): string {
   return `${(bytes / GB).toFixed(1)} GB`;
 }
 
+/** 清理预览的一行：《片名》SxxEyy（电影无季集号）；未识别的条目落回产物编号。 */
+function cleanupEntryTitle(file: StaleCleanupResult["files"][number]): string {
+  if (!file.title) return `未识别条目的预转码版本 #${file.file_id}`;
+  const unit =
+    file.season_number > 0
+      ? ` S${String(file.season_number).padStart(2, "0")}E${String(file.episode_number).padStart(2, "0")}`
+      : "";
+  return `《${file.title}》${unit}`;
+}
+
 /**
  * 失败原因：长报错（ffmpeg stderr 尾巴服务端截到 2000 字符）折叠成一行 +
  * 「查看详情」展开，短消息直接平铺。展开状态行内自管——每行任务独立。
@@ -370,9 +380,22 @@ export function TranscodeSection() {
                   <>
                     将删除 {cleanupPreview.count} 个版本，释放约{" "}
                     {formatGB(cleanupPreview.total_bytes)}。
+                    <ul className="scroll-thin mt-2 max-h-56 space-y-1 overflow-y-auto">
+                      {cleanupPreview.files.map((file) => (
+                        <li
+                          key={file.file_id}
+                          className="flex items-baseline justify-between gap-3 text-caption"
+                        >
+                          <span className="min-w-0 truncate">{cleanupEntryTitle(file)}</span>
+                          <span className="tnum shrink-0 text-[var(--text-faint)]">
+                            {formatGB(file.size_bytes)} · 未播 {file.days_since_play} 天
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
                     <button
                       type="button"
-                      className="ml-2 underline underline-offset-2"
+                      className="mt-2 underline underline-offset-2"
                       disabled={cleaning}
                       onClick={runCleanup}
                     >

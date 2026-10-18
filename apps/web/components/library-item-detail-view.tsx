@@ -73,6 +73,7 @@ import {
   type PreloadTaskView,
   cancelPreloadTask,
   createPreloadTask,
+  deletePreloadFile,
   estimatePreload,
   getPreloadPresets,
   listPreloadTasks,
@@ -597,6 +598,29 @@ export function LibraryItemDetailView({
       }
     },
     [refreshPreloadTasks, toast],
+  );
+
+  // 预转码产物（便携版本）的删除：产物可再生，走轻量确认，不走整文件的「彻底删除」流程
+  const handleDeletePortable = useCallback(
+    async (file: LibraryItemFile) => {
+      const ok = await confirm({
+        title: `删除「${file.file_name}」这个预转码版本？`,
+        description: "产物可随时重新转码，源文件不受影响。",
+        confirmLabel: "删除",
+        cancelLabel: "先不",
+      });
+      if (!ok) return;
+      try {
+        await deletePreloadFile(file.id);
+        toast.success("预转码版本已删除，可重新下单转码");
+        invalidateLibraryDetailSnapshot(libraryId);
+        refreshPreloadTasks();
+        reload();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "删除失败，请稍后重试");
+      }
+    },
+    [confirm, libraryId, refreshPreloadTasks, reload, toast],
   );
 
   usePageTitle(detail?.title);
@@ -1224,7 +1248,14 @@ export function LibraryItemDetailView({
               title="文件"
               duplicateHref={canManageLibraries ? duplicateHref : null}
               duplicateLabel={duplicateLabel}
-              onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
+              onDeleteFile={
+                canManageLibraries
+                  ? (file) =>
+                      file.derivation?.kind === "preload"
+                        ? handleDeletePortable(file)
+                        : setDeleteFileTarget(file)
+                  : undefined
+              }
               onRestoreFile={canManageLibraries ? restoreTrashedFile : undefined}
               onPurgeFile={canManageLibraries ? purgeTrashedFile : undefined}
               preloadTasks={preloadTasks}
@@ -2562,7 +2593,7 @@ function PreloadDialog({
   files: LibraryItemFile[];
   tasks: PreloadTaskView[];
   onPreload?: (file: LibraryItemFile, presetId?: string) => void;
-  /** 整季批量下单：按季分组时每季一个入口；只收没有活跃任务的可转文件 */
+  /** 整季批量下单：按季分组时每季一个入口；只收还能下单的文件（见 canOrderPreload） */
   onPreloadMany?: (files: LibraryItemFile[], presetId?: string) => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
@@ -2590,15 +2621,6 @@ function PreloadDialog({
   const taskFor = (file: LibraryItemFile) =>
     tasks.find(
       (t) => t.target_file_id === file.id && t.preset_id === selectedPreset,
-    ) ?? null;
-  // 整季下单只收这季里还没有活跃任务的文件；一个都不剩时按钮不可点
-  const ACTIVE_STATUSES = ["queued", "claimed", "running"];
-  const activeFor = (file: LibraryItemFile) =>
-    tasks.find(
-      (t) =>
-        t.target_file_id === file.id &&
-        t.preset_id === selectedPreset &&
-        ACTIVE_STATUSES.includes(t.status),
     ) ?? null;
   // 剧集按季分组（电影无季号走平铺）：每季一个「整季下单」，逐集仍可单转
   const hasSeasons = files.some((f) => f.season_number > 0);
@@ -2659,7 +2681,7 @@ function PreloadDialog({
         ) : hasSeasons ? (
           <div className="mt-4 overflow-hidden rounded-xl border border-white/[0.06]">
             {seasonGroups.map(([season, seasonFiles]) => {
-              const eligible = seasonFiles.filter((f) => !activeFor(f));
+              const eligible = seasonFiles.filter((f) => canOrderPreload(taskFor(f)));
               return (
                 <div key={season} className="border-b border-white/[0.05] last:border-b-0">
                   <div className="flex items-center justify-between gap-3 bg-white/[0.03] px-4 py-2">
@@ -2679,7 +2701,7 @@ function PreloadDialog({
                       >
                         {eligible.length > 0
                           ? `整季下单 · ${eligible.length} 集`
-                          : "整季已在队列"}
+                          : "整季已转码或在队列"}
                       </button>
                     )}
                   </div>
@@ -2707,6 +2729,14 @@ function PreloadDialog({
       </div>
     </Modal>
   );
+}
+
+/**
+ * 这一行能不能下单。没有任务、已取消或产物已失效可以；排队/执行中不用；已完成 = 产物
+ * 还在，再下单就是第二份同档产物；失败只留「重试」。
+ */
+function canOrderPreload(task: PreloadTaskView | null): boolean {
+  return !task || task.status === "cancelled" || task.status === "invalidated";
 }
 
 /** 弹窗里的一行文件：规格摘要、任务状态徽章、取消/重试/下单。 */
@@ -2768,8 +2798,7 @@ function PreloadFileRow({
           重试
         </button>
       )}
-      {/* 终态（完成/取消/失败/失效）允许再下单：后端幂等只拦活跃态 */}
-      {(!task || !["queued", "claimed", "running"].includes(task.status)) && onPreload && (
+      {canOrderPreload(task) && onPreload && (
         <button
           type="button"
           onClick={() => onPreload(file, presetId)}
@@ -3678,8 +3707,8 @@ function DeleteFileDialog({
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const deletePreview = useDeletePreview(file != null, libraryId, detail.media_item_id, file?.id);
-  // 条目在本库只剩这一行台账（含 missing 行）→ 后端会升级为整条目删除
-  const isLast = detail.files.length === 1;
+  // 条目在本库只剩这一个原生文件（派生的预转码版本不计）→ 后端会升级为整条目删除
+  const isLast = detail.files.filter((f) => !f.derivation).length === 1;
 
   useEffect(() => {
     if (file) {

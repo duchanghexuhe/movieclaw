@@ -89,7 +89,11 @@ export interface StaleCleanupResult {
   files: {
     file_id: number;
     media_item_id: number | null;
+    /** 片名；未识别为 null */
     title: string | null;
+    /** 电影为 0 */
+    season_number: number;
+    episode_number: number;
     size_bytes: number;
     days_since_play: number;
   }[];

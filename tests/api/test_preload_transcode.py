@@ -78,9 +78,12 @@ _seed_counter = {"n": 0}
 
 def _seed_file(
     client: TestClient, tmp_path, *, hdr=None, codec="hevc", resolution="2160p",
-    color_space: str | None = None,
+    color_space: str | None = None, in_dir: bool = False,
 ) -> int:
-    """造一个源文件行（4K HEVC HDR 是预转码的典型对象）。"""
+    """造一个源文件行（4K HEVC HDR 是预转码的典型对象）。
+
+    ``in_dir``：条目住在自己的刮削目录里（NFO/海报与视频同目录），整条目删除才会整目录清掉。
+    """
     _seed_counter["n"] += 1
     n = _seed_counter["n"]
 
@@ -88,6 +91,11 @@ def _seed_file(
         media_root = tmp_path / "movies"
         media_root.mkdir(exist_ok=True)
         path = media_root / f"movie{n}.mkv"
+        if in_dir:
+            path = media_root / f"Movie {n} (2026)" / f"movie{n}.mkv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            (path.parent / "movie.nfo").write_text("<movie/>", encoding="utf-8")
+            (path.parent / "poster.jpg").write_bytes(b"POSTER")
         path.write_bytes(b"FAKE-MEDIA-BYTES" * 256)
         async with get_database().session() as session:
             from sqlmodel import select
@@ -1020,9 +1028,7 @@ def test_local_executor_lands_artifact_under_dynamic_name(client, tmp_path, monk
     from movieclaw_api.services.preload import dispatcher as _dispatcher
     from movieclaw_api.services.preload import service as _svc
 
-    # SDR 源：本地软编链装得出来（HDR 源在无 caps 时 unusable、argv 为空）；
-    # HEVC 格式下登记闸认 hevc 产物
-    _set_format(client, "hevc")
+    # H.264 档：本地软编链装得出来（HEVC 只有 NVENC 一条链，本机软编不领 HEVC 单）
     file_id = _seed_file(client, tmp_path)
     task = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
     task_id = task["id"]
@@ -1047,7 +1053,7 @@ def test_local_executor_lands_artifact_under_dynamic_name(client, tmp_path, monk
     monkeypatch.setattr(
         "movieclaw_api.services.media_probe.probe_media",
         lambda path: MediaSpec(
-            resolution="1080p", video_codec="hevc", hdr=None, bit_depth=8,
+            resolution="480p", video_codec="h264", hdr=None, bit_depth=8,
             duration_seconds=7200, bit_rate=1_500_000,
             # 登记闸：产物没有音轨（源有）整件作废
             audio_streams=[{"codec": "aac"}],
@@ -1074,7 +1080,7 @@ def test_local_executor_lands_artifact_under_dynamic_name(client, tmp_path, monk
     client.portal.call(partial(_claim_and_run))  # type: ignore[attr-defined]
     # 产物以动态片名落盘且已登记；协议名不残留
     directory = _svc.artifact_dir_for(task_id)
-    dynamic = directory / "示例 - 省流 1080p HEVC 1.5Mbps.mkv"
+    dynamic = directory / "示例 - 省流 480p H.264 1.5Mbps.mkv"
     assert dynamic.exists()
     assert not (directory / "artifact.mkv").exists()
     view = client.get(f"{_PRELOAD}/tasks/{task_id}").json()["data"]
@@ -1150,3 +1156,335 @@ def test_finished_tasks_pruned_to_keep(client, tmp_path):
     assert seeded["oldest_id"] not in completed_ids
     assert all(i in completed_ids for i in seeded["newest_ids"])
     assert active_count == 2  # 排队中的（旧 1 条 + 新下单 1 条）不被清理
+
+
+# ---------------------------------------------------------------------------
+# 生命周期回归：删除入口 / 整条目删除 / 任务与产物对账 / 失败重试 / 配额 / HEVC / 冷数据预览
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_local(monkeypatch):  # type: ignore[no-untyped-def]
+    """本地执行器不抢单：硬件探测置空（测试只走 Worker 数据面，避免后台协程改写台账）。"""
+    monkeypatch.setattr(
+        "movieclaw_api.services.playback.hwprobe.available_local_backends", lambda: []
+    )
+
+
+def _ids_of(client: TestClient, file_id: int) -> tuple[int, int]:
+    """源文件所在的 (library_id, media_item_id)。"""
+
+    async def _load() -> tuple[int, int]:
+        async with get_database().session() as session:
+            row = await session.get(LibraryFile, file_id)
+            assert row is not None
+            return int(row.library_id), int(row.media_item_id)
+
+    return client.portal.call(partial(_load))  # type: ignore[attr-defined]
+
+
+def _path_of(client: TestClient, row_id: int) -> Path:
+    async def _load() -> Path:
+        async with get_database().session() as session:
+            row = await session.get(LibraryFile, row_id)
+            assert row is not None
+            return Path(row.file_path)
+
+    return client.portal.call(partial(_load))  # type: ignore[attr-defined]
+
+
+def _row_exists(client: TestClient, row_id: int) -> bool:
+    async def _check() -> bool:
+        async with get_database().session() as session:
+            return await session.get(LibraryFile, row_id) is not None
+
+    return client.portal.call(partial(_check))  # type: ignore[attr-defined]
+
+
+def _age_row(client: TestClient, row_id: int, *, days: int) -> None:
+    async def _age() -> None:
+        from datetime import timedelta
+
+        from movieclaw_db.models.base import utcnow
+
+        async with get_database().session() as session:
+            row = await session.get(LibraryFile, row_id)
+            row.created_at = utcnow() - timedelta(days=days)
+            session.add(row)
+            await session.commit()
+
+    client.portal.call(partial(_age))  # type: ignore[attr-defined]
+
+
+def _task_row(client: TestClient, task_id: int) -> dict:
+    return client.get(f"{_PRELOAD}/tasks/{task_id}").json()["data"]
+
+
+def _make_product(
+    client: TestClient, monkeypatch, token: str, file_id: int, *, preset_id: str = "premium"
+) -> tuple[int, int]:
+    """下单 → Worker 领取上传 → complete 登记；返回 (任务 id, 产物行 id)。"""
+    task_id = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": preset_id}
+    ).json()["data"]["id"]
+    _claim_and_upload(client, token, task_id)
+    _fake_probe(monkeypatch)
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
+    assert done.status_code == 200, done.text
+    return task_id, done.json()["data"]["file_id"]
+
+
+def test_portable_version_deletes_via_library_route(client, tmp_path, monkeypatch, no_local):
+    """详情页删便携版本：库的单文件删除路由认派生行（产物在 data/preload 下、不在库根里，
+    原先报「不在库根路径之内」删不掉）；删完挂着它的已完成任务转已失效。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    token = _pair_worker(client)
+    task_id, derived_id = _make_product(client, monkeypatch, token, file_id)
+    library_id, item_id = _ids_of(client, file_id)
+    product = _path_of(client, derived_id)
+    assert product.is_file()
+
+    preview = client.get(
+        f"/api/v1/libraries/{library_id}/items/{item_id}/delete-preview",
+        params={"file_id": derived_id},
+    )
+    assert preview.status_code == 200, preview.text
+    assert str(product) in preview.json()["data"]["plan"]["removed_paths"]
+
+    resp = client.delete(f"/api/v1/libraries/{library_id}/items/{item_id}/files/{derived_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["errors"] == [], resp.text
+    assert not product.exists()
+    assert not _row_exists(client, derived_id)
+    assert _task_row(client, task_id)["status"] == PreloadTaskStatus.INVALIDATED.value
+
+
+def test_whole_item_delete_skips_portable_rows(client, tmp_path, monkeypatch, no_local):
+    """整条目删除：预转码版本不再逐个报「部分删除失败」，源行删除时它随之失效清理；
+    两个产物并存时也不能再冒 SQLAlchemy 的「expected to delete N row(s)」告警。"""
+    import warnings
+
+    file_id = _seed_file(client, tmp_path, hdr="HDR10", in_dir=True)
+    token = _pair_worker(client)
+    _, premium_id = _make_product(client, monkeypatch, token, file_id, preset_id="premium")
+    _, saver_id = _make_product(client, monkeypatch, token, file_id, preset_id="saver")
+    library_id, item_id = _ids_of(client, file_id)
+    source_dir = _path_of(client, file_id).parent
+    products = [_path_of(client, premium_id), _path_of(client, saver_id)]
+    assert all(p.is_file() for p in products)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resp = client.delete(f"/api/v1/libraries/{library_id}/items/{item_id}")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["errors"] == [], data
+    assert not source_dir.exists()
+    assert not any(p.exists() for p in products)
+    assert not _row_exists(client, premium_id) and not _row_exists(client, saver_id)
+    messages = [str(w.message) for w in caught]
+    assert not [m for m in messages if "expected to delete" in m], messages
+
+
+def test_last_native_file_delete_upgrades_despite_portable(
+    client, tmp_path, monkeypatch, no_local
+):
+    """条目只剩一个原生文件时删它 = 整条目删除：派生的预转码版本不计入「还剩几个文件」，
+    否则会留下只剩 NFO/海报的空刮削目录。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10", in_dir=True)
+    token = _pair_worker(client)
+    _, derived_id = _make_product(client, monkeypatch, token, file_id)
+    library_id, item_id = _ids_of(client, file_id)
+    source_dir = _path_of(client, file_id).parent
+
+    resp = client.delete(f"/api/v1/libraries/{library_id}/items/{item_id}/files/{file_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["errors"] == [], resp.text
+    assert not source_dir.exists()  # NFO/海报一并清掉
+    assert not _row_exists(client, derived_id)
+
+
+def test_deleting_product_invalidates_task_and_allows_reorder(
+    client, tmp_path, monkeypatch, no_local
+):
+    """删产物后任务转已失效（源行不再显示「转码完成」）；之后可以重新下单转码。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    token = _pair_worker(client)
+    task_id, derived_id = _make_product(client, monkeypatch, token, file_id)
+
+    resp = client.delete(f"{_PRELOAD}/files/{derived_id}")
+    assert resp.status_code == 200, resp.text
+    task = _task_row(client, task_id)
+    assert task["status"] == PreloadTaskStatus.INVALIDATED.value
+    assert task["result_file_id"] is None
+    assert "可重新转码" in task["error"]
+
+    reorder = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "premium"})
+    assert reorder.status_code == 200, reorder.text
+    assert reorder.json()["data"]["status"] == PreloadTaskStatus.QUEUED.value
+    assert reorder.json()["data"]["id"] != task_id
+
+
+def test_cold_cleanup_preview_lists_titles_and_invalidates_task(
+    client, tmp_path, monkeypatch, no_local
+):
+    """冷数据清理：预览带片名、季集号、体积与未播天数（不再只有数量）；执行后任务转已失效。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    token = _pair_worker(client)
+    task_id, derived_id = _make_product(client, monkeypatch, token, file_id)
+    _age_row(client, derived_id, days=100)
+
+    preview = client.post(f"{_PRELOAD}/cleanup-stale", json={"days": 90, "confirm": False})
+    data = preview.json()["data"]
+    assert data["count"] == 1
+    entry = data["files"][0]
+    assert entry["file_id"] == derived_id
+    assert entry["title"] == "示例"
+    assert entry["season_number"] == 0 and entry["episode_number"] == 0
+    assert entry["size_bytes"] > 0 and entry["days_since_play"] >= 90
+
+    run = client.post(f"{_PRELOAD}/cleanup-stale", json={"days": 90, "confirm": True})
+    assert run.status_code == 200, run.text
+    assert not _row_exists(client, derived_id)
+    task = _task_row(client, task_id)
+    assert task["status"] == PreloadTaskStatus.INVALIDATED.value
+    assert task["result_file_id"] is None
+
+
+def test_failed_complete_voids_artifact_so_retry_reruns(client, tmp_path, monkeypatch, no_local):
+    """complete 校验失败 → 分段与断点台账整件作废，重试从头转。
+
+    原先分段已删而断点台账保留：重领时 Worker 跳过全部段直接 complete，
+    永远卡在「没有收到任何产物分段」。
+    """
+    from movieclaw_api.services.preload import service as _svc
+
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    task_id = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "premium"}
+    ).json()["data"]["id"]
+    token = _pair_worker(client)
+    _claim_and_upload(client, token, task_id)  # 段 0 已收，断点 resume_parts = 1
+    # 产物时长与源偏差 >5%：登记闸拒收
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.preload_worker.probe_media",
+        lambda path: MediaSpec(
+            resolution="720p", video_codec="h264", hdr=None, bit_depth=8,
+            duration_seconds=3600, bit_rate=3_000_000,
+            audio_streams=[{"codec": "aac"}], subtitle_streams=[{"codec": "subrip"}],
+        ),
+    )
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
+    assert done.status_code == 400, done.text
+    assert _task_row(client, task_id)["resume_parts"] == 0
+    assert not list(_svc.artifact_dir_for(task_id).glob("seg*.mkv"))
+
+    failed = client.post(
+        f"{_WORKER}/tasks/{task_id}/fail",
+        json={"error": "产物时长与源偏差"},
+        headers=_worker_headers(token),
+    )
+    assert failed.status_code == 200
+    assert client.post(f"{_PRELOAD}/tasks/{task_id}/retry").status_code == 200
+
+    # 重领：断点已归零，从段 0 重转上传（原先 resume_parts=1，跳过段后必败）
+    claimed = client.post(f"{_WORKER}/claim", headers=_worker_headers(token)).json()["data"]["task"]
+    assert claimed["task_id"] == task_id and claimed["resume_parts"] == 0
+    _upload_segment(client, claimed)
+    _fake_probe(monkeypatch)
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
+    assert done.status_code == 200, done.text
+    assert _task_row(client, task_id)["status"] == PreloadTaskStatus.COMPLETED.value
+
+
+def test_quota_precheck_counts_inflight_tasks(client, tmp_path, monkeypatch, no_local):
+    """配额预检算上在途任务：配额是单子预估的 1.5 倍时，第二单（哪怕是另一部片）必须被拒。"""
+    from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    first = _seed_file(client, tmp_path, hdr="HDR10")
+    second = _seed_file(client, tmp_path, hdr="HDR10")
+    est = client.post(f"{_PRELOAD}/estimate", json={"file_id": first}).json()["data"][
+        "estimated_bytes"
+    ]
+    quota = int(est * 1.5)
+
+    async def _set_quota() -> None:
+        await get_setting_store().set(PreloadSetting(quota_bytes=quota))
+
+    client.portal.call(partial(_set_quota))  # type: ignore[attr-defined]
+    assert client.post(f"{_PRELOAD}/tasks", json={"file_id": first}).status_code == 200
+    # 第一单还在排队、尚未登记产物：估价接口的剩余配额要扣掉它
+    free = client.post(f"{_PRELOAD}/estimate", json={"file_id": second}).json()["data"][
+        "free_bytes"
+    ]
+    assert free == quota - est
+    over = client.post(f"{_PRELOAD}/tasks", json={"file_id": second})
+    assert over.status_code == 409, over.text
+    assert over.json()["code"] == "PRELOAD_QUOTA_EXCEEDED"
+
+
+def test_hevc_task_only_claimed_by_nvenc_worker(client, tmp_path, monkeypatch, no_local):
+    """HEVC 单只派给有 hevc_nvenc + scale_cuda 的执行者；软编 Worker 跳过它（不占队首）。"""
+    _set_format(client, "hevc")
+    file_id = _seed_file(client, tmp_path)  # SDR 源
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    token = _pair_worker(client)
+
+    cpu = client.post(
+        f"{_WORKER}/claim",
+        json={"caps": {"encoders": ["libx264"], "filters": []}},
+        headers=_worker_headers(token),
+    )
+    assert cpu.status_code == 200, cpu.text
+    assert cpu.json()["data"]["task"] is None
+    assert _task_row(client, task_id)["status"] == PreloadTaskStatus.QUEUED.value
+
+    nvenc = client.post(
+        f"{_WORKER}/claim",
+        json={"caps": {
+            "encoders": ["h264_nvenc", "hevc_nvenc"],
+            "filters": ["scale_cuda"],
+            "hw_decoders": ["hevc", "h264"],
+        }},
+        headers=_worker_headers(token),
+    )
+    task = nvenc.json()["data"]["task"]
+    assert task is not None and task["task_id"] == task_id, nvenc.text
+    assert task["unusable_reason"] is None
+    assert "hevc_nvenc" in task["argv"] and "libx264" not in task["argv"]
+
+
+def test_hevc_command_needs_nvenc_and_says_so():
+    """HEVC 没有 NVENC 时命令直接标不可用（原先静默降成 libx264，整片转完才被登记闸拒收）。"""
+    from types import SimpleNamespace
+
+    from movieclaw_api.services.preload import service as _svc
+
+    task = SimpleNamespace(
+        id=1, preset_id="saver", video_format="hevc", resume_parts=0, part_bytes=0
+    )
+    file = SimpleNamespace(
+        resolution="2160p", video_codec="hevc", hdr=None, dv_profile=None, color_space=None,
+        bit_depth=10, duration_seconds=7200, size_bytes=1, audio_streams=[{"codec": "eac3"}],
+        subtitle_streams=[], chapters=[],
+    )
+    no_gpu = _svc.build_task_command(task, file, worker_caps=None)
+    assert no_gpu["argv"] == [] and "hevc_nvenc" in no_gpu["unusable_reason"]
+    h264_only = _svc.build_task_command(
+        task, file, worker_caps={"encoders": ["h264_nvenc"], "filters": ["scale_cuda"]}
+    )
+    assert h264_only["argv"] == [] and h264_only["unusable_reason"]
+    hevc_gpu = _svc.build_task_command(
+        task, file,
+        worker_caps={
+            "encoders": ["hevc_nvenc"], "filters": ["scale_cuda"], "hw_decoders": ["hevc"],
+        },
+    )
+    assert hevc_gpu["unusable_reason"] is None and "hevc_nvenc" in hevc_gpu["argv"]

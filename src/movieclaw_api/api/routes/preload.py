@@ -212,7 +212,10 @@ async def estimate(
         duration_seconds=file.duration_seconds,
         preset=effective_preset(payload.preset_id, setting.video_format),
     )
-    used = await preload_service.preload_usage_bytes(session)
+    # 占用 = 已有产物 + 在途任务的预估（与配额预检同口径，在途单也占配额）
+    used = await preload_service.preload_usage_bytes(session) + (
+        await preload_service.preload_inflight_bytes(session)
+    )
     return ok(
         {
             "estimated_bytes": estimated,

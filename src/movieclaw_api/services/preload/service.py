@@ -25,7 +25,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.exceptions import (
@@ -36,6 +36,7 @@ from movieclaw_api.exceptions import (
 from movieclaw_api.services.media_probe import PROBE_SCHEMA_VERSION, MediaSpec
 from movieclaw_api.services.preload.ffmpeg_preload import (
     FORMAT_DEFAULT,
+    FORMAT_HEVC,
     PRELOAD_PART_BYTES,
     PRESET_DEFAULT,
     build_preload_command,
@@ -110,10 +111,33 @@ async def preload_usage_bytes(session: AsyncSession) -> int:
     return int(row)
 
 
+#: 在途任务的状态：还没登记成产物，但预估体积已经要占配额
+_INFLIGHT_STATUSES = (
+    PreloadTaskStatus.QUEUED,
+    PreloadTaskStatus.CLAIMED,
+    PreloadTaskStatus.RUNNING,
+)
+
+
+async def preload_inflight_bytes(session: AsyncSession) -> int:
+    """在途任务（排队/领取/执行中）的预估体积之和。"""
+    row = (
+        await session.execute(
+            select(func.coalesce(func.sum(PreloadTask.estimated_bytes), 0)).where(
+                PreloadTask.status.in_(_INFLIGHT_STATUSES)
+            )
+        )
+    ).scalar_one()
+    return int(row)
+
+
 async def check_quota(session: AsyncSession, *, needed_bytes: int) -> None:
-    """配额预检（§6）：现有占用 + 本单预估 ≤ 配额，否则拒绝入队。"""
+    """配额预检（§6）：现有产物 + 在途任务预估 + 本单预估 ≤ 配额，否则拒绝入队。
+
+    在途任务必须计入：否则整季一批下单在产物登记前全都能过预检，合起来照样超配额。
+    """
     setting = await get_setting_store().get(PreloadSetting)
-    used = await preload_usage_bytes(session)
+    used = await preload_usage_bytes(session) + await preload_inflight_bytes(session)
     if used + needed_bytes > setting.quota_bytes:
         raise PreloadQuotaExceeded(needed_bytes, setting.quota_bytes - used)
 
@@ -415,8 +439,36 @@ async def retry_task(session: AsyncSession, task_id: int) -> PreloadTask:
     return task
 
 
-async def delete_derived_file(session: AsyncSession, file_id: int) -> None:
-    """删除一个预转码产物（版本列表的删除按钮）：删文件 + 删行 + 删目录。"""
+#: 产物被删/被冷数据清理时，挂着它的已完成任务转「已失效」的原因（可重新转码）
+PRODUCT_REMOVED_REASON = "预转码版本已删除，可重新转码"
+PRODUCT_STALE_REASON = "预转码版本已被冷数据清理，可重新转码"
+
+
+async def _invalidate_tasks_of(session: AsyncSession, product_file_id: int, reason: str) -> None:
+    """产物行即将删除：挂着它的已完成任务转「已失效」。
+
+    必须在删行之前调用——result_file_id 是 ON DELETE SET NULL，删完就找不回这张任务，
+    它会一直显示「转码完成」，而产物已经不在了。
+    """
+    tasks = (
+        await session.execute(
+            select(PreloadTask).where(
+                PreloadTask.result_file_id == product_file_id,
+                PreloadTask.status == PreloadTaskStatus.COMPLETED,
+            )
+        )
+    ).scalars().all()
+    for task in tasks:
+        task.status = PreloadTaskStatus.INVALIDATED
+        task.error = reason
+        task.updated_at = utcnow()
+
+
+async def delete_derived_file(session: AsyncSession, file_id: int) -> str:
+    """删除一个预转码产物（版本列表的删除按钮 / 单文件删除的派生分支）：删文件 + 删行 + 删目录。
+
+    返回被删的产物路径（调用方回显给用户）。
+    """
     file = await session.get(LibraryFile, file_id)
     if file is None or file.derivation is None:
         raise NotFoundException("预转码产物不存在")
@@ -427,11 +479,13 @@ async def delete_derived_file(session: AsyncSession, file_id: int) -> None:
         except OSError:
             logger.warning("删除预转码产物失败（保留台账行）：%s", path, exc_info=True)
             raise BadRequestException("产物文件删除失败，请检查磁盘") from None
+    await _invalidate_tasks_of(session, file_id, PRODUCT_REMOVED_REASON)
     await session.delete(file)
     await session.commit()
     # 任务目录里只剩产物：一并清掉
     shutil.rmtree(path.parent, ignore_errors=True)
     logger.info("预转码产物已删除：file=%s", file_id)
+    return str(path)
 
 
 async def list_tasks(
@@ -500,8 +554,12 @@ async def claim_next_task(
     *,
     device_id: int | None = None,
     max_parts_bytes: int | None = None,
+    accept_hevc: bool = True,
 ) -> tuple[PreloadTask, LibraryFile] | None:
     """领取下一个排队任务（§7：在线时领、离线无碍）。
+
+    ``accept_hevc=False``：执行者没有 hevc_nvenc 时跳过 HEVC 单（HEVC 只有 NVENC 一条链，
+    领了也装不出命令）。是跳过而不是占住队首——H.264 单照常派。
 
     ``device_id=None`` 是本地执行器抢占（worker_device_id 写 NULL——
     它不走 Worker 的 REST 数据面，台账里 NULL 表达「不归任何一台 Worker」；
@@ -510,13 +568,16 @@ async def claim_next_task(
     串行化保证）。
     """
     await reclaim_expired_leases(session)
-    row = (
-        await session.execute(
-            select(PreloadTask)
-            .where(PreloadTask.status == PreloadTaskStatus.QUEUED)
-            .order_by(PreloadTask.created_at.asc())
-            .limit(1)
+    query = select(PreloadTask).where(PreloadTask.status == PreloadTaskStatus.QUEUED)
+    if not accept_hevc:
+        query = query.where(
+            or_(
+                PreloadTask.video_format.is_(None),  # type: ignore[union-attr]
+                PreloadTask.video_format != FORMAT_HEVC,  # type: ignore[operator]
+            )
         )
+    row = (
+        await session.execute(query.order_by(PreloadTask.created_at.asc()).limit(1))
     ).scalar_one_or_none()
     if row is None:
         return None
@@ -591,12 +652,23 @@ def build_task_command(
 
 
 def _caps_have_nvenc(caps: dict | None) -> bool:
-    """NVENC 全 GPU 链的最低门槛：编码器 + scale_cuda（缺一 4K 缩放就断）。"""
+    """NVENC 全 GPU 链的最低门槛：任一 NVENC 编码器 + scale_cuda（缺一 4K 缩放就断）。
+    档位要的是哪个编码器，由 build_preload_command 逐档判定。"""
     if not caps:
         return False
     encoders = {str(e).lower() for e in caps.get("encoders") or []}
     filters = {str(f).lower() for f in caps.get("filters") or []}
-    return "h264_nvenc" in encoders and "scale_cuda" in filters
+    return bool({"h264_nvenc", "hevc_nvenc"} & encoders) and "scale_cuda" in filters
+
+
+def caps_accept_hevc(caps: dict | None) -> bool:
+    """执行者能不能吃 HEVC 单：只有 NVENC 一条链（hevc_nvenc + scale_cuda，与
+    build_preload_command 的 use_nvenc 同口径）。"""
+    if not caps:
+        return False
+    encoders = {str(e).lower() for e in caps.get("encoders") or []}
+    filters = {str(f).lower() for f in caps.get("filters") or []}
+    return "hevc_nvenc" in encoders and "scale_cuda" in filters
 
 
 async def renew_lease(session: AsyncSession, task_id: int) -> None:
@@ -617,6 +689,23 @@ async def record_part_count(session: AsyncSession, task_id: int, *, part: int) -
     await renew_lease(session, task_id)
     await session.commit()
     return task.resume_parts
+
+
+async def void_artifact(session: AsyncSession, task: PreloadTask) -> None:
+    """整件作废（§7 扩展点 2：校验不过不做部分采纳）：分段、拼接中间物、已拼的产物文件
+    一并删掉，断点台账清零——重领从头转。
+
+    只清台账不删段是死路：重领时 Worker 会跳过全部已记录的段直接 complete，
+    永远卡在「没有收到任何产物分段」。
+    """
+    directory = artifact_dir_for(task.id or 0)
+    for part_path in directory.glob("seg*.mkv"):
+        part_path.unlink(missing_ok=True)
+    (directory / "concat.txt").unlink(missing_ok=True)
+    (await artifact_path_for(session, task)).unlink(missing_ok=True)
+    task.resume_parts = 0
+    task.updated_at = utcnow()
+    await session.commit()
 
 
 async def complete_task(
@@ -647,29 +736,8 @@ async def complete_task(
         # 取消/失效后迟到的完成上报（本地协程被取消的瞬间、REST 侧终态闸
         # 之后的极窄窗口）不能把任务翻回已完成
         raise BadRequestException(f"任务已不在执行态（{task.status}），完成上报被拒")
-    # 重转场景：同任务目录下可能还挂着上一轮的派生行（file_path 唯一约束
-    # 会炸登记）。产物可再生的语义下，新产物直接顶掉旧版本行；按任务目录圈
-    # 定范围——产物名是动态的，旧命名（portable.mkv）的历史行也在内
     directory = artifact_dir_for(task.id or 0)
     path = await artifact_path_for(session, task)
-    stale_rows = list(
-        (
-            await session.execute(
-                select(LibraryFile).where(
-                    LibraryFile.derives_from_file_id == task.target_file_id
-                )
-            )
-        ).scalars()
-    )
-    for stale in stale_rows:
-        if Path(stale.file_path).parent != directory:
-            continue
-        old_path = Path(stale.file_path)
-        if old_path != path and old_path.is_file():
-            old_path.unlink(missing_ok=True)  # 改名后的旧文件；同名的是本轮新鲜产物
-        await session.delete(stale)
-        await session.flush()
-        logger.info("重转顶掉旧产物行：file=%s（task=%s）", stale.id, task.id)
     if not path.is_file():
         raise BadRequestException("产物文件不存在，无法登记")
     size = path.stat().st_size
@@ -700,6 +768,28 @@ async def complete_task(
     target = await session.get(LibraryFile, task.target_file_id)
     if target is None:
         raise BadRequestException("源文件已不存在，产物作废")
+    # 重转场景：同任务目录下可能还挂着上一轮的派生行（file_path 唯一约束会炸登记）。
+    # 产物可再生的语义下新产物直接顶掉旧版本行；按任务目录圈定范围——产物名是动态的，
+    # 旧命名（portable.mkv）的历史行也在内。须校验全部通过后才动：校验失败是整件作废，
+    # 不能先删了旧行、文件又回不来
+    stale_rows = list(
+        (
+            await session.execute(
+                select(LibraryFile).where(
+                    LibraryFile.derives_from_file_id == task.target_file_id
+                )
+            )
+        ).scalars()
+    )
+    for stale in stale_rows:
+        if Path(stale.file_path).parent != directory:
+            continue
+        old_path = Path(stale.file_path)
+        if old_path != path and old_path.is_file():
+            old_path.unlink(missing_ok=True)  # 改名后的旧文件；同名的是本轮新鲜产物
+        await session.delete(stale)
+        await session.flush()
+        logger.info("重转顶掉旧产物行：file=%s（task=%s）", stale.id, task.id)
     preset = _preset_of(task)
     derived = LibraryFile(
         library_id=target.library_id,
@@ -852,11 +942,23 @@ async def cleanup_stale(
     收口，路由层事后过滤返回值等于没防。
     """
     stale = await stale_preload_files(session, days=days, library_ids=library_ids)
+    item_ids = {row.media_item_id for row, _ in stale if row.media_item_id}
+    titles: dict[int, str] = {}
+    if item_ids:
+        titles = {
+            item.id: item.title
+            for item in (
+                await session.execute(select(MediaItem).where(MediaItem.id.in_(item_ids)))
+            ).scalars()
+        }
+    # 预览要让人认得出删的是哪一集：片名 + 季集号（电影为 0/0）+ 体积 + 未播天数
     preview = [
         {
             "file_id": row.id,
             "media_item_id": row.media_item_id,
-            "title": (row.origin or {}).get("label") if row.origin else None,
+            "title": titles.get(row.media_item_id),
+            "season_number": row.season_number,
+            "episode_number": row.episode_number,
             "size_bytes": row.size_bytes,
             "days_since_play": days_since,
             # 成员可见性过滤用（管理员不筛）
@@ -879,6 +981,7 @@ async def cleanup_stale(
             continue
         freed += row.size_bytes or 0
         shutil.rmtree(path.parent, ignore_errors=True)
+        await _invalidate_tasks_of(session, row.id, PRODUCT_STALE_REASON)
         await session.delete(row)
     await session.commit()
     logger.info(
@@ -988,6 +1091,9 @@ async def invalidate_for_source(session: AsyncSession, source_file_id: int) -> i
         await session.delete(row)
         count += 1
     if count:
+        # 产物行先落删：调用方随后删源行时，库里的 CASCADE 会和产物的 DELETE 在同一次
+        # flush 里打架，ORM 按行数核对就报 "expected to delete 2 row(s); 1 were matched"
+        await session.flush()
         logger.info("源文件 #%s 失效，已清理 %d 个预转码产物", source_file_id, count)
     return count
 
@@ -1086,6 +1192,7 @@ __all__ = [
     "artifact_path_for",
     "build_task_command",
     "cancel_task",
+    "caps_accept_hevc",
     "check_quota",
     "claim_next_task",
     "cleanup_stale",
@@ -1095,9 +1202,11 @@ __all__ = [
     "fail_task",
     "invalidate_for_source",
     "list_tasks",
+    "preload_inflight_bytes",
     "preload_usage_bytes",
     "reclaim_expired_leases",
     "record_part_count",
     "renew_lease",
     "retry_task",
+    "void_artifact",
 ]

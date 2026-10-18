@@ -3430,6 +3430,15 @@ async def get_item_artwork(
     raise NotFoundException("条目目录里没有本地美术图")
 
 
+def _file_scope_targets(rows: list[LibraryFile], row: LibraryFile) -> list[LibraryFile]:
+    """单文件删除的影响范围。条目只剩这一个原生文件时升级为整条目（派生的预转码版本不计入
+    「还剩几个文件」——否则删掉唯一的原片会留下只剩 NFO/海报的空刮削目录）。"""
+    natives = [r for r in rows if r.derivation is None]
+    if row.derivation is None and len(natives) == 1:
+        return rows
+    return [row]
+
+
 def _delete_view(result: DeleteResult, *, dry_run: bool = False) -> ItemDeleteResultView:
     return ItemDeleteResultView(
         removed_paths=result.removed_paths,
@@ -3550,7 +3559,7 @@ async def preview_library_delete(
         row = next((r for r in rows if r.id == file_id), None)
         if row is None:
             raise NotFoundException(f"台账文件不存在或不属于「{item.title}」：id={file_id}")
-        scope, targets = "file", rows if len(rows) == 1 else [row]
+        scope, targets = "file", _file_scope_targets(rows, row)
         plan = await delete_single_file(session, library, row, rows, dry_run=True)
     whole = len(targets) == len(rows)
     request = _delete_request(library_id, item, targets, whole=whole)
@@ -3673,16 +3682,17 @@ async def delete_library_file(
     if row is None:
         raise NotFoundException(f"台账文件不存在或不属于「{item.title}」：id={file_id}")
     file_name = PurePath(row.file_path).name
+    targets = _file_scope_targets(rows, row)
+    whole = len(targets) == len(rows)
     if dry_run:
         plan = await delete_single_file(session, library, row, rows, dry_run=True)
-        whole = "（这是最后一个文件，将整条删除）" if len(rows) == 1 else ""
+        note = "（这是最后一个文件，将整条删除）" if whole else ""
         return ok(
             _delete_view(plan, dry_run=True),
-            message=f"演练：「{file_name}」将被删除{whole}（未删除任何东西）",
+            message=f"演练：「{file_name}」将被删除{note}（未删除任何东西）",
         )
-    targets = rows if len(rows) == 1 else [row]
     keys = await _checked_options(
-        _delete_request(library_id, item, targets, whole=len(rows) == 1), "file", options
+        _delete_request(library_id, item, targets, whole=whole), "file", options
     )
     record_deleted = await deletion_recorder(session, library_id, item, rows, options=keys)
     follow_ups: list[dict[str, str]] = []
@@ -3705,7 +3715,7 @@ async def delete_library_file(
     view.follow_ups = [DeleteFollowUpView(**f) for f in follow_ups]
     if result.errors:
         message = f"「{file_name}」删除失败：{'；'.join(result.errors)}"
-    elif len(rows) == 1:
+    elif whole:
         message = f"「{item.title}」的最后一个文件已删除，整个条目已从磁盘清除"
     else:
         message = f"「{file_name}」已从磁盘删除"
