@@ -22,11 +22,11 @@ from sqlmodel import select
 import movieclaw_api.services.subscription.pack_extension as pack_extension
 import movieclaw_api.services.torrent_submit as torrent_submit_service
 from movieclaw_api.core.config import get_settings
-from movieclaw_api.exceptions import UpstreamServiceException
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.site_access import SiteUnavailableError
 from movieclaw_api.services.subscription import SubscriptionService
 from movieclaw_api.services.subscription.dispatch import dispatch
+from movieclaw_api.services.subscription.file_selection import UnsatisfiableSelection
 from movieclaw_api.services.subscription.pack_extension import (
     ExtensionRefused,
     extend_owned_pack,
@@ -247,7 +247,10 @@ class TestStrictSelection:
     async def test_unmappable_pack_is_never_downloaded_in_full(
         self, db, downloader_row_id, monkeypatch
     ) -> None:
-        """包里缺第 2、3 集的文件：宽松路径会全量恢复（整包可能上千集），严格路径移除任务。"""
+        """包里缺第 2、3 集的文件：宽松路径会全量恢复（整包可能上千集），严格路径移除任务。
+
+        文件清单的结论按 ``UnsatisfiableSelection`` 原样抛出（不包成下载器故障），
+        调用方据此收窄。"""
 
         class _ShortPack(_Downloader):
             async def submit(self, request):
@@ -259,7 +262,7 @@ class TestStrictSelection:
         fake = _ShortPack()
         _install_for_submit(monkeypatch, fake)
         async with db.session() as session:
-            with pytest.raises(UpstreamServiceException):
+            with pytest.raises(UnsatisfiableSelection):
                 await torrent_submit_service.submit_torrent(
                     session, **_SUBMIT, select_units=_FIRST_THREE, known_seasons=[1]
                 )
