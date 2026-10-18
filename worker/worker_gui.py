@@ -13,15 +13,15 @@ runtime → UI 的信息都经 ``queue.Queue``，由 ``root.after`` 轮询取用
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
-import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -57,7 +57,7 @@ MENU_OPEN, MENU_EXIT = 1, 2
 class TrayIcon:
     """托管一个托盘图标；消息循环跑在独立线程，动作经 ``actions`` 队列交还 Tk。"""
 
-    def __init__(self, tooltip: str, actions: "queue.Queue[tuple]") -> None:
+    def __init__(self, tooltip: str, actions: queue.Queue[tuple]) -> None:
         import ctypes
         from ctypes import wintypes
 
@@ -187,7 +187,6 @@ class TrayIcon:
         import ctypes
 
         if getattr(self, "_hwnd", None):
-            nid = self._ct.windll.user32
             class NID(ctypes.Structure):
                 _fields_ = [("cbSize", ctypes.c_uint), ("hWnd", ctypes.c_void_p),
                             ("uID", ctypes.c_uint)]
@@ -257,7 +256,7 @@ class WorkerGUI:
         self._start_thread: threading.Thread | None = None
         self._exiting = False
         self._exit_at = 0.0
-        self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
+        self.ui_queue: queue.Queue[tuple] = queue.Queue()
         self.tray: TrayIcon | None = None
         self._build_ui()
         self._load_config_to_ui()
@@ -495,10 +494,9 @@ class WorkerGUI:
                 self.lbl_connection.configure(text="已停止")
                 self.lbl_slots.configure(text="任务：—")
         # 退出等待：收尾完成（或 30s 兜底）后真正关窗
-        if self._exiting:
-            if self.runtime is None or time.monotonic() - self._exit_at > 30:
-                self.root.destroy()
-                return
+        if self._exiting and (self.runtime is None or time.monotonic() - self._exit_at > 30):
+            self.root.destroy()
+            return
         self.root.after(150, self._poll_queue)
 
 
@@ -521,10 +519,8 @@ def main() -> None:
         )
         sys.exit(0)
     root = tk.Tk()
-    try:
+    with contextlib.suppress(tk.TclError):
         ttk.Style(root).theme_use("vista")
-    except tk.TclError:
-        pass
     WorkerGUI(root)
     root.mainloop()
 

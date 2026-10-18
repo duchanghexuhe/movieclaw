@@ -75,12 +75,9 @@ class Api:
         headers: dict | None = None,
         raw: bool = False,
     ):
-        if path.startswith("http"):
-            url = path
-        else:
-            # 控制面路径带前导 /；claim 返回的 source_url/artifact_url 是
-            # 协议相对路径（无前导 /）。两者都拼到 server 上
-            url = f"{self.server}/{path.lstrip('/')}"
+        # 控制面路径带前导 /；claim 返回的 source_url/artifact_url 是
+        # 协议相对路径（无前导 /）。两者都拼到 server 上
+        url = path if path.startswith("http") else f"{self.server}/{path.lstrip('/')}"
         # 每请求独立连接：段转码期间 keep-alive 会被服务端空闲超时（5s）关闭，
         # 复用死连接 PUT 大段体 → WinError 10053（2026-10-14 本地流程实测）
         head = {"Accept": "application/json", "Connection": "close"}
@@ -233,9 +230,15 @@ def probe_caps(ffmpeg: str) -> dict:
             # hello 的 ffmpeg_version 字段：状态页 Worker 列表按它展示
             caps["ffmpeg_version"] = first[len("ffmpeg version "):].split()[0]
         caps["hardware"] = {"cpu_cores": os.cpu_count() or 0, "memory_bytes": _total_memory()}
-        out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW).stdout
+        out = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True,
+            timeout=30, creationflags=_NO_WINDOW,
+        ).stdout
         caps["encoders"] = sorted(set(out.split()) & {"h264_nvenc", "hevc_nvenc"})
-        out = subprocess.run([ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW).stdout
+        out = subprocess.run(
+            [ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True,
+            timeout=30, creationflags=_NO_WINDOW,
+        ).stdout
         tokens = set(out.split())
         caps["filters"] = sorted(
             {"scale_cuda", "hwupload_cuda", "hwdownload", "tonemapx", "tonemap_cuda"} & tokens
@@ -245,10 +248,8 @@ def probe_caps(ffmpeg: str) -> dict:
     except (OSError, subprocess.SubprocessError):
         pass
     caps["key"] = cache_key
-    try:
+    with contextlib.suppress(OSError):
         caps_file.write_text(json.dumps(caps))
-    except OSError:
-        pass
     return caps
 
 
@@ -378,10 +379,8 @@ def process_task(
         progress.update(phase="transcoding", downloaded_bytes=expected, total_bytes=expected)
 
         # 3) 计算段数并跳过已收段
-        if segment_seconds and duration:
-            total_parts = -(-duration // segment_seconds)  # ceil
-        else:
-            total_parts = 1  # 直拷/单段
+        # 向上取整；无分段（直拷/单段）就是 1 段
+        total_parts = -(-duration // segment_seconds) if segment_seconds and duration else 1
         progress["segment_total"] = total_parts
         print(f"[{task_id}] 共 {total_parts} 段，断点在第 {resume} 段后")
 
@@ -423,7 +422,12 @@ def process_task(
                 api.request(
                     "POST",
                     f"/api/v1/preload-worker/tasks/{task_id}/fail",
-                    json_body={"error": f"ffmpeg 退出码 {code}（第 {part + 1}/{total_parts} 段）：{stderr_tail[-600:]}"},
+                    json_body={
+                        "error": (
+                            f"ffmpeg 退出码 {code}（第 {part + 1}/{total_parts} 段）："
+                            f"{stderr_tail[-600:]}"
+                        )
+                    },
                 )
                 print(f"[{task_id}] ffmpeg 失败（{code}，第 {part + 1}/{total_parts} 段）")
                 return False
@@ -580,10 +584,9 @@ class WorkerRuntime:
         self._realtime_client = None
 
     def _emit(self, kind: str, **fields: object) -> None:
-        try:
+        # 状态回调绝不能拖垮转码循环
+        with contextlib.suppress(Exception):
             self.status_cb(kind, **fields)
-        except Exception:
-            pass  # 状态回调绝不能拖垮转码循环
 
     def log(self, line: str) -> None:
         self._emit("log", line=line)

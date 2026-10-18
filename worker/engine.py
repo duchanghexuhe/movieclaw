@@ -23,6 +23,7 @@ HTTP 代理用 http.server + urllib。
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import secrets
@@ -34,10 +35,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 #: 与服务端 REMOTE_WORKER_PROTOCOL_VERSION 对齐（remote_worker.py）
 #: v2：hello 报 roles+max_concurrency；job.start 带 class（realtime/preload）
@@ -146,12 +148,10 @@ class FragmentSegmenter:
             return None
         size = _read_u32(buf, 0)
         kind = buf[4:8].decode("latin-1")
-        header = 8
         if size == 1:
             if len(buf) < 16:
                 return None
             size = _read_u64(buf, 8)
-            header = 16
         if size < 8 or size > self.MAX_BOX_BYTES:
             self.failure = f"分片化 MP4 里出现了长度不合理的盒子（{kind} {size} 字节）"
             self.buffer = b""
@@ -734,10 +734,9 @@ class SourceReadProxy:
                 self.send_header("Content-Range", f"bytes {start}-{offset - 1}/{total}")
                 self.send_header("Accept-Ranges", "bytes")
                 self.end_headers()
-                try:
+                # ffmpeg 掐断（seek）：正常
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                     self.wfile.write(payload)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass  # ffmpeg 掐断（seek）：正常
 
             def _passthrough(self) -> None:
                 """小文件直通（清单/探针）：读进内存再转发，量小无碍。"""
@@ -764,10 +763,8 @@ class SourceReadProxy:
                             self.send_header(key, resp.headers[key])
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
-                    try:
+                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                         self.wfile.write(body)
-                    except (BrokenPipeError, ConnectionResetError):
-                        pass
 
             # HEAD 供 ffprobe 探时长（尽力而为：直连也是这个待遇）
             def do_HEAD(self) -> None:  # noqa: N802
@@ -979,11 +976,11 @@ class _WebSocket:
         while len(chunks) < count:
             try:
                 chunk = self._sock.recv(count - len(chunks))
-            except (socket.timeout, TimeoutError):
+            except TimeoutError as exc:
                 if not chunks:
                     # 帧边界超时≠断线：让 recv_json 转成 None 继续等；
                     # 半截数据卡住才算连接有问题，维持抛超时由上层断线
-                    raise _SocketIdle
+                    raise _SocketIdle from exc
                 # 帧开了头才超时：多半是跨段报文的后一段慢了半拍，不是断线。
                 # 给一段宽限收完本帧，宽限烧完才按断线上抛——空等超时被压短
                 # 之后，没有这道宽限慢帧会被误杀（fc03ad2d 同类教训）
@@ -994,7 +991,7 @@ class _WebSocket:
                 self._sock.settimeout(_FRAME_GRACE_S)
                 continue
             if not chunk:
-                return None if not chunks else chunks
+                return chunks if chunks else None
             chunks += chunk
         return chunks
 
@@ -1007,10 +1004,8 @@ class _WebSocket:
                 self._sock.sendall(self._frame(0x8, b""))
         except OSError:
             pass
-        try:
+        with contextlib.suppress(OSError):
             self._sock.close()
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1091,7 @@ class RealtimeJob:
         job_id: str,
         message: dict,
         ffmpeg: str,
-        client: "RealtimeClient",
+        client: RealtimeClient,
     ) -> None:
         self.job_id = job_id
         self.attempt_id = str(message.get("attempt_id") or job_id)
@@ -1161,9 +1156,11 @@ class RealtimeJob:
             return
         try:
             stamp = time.monotonic() - self._debug_t0
-            with self._debug_lock:
-                with open(self._debug_file, "a", encoding="utf-8", errors="replace") as fh:
-                    fh.write(f"[+{stamp:7.2f}s] {message}\n")
+            with (
+                self._debug_lock,
+                open(self._debug_file, "a", encoding="utf-8", errors="replace") as fh,
+            ):
+                fh.write(f"[+{stamp:7.2f}s] {message}\n")
         except OSError:
             pass
 
@@ -1318,7 +1315,11 @@ class RealtimeJob:
                     "type": "job.failed",
                     "job_id": self.job_id,
                     "attempt_id": self.attempt_id,
-                    "error": f"ffmpeg 退出码 {exit_code}：{tail}" if tail else f"ffmpeg 退出码 {exit_code}",
+                    "error": (
+                        f"ffmpeg 退出码 {exit_code}：{tail}"
+                        if tail
+                        else f"ffmpeg 退出码 {exit_code}"
+                    ),
                 }
             )
 
@@ -1492,7 +1493,6 @@ class RealtimeClient:
         parsed = urllib.parse.urlsplit(self.server)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
         path = parsed.path.rstrip("/") + "/api/v1/transcode-worker/ws"
         ws = _WebSocket(host, port, path, self.token)
         self.log("实时通道已连上，握手中…")
@@ -1678,7 +1678,9 @@ class RealtimeClient:
         yield_slots = getattr(self, "preload_yield", None)
         if yield_slots is not None:
             yield_slots(max(0, self.max_jobs - 1 - len(self.jobs)))
-        threading.Thread(target=job.run, args=(message,), name=f"job-{job_id[-6:]}", daemon=True).start()
+        threading.Thread(
+            target=job.run, args=(message,), name=f"job-{job_id[-6:]}", daemon=True
+        ).start()
 
     def _send_safe(self, payload: dict) -> None:
         """任务线程投递状态消息；由主循环发到当前连接。"""
