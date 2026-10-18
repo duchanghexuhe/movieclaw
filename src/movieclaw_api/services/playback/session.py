@@ -39,6 +39,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.services.playback import backend_health
 from movieclaw_api.services.playback.cache import (
     Manifest,
     cache_components,
@@ -57,7 +58,6 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     segment_type,
 )
 from movieclaw_api.services.playback.limits import auto_quota_bytes
-from movieclaw_api.services.playback import backend_health
 from movieclaw_api.services.playback.qoe import note_transcode_session
 from movieclaw_api.services.playback.remote_signing import issue_remote_grant
 from movieclaw_api.services.playback.remote_worker import (
@@ -924,7 +924,10 @@ class TranscodeSessionManager:
             idle = now - s.last_ping
             if idle > SESSION_IDLE_TIMEOUT_S:
                 stale.append(
-                    (sid, f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）")
+                    (
+                        sid,
+                        f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）",
+                    )
                 )
             elif (
                 idle > STREAM_DISCONNECT_REAP_S

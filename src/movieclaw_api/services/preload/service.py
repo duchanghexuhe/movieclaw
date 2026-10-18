@@ -710,7 +710,9 @@ async def complete_task(
         size_bytes=size,
         container=container,
         resolution=spec.resolution if spec else "1080p",
-        video_codec=spec.video_codec if spec else (video_codec or preset.get("video_codec", "h264")),
+        video_codec=(
+            spec.video_codec if spec else (video_codec or preset.get("video_codec", "h264"))
+        ),
         hdr=spec.hdr if spec else None,
         bit_depth=spec.bit_depth if spec else None,
         duration_seconds=duration_seconds,

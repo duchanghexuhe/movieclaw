@@ -365,7 +365,8 @@ def decide_playback(
     到该高度。None = 自动（不限制）。universal 分支与未探测到规格的 strm
     不受它影响：前者是全解码客户端自己拉流，后者无从判断、只能乐观直连。
 
-    ``uplink_bps`` 是外网会话的家宽上行预算（bps；内网 / 未配置为 None，同 max_height 一样不参与判定）。源片码率超出
+    ``uplink_bps`` 是外网会话的家宽上行预算（bps；内网 / 未配置为 None，同
+    max_height 一样不参与判定）。源片码率超出
     min(上行, 外网天花板 1080p 档) 时直通档换成转码——但**不自动生效**：计划带
     ``uplink_forced`` 透出，网页端拦下起播弹窗让用户确认。与 max_height 互斥地
     生效：手选了画质上限就不传上行，用户的选择优先。universal 分支同样不受影响。

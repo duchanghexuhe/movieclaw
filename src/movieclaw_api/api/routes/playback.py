@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api.api.client_address import client_address, is_lan_address
 from movieclaw_api.api.deps import require_admin, require_login
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import (
@@ -88,7 +89,6 @@ from movieclaw_api.services.library.items import (
     season_resume_episode,
 )
 from movieclaw_api.services.media_probe import probe_keyframe_before
-from movieclaw_api.api.client_address import client_address, is_lan_address
 from movieclaw_api.services.playback import marks as playback_marks
 from movieclaw_api.services.playback import metrics, qoe, track_memory, trickplay, video_cues
 from movieclaw_api.services.playback import plan as playback_plan
@@ -1161,7 +1161,9 @@ async def start_playback_session(
         for candidate in await _requested_file_ids(session, payload):
             replaced += await manager.stop_for_file(candidate, member_id)
         if replaced:
-            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps, external=external)
+            decision = await _decide(
+                payload, principal, session, uplink_bps=uplink_bps, external=external
+            )
             if decision is None:
                 raise NotFoundException("没有找到可播放的文件")
             view = playback_plan.to_view(decision)
@@ -1184,7 +1186,9 @@ async def start_playback_session(
         if principal.device is not None and principal.device.kind in _SINGLE_PLAYER_KINDS:
             replaced += await manager.stop_stale_for_device(device_id, keep_file_id=file.id)
         if replaced:
-            decision = await _decide(payload, principal, session, uplink_bps=uplink_bps, external=external)
+            decision = await _decide(
+                payload, principal, session, uplink_bps=uplink_bps, external=external
+            )
             if decision is None:
                 raise NotFoundException("没有找到可播放的文件")
             view = playback_plan.to_view(decision)

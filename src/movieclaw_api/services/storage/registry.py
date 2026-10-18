@@ -121,7 +121,11 @@ def _orphans_by_id(model_name: str) -> EntryProbe:
 
 async def _preload_orphans(entries: list[Path]) -> set[Path]:
     """预转码孤儿：目录名的整数 ∉ preload_task 主键（上传中断的半成品）。"""
-    return {e for e in entries if (i := _leading_int(e.name)) is not None and i not in await _existing_ids("PreloadTask")}
+    return {
+        e
+        for e in entries
+        if (i := _leading_int(e.name)) is not None and i not in await _existing_ids("PreloadTask")
+    }
 
 
 async def _unused_profile_tiers(entries: list[Path]) -> set[Path]:
