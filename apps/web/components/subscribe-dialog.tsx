@@ -24,6 +24,7 @@ import {
   useSheetForm,
 } from "@/components/sheet-scaffold";
 import { SubscriptionCancelDialog } from "@/components/subscription-cancel-dialog";
+import { SeasonCapLine } from "@/components/subscription-episode-cap";
 import { UpgradeRunReportView } from "@/components/upgrade-run-dialog";
 import { listLibraries, type MediaLibrary } from "@/lib/api/libraries";
 import {
@@ -45,6 +46,12 @@ import {
 import { imageUrl } from "@/lib/image-proxy";
 import type { MediaType } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
+import {
+  capsPayload,
+  effectiveCap,
+  isLongSeason,
+  type CapDraft,
+} from "@/lib/subscription-episode-cap";
 
 /**
  * 订阅弹层只传递 Discover 签发的 titleRef；来源识别与 TMDB 锚定由后端负责。
@@ -102,6 +109,8 @@ export function SubscribeDialog({
   const [followFuture, setFollowFuture] = useState(false);
   // 豆瓣集数多于 TMDB 时（issue #640）：用户确认后按豆瓣集数追，默认不改
   const [useDoubanEpisodes, setUseDoubanEpisodes] = useState(false);
+  // 超长的一季先订阅一部分：用户的改动（没动过 = 按默认先订阅一批），见 lib/subscription-episode-cap
+  const [capDraft, setCapDraft] = useState<CapDraft>({});
   const [ruleSetId, setRuleSetId] = useState<number | null>(null);
   const [selectionMode, setSelectionMode] = useState<"smart" | "rules">("smart");
   const [smartProfile, setSmartProfile] = useState<SmartProfile | null>(null);
@@ -155,6 +164,7 @@ export function SubscribeDialog({
       setSmartProfile(null);
       setOptionsOpen(!!t.upgradeIntent);
       setRangeExpanded(false);
+      setCapDraft({});
       setPrepared(null);
       setError(null);
       setUpgradeReport(null);
@@ -268,11 +278,19 @@ export function SubscribeDialog({
       ? prepared.douban_episodes
       : null;
 
+  // 勾上的超长季（洗版不涉及）：多出一行「先订阅前 N 集」
+  const capSeasons = upgradeMode
+    ? []
+    : (prepared?.seasons ?? []).filter(
+        (season) => selectedSeasons.has(season.season_number) && isLongSeason(season),
+      );
+
   const submit = async () => {
     if (!target || !prepared?.media) return;
     setBusy(true);
     setError(null);
     try {
+      const episodeCaps = capsPayload(capSeasons, selectedSeasons, capDraft);
       // 提交预检已经收敛好的 TMDB 引用，而不是入口的豆瓣引用：豆瓣→TMDB 的
       // 收敛（多路 TMDB 搜索 + 逐候选季表）没有缓存，再传豆瓣引用会让创建接口
       // 把这一整套外网请求重跑一遍。豆瓣身份靠 source_title_ref 原样带回。
@@ -288,6 +306,7 @@ export function SubscribeDialog({
         ...(doubanEpisodes && useDoubanEpisodes
           ? { episode_floors: { [doubanEpisodes.season_number]: doubanEpisodes.douban_count } }
           : {}),
+        ...(Object.keys(episodeCaps).length > 0 ? { episode_caps: episodeCaps } : {}),
       });
       onChanged?.();
       if (upgradeMode) {
@@ -441,6 +460,15 @@ export function SubscribeDialog({
         <span className="text-sub text-[var(--text-muted)]">{rangeExpanded ? "收起" : "调整"}</span>
         <ChevronRightIcon aria-hidden className={`size-3.5 shrink-0 text-[var(--text-faint)] transition-transform ${rangeExpanded ? "rotate-90" : ""}`} />
       </button>
+      {capSeasons.length > 0 && <div className="space-y-2 border-t border-[var(--line)] px-4 py-3">
+        {capSeasons.map((season) => <SeasonCapLine
+          key={season.season_number}
+          season={season}
+          cap={effectiveCap(season, capDraft)}
+          showName={selectedSeasons.size > 1}
+          onChange={(next) => setCapDraft((prev) => ({ ...prev, [season.season_number]: next }))}
+        />)}
+      </div>}
       {rangeExpanded && <div className="border-t border-[var(--line)]">
         <div className="max-h-64 divide-y divide-white/[0.07] overflow-y-auto">
           {(prepared?.seasons ?? []).map((season) => <SeasonChoiceRow key={season.season_number} season={season} checked={selectedSeasons.has(season.season_number)} onToggle={() => toggleSeason(season.season_number)} />)}

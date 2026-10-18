@@ -114,6 +114,13 @@ export interface WantedUpgrade {
   indeterminate: boolean;
 }
 
+/** 被订阅上限截断的一季：订阅到第 cap 集，本季共 total 集。 */
+export interface EpisodeWindow {
+  season_number: number;
+  cap: number;
+  total: number;
+}
+
 export interface Subscription {
   id: number;
   media: SubscriptionMedia;
@@ -130,6 +137,11 @@ export interface Subscription {
   progress: SubscriptionProgress;
   /** 剧集按季收录统计；电影为空数组 */
   season_collection: SeasonOverview[];
+  /**
+   * 被订阅上限截断的季（只订阅了一季的前一部分）；没有上限为空。有内容时订阅
+   * 不会判「已收齐」，用户可以继续订阅。旧服务端没有
+   */
+  episode_windows?: EpisodeWindow[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -241,6 +253,8 @@ export interface EpisodeSeason {
   tmdb_count: number;
   /** 已设的集数下限；null=以 TMDB 为准 */
   floor: number | null;
+  /** 已设的订阅上限；null=订阅整季。旧服务端没有 */
+  cap?: number | null;
 }
 
 /** 待确认的集数提示：站点或豆瓣显示本季比现在追的更多集。 */
@@ -354,6 +368,8 @@ export interface CreateSubscriptionPayload {
   library_id?: number | null;
   /** 每季集数下限 {季号: 集数}：确认「按豆瓣集数追」时带上 */
   episode_floors?: Record<number, number>;
+  /** 每季订阅到第几集的上限 {季号: 集号}：超长的一季先订阅前面一部分 */
+  episode_caps?: Record<number, number>;
 }
 
 export interface CreateSubscriptionResult {
@@ -626,6 +642,8 @@ export function updateSubscription(
     library_id?: number | null;
     /** 整体替换每季集数下限 {季号: 集数}；{} 清除、改回以 TMDB 为准；缺省不变 */
     episode_floors?: Record<number, number>;
+    /** 整体替换每季订阅上限 {季号: 集号}；{} 清除、改回订阅整季；缺省不变 */
+    episode_caps?: Record<number, number>;
   },
 ): Promise<SubscriptionDetail> {
   return unwrap(

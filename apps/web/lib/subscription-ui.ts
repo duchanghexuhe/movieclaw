@@ -34,6 +34,9 @@ export function subscriptionProgressNote(sub: Subscription): string {
       return imported > 0 ? "已入库" : inPipeline > 0 ? "下载安排中" : "已收齐";
     }
     if (inPipeline > 0) return `${inPipeline} 集下载中 · 已入库 ${imported}`;
+    // 订阅上限截断了本季：等的是用户，不是片源
+    const win = sub.episode_windows?.[0];
+    if (sub.status === "active" && win) return `已订阅到第 ${win.cap} 集 · 可继续`;
     if (sub.status === "active") return "等待新集播出";
     return imported > 0 ? `全部 ${total} 集已入库` : `全部 ${total} 集已安排`;
   }
