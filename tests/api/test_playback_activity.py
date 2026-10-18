@@ -1364,8 +1364,6 @@ def _fake_stall_session(video, audio, *, remote=False, wait_ms=None, pending_ago
 
 
 def _meter(rate_bytes: int):
-    from types import SimpleNamespace
-
     from movieclaw_playback.activity import StreamMeter
 
     meter = StreamMeter(
@@ -1391,8 +1389,8 @@ def test_stall_hint_is_bandwidth_when_stream_lags_bitrate() -> None:
 
 def test_stall_hint_decode_when_remote_speed_lags(monkeypatch) -> None:
     """远程转码速度跟不上实时：标成解码瓶颈，即使拉流速率正常。"""
-    from movieclaw_api.services.playback_activity import _stall_hint
     from movieclaw_api.services.playback import remote_worker
+    from movieclaw_api.services.playback_activity import _stall_hint
     from movieclaw_playback.decide import AudioPlan, VideoPlan
 
     class _Registry:

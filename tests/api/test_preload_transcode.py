@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from movieclaw_api.services.media_probe import MediaSpec
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import FileState, LibraryFile, MediaItem
+from movieclaw_db.models import FileState, LibraryFile, MediaItem, PreloadTask
 from movieclaw_db.models.preload_task import PreloadTaskStatus
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
@@ -173,7 +173,9 @@ def _upload_segment(client: TestClient, task: dict) -> None:
     from movieclaw_api.services.preload import service as _svc
 
     part_file = _svc.artifact_dir_for(task_id) / "seg00000.mkv"
-    assert part_file.read_bytes()[:4] == bytes([0x1A, 0x45, 0xDF, 0xA3]), part_file.read_bytes()[:16]
+    assert part_file.read_bytes()[:4] == bytes([0x1A, 0x45, 0xDF, 0xA3]), (
+        part_file.read_bytes()[:16]
+    )
     seg.unlink(missing_ok=True)
 
 
@@ -319,7 +321,7 @@ def test_claim_selects_nvenc_when_worker_reports_caps(client, tmp_path):
     """Worker 上报 NVENC 能力 → 下发全 GPU 链：编码器随格式（默认 H.264）、
     码率帽随档位；HDR 源下色调映射回内存。"""
     file_id = _seed_file(client, tmp_path, hdr="HDR10")
-    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id})
     token = _pair_worker(client)
     caps = {
         "encoders": ["h264_nvenc", "hevc_nvenc"],
@@ -459,11 +461,15 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
     )
     part_a = seg.read_bytes()
     first = client.put(
-        f"{artifact_url}{sep}part=0", content=part_a, headers={"Content-Type": "application/octet-stream"}
+        f"{artifact_url}{sep}part=0",
+        content=part_a,
+        headers={"Content-Type": "application/octet-stream"},
     )
     assert first.status_code == 201, (first.status_code, first.text)
     gap = client.put(
-        f"{artifact_url}{sep}part=2", content=b"B" * 8, headers={"Content-Type": "application/octet-stream"}
+        f"{artifact_url}{sep}part=2",
+        content=b"B" * 8,
+        headers={"Content-Type": "application/octet-stream"},
     )
     assert gap.status_code == 409  # 跳段拒绝
 
@@ -476,7 +482,9 @@ def test_full_worker_roundtrip(client, tmp_path, monkeypatch):
             audio_streams=[{"codec": "aac"}], subtitle_streams=[{"codec": "subrip"}],
         ),
     )
-    done = client.post(f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token))
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
     assert done.status_code == 200, done.text
     assert done.json()["data"]["file_id"] > 0
 
@@ -645,8 +653,6 @@ def test_progress_report_persists_payload(client, tmp_path, monkeypatch):
         async with get_database().session() as session:
             from sqlmodel import select
 
-            from movieclaw_db.models import PreloadTask
-
             return (
                 await session.execute(select(PreloadTask).where(PreloadTask.id == task_id))
             ).scalar_one()
@@ -704,7 +710,9 @@ def test_source_delete_invalidates_derived(client, tmp_path, monkeypatch):
     token = _pair_worker(client)
     _claim_and_upload(client, token, task_id)
     _fake_probe(monkeypatch)
-    done = client.post(f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token))
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
     assert done.status_code == 200, done.text
     derived_id = done.json()["data"]["file_id"]
 
@@ -799,7 +807,9 @@ def test_cleanup_stale_preview_and_run(client, tmp_path, monkeypatch):
     token = _pair_worker(client)
     _claim_and_upload(client, token, task_id)
     _fake_probe(monkeypatch)
-    done = client.post(f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token))
+    done = client.post(
+        f"{_WORKER}/tasks/{task_id}/complete", json={}, headers=_worker_headers(token)
+    )
     assert done.status_code == 200, done.text
     derived_id = done.json()["data"]["file_id"]
 

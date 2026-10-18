@@ -7,15 +7,12 @@ Mac 端 ProgressiveSegments.swift 的语义一致（设计文档 transcode-laten
 from __future__ import annotations
 
 import shutil
-import struct
 import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 
 import pytest
-
 from engine import (
     ArtifactUploadProxy,
     FragmentOutput,
