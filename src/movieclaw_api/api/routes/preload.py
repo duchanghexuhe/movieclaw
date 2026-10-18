@@ -36,7 +36,7 @@ from movieclaw_api.services.preload.ffmpeg_preload import (
     presets_for_format,
 )
 from movieclaw_db.engine import get_session
-from movieclaw_db.models import LibraryFile, MediaItem, PreloadTask
+from movieclaw_db.models import LibraryFile, LoginDevice, MediaItem, PreloadTask, PreloadTaskStatus
 
 router = APIRouter(prefix="/preload", tags=["preload"])
 
@@ -68,6 +68,7 @@ def _task_view(
     episode_number: int | None = None,
     source_quality: str | None = None,
     library_id: int | None = None,
+    executor: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -94,6 +95,8 @@ def _task_view(
         "source_quality": source_quality,
         # 成员可见性过滤用（成员区列表按库筛；管理员不限）
         "library_id": library_id,
+        # 执行者（活动页标明在哪转）：「NAS 本地」或 Worker 设备名；未领取为 None
+        "executor": executor,
     }
 
 
@@ -117,6 +120,18 @@ async def enriched_task_views(
             await session.execute(select(MediaItem).where(MediaItem.id.in_(item_ids)))
         ).scalars()
     }
+    # 执行者名：Worker 按登录设备名显示，NAS 本地记为「NAS 本地」（活动页据此标明在哪转）
+    device_ids = {task.worker_device_id for task in tasks if task.worker_device_id is not None}
+    device_names = (
+        {
+            device.id: device.name
+            for device in (
+                await session.execute(select(LoginDevice).where(LoginDevice.id.in_(device_ids)))
+            ).scalars()
+        }
+        if device_ids
+        else {}
+    )
     views = []
     for task in tasks:
         file = files.get(task.target_file_id)
@@ -129,9 +144,19 @@ async def enriched_task_views(
                 episode_number=file.episode_number if file else None,
                 source_quality=quality_label_of(file) if file else None,
                 library_id=file.library_id if file else None,
+                executor=_executor_label(task, device_names),
             )
         )
     return views
+
+
+def _executor_label(task: PreloadTask, device_names: dict[int, str]) -> str | None:
+    """执行中的任务谁在转：没有领取设备 = NAS 本地；有 = Worker 设备名。排队中的为空。"""
+    if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
+        return None
+    if task.worker_device_id is None:
+        return "NAS 本地"
+    return device_names.get(task.worker_device_id) or "转码 Worker"
 
 
 async def get_setting_store_dep():
@@ -208,9 +233,11 @@ async def estimate(
     await assert_library_visible(session, principal, file.library_id)  # type: ignore[arg-type]
     if not preset_available(payload.preset_id, setting.video_format):
         raise BadRequestException(f"未知档位：{payload.preset_id}")
+    plan = await preload_service.plan_for(session, file)
     estimated = estimate_size_bytes(
         duration_seconds=file.duration_seconds,
         preset=effective_preset(payload.preset_id, setting.video_format),
+        audio_tracks=len(plan.audio),
     )
     # 占用 = 已有产物 + 在途任务的预估（与配额预检同口径，在途单也占配额）
     used = await preload_service.preload_usage_bytes(session) + (

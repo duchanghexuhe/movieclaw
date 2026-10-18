@@ -46,6 +46,8 @@ export interface PreloadTaskView {
   episode_number: number | null;
   /** 源文件规格签名（「2160p WEB-DL DV」） */
   source_quality: string | null;
+  /** 执行中的任务由谁转：「NAS 本地」或 Worker 设备名；排队中为 null */
+  executor: string | null;
 }
 
 /** 任务状态中文标签（设置页任务行与活动页任务卡共用一套口径）。 */

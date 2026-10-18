@@ -18,14 +18,17 @@ derives_from_file_id / derivation。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shutil
+import subprocess
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.exceptions import (
@@ -39,10 +42,15 @@ from movieclaw_api.services.preload.ffmpeg_preload import (
     FORMAT_HEVC,
     PRELOAD_PART_BYTES,
     PRESET_DEFAULT,
+    LocalHw,
+    TrackPlan,
     build_preload_command,
     effective_preset,
     estimate_size_bytes,
+    final_mux_argv,
+    plan_tracks,
     preset_available,
+    segment_total,
 )
 from movieclaw_api.settings import PreloadSetting
 from movieclaw_api.settings.store import get_setting_store
@@ -263,6 +271,13 @@ def _source_spec(file: LibraryFile) -> dict:
     }
 
 
+async def plan_for(session: AsyncSession, file: LibraryFile) -> TrackPlan:
+    """这一单保留哪些轨（§5）：默认轨策略取库语言与原始语言，与播放端同一份上下文。"""
+    from movieclaw_api.services.playback.track_context import track_context
+
+    return plan_tracks(file, await track_context(session, file))
+
+
 async def get_target_file(session: AsyncSession, file_id: int) -> LibraryFile:
     file = await session.get(LibraryFile, file_id)
     if file is None or file.state == FileState.TRASHED:
@@ -312,18 +327,24 @@ async def create_preload_task(
         return existing
 
     preset = effective_preset(preset_id, video_format)
+    plan = await plan_for(session, file)
     command = build_preload_command(
         source_path=file.file_path,
         output_path="preview.mkv",
         preset=preset,
         source=_source_spec(file),
+        tracks=plan,
     )
     if command.video_copy:
         # 直拷形态：源已经就是档位（≤档位高度的 H.264 SDR），转出来是同一个
         # 文件——明确拒绝而不是白耗一次上传下载
         raise BadRequestException("这个版本已经是便携档（≤档位高度的 H.264 SDR），无需转码")
 
-    estimated = estimate_size_bytes(duration_seconds=file.duration_seconds, preset=preset)
+    estimated = estimate_size_bytes(
+        duration_seconds=file.duration_seconds,
+        preset=preset,
+        audio_tracks=len(plan.audio),
+    )
     await check_quota(session, needed_bytes=estimated)
 
     task = PreloadTask(
@@ -428,7 +449,7 @@ async def retry_task(session: AsyncSession, task_id: int) -> PreloadTask:
         raise BadRequestException("只有失败的任务可以重试")
     task.status = PreloadTaskStatus.QUEUED
     task.error = None
-    task.worker_device_id = None
+    release_owner(task)
     task.claimed_at = None
     task.lease_expires_at = None
     # 熔断计数清零：attempts 是「连续失败」语义，手动重试意味着新一轮
@@ -525,7 +546,7 @@ async def reclaim_expired_leases(session: AsyncSession) -> int:
         task.status = PreloadTaskStatus.QUEUED
         task.lease_expires_at = None
         task.claimed_at = None
-        task.worker_device_id = None
+        release_owner(task)
         task.progress = None  # 上一次执行的进度不属于回队后的执行
         task.updated_at = now
         logger.info("预转码任务租约到期回队：task=%s", task.id)
@@ -568,19 +589,76 @@ async def claim_next_task(
     串行化保证）。
     """
     await reclaim_expired_leases(session)
-    query = select(PreloadTask).where(PreloadTask.status == PreloadTaskStatus.QUEUED)
+    # 已有分段的任务只回到产出它的执行者（见 release_owner）：别人接手会把两种编码器的分段拼在一起
+    query = select(PreloadTask).where(
+        PreloadTask.status == PreloadTaskStatus.QUEUED,
+        or_(
+            PreloadTask.resume_parts == 0,  # type: ignore[operator]
+            PreloadTask.worker_device_id == device_id,  # type: ignore[arg-type]
+        ),
+    )
     if not accept_hevc:
-        query = query.where(
-            or_(
-                PreloadTask.video_format.is_(None),  # type: ignore[union-attr]
-                PreloadTask.video_format != FORMAT_HEVC,  # type: ignore[operator]
-            )
-        )
+        query = query.where(_not_hevc())
     row = (
         await session.execute(query.order_by(PreloadTask.created_at.asc()).limit(1))
     ).scalar_one_or_none()
     if row is None:
         return None
+    return await _claim_row(session, row, device_id=device_id)
+
+
+async def claim_local_task(
+    session: AsyncSession, *, allow_h264: bool, allow_hevc: bool
+) -> tuple[PreloadTask, LibraryFile] | None:
+    """NAS 本机领单（§7）：队列里本机能转、且该本机领的第一单。
+
+    - 已有分段、归本机的任务（被播放让位后回队的）：本机必须接着转，不管有没有 Worker 在线；
+    - 从未出过段的新单：只在**没有能转它的 Worker 在线**时才接——有 Worker 就让 GPU 清队，
+      NAS 留给家里播放。``allow_h264`` / ``allow_hevc`` 由调用方按「有没有能转它的 Worker」给出；
+    - HEVC 单还要求本机真跑过 HEVC 硬件编码（``allow_hevc``）。
+    """
+    await reclaim_expired_leases(session)
+    pinned = and_(PreloadTask.resume_parts > 0, PreloadTask.worker_device_id.is_(None))  # type: ignore[union-attr]
+    usable = [pinned] if allow_hevc else [and_(pinned, _not_hevc())]
+    if allow_h264:
+        usable.append(and_(PreloadTask.resume_parts == 0, _not_hevc()))  # type: ignore[operator]
+    if allow_hevc:
+        usable.append(and_(PreloadTask.resume_parts == 0, _is_hevc()))  # type: ignore[operator]
+    row = (
+        await session.execute(
+            select(PreloadTask)
+            .where(PreloadTask.status == PreloadTaskStatus.QUEUED, or_(*usable))
+            .order_by(PreloadTask.created_at.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return await _claim_row(session, row, device_id=None)
+
+
+def _is_hevc():  # type: ignore[no-untyped-def]
+    return PreloadTask.video_format == FORMAT_HEVC  # type: ignore[union-attr]
+
+
+def _not_hevc():  # type: ignore[no-untyped-def]
+    return or_(
+        PreloadTask.video_format.is_(None),  # type: ignore[union-attr]
+        PreloadTask.video_format != FORMAT_HEVC,  # type: ignore[operator]
+    )
+
+
+def release_owner(task: PreloadTask) -> None:
+    """回到队列时释放领取者。已有分段的任务保留执行者：续转只能回到同一种执行者（NAS 本地 =
+    无设备，Worker = 其设备），不同编码器产出的分段不能混拼。从未出过段的任务随便谁接。"""
+    if task.resume_parts == 0:
+        task.worker_device_id = None
+
+
+async def _claim_row(
+    session: AsyncSession, row: PreloadTask, *, device_id: int | None
+) -> tuple[PreloadTask, LibraryFile] | None:
+    """抢占一行（原子：UPDATE ... WHERE status=queued）并装入源文件；源已失效则直接失败。"""
     now = utcnow()
     changed = (
         await session.execute(
@@ -611,41 +689,48 @@ async def claim_next_task(
 
 
 def build_task_command(
-    task: PreloadTask, file: LibraryFile, *, worker_caps: dict | None = None
+    task: PreloadTask,
+    file: LibraryFile,
+    *,
+    worker_caps: dict | None = None,
+    local: LocalHw | None = None,
+    plan: TrackPlan | None = None,
 ) -> dict[str, Any]:
-    """领取响应里的命令载荷：argv + 元数据（Worker 原样执行 argv）。
+    """领取响应里的命令载荷：argv + 元数据（执行者原样执行 argv）。
 
     ``worker_caps`` 是 Worker 在 claim 请求里上报的本机能力
-    （``{encoders, filters, hw_decoders}``）。有 NVENC + ``scale_cuda``
-    就下发硬编链（编码器随档位，用户拍板：高功耗机器专门开机干活，
-    全功率越快越好）；没有或能力不全自动落回 libx264 软编。
+    （``{encoders, filters, hw_decoders}``）：
+    有 NVENC + ``scale_cuda`` 就下发硬编链，没有落回 libx264 软编。``local`` 是 NAS 本机的
+    QSV/VAAPI 能力（见 ``LocalHw``），二者互斥。``plan`` 是这一单保留的轨（:func:`plan_for`）。
     """
-    hw_backend = "nvenc" if _caps_have_nvenc(worker_caps) else None
+    hw_backend = "nvenc" if local is None and _caps_have_nvenc(worker_caps) else None
     command = build_preload_command(
         source_path="source.mkv",
         output_path=ARTIFACT_UPLOAD_NAME,
         preset=_preset_of(task),
         source=_source_spec(file),
+        tracks=plan,
         hw_backend=hw_backend,
         worker_caps=worker_caps,
+        local=local,
     )
+    seconds = 0 if command.video_copy else SEGMENT_SECONDS
     return {
         "argv": command.argv,
         "preset_id": task.preset_id,
         "tone_map": command.tone_map,
         "video_copy": command.video_copy,
         "hw_backend": command.hw_backend,
-        # 非空 = 服务端装不出可执行的命令（HDR 源 + Worker 缺 tonemapx），
-        # Worker 收到后直接按失败上报，原文透传给用户
+        # 非空 = 这条命令装不出来（HDR 缺 tonemap、HEVC 缺硬件编码器），领取方据此拒做并说明
         "unusable_reason": command.unusable_reason,
         "skipped_subtitle_indexes": command.skipped_subtitle_indexes,
         "resume_parts": task.resume_parts,
         "part_bytes": task.part_bytes,
-        # 断点续转（§7）：转码按固定时长分段，Worker 对第 i 段在 -i 前插
-        # "-ss <i*SEGMENT_SECONDS>"（末段省 -t 让 ffmpeg 到 EOF），产物命名为
-        # 段文件 partNNNN.mkv 逐段上传；服务端按 resume_parts 跳过已收段，
-        # complete 时 concat demuxer 拼接。video_copy（直拷）不分段
-        "segment_seconds": 0 if command.video_copy else SEGMENT_SECONDS,
+        # 断点续转（§7）：视频与音频按固定时长分段（字幕不分段，拼接时内封）。执行者对第 i 段在
+        # -i 前插 "-ss i*SEGMENT_SECONDS"、在输入后插 "-t"（末段转到 EOF）；服务端按 resume_parts
+        # 跳过已收段，complete 时拼接。video_copy（直拷）不分段
+        "segment_seconds": seconds,
+        "segment_total": segment_total(file.duration_seconds, seconds),
         "duration_seconds": file.duration_seconds,
         "source_size_bytes": file.size_bytes,
     }
@@ -706,6 +791,69 @@ async def void_artifact(session: AsyncSession, task: PreloadTask) -> None:
     task.resume_parts = 0
     task.updated_at = utcnow()
     await session.commit()
+
+
+async def finalize_artifact(
+    session: AsyncSession,
+    task: PreloadTask,
+    *,
+    probe: Callable[[str], MediaSpec | None],
+) -> LibraryFile:
+    """拼接分段 + 字幕内封 + 探测 + 登记为版本（REST 完成上报与 NAS 本地执行共用，§7）。
+
+    拼接时字幕与章节从源文件一次拷入（:func:`final_mux_argv`）。任何一步校验失败都整件作废
+    （:func:`void_artifact`，断点归零，重转从头来）；成功后分段即删。
+    """
+    directory = artifact_dir_for(task.id or 0)
+    final_path = await artifact_path_for(session, task)
+    if final_path.exists():
+        final_path.unlink()  # 重跑的兜底
+    parts = sorted(directory.glob("seg*.mkv"))
+    try:
+        if not parts:
+            raise BadRequestException("没有收到任何产物分段")
+        source = await session.get(LibraryFile, task.target_file_id)
+        if source is None or not source.file_path:
+            raise BadRequestException("源文件已不存在，产物作废")
+        plan = await plan_for(session, source)
+        listing = directory / "concat.txt"
+        listing.write_text(
+            "".join(f"file '{part.resolve().as_posix()}'\n" for part in parts), encoding="utf-8"
+        )
+        argv = final_mux_argv(
+            concat_list=str(listing),
+            source_path=source.file_path,
+            output=str(final_path),
+            subtitle_indexes=plan.subtitles,
+        )
+        try:
+            # 拼接是 IO 密集的大活：放线程池，事件循环（WS 心跳、播放会话）照常跑
+            muxed = await asyncio.to_thread(
+                subprocess.run, argv, capture_output=True, text=True, timeout=3600
+            )
+        finally:
+            listing.unlink(missing_ok=True)
+        if muxed.returncode != 0:
+            logger.warning("预转码拼接/字幕内封失败：task=%s %s", task.id, muxed.stderr[-500:])
+            raise BadRequestException("产物分段拼接失败，整件作废")
+        size = final_path.stat().st_size
+        if size <= 0:
+            raise BadRequestException("产物为空，整件作废")
+        spec = await asyncio.to_thread(probe, str(final_path))
+        derived = await complete_task(
+            session,
+            task,
+            actual_bytes=size,
+            duration_seconds=spec.duration_seconds if spec else None,
+            video_codec=spec.video_codec if spec else None,
+            spec=spec,
+        )
+    except BadRequestException:
+        await void_artifact(session, task)
+        raise
+    for part in parts:
+        part.unlink(missing_ok=True)
+    return derived
 
 
 async def complete_task(
@@ -1194,14 +1342,17 @@ __all__ = [
     "cancel_task",
     "caps_accept_hevc",
     "check_quota",
+    "claim_local_task",
     "claim_next_task",
     "cleanup_stale",
     "complete_task",
     "create_preload_task",
     "delete_derived_file",
     "fail_task",
+    "finalize_artifact",
     "invalidate_for_source",
     "list_tasks",
+    "plan_for",
     "preload_inflight_bytes",
     "preload_usage_bytes",
     "reclaim_expired_leases",

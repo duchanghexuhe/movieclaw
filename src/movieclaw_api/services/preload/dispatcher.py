@@ -1,18 +1,19 @@
-"""预转码任务的调度器（Worker 统一调度 v2 的服务端半边）。
+"""预转码任务的调度器（Worker 统一调度 v2 的服务端半边，§7）。
 
-队列、原子抢占、断点台账、租约回收全部沿用 ``service.py`` 的数据库状态
-机；这里负责**选执行者并把任务交给它**：
+队列、原子抢占、断点台账、租约回收全部沿用 ``service.py`` 的数据库状态机；这里负责**选执行者并把
+任务交给它**：
 
-- **Worker 优先**（Q3 自动调度，2026-10-16 由「本地优先」翻转）：在线
-  Worker 按预算把排队任务清到满员——GPU Worker 比 NAS 核显快好几倍，
-  单任务也不该被本地慢槽抢走；
-- **本地兜底**：Worker 离线/满员/避让中，且 NAS 有可用硬件、播放不吃紧
-  时，任务由本机后台执行器跑掉——产物直接落盘（不经 Worker 的下载/
-  上传回路）；HDR 源本机装不出正确命令的只能远程。
+- **远程 Worker**：在线且有余量的 Worker 按预算接单，队首单它领不走（HEVC 没有硬件编码、或已有分段
+  归别人）就换下一台；
+- **NAS 本地**（§7）：正经的执行者，不是兜底。跑与 Worker 同一套分段协议（视频/音频按
+  ``SEGMENT_SECONDS`` 分段，分段直接写进任务目录，推进断点台账，中断后续转），命令走 NAS 的硬件链
+  （QSV/VAAPI，无硬件时 libx264）。调度规则：
 
-不与播放抢资源的口径（占用制避让）：本机在跑的**播放**转码会话数 ≥1 时
-本地预转码不再起新任务（已起的继续跑完——省流档本来就是要占机器的活，
-播放会话有它的低水位保护管着）。Worker 侧同理（T2 预算 = 并发−1）。
+  * 有能转这一单的 Worker 在线时，NAS 不接新单，让 GPU 按顺序清队，NAS 留给家里播放；
+  * 没有可用 Worker（离线、能力不符、排空）时，NAS 接单；
+  * NAS 已在跑的任务跑完为止，不中途交给 Worker（不同编码器的分段不能混拼）；
+  * **播放优先**：本机开始任何播放转码会话，本地预转码立刻停下（杀掉 ffmpeg、保留断点、任务回队）；
+    播放全部结束后再续派。看门狗每 2 秒看一次播放状态，这是“立刻”的实现方式。
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,19 +32,27 @@ from movieclaw_api.services.playback.remote_worker import (
     get_remote_worker_registry,
 )
 from movieclaw_api.services.preload import service as preload_service
+from movieclaw_api.services.preload.ffmpeg_preload import (
+    LOCAL_HW_BACKENDS,
+    LocalHw,
+    TrackPlan,
+    segment_argv,
+)
 from movieclaw_api.services.preload.service import ARTIFACT_UPLOAD_NAME
 from movieclaw_api.services.preload.signing import issue_preload_grant
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import PreloadTask, PreloadTaskStatus
+from movieclaw_db.models import LibraryFile, PreloadTask, PreloadTaskStatus
 
 logger = logging.getLogger("movieclaw_api.preload.dispatcher")
 
 #: 与 claim 长轮询时代同一个有效期（签的是整个任务周期）
 GRANT_TTL_S = 24 * 3600
 
-#: 本地预转码同时最多跑几个（软编链按核数折算，与 limits.auto_transcode_concurrency
-#: 软件档同一口径）。预转码是小时级后台活，不跟播放抢即时性。
+#: NAS 本地同时最多跑几个预转码（硬件链一个就够吃满，小时级后台活）
 _LOCAL_MAX_CONCURRENCY = 1
+
+#: 看门狗的巡检周期：播放开始到预转码停下的上限延迟
+_WATCH_INTERVAL = 2.0
 
 #: 本地执行连续失败的熔断线：attempts 在每次抢占时 +1，坏源/坏参数的任务
 #: 回队重转会无限烧算力（推送失败回队不受此限——那是环境问题不是任务问题）
@@ -68,7 +79,7 @@ def _get_dispatch_lock() -> asyncio.Lock:
 
 
 async def dispatch_queued_tasks() -> None:
-    """调度排队任务：Worker 优先，本地兜底。
+    """调度排队任务：远程 Worker 优先，NAS 本地按规则接单。
 
     单飞：一轮进行中时再触发只记「要重跑」标记，本轮结束后自动补一轮——
     队列不会因为并发触发而漏派，也不会两个循环同时读容量互相超发。
@@ -89,30 +100,42 @@ async def dispatch_queued_tasks() -> None:
 async def _dispatch_round() -> None:
     """一轮派发（调用方保证持有派发锁）。"""
     dispatched = 0
-    # Worker 先吃（每轮实时记账：占用是动态的），队列空或全员满员为止
+    # 远程 Worker 先吃（每轮实时记账：占用是动态的），队列空或全员满员为止
     async with get_database().session() as session:
         while True:
             if await _dispatch_one_remote(session) is None:
                 break
             dispatched += 1
-    # 本地兜底：Worker 没吃掉的（离线/满员）由本地槽消化（每轮重读容量）
-    while _local_capacity() > 0:
-        async with get_database().session() as session:
-            # 本机软编吃不了 HEVC（只有 NVENC 一条链）：HEVC 单留给远程硬件 Worker
-            claimed = await _claim_for(session, device_id=None, accept_hevc=False)
-            if claimed is None:
-                break
-            task, file = claimed
-            command = preload_service.build_task_command(task, file, worker_caps=None)
-            if command["unusable_reason"] or command["video_copy"]:
-                # 本地装不出正确命令（HDR 无 tonemapx）或直拷形态：回队等
-                # 远程 Worker（jellyfin-ffmpeg 有 tonemapx；直拷的远程路径
-                # 已有）。**必须跳出本地循环**——队列头就是这个任务，留在
-                # 循环里会原样再抢一次
-                await return_task(session, task.id, reason="本地不可执行，转远程")
-                break
-            _run_local(task, file, command)
-            dispatched += 1
+    # NAS 本地：只在本机有硬件时接单（没有硬件就不跑，免得 NAS 用 CPU 软编拖死机器）；播放在跑
+    # 时容量为 0；能转哪一类单由「有没有能转它的 Worker 在线」决定
+    if _hardware_available():
+        _ensure_watchdog()  # 播放让位后要续派，看门狗负责这一步
+    if _local_capacity() > 0:
+        local = await _local_hardware()
+        workers = get_remote_worker_registry().preload_workers()
+        allow_h264 = not workers
+        allow_hevc = local is not None and local.hevc_encoder is not None and not any(
+            preload_service.caps_accept_hevc(_preload_caps(w)) for w in workers
+        )
+        while _local_capacity() > 0:
+            async with get_database().session() as session:
+                claimed = await preload_service.claim_local_task(
+                    session, allow_h264=allow_h264, allow_hevc=allow_hevc
+                )
+                if claimed is None:
+                    break
+                task, file = claimed
+                plan = await preload_service.plan_for(session, file)
+                command = preload_service.build_task_command(
+                    task, file, local=local, plan=plan
+                )
+                if command["unusable_reason"]:
+                    # 本机装不出正确命令（如 HDR 没有任何 tone-map）：回队等远程，循环必须就此停，
+                    # 否则队首就是它，会原样再抢一次
+                    await return_task(session, task.id, reason="本地不可执行，转远程")
+                    break
+                _run_local(task, file, command)
+                dispatched += 1
     if dispatched:
         logger.info("预转码调度：%d 个任务已分发（远程/本地）", dispatched)
 
@@ -134,12 +157,13 @@ async def _dispatch_one_remote(session: AsyncSession) -> int | None:
             accept_hevc=preload_service.caps_accept_hevc(caps),
         )
         if claimed is None:
-            continue  # 这台没有可领的单（队列空，或剩下的只有它做不了的 HEVC）
+            continue  # 这台没有可领的单（队列空，或剩下的只有它做不了的 HEVC / 别人的分段）
         task, file = claimed
         # 硬编能力从 hello 申报取（与实时同源），软编回落；凭据绑定认领者，
         # 任务被回收重派后旧 Worker 的长凭据写不进产物
+        plan = await preload_service.plan_for(session, file)
         payload = await _payload_for(
-            session, task, file, caps, device_id=worker.login_device_id
+            session, task, file, caps, device_id=worker.login_device_id, plan=plan
         )
         ok = await registry.send_preload_job(worker, payload)
         if ok:
@@ -167,24 +191,27 @@ def _preload_caps(worker: WorkerConnection) -> dict:
 
 
 async def _claim_for(session: AsyncSession, *, device_id: int | None, accept_hevc: bool = True):
-    """抢占下一个排队任务（沿用 claim_next_task 的原子抢占）。
-
-    ``device_id=None`` 表示本地执行器抢占（worker_device_id 写 NULL）。
-    """
+    """抢占下一个排队任务（沿用 claim_next_task 的原子抢占与分段归属规则）。"""
     return await preload_service.claim_next_task(
         session, device_id=device_id, accept_hevc=accept_hevc
     )
 
 
 async def _payload_for(
-    session: AsyncSession, task, file, worker_caps: dict | None, *, device_id: int | None
+    session: AsyncSession,
+    task,
+    file,
+    worker_caps: dict | None,
+    *,
+    device_id: int | None,
+    plan: TrackPlan,
 ) -> dict:
     """组装与 claim 长轮询完全同构的 job.start 载荷（Worker 端只认这一种）。"""
     grant = await issue_preload_grant(
         task_id=task.id, file_id=file.id, ttl_seconds=GRANT_TTL_S, device_id=device_id
     )
     command = preload_service.build_task_command(
-        task, file, worker_caps=worker_caps
+        task, file, worker_caps=worker_caps, plan=plan
     )
     command["source_url"] = (
         f"api/v1/preload-worker/preload-source/{task.id}?token={grant}"
@@ -200,17 +227,25 @@ async def _payload_for(
     return command
 
 
-async def return_task(session: AsyncSession, task_id: int, *, reason: str) -> None:
-    """当场退回队列（断点台账保留，下一次触发点重派）。"""
+async def return_task(
+    session: AsyncSession, task_id: int, *, reason: str, yielded: bool = False
+) -> None:
+    """当场退回队列（断点台账保留，下一次触发点重派）。
+
+    ``yielded``：是播放让位而停（不是失败）——这次领取不计入熔断次数。已有分段的任务保留执行者。
+    """
     task = await session.get(PreloadTask, task_id)
     if task is not None and task.status in (
         PreloadTaskStatus.CLAIMED,
         PreloadTaskStatus.RUNNING,
     ):
         task.status = PreloadTaskStatus.QUEUED
-        task.worker_device_id = None
         task.claimed_at = None
         task.lease_expires_at = None
+        task.progress = None
+        preload_service.release_owner(task)
+        if yielded:
+            task.attempts = max(0, task.attempts - 1)
         await session.commit()
         logger.warning("预转码任务已退回队列：task=%s（%s）", task_id, reason)
 
@@ -237,8 +272,6 @@ async def return_task_or_fail(session: AsyncSession, task_id: int, *, reason: st
 
 def trigger_dispatch() -> None:
     """从同步上下文安全地触发一次派单（无事件循环时丢弃，等下一个触发点）。"""
-    import asyncio
-
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -247,42 +280,88 @@ def trigger_dispatch() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 本地执行器：NAS 后台跑预转码（Worker 离线/满员时的兜底路径）
+# NAS 本地执行器（§7）
 # ---------------------------------------------------------------------------
 
 #: 进程内本地任务记账（task_id → 协程句柄）。服务重启后这里的内存丢了
-#: 也无碍：租约 10 分钟到期回队，断点台账保留。
+#: 也无碍：租约到期回队，断点台账保留。
 _LOCAL_RUNNING: dict[int, asyncio.Task] = {}
+#: 正在被播放让位的任务（只发一次取消，避免清理途中被再次打断）
+_PREEMPTING: set[int] = set()
+
+def detect_local_hw() -> LocalHw | None:
+    """NAS 本机的硬件链能力（QSV/VAAPI）。阻塞：调用方放线程池（见 :func:`_local_hardware`）。
+
+    第一个探测通过的后端胜出（顺序同播放端）；原生 tone-map、HEVC 编码器、tonemapx 都在这里
+    按自检结论给出，装配层只读它。没有硬件返回 None（本地只能软编 H.264）。
+    """
+    from movieclaw_api.services.playback.ffmpeg_args import (
+        HW_BACKENDS,
+        encoder_options,
+        native_tonemap_filter,
+    )
+    from movieclaw_api.services.playback.hwprobe import (
+        available_local_backends,
+        local_filter_available,
+        local_hevc_encoder,
+    )
+
+    names = [name for name in available_local_backends() if name in LOCAL_HW_BACKENDS]
+    if not names:
+        return None
+    name = names[0]
+    backend = HW_BACKENDS[name]
+    return LocalHw(
+        backend=name,
+        hevc_encoder=local_hevc_encoder(name),
+        native_tonemap=native_tonemap_filter(backend),
+        has_tonemapx=local_filter_available("tonemapx"),
+        encoder_opts=tuple(encoder_options(backend)),
+    )
+
+
+async def _local_hardware() -> LocalHw | None:
+    """本机硬件能力。探测结果在 hwprobe 里已缓存，这里每轮重算（便宜）；阻塞调用放线程池。"""
+    return await asyncio.to_thread(detect_local_hw)
+
+
+def _playback_transcoding() -> bool:
+    """本机是否有任何播放转码会话在跑（远程会话与离线导出不算：导出本身会让位给播放）。"""
+    from movieclaw_api.services.playback.session import get_session_manager
+    from movieclaw_playback.decide import PlaybackTier
+
+    return any(
+        session.tier >= PlaybackTier.AUDIO_TRANSCODE
+        and not getattr(session, "remote", False)
+        and getattr(session, "export_id", None) is None
+        for session in get_session_manager().active()
+    )
+
+
+def _hardware_available() -> bool:
+    """本机有没有 NAS 本地能用的硬件后端（只看探测结论，不触发探测）。"""
+    from movieclaw_api.services.playback.hwprobe import available_local_backends
+
+    return bool(available_local_backends())
 
 
 def _local_capacity() -> int:
-    """本地还能起几个预转码任务。
-
-    两道闸：
-    - **硬件可用**：纯软编在 NAS 上是幻灯片（省流档 1080p 也要小时级），
-      只有硬件（核显）能跑出可用的速度。硬解+软编混合链没有探测依据，
-      不赌；
-    - **播放避让**：有任何一个播放转码会话在跑就不再起新任务——播放是
-      即时性活，预转码是后台活，让路的永远是后者。
-    """
-    from movieclaw_api.services.playback.hwprobe import available_local_backends
-    from movieclaw_api.services.playback.session import get_session_manager
-
-    if not available_local_backends():
-        return 0
-    if any(
-        s.tier is not None and s.tier >= 3 for s in get_session_manager().active()
-    ):
+    """NAS 还能同时跑几个预转码。没有硬件、或播放在跑时为 0（播放优先，NAS 不接新单）。"""
+    if not _hardware_available() or _playback_transcoding():
         return 0
     return max(0, _LOCAL_MAX_CONCURRENCY - len(_LOCAL_RUNNING))
 
 
-def _run_local(task, file, command: dict) -> None:
+def _run_local(task, file, command: dict) -> None:  # noqa: ARG001 - 与远程派单签名对齐
     """把任务交给后台协程执行（调用方已完成抢占）。"""
-    runner = asyncio.create_task(_execute_local_task(task.id, file, command["argv"]))
-    _LOCAL_RUNNING[task.id] = runner
-    runner.add_done_callback(lambda _t, tid=task.id: _LOCAL_RUNNING.pop(tid, None))
-    logger.info("预转码任务由本地执行：task=%s（软编链）", task.id)
+    task_id = task.id
+    runner = asyncio.create_task(_execute_local_task(task_id, command))
+    _ensure_watchdog()
+    _LOCAL_RUNNING[task_id] = runner
+    runner.add_done_callback(lambda _t, tid=task_id: _LOCAL_RUNNING.pop(tid, None))
+    logger.info(
+        "预转码任务由 NAS 本地执行：task=%s（%d 段）", task_id, command["segment_total"]
+    )
 
 
 def cancel_local_task(task_id: int) -> bool:
@@ -295,98 +374,143 @@ def cancel_local_task(task_id: int) -> bool:
     return True
 
 
-async def _execute_local_task(
-    task_id: int, file, argv: list[str]
-) -> None:
-    """跑一条本地预转码命令并登记产物（与 Worker 的 REST 数据面等价）。
+class _LocalStopped(Exception):
+    """播放开始：本段停下，任务回队（不是失败）。"""
 
-    与 Worker 路径的差异：源直接读 NAS 盘上的原文件（argv 里的 source.mkv
-    换成真实路径），产物先写协议名（artifact.mkv），完成后改名为动态片名
-    （与 REST complete 的 concat 目标同名），再调 complete 的服务层校验登记。
-    失败/异常时任务回队（断点保留）——本地路径随时可能因播放抢占而中断，
-    回队让下一个触发点重派。
+
+class _LocalFailure(Exception):
+    """本段 ffmpeg 失败。"""
+
+
+async def _execute_local_task(task_id: int, command: dict) -> None:
+    """NAS 本机分段转码（与 Worker 的数据面等价：分段进任务目录、断点台账推进、拼接登记）。
+
+    每段一个 ffmpeg 进程，完成即落盘并推进 ``resume_parts``；中途被播放抢占（看门狗取消本协程，
+    或段与段之间发现播放在跑）只杀掉当前进程、删掉半截段，任务回队，断点保留。
     """
-    from movieclaw_api.services.media_probe import probe_media
+    from movieclaw_api.services import media_probe
 
     directory = preload_service.artifact_dir_for(task_id)
     directory.mkdir(parents=True, exist_ok=True)
-    # argv 尾部是 [-f, matroska, <output>]；输入的 source.mkv 是 Worker
-    # 落盘约定名，本地直接换成真实源路径
-    local_argv = list(argv)
-    input_index = local_argv.index("-i")
-    local_argv[input_index + 1] = file.file_path
-    tmp_path = directory / ARTIFACT_UPLOAD_NAME
-    local_argv[-1] = str(tmp_path)
-    final_path = None
-    process = None
+    holder: dict[str, Any] = {"process": None}
+    stop_renew = asyncio.Event()
+    renewer = asyncio.create_task(_renew_local_lease(task_id, stop_renew))
+    segment_tmp: Path | None = None
     try:
-        # 续约线程：任务跑几小时，租约 10 分钟一续
-        stop_renew = asyncio.Event()
-        renewer = asyncio.create_task(_renew_local_lease(task_id, stop_renew))
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg", *local_argv,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
-        finally:
-            stop_renew.set()
-            renewer.cancel()
-        if process.returncode != 0:
-            tail = (stderr or b"")[-600:].decode(errors="replace")
-            logger.warning(
-                "本地预转码失败：task=%s 退出码 %s：%s", task_id, process.returncode, tail
-            )
-            async with get_database().session() as session:
-                await return_task_or_fail(
-                    session, task_id, reason=f"ffmpeg 退出码 {process.returncode}"
-                )
-            return
-        spec = probe_media(str(tmp_path))
         async with get_database().session() as session:
-            from movieclaw_db.models import PreloadTask
-
             task = await session.get(PreloadTask, task_id)
-            if task is None:
+            file = await session.get(LibraryFile, task.target_file_id) if task else None
+            if task is None or file is None:
                 return
-            # 与 REST complete 同一收尾：产物定名为动态片名后再校验登记
-            #（complete_task 按 artifact_path_for 找文件——协议名不是它要的）
-            final_path = await preload_service.artifact_path_for(session, task)
-            if final_path != tmp_path:
-                tmp_path.replace(final_path)
-            else:
-                final_path = None  # 源条目已失效：complete 会拦下，占位文件留给 finally 清
-            derived = await preload_service.complete_task(
-                session,
-                task,
-                actual_bytes=(final_path or tmp_path).stat().st_size,
-                duration_seconds=spec.duration_seconds if spec else None,
-                video_codec=spec.video_codec if spec else None,
-                spec=spec,
+            source_path = file.file_path
+            resume = task.resume_parts
+        total = command["segment_total"]
+        seconds = command["segment_seconds"]
+        started_at = time.monotonic()
+        for part in range(resume, total):
+            if _playback_transcoding():
+                raise _LocalStopped("播放开始，预转码让位")
+            segment_tmp = directory / f"seg{part:05d}.part.mkv"
+            argv = segment_argv(
+                command["argv"],
+                part=part,
+                total=total,
+                seconds=seconds,
+                source=source_path,
+                output=str(segment_tmp),
             )
-        final_path = None  # 已登记为版本（file_path 指向它），finally 不再清理
-        logger.info("本地预转码完成：task=%s → file=%s", task_id, derived.id)
+            seg_started = time.monotonic()
+            code, tail = await _run_ffmpeg(holder, argv)
+            if code != 0:
+                raise _LocalFailure(f"ffmpeg 退出码 {code}：{tail}")
+            segment_tmp.replace(directory / f"seg{part:05d}.mkv")
+            segment_tmp = None
+            done = part + 1 - resume
+            per_segment = (time.monotonic() - started_at) / max(done, 1)
+            async with get_database().session() as session:
+                await preload_service.record_part_count(session, task_id, part=part)
+                await _set_local_progress(
+                    session,
+                    task_id,
+                    {
+                        "phase": "transcoding",
+                        "segment_index": part + 1,
+                        "segment_total": total,
+                        "eta_seconds": int(per_segment * (total - part - 1)),
+                        "segment_seconds_taken": round(time.monotonic() - seg_started, 1),
+                    },
+                )
+        async with get_database().session() as session:
+            task = await session.get(PreloadTask, task_id)
+            derived = await preload_service.finalize_artifact(
+                session, task, probe=media_probe.probe_media
+            )
+        logger.info("NAS 本地预转码完成：task=%s → file=%s", task_id, derived.id)
+    except _LocalStopped as exc:
+        await _yield_to_playback(task_id, str(exc))
     except asyncio.CancelledError:
-        # 用户取消：communicate() 被取消不会杀子进程——手动收掉，否则小时级
-        # ffmpeg 成孤儿继续烧机，容量位还被 done_callback 提前还给派单器
-        if process is not None and process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
+        # 播放让位（看门狗取消）或服务关停：先收掉 ffmpeg，任务回队保留断点；用户取消时任务
+        # 已是 CANCELLED，return_task 不动它
+        _kill_process(holder)
+        await _yield_to_playback(task_id, "本机预转码中断（播放或停机）")
         raise
+    except _LocalFailure as exc:
+        logger.warning("本地预转码失败：task=%s %s", task_id, exc)
+        async with get_database().session() as session:
+            await return_task_or_fail(session, task_id, reason=str(exc)[:500])
     except Exception:  # noqa: BLE001
         logger.exception("本地预转码异常：task=%s", task_id)
         async with get_database().session() as session:
             await return_task_or_fail(session, task_id, reason="本地执行异常")
     finally:
-        # 失败/异常时协议名与改名后的半成品都留在目录里会污染下一轮
-        #（断点续转按段文件算），清掉；成功时 final_path 已置 None
+        stop_renew.set()
+        renewer.cancel()
+        _PREEMPTING.discard(task_id)
         with contextlib.suppress(OSError):
-            if final_path is not None and final_path.exists():
-                final_path.unlink()
-        with contextlib.suppress(OSError):
-            if tmp_path.exists():
-                tmp_path.unlink()
+            if segment_tmp is not None and segment_tmp.exists():
+                segment_tmp.unlink()
+
+
+async def _run_ffmpeg(holder: dict[str, Any], argv: list[str]) -> tuple[int, str]:
+    """跑一段 ffmpeg；进程挂在 holder 上，被取消时由调用方杀掉。"""
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", *argv,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    holder["process"] = process
+    try:
+        _, stderr = await process.communicate()
+    finally:
+        holder["process"] = None
+    return process.returncode or 0, (stderr or b"")[-600:].decode(errors="replace")
+
+
+def _kill_process(holder: dict[str, Any]) -> None:
+    """取消时收掉 ffmpeg：``communicate()`` 被取消不会杀子进程，手动收，
+    否则小时级 ffmpeg 成孤儿。"""
+    process = holder.get("process")
+    if process is not None and process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+
+async def _yield_to_playback(task_id: int, reason: str) -> None:
+    """播放让位：任务回队（断点保留，不计失败次数）。在被取消的协程里做 DB 操作是允许的。"""
+    async with get_database().session() as session:
+        await return_task(session, task_id, reason=reason, yielded=True)
+
+
+async def _set_local_progress(session: AsyncSession, task_id: int, progress: dict) -> None:
+    """本地执行的进度落台账（活动页据此显示第几段/剩余时间），并把执行中状态记为 RUNNING。"""
+    task = await session.get(PreloadTask, task_id)
+    if task is None:
+        return
+    if task.status == PreloadTaskStatus.CLAIMED:
+        task.status = PreloadTaskStatus.RUNNING
+    task.progress = progress
+    await preload_service.renew_lease(session, task_id)
+    await session.commit()
 
 
 async def _renew_local_lease(task_id: int, stop: asyncio.Event) -> None:
@@ -399,3 +523,67 @@ async def _renew_local_lease(task_id: int, stop: asyncio.Event) -> None:
         async with get_database().session() as session:
             await preload_service.renew_lease(session, task_id)
             await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# 播放让位看门狗（§7）
+# ---------------------------------------------------------------------------
+
+_WATCHDOG: asyncio.Task | None = None
+
+
+def _ensure_watchdog() -> None:
+    """启动看门狗（幂等）。没有事件循环（同步上下文）时什么也不做，等下一个触发点。"""
+    global _WATCHDOG
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _WATCHDOG is None or _WATCHDOG.done():
+        _WATCHDOG = asyncio.create_task(_watchdog_loop())
+
+
+def _preempt_local_runners() -> None:
+    """播放在跑：让所有本地执行协程停下（each 取消一次，清理在协程内完成）。"""
+    for task_id, runner in list(_LOCAL_RUNNING.items()):
+        if runner.done() or task_id in _PREEMPTING:
+            continue
+        _PREEMPTING.add(task_id)
+        runner.cancel()
+        logger.info("播放开始：本地预转码让位，task=%s", task_id)
+
+
+async def _has_open_tasks() -> bool:
+    """还有没结束的任务（排队/领取/执行中）吗？看门狗据此决定要不要继续巡检。"""
+    from sqlalchemy import func, select
+
+    async with get_database().session() as session:
+        count = (
+            await session.execute(
+                select(func.count()).select_from(PreloadTask).where(
+                    PreloadTask.status.in_(
+                        [
+                            PreloadTaskStatus.QUEUED,
+                            PreloadTaskStatus.CLAIMED,
+                            PreloadTaskStatus.RUNNING,
+                        ]
+                    )
+                )
+            )
+        ).scalar_one()
+    return bool(count)
+
+
+async def _watchdog_loop() -> None:
+    """每 2 秒：播放在跑就让本地执行停下；播放停了就续派。没有开放任务时退出。"""
+    while True:
+        try:
+            if _playback_transcoding():
+                _preempt_local_runners()
+            else:
+                await dispatch_queued_tasks()
+            if not _LOCAL_RUNNING and not await _has_open_tasks():
+                return
+        except Exception:  # noqa: BLE001 - 巡检失败不能让看门狗死掉
+            logger.warning("预转码看门狗巡检失败", exc_info=True)
+        await asyncio.sleep(_WATCH_INTERVAL)

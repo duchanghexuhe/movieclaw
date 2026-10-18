@@ -1,33 +1,49 @@
 """预转码的 ffmpeg 参数构造（docs/design/preload-transcode.md §2/§4/§5）。
 
-与实时转码（``ffmpeg_args.build_hls_command``）共用 HDR 色调映射与色彩转换的
-**思路**，输出侧完全不同：
+与实时转码（``ffmpeg_args.build_hls_command``）共用 HDR 色调映射、硬件链与色彩转换的
+**思路与参数表**（``HW_BACKENDS`` / 原生 tone-map 自检 / ``tonemapx``），输出侧完全不同：
 
 - 实时转码：HLS 分片 + 码率阶梯（受播放实时性约束）；
-- 预转码：整文件 MKV + 质量优先参数——高功耗 Windows 专门开机干活，
-  **越快转完越省电**（用户拍板），所以有 NVENC 就用 NVENC 全速跑。
+- 预转码：整文件 MKV + 质量优先参数——闲时干活，**越快转完越省电**，所以有硬件就用硬件。
 
-硬件优先（用户拍板：全功率越快越好）：
-- Worker 上报本机能力（``claim`` 携带 ``encoders``/``gpu_filters``）；
-- SDR 源 + NVENC：硬解 → ``scale_cuda`` → NVENC 整链留 GPU（编码器随格式：
-  HEVC= ``hevc_nvenc``，H.264= ``h264_nvenc``）；
-- HDR 源 + NVENC：硬解 → 下载回内存 → 软件 ``tonemap``（上游 ffmpeg 没有
-  jellyfin 的 ``tonemapx``/``tonemap_cuda``，色调映射只能 CPU；用 hable
-  算法——上游 ``tonemap`` 的可选算法里高光滚降最接近 BT.2390 的观感）→
-  回传 GPU → NVENC。色调映射只是一趟滤镜，编码大头仍在 GPU；
-- 无 NVENC / 探测失败：libx264 软编回退，参数与原第一版一致。
+执行端的硬件链（用户拍板：硬件优先）：
+- Worker 上报本机能力（claim 携带 ``encoders``/``filters``）；NVENC 全 GPU 链；
+- NAS 本地（``LocalHw``，自检结果来自 ``hwprobe``）：QSV / VAAPI；HDR 有原生 tone-map 用
+  原生，没有就 CPU ``tonemapx`` 下载→映射→回传 GPU 编码（jellyfin-ffmpeg 镜像都有）；
+- 没有硬件：libx264 软编（H.264）。HEVC 没有硬件编码器就判为不可执行（软编 HEVC 太慢）。
 
-字幕与音轨（§5）：全部音轨内封（AAC 转码 / 原轨 AAC 直拷），文本字幕全部
-内封；图形字幕（PGS/VobSub）第一版跳过，任务结果里说明。
+**字幕与音轨（§5，用户拍板）**：
+
+- 音轨：只留默认轨（``track_policy.default_audio``），默认轨是配音且与原声不同时再加原声；
+  最多两条，统一下混成立体声 AAC（省流 128k、高清 192k），评论轨丢弃；
+- 字幕：文本字幕（SRT/ASS/SSA）原样内封（``-c:s copy``）；PGS 只留默认字幕、库语言字幕
+  （含简繁/双语）和强制字幕；VobSub 跳过（播放器不支持）。外挂/AI 字幕不复制。
+- 字幕**不进分段**：分段用 ``-ss``（输入侧）切时，字幕包既不裁剪、时间戳也不跟着平移，
+  concat 后会重复、错位（真机实测，见 ``final_mux_argv``）。所以分段只含视频与音频，
+  字幕在拼接时从源文件整轨一次拷进去（时间轴与源一致，段边界零问题）。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
+from typing import Any
 
 from movieclaw_api.services.playback.ffmpeg_args import (
     _BT709_OUTPUT_TAGS,
     _COLOR_CONVERT_INPUT,
+    _SOFTWARE_TONEMAP,
+    HW_BACKENDS,
+    HwBackend,
+)
+from movieclaw_playback.subtitles import parse_embedded_track
+from movieclaw_playback.track_policy import (
+    NO_CONTEXT,
+    TrackContext,
+    default_audio,
+    default_subtitle,
+    dubbed_default_original,
+    library_subtitle_indexes,
 )
 
 #: 预转码编码格式（全局设置，下单时快照到任务行）：h264 全设备兼容；
@@ -44,6 +60,7 @@ FORMAT_DEFAULT = FORMAT_H264
 #:   HEVC 1080p·1.5M（原省流档原样——效率红利在这：同流量清晰度更高）；
 #: - 高清 = 各编码下更清晰的点：H.264 720p·3M（= 播放页 720p 档），
 #:   HEVC 1080p·4M（原高清档换编码，码率不动）。
+#: 音频：统一立体声 AAC，省流 128k、高清 192k（§5，用户拍板）。
 PRESET_SAVER = "saver"
 PRESET_PREMIUM = "premium"
 PRESET_IDS = (PRESET_SAVER, PRESET_PREMIUM)
@@ -55,11 +72,11 @@ _PRESET_SPECS: dict[str, dict] = {
         "variants": {
             FORMAT_H264: {
                 "height": 480, "maxrate": "1.5M", "bufsize": "3M",
-                "audio_bitrate": "192k", "video_codec": "h264",
+                "audio_bitrate": "128k", "video_codec": "h264",
             },
             FORMAT_HEVC: {
                 "height": 1080, "maxrate": "1.5M", "bufsize": "3M",
-                "audio_bitrate": "192k", "video_codec": "hevc",
+                "audio_bitrate": "128k", "video_codec": "hevc",
             },
         },
     },
@@ -68,11 +85,11 @@ _PRESET_SPECS: dict[str, dict] = {
         "variants": {
             FORMAT_H264: {
                 "height": 720, "maxrate": "3M", "bufsize": "6M",
-                "audio_bitrate": "256k", "video_codec": "h264",
+                "audio_bitrate": "192k", "video_codec": "h264",
             },
             FORMAT_HEVC: {
                 "height": 1080, "maxrate": "4M", "bufsize": "8M",
-                "audio_bitrate": "256k", "video_codec": "hevc",
+                "audio_bitrate": "192k", "video_codec": "hevc",
             },
         },
     },
@@ -100,32 +117,68 @@ def presets_for_format(video_format: str) -> list[dict]:
     """某格式下的全部档位（presets 接口/标题动态化的数据源）。"""
     return [effective_preset(pid, video_format) for pid in PRESET_IDS]
 
+
 #: 断点续转的产物分段大小（§7）：64 MiB 一段，上传失败只重传一段。
 PRELOAD_PART_BYTES = 64 * 1024 * 1024
 
-#: 图形字幕编码名集合（第一版跳过，不进产物）
-GRAPHIC_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvdsub", "pgssub"})
+#: 文本字幕：原样内封（``-c:s copy``），ASS 特效由网页端 JASSUB 渲染（§5）
+TEXT_SUBTITLE_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "mov_text", "webvtt"})
+#: PGS 图形字幕：只留默认 / 库语言 / 强制三类（§5，网页端 libbitsub 渲染，不烧录）
+PGS_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "pgssub"})
 
-#: jellyfin-ffmpeg 的 tonemapx（HDR 色调映射的唯一软件路径；上游 ffmpeg
-#: 的 zimg 缺 PQ→linear 路径，tonemap 滤镜到不了——见 build_preload_command）
-_SW_TONEMAP_JELLYFIN = (
-    "tonemapx=tonemap=bt2390:desat=0:p=bt709:t=bt709:m=bt709:format=yuv420p"
-)
+#: 音轨统一下混成的声道数（§5：立体声 AAC）
+AUDIO_CHANNELS = 2
+#: 最多保留的音轨数：默认轨 + 原声（§5）
+MAX_AUDIO_TRACKS = 2
+
+#: NAS 本地硬件后端（§7）：只用 QSV / VAAPI，设备路径与 ``HW_BACKENDS`` 同源
+LOCAL_HW_BACKENDS = ("vaapi", "qsv")
+_VAAPI_DEVICE = "/dev/dri/renderD128"
 
 
 @dataclass(frozen=True)
-class PreloadCommand:
-    """预转码命令与元数据：argv 由 Worker 原样执行。"""
+class TrackPlan:
+    """这一单保留哪些轨（源 ``audio_streams`` / ``subtitle_streams`` 的下标）。
 
-    argv: list[str]
-    preset_id: str
-    tone_map: bool
-    video_copy: bool  # 源已低于档位：视频直拷不升档（§2）
-    hw_backend: str | None  # nvenc | None（软编）
-    skipped_subtitle_indexes: list[int]  # 跳过的图形字幕轨（0 基，ffmpeg 流序）
-    has_chapters: bool
-    #: 非空 = 这条命令装不出来（HDR 源 + Worker 无 tonemapx），领取方据此拒做并说明
-    unusable_reason: str | None = None
+    ``audio`` 的顺序即输出顺序：默认轨在前。
+    """
+
+    audio: tuple[int, ...] = ()
+    subtitles: tuple[int, ...] = ()
+
+
+def plan_tracks(file: Any, context: TrackContext = NO_CONTEXT) -> TrackPlan:
+    """选轨（§5）：音轨只留默认轨（+ 配音时的原声），字幕文本全留、PGS 按规则留。
+
+    ``file`` 只需要 ``audio_streams`` / ``subtitle_streams`` / ``external_subtitles`` /
+    ``file_path`` 这几个属性（LibraryFile 与测试用的轻量对象都行）。
+    """
+    choice = default_audio(file, context)
+    audio: list[int] = [] if choice.index is None else [choice.index]
+    extra = dubbed_default_original(file, context)
+    if extra is not None and extra not in audio and len(audio) < MAX_AUDIO_TRACKS:
+        audio.append(extra)
+
+    pgs_wanted = _pgs_wanted(file, context, choice.ref)
+    subtitles: list[int] = []
+    for index, raw in enumerate(file.subtitle_streams or []):
+        codec = str(raw.get("codec") or "").lower() if isinstance(raw, dict) else ""
+        if codec in TEXT_SUBTITLE_CODECS or (codec in PGS_SUBTITLE_CODECS and index in pgs_wanted):
+            subtitles.append(index)
+    return TrackPlan(audio=tuple(audio), subtitles=tuple(subtitles))
+
+
+def _pgs_wanted(file: Any, context: TrackContext, audio_ref: str | None) -> set[int]:
+    """PGS 要留的下标：默认字幕（按将要放的音轨算）+ 库语言字幕 + 强制字幕（§5）。"""
+    wanted = set(library_subtitle_indexes(file, context))
+    default_ref = default_subtitle(file, context, audio_ref).ref
+    default_index = parse_embedded_track(default_ref) if default_ref else None
+    if default_index is not None:
+        wanted.add(default_index)
+    for index, raw in enumerate(file.subtitle_streams or []):
+        if isinstance(raw, dict) and raw.get("forced"):
+            wanted.add(index)
+    return wanted
 
 
 def _source_needs_tone_map(hdr: str | None, dv_profile: int | None) -> bool:
@@ -137,6 +190,37 @@ def _source_color_convert(color_space: str | None) -> str | None:
     """非 BT.709 的 SDR 源要显式色彩转换（与实时链同一张表）。"""
     spec = _COLOR_CONVERT_INPUT.get(color_space or "")
     return f"colorspace={spec}:all=bt709:format=yuv420p" if spec else None
+
+
+@dataclass(frozen=True)
+class LocalHw:
+    """NAS 本机的硬件能力快照（由 ``hwprobe`` 自检得出，装配层只读它，不跑 ffmpeg）。"""
+
+    backend: str  # vaapi | qsv
+    #: 本机真跑通过 HEVC 硬件编码的编码器名；None = 没有（HEVC 格式不能在本机执行）
+    hevc_encoder: str | None = None
+    #: 自检确认的原生 tone-map 滤镜表达式；None = 只能走 CPU 的 tonemapx
+    native_tonemap: str | None = None
+    #: 本机 ffmpeg 有 tonemapx（jellyfin-ffmpeg）：CPU 色调映射可用
+    has_tonemapx: bool = False
+    #: 自检确认、跟在编码器后面的参数（VAAPI 低功耗编码）
+    encoder_opts: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class PreloadCommand:
+    """预转码命令与元数据：argv 由执行者原样执行。"""
+
+    argv: list[str]
+    preset_id: str
+    tone_map: bool
+    video_copy: bool  # 源已低于档位：视频直拷不升档（§2）
+    hw_backend: str | None  # nvenc | vaapi | qsv | None（软编）
+    skipped_subtitle_indexes: list[int]  # 没留的字幕轨（0 基，源的字幕序）
+    has_chapters: bool
+    tracks: TrackPlan = field(default_factory=TrackPlan)
+    #: 非空 = 这条命令装不出来（缺 tonemapx / 缺 HEVC 硬件编码器），领取方据此拒做并说明
+    unusable_reason: str | None = None
 
 
 def _gpu_filters(
@@ -151,10 +235,7 @@ def _gpu_filters(
     """NVENC 链的滤镜序列（帧全程或大部分留在 GPU 上）。
 
     SDR：``scale_cuda``（输出 nv12 8-bit，NVENC 只吃这个）。
-    HDR 有 ``tonemap_cuda``（jellyfin-ffmpeg）：色调映射也在 GPU 上
-    （参数与软件档同源，BT.2390 + DV 元数据由滤镜的 apply_dovi 还原），
-    整条链硬解→映射→缩放→编码帧不出 GPU——真机实测 4K DV 源 14× 实时，
-    比回内存软件映射快 5 倍以上（2026-10-14，RTX 2070 SUPER）。
+    HDR 有 ``tonemap_cuda``（jellyfin-ffmpeg）：色调映射也在 GPU 上；
     HDR 只有 tonemapx：下载回内存做软件色调映射，再回传 GPU 编码（慢路）。
     """
     if needs_tone_map and has_tonemap_cuda:
@@ -165,7 +246,7 @@ def _gpu_filters(
             parts.append(f"scale_cuda=-2:{height_cap}:format=nv12")
         return parts
     if needs_tone_map:
-        parts = [f"hwdownload,format=p010le,{_SW_TONEMAP_JELLYFIN}"]
+        parts = [f"hwdownload,format=p010le,{_SOFTWARE_TONEMAP}"]
         if needs_scale:
             parts.append(f"hwupload_cuda,scale_cuda=-2:{height_cap}:format=nv12")
         return parts
@@ -183,15 +264,12 @@ def _gpu_filters(
 
 
 #: NVENC 编码器随格式：HEVC 同流量清晰度更高，H.264 全设备兼容。
-#: HEVC 的编码器名是 hevc_nvenc（2026-10-14 jf-ffmpeg 8.1.3 实测 -encoders
-#: 只此一名，无 h265_nvenc 别名），必须与 Worker 上报的 caps 名一致
+#: HEVC 的编码器名是 hevc_nvenc（无 h265_nvenc 别名），必须与 Worker 上报的 caps 名一致
 _NVENC_ENCODER_BY_CODEC = {"h264": "h264_nvenc", "hevc": "hevc_nvenc"}
 
 
 def _nvenc_video_args(preset: dict, filters: list[str]) -> list[str]:
-    """NVENC 编码参数 + maxrate 约束（NVENC 不认 CRF 模式下的
-    恒质量……实际上支持 -cq，但与 maxrate 混用的行为随驱动版本漂；用
-    纯码率模式最稳）。速度档 p2（用户盲测 p2/p4 无差别后拍板，真机实测
+    """NVENC 编码参数 + maxrate 约束。速度档 p2（用户盲测 p2/p4 无差别后拍板，真机实测
     快约 35%；p1 不再更快）+ spatial AQ 保暗场。"""
     codec = preset.get("video_codec", "h264")
     args: list[str] = []
@@ -214,9 +292,7 @@ def _nvenc_video_args(preset: dict, filters: list[str]) -> list[str]:
 
 
 def _x264_video_args(preset: dict, filters: list[str]) -> list[str]:
-    """软编回退：质量优先参数（无 NVENC 的机器仍能干活）。两个档位都用
-    libx264——libx265 软编慢一个量级（一部电影要转大半天），回退场景要的
-    是"能出活"，体积目标靠档位的 maxrate 帽兜住。"""
+    """软编回退：质量优先参数。只有 H.264 走软编（HEVC 软编太慢，见模块说明）。"""
     args: list[str] = []
     if filters:
         args += ["-vf", ",".join(filters)]
@@ -233,27 +309,104 @@ def _x264_video_args(preset: dict, filters: list[str]) -> list[str]:
     return args
 
 
+def _local_hw_video(
+    *,
+    preset: dict,
+    local: LocalHw,
+    needs_tone_map: bool,
+    needs_scale: bool,
+    color_space: str | None,
+) -> tuple[list[str], list[str], list[str], str | None]:
+    """NAS 本地的硬件链（QSV / VAAPI）。
+
+    返回 (编码前的设备参数, 输入侧 -hwaccel 参数, 视频参数, 不可行原因)。
+
+    解码留在 GPU（和播放同一套 ``-hwaccel`` 参数）。原生 tone-map 与缩放都在 GPU 上做；
+    遇到只有 CPU 能做的步骤（色彩空间转换、没有原生滤镜的 HDR）时，解码帧下载回内存，
+    CPU 滤镜处理完再 ``hwupload`` 回 GPU 编码——与 NVENC 的慢路同形。
+    """
+    codec = preset.get("video_codec", "h264")
+    if codec == "hevc" and local.hevc_encoder is None:
+        return [], [], [], (
+            "HEVC 格式需要本机的 HEVC 硬件编码器（QSV/VAAPI 自检未通过）；"
+            "请交给带 NVENC 的 Worker，或在设置里改用 H.264"
+        )
+    if needs_tone_map and local.native_tonemap is None and not local.has_tonemapx:
+        return [], [], [], (
+            "HDR 源需要原生 tone-map 或 jellyfin-ffmpeg 的 tonemapx 滤镜，本机都没有"
+        )
+    backend: HwBackend = HW_BACKENDS[local.backend]
+    encoder = local.hevc_encoder if codec == "hevc" else backend.encoder
+    height = int(preset["height"])
+    software = bool(_source_color_convert(color_space)) or (
+        needs_tone_map and local.native_tonemap is None
+    )
+
+    hwaccel = ["-hwaccel", backend.hwaccel]
+    if backend.device:
+        hwaccel += ["-hwaccel_device", backend.device]
+    pre_input: list[str] = []
+    filters: list[str] = []
+    if not software:
+        # 整链留在 GPU：输出硬件帧（tone-map 与缩放都是 GPU 滤镜）
+        hwaccel += ["-hwaccel_output_format", backend.hwaccel_output_format or backend.hwaccel]
+        if needs_tone_map:
+            filters.append(local.native_tonemap or "")
+        if needs_scale or needs_tone_map:
+            scale = f"{backend.scale_filter}=w=-2:h={height}:format=nv12" if needs_scale else ""
+            if scale:
+                filters.append(scale)
+        if not needs_tone_map and not needs_scale:
+            filters.append(f"{backend.scale_filter}=format=nv12")  # 钉死 8-bit
+        filters = [f for f in filters if f]
+    else:
+        # 软件段：解码帧下载回内存（不发 -hwaccel_output_format），CPU 滤镜后再上传
+        if backend.name == "vaapi":
+            pre_input = ["-vaapi_device", backend.device or _VAAPI_DEVICE]
+            upload = "hwupload"
+        else:
+            pre_input = ["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw"]
+            upload = "hwupload=extra_hw_frames=64"
+        convert = _source_color_convert(color_space)
+        if convert:
+            filters.append(convert)
+        if needs_tone_map:
+            filters.append(_SOFTWARE_TONEMAP)
+        if needs_scale:
+            filters.append(f"scale=-2:{height}")
+        filters += ["format=nv12", upload]
+
+    args: list[str] = []
+    if filters:
+        args += ["-vf", ",".join(filters)]
+    args += ["-c:v", encoder or backend.encoder, *local.encoder_opts]
+    if codec == "hevc":
+        args += ["-profile:v", "main"]
+    else:
+        args += ["-profile:v", "high", "-level:v", "4.1"]
+    args += ["-b:v", "0", "-maxrate", preset["maxrate"], "-bufsize", preset["bufsize"]]
+    return pre_input, hwaccel, args, None
+
+
 def build_preload_command(
     *,
     source_path: str,
     output_path: str,
     preset: dict,
     source: dict,
+    tracks: TrackPlan | None = None,
     hw_backend: str | None = None,
     worker_caps: dict | None = None,
+    local: LocalHw | None = None,
 ) -> PreloadCommand:
-    """构造预转码 ffmpeg 命令。
+    """构造预转码 ffmpeg 命令（视频与音频；字幕由拼接时的 :func:`final_mux_argv` 内封）。
 
-    ``source`` 是源文件的台账规格（``LibraryFile`` 的探测列 dict）：
-    resolution/video_codec/hdr/dv_profile/color_space/bit_depth/duration_seconds/
-    audio_streams/subtitle_streams。缺探测值时按最保守假设处理。
+    ``source`` 是源文件的台账规格（``LibraryFile`` 的探测列 dict）。
+    ``tracks`` 是 :func:`plan_tracks`
+    的结果（不给时：第一条音轨 + 全部文本字幕，只用于没有上下文的兜底）。
 
-    ``hw_backend``：``"nvenc"``（Worker 上报有 h264_nvenc）或 ``None``（软编）。
-    ``worker_caps``：Worker 的能力集（``encoders``/``gpu_filters``/``filters``），
-    用于判断 scale_cuda 与 tonemapx 可用性。
-
-    档位是**直拷判定的产品语义**（§2）：源 ≤ 档位高度且已是 H.264/SDR 时
-    直拷（只属于 H.264 格式的档位）。
+    执行者二选一：``local``（NAS 本机的 QSV/VAAPI 能力）或 ``worker_caps``（Worker 上报的
+    NVENC 能力，``hw_backend="nvenc"``）；都没有就 libx264 软编（只限 H.264）。
     """
     height_cap = preset["height"]
     caps = worker_caps or {}
@@ -262,14 +415,21 @@ def build_preload_command(
 
     audio_streams = source.get("audio_streams") or []
     subtitle_streams = source.get("subtitle_streams") or []
+    if tracks is None:
+        tracks = TrackPlan(
+            audio=(0,) if audio_streams else (),
+            subtitles=tuple(
+                i for i, t in enumerate(subtitle_streams)
+                if (t.get("codec") or "").lower() in TEXT_SUBTITLE_CODECS
+            ),
+        )
 
     # -- 视频链 --------------------------------------------------------------
     src_codec = (source.get("video_codec") or "").lower()
     src_height = _height_of(source.get("resolution"))
     needs_tone_map = _source_needs_tone_map(source.get("hdr"), source.get("dv_profile"))
     # 直拷只属于高清档（§2：源 ≤1080p 且已是 H.264/SDR = 已经是目标档）。
-    # 省流档永远重编码：台账没有源视频码率，判断不了"已经够小"，而省流的
-    # 全部意义在体积上限，宁可多转一次
+    # 省流档永远重编码：台账没有源视频码率，判断不了"已经够小"，而省流的全部意义在体积上限
     video_copy = (
         preset.get("video_codec", "h264") == "h264"
         and src_codec == "h264"
@@ -277,184 +437,203 @@ def build_preload_command(
         and 0 < src_height <= height_cap
         and not needs_tone_map
     )
+    needs_scale = src_height is None or src_height > height_cap
+    color_space = source.get("color_space")
 
-    # 硬编可用性：档位要的 NVENC 编码器 + scale_cuda 都在才算全 GPU 链可用
-    # （缺 scale_cuda 时 4K 源没法在 GPU 上缩放，链会断）
-    preset_encoder = _NVENC_ENCODER_BY_CODEC.get(preset.get("video_codec", "h264"), "h264_nvenc")
-    use_nvenc = (
-        hw_backend == "nvenc"
-        and preset_encoder in encoders
-        and "scale_cuda" in filters_available
-    )
-    has_tonemapx = "tonemapx" in filters_available
-    # HDR 色调映射的最低门槛是 tonemapx（jellyfin-ffmpeg）：上游 ffmpeg 的
-    # zimg 没有编进 PQ(HDR10/杜比视界)→linear 的转换路径（zscale 报
-    # "no path between colorspaces"，2026-10-14 真机实测），上游 tonemap
-    # 滤镜又只吃 linear 输入——没有 tonemapx 时 HDR 源装不出任何正确的链。
-    # 拒绝比转出一部偏色的片子好：错误信息直接告诉用户换 build。
-    unusable_reason: str | None = None
-    if needs_tone_map and not has_tonemapx and "tonemap_cuda" not in filters_available:
-        unusable_reason = (
-            "HDR 源需要 jellyfin-ffmpeg（tonemapx 滤镜）做色调映射，"
-            "当前 Worker 的 ffmpeg 不含它；请给 Worker 换 jellyfin-ffmpeg "
-            "的 Windows build 后重试"
-        )
-    # HEVC 只有 NVENC 一条链：软编回退恒为 libx264，产物编码对不上档位，会在整片转完后
-    # 被登记闸拒收。装不出就在这里说清，本地派单器据此转远程
-    if unusable_reason is None and preset.get("video_codec") == "hevc" and not use_nvenc:
-        unusable_reason = (
-            "HEVC 格式需要 NVENC 硬件编码（hevc_nvenc + scale_cuda），当前执行端没有；"
-            "请交给带 NVENC 的 Worker，或在设置里改用 H.264"
-        )
-    # 硬解可用性：解码器在 Worker 上报的 hw_decoders 里（缺省视为可硬解——
-    # ffmpeg 自己会回退软解，不作为整条链的开关）
-    hw_decodable = bool(caps.get("hw_decoders")) and src_codec in caps["hw_decoders"]
-
-    if unusable_reason:
-        return PreloadCommand(
-            argv=[], preset_id=preset["id"], tone_map=needs_tone_map, video_copy=False,
-            hw_backend=None, skipped_subtitle_indexes=[], has_chapters=False,
-            unusable_reason=unusable_reason,
-        )
-
+    pre_input: list[str] = []
     input_args: list[str] = []
-    if not video_copy:
-        if use_nvenc:
-            needs_scale = src_height is None or src_height > height_cap
-            has_tonemap_cuda = "tonemap_cuda" in filters_available
-            filters = _gpu_filters(
-                needs_tone_map=needs_tone_map,
-                needs_scale=needs_scale,
-                height_cap=height_cap,
-                color_space=source.get("color_space"),
-                has_tonemapx=has_tonemapx,
-                has_tonemap_cuda=has_tonemap_cuda,
-            )
-            # 需要下载回内存做 CPU 滤镜（HDR 走软件 tonemapx）时，硬解帧也要能
-            # hwdownload——用 nv12/p010 硬解输出格式；tonemap_cuda 全 GPU 链不
-            # 需要下载。BT.2020 色彩转换只在 SDR 源才轮得到：HDR 源的色调映射
-            # 滤镜（tonemap_cuda/tonemapx）本身就把画面转到 BT.709，再挂
-            # colorspace 是重复转换；若因它强制下载，全 GPU 滤镜链会吃到系统
-            # 内存帧直接报错（真机 -40，2026-10-14 冒烟实测）
-            needs_download = needs_tone_map and not has_tonemap_cuda
-            if not needs_tone_map:
-                needs_download = needs_download or bool(
-                    _source_color_convert(source.get("color_space"))
-                )
-            if hw_decodable and not needs_download:
-                # 整链留 GPU：硬解输出 cuda 帧
-                input_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            elif hw_decodable:
-                # 硬解但后面要下载：不用显式 hwaccel_output_format，ffmpeg 自行协商
-                input_args = ["-hwaccel", "cuda"]
-            video_args = _nvenc_video_args(preset, filters)
-            hw_backend_used: str | None = "nvenc"
-        else:
-            filters: list[str] = []
-            if needs_tone_map:
-                # 到这里必然 has_tonemapx（无 tonemapx 已在上面拒掉）
-                filters.append(_SW_TONEMAP_JELLYFIN)
-            else:
-                convert = _source_color_convert(source.get("color_space"))
-                if convert:
-                    filters.append(convert)
-            if src_height is None or src_height > height_cap:
-                filters.append(f"scale=-2:{height_cap}")
-            if filters:
-                filters.append("format=yuv420p")
-            video_args = _x264_video_args(preset, filters)
-            hw_backend_used = None
-    else:
+    video_args: list[str]
+    hw_backend_used: str | None = None
+    unusable_reason: str | None = None
+    if video_copy:
         video_args = ["-c:v", "copy"]
-        hw_backend_used = None
-
-    # -- 音轨（§5：全部内封；AAC 原轨直拷，其余 AAC 转码）--------------------
-    audio_args: list[str] = []
-    for i, track in enumerate(audio_streams):
-        codec = (track.get("codec") or "").lower()
-        if codec == "aac":
-            audio_args += [f"-c:a:{i}", "copy"]
+    elif local is not None and hw_backend is None:
+        pre_input, input_args, video_args, unusable_reason = _local_hw_video(
+            preset=preset, local=local, needs_tone_map=needs_tone_map,
+            needs_scale=needs_scale, color_space=color_space,
+        )
+        hw_backend_used = None if unusable_reason else local.backend
+    else:
+        # Worker 路径（NVENC）：能力缺一个就整链软编
+        preset_encoder = _NVENC_ENCODER_BY_CODEC.get(
+            preset.get("video_codec", "h264"), "h264_nvenc"
+        )
+        use_nvenc = (
+            hw_backend == "nvenc"
+            and preset_encoder in encoders
+            and "scale_cuda" in filters_available
+        )
+        has_tonemapx = "tonemapx" in filters_available
+        # HDR 色调映射的最低门槛是 tonemapx（jellyfin-ffmpeg）：上游 ffmpeg 的 zimg 没有
+        # PQ→linear 路径，拒绝比转出一部偏色的片子好
+        if needs_tone_map and not has_tonemapx and "tonemap_cuda" not in filters_available:
+            unusable_reason = (
+                "HDR 源需要 jellyfin-ffmpeg（tonemapx 滤镜）做色调映射，"
+                "当前 Worker 的 ffmpeg 不含它；请给 Worker 换 jellyfin-ffmpeg "
+                "的 Windows build 后重试"
+            )
+        elif preset.get("video_codec") == "hevc" and not use_nvenc:
+            unusable_reason = (
+                "HEVC 格式需要 NVENC 硬件编码（hevc_nvenc + scale_cuda），当前执行端没有；"
+                "请交给带 NVENC 的 Worker，或在设置里改用 H.264"
+            )
+        if unusable_reason is None:
+            if use_nvenc:
+                has_tonemap_cuda = "tonemap_cuda" in filters_available
+                filters = _gpu_filters(
+                    needs_tone_map=needs_tone_map,
+                    needs_scale=needs_scale,
+                    height_cap=height_cap,
+                    color_space=color_space,
+                    has_tonemapx=has_tonemapx,
+                    has_tonemap_cuda=has_tonemap_cuda,
+                )
+                # 需要下载回内存做 CPU 滤镜（HDR 走软件 tonemapx）时，硬解也要能 hwdownload；
+                # tonemap_cuda 全 GPU 链不需要下载。BT.2020 色彩转换只在 SDR 源才轮得到
+                needs_download = needs_tone_map and not has_tonemap_cuda
+                if not needs_tone_map:
+                    needs_download = needs_download or bool(
+                        _source_color_convert(color_space)
+                    )
+                hw_decodable = bool(caps.get("hw_decoders")) and src_codec in caps["hw_decoders"]
+                if hw_decodable and not needs_download:
+                    input_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+                elif hw_decodable:
+                    input_args = ["-hwaccel", "cuda"]
+                video_args = _nvenc_video_args(preset, filters)
+                hw_backend_used = "nvenc"
+            else:
+                filters = []
+                if needs_tone_map:
+                    filters.append(_SOFTWARE_TONEMAP)
+                else:
+                    convert = _source_color_convert(color_space)
+                    if convert:
+                        filters.append(convert)
+                if needs_scale:
+                    filters.append(f"scale=-2:{height_cap}")
+                if filters:
+                    filters.append("format=yuv420p")
+                video_args = _x264_video_args(preset, filters)
         else:
-            audio_args += [
-                f"-c:a:{i}", "aac",
-                f"-b:a:{i}", preset["audio_bitrate"],
-                f"-profile:a:{i}", "aac_low",
-            ]
+            video_args = []
 
-    # -- 字幕（§5：文本内封，图形跳过）--------------------------------------
-    text_subtitle_indexes = [
-        i for i, t in enumerate(subtitle_streams)
-        if (t.get("codec") or "").lower() not in GRAPHIC_SUBTITLE_CODECS
-    ]
-    skipped_subtitle_indexes = [
-        i for i, t in enumerate(subtitle_streams)
-        if (t.get("codec") or "").lower() in GRAPHIC_SUBTITLE_CODECS
-    ]
+    # -- 音轨（§5：默认轨 [+ 原声]，统一立体声 AAC）----------------------------
+    audio_maps: list[str] = []
+    audio_args: list[str] = []
+    for out_index, src_index in enumerate(tracks.audio):
+        audio_maps += ["-map", f"0:a:{src_index}"]
+        audio_args += [
+            f"-c:a:{out_index}", "aac",
+            f"-b:a:{out_index}", preset["audio_bitrate"],
+            f"-ac:a:{out_index}", str(AUDIO_CHANNELS),
+            f"-profile:a:{out_index}", "aac_low",
+        ]
 
     # -- 装配 ----------------------------------------------------------------
-    argv: list[str] = ["-hide_banner", "-nostdin", "-y"]
-    argv += input_args
-    # 源是 Worker 本地落盘的临时文件（服务端签名 URL 下载而来）
+    argv: list[str] = ["-hide_banner", "-nostdin", "-y", *pre_input, *input_args]
+    # 源是执行者能读到的文件（Worker 落盘的临时名 / NAS 原文件）
     argv += ["-i", source_path]
-    argv += ["-map", "0:v:0"]
-    if audio_streams:
-        argv += ["-map", "0:a?", "-map", "0:s?"]
-        argv += audio_args
-        # -af 全局作用于所有音频流，直拷轨吃不了滤镜；有任一轨要转码才挂
-        if any((t.get("codec") or "").lower() != "aac" for t in audio_streams):
-            argv += ["-af", "aresample=async=1"]
-        if text_subtitle_indexes:
-            argv += ["-c:s", "srt"]
-    # 图形字幕显式排除（-map 0:s? 会把它们也拖进来；第一版口径是"不含该轨
-    # 并在任务结果里说明"，保持产物与声明一致）
-    for index in skipped_subtitle_indexes:
-        argv += ["-map", f"-0:s:{index}"]
-    if not text_subtitle_indexes:
-        argv += ["-sn"]
-
+    argv += ["-map", "0:v:0", *audio_maps]
+    if tracks.audio:
+        # -af 全局作用于所有音频流：聚拢时间戳，分段的起点不留缝
+        argv += ["-af", "aresample=async=1"]
+    argv += audio_args
+    # 分段只含视频与音频：字幕与章节在拼接时从源文件一次拷入（见模块说明）
+    argv += ["-sn", "-map_chapters", "-1", "-map_metadata", "-1"]
     argv += video_args
-    if not video_copy and (
+    if not video_copy and unusable_reason is None and (
         needs_tone_map
-        or source.get("color_space") == "BT.709"
-        or source.get("color_space") in _COLOR_CONVERT_INPUT
+        or color_space == "BT.709"
+        or color_space in _COLOR_CONVERT_INPUT
     ):
         argv += _BT709_OUTPUT_TAGS
-
-    # 章节随源内封（mkv 原生支持）
-    argv += ["-map_chapters", "0"]
-    # 元数据不外泄：把源文件的标题轨清掉（压制组常写奇怪的字段）
-    argv += ["-map_metadata", "-1"]
-
     argv += ["-f", "matroska", output_path]
 
+    skipped = [
+        i for i in range(len(subtitle_streams)) if i not in set(tracks.subtitles)
+    ]
     return PreloadCommand(
-        argv=argv,
+        argv=argv if unusable_reason is None else [],
         preset_id=preset["id"],
         tone_map=needs_tone_map,
         video_copy=video_copy,
         hw_backend=hw_backend_used,
-        skipped_subtitle_indexes=skipped_subtitle_indexes,
+        skipped_subtitle_indexes=skipped,
         has_chapters=bool(source.get("chapters")),
+        tracks=tracks,
+        unusable_reason=unusable_reason,
     )
+
+
+def segment_total(duration_seconds: int | None, segment_seconds: int) -> int:
+    """按分段时长切成几段（至少一段；时长未知或不分段时为一段）。"""
+    if not segment_seconds or not duration_seconds or duration_seconds <= 0:
+        return 1
+    return max(1, math.ceil(duration_seconds / segment_seconds))
+
+
+def segment_argv(
+    base: list[str], *, part: int, total: int, seconds: int, source: str, output: str
+) -> list[str]:
+    """第 ``part`` 段的命令：在整片命令上换源、换输出，并切时长。
+
+    与 Worker 的分段完全同形（worker/worker.py）：``-ss`` 插在 ``-i`` 前（快速寻址），
+    ``-t`` 插在输入路径之后（输出侧）——输入侧 ``-t`` 切不动字幕包，所以字幕不走分段。
+    末段不加 ``-t``，转到 EOF。
+    """
+    argv = list(base)
+    argv[-1] = output
+    input_index = argv.index("-i")
+    argv[input_index + 1] = source
+    if seconds:
+        if part > 0:
+            argv[input_index:input_index] = ["-ss", str(part * seconds)]
+            input_index += 2
+        if part < total - 1:
+            argv[input_index + 2:input_index + 2] = ["-t", str(seconds)]
+    return argv
+
+
+def final_mux_argv(
+    *, concat_list: str, source_path: str, output: str, subtitle_indexes: tuple[int, ...]
+) -> list[str]:
+    """拼接 + 字幕内封（一趟 ``-c copy``）：视频/音频来自拼接清单，字幕与章节取自源文件。
+
+    字幕在源文件上的时间轴与分段拼接后的视频一致，所以不会重复、不会错位（真机实测）。
+    """
+    argv = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", concat_list,
+        "-i", source_path,
+        "-map", "0",
+    ]
+    for index in subtitle_indexes:
+        argv += ["-map", f"1:s:{index}"]
+    argv += ["-c", "copy", "-map_chapters", "1", "-map_metadata", "-1", output]
+    return argv
 
 
 def estimate_size_bytes(
     *,
     duration_seconds: int | None,
     preset: dict,
+    audio_tracks: int = 1,
 ) -> int:
-    """体积预估（§2）：码率 × 时长 + 音轨/字幕开销（±20% 内即可）。
+    """体积预估（§2）：视频按档位码率上限（保守值）+ 实际保留的音轨数 × 音频码率。
 
-    视频按档位码率上限算保守值，音频按档位码率算一轨，字幕每轨忽略不计。
+    字幕体积可忽略（文本几 KB，PGS 每条几 KB）。
     """
     if not duration_seconds or duration_seconds <= 0:
         return 0
-    total_bps = _bitrate_bps(preset["maxrate"]) + _bitrate_bps(preset["audio_bitrate"])
+    total_bps = _bitrate_bps(preset["maxrate"]) + max(audio_tracks, 0) * _bitrate_bps(
+        preset["audio_bitrate"]
+    )
     return int(duration_seconds * total_bps / 8)
 
 
 def _bitrate_bps(spec: str) -> int:
-    """ffmpeg 码率字面量（"1.5M"/"256k"）→ bps。"""
+    """ffmpeg 码率字面量（"1.5M"/"128k"）→ bps。"""
     text = spec.strip().lower()
     if text.endswith("k"):
         return int(float(text[:-1]) * 1_000)
