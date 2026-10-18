@@ -858,13 +858,14 @@ async def _assert_decide_payload(
     openapi_extra={"x-cli-hidden": True},
 )
 async def shared_decide(
+    request: Request,
     payload: PlaybackDecideRequest,
     principal: Principal = Depends(require_share_access),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[PlaybackDecisionView]:
     await _assert_decide_payload(session, principal, payload)
     return await playback_routes.decide_playback_route(
-        payload, principal=principal, session=session
+        request, payload, principal=principal, session=session
     )
 
 
@@ -876,6 +877,7 @@ async def shared_decide(
     openapi_extra={"x-cli-hidden": True},
 )
 async def shared_start_session(
+    request: Request,
     payload: PlaybackSessionRequest,
     response: Response,
     background_tasks: BackgroundTasks,
@@ -884,6 +886,7 @@ async def shared_start_session(
 ) -> ApiResponse[PlaybackSessionView]:
     await _assert_decide_payload(session, principal, payload)
     return await playback_routes.start_playback_session(
+        request,
         payload,
         response=response,
         background_tasks=background_tasks,

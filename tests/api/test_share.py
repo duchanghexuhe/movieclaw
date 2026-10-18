@@ -387,6 +387,32 @@ async def test_share_start_session_returns_timing_and_runs_background_tasks(
             assert attempt.status == "started" and attempt.tier == 0
 
 
+@pytest.mark.parametrize("by_file", [True, False])
+async def test_share_decide_returns_a_plan(client: TestClient, tmp_path, by_file) -> None:
+    """分享页判定的成功路径。
+
+    播放路由的判定 / 起播函数加过 request 参数，这里的转调曾漏改，访客一律 500；
+    当时只有 404 分支的用例，没人走到转调那一行。
+    """
+    from tests.api.test_playback_stream import CAPABILITY, _seed
+
+    file_id = await _seed(tmp_path, container="mp4")
+    async with get_database().session() as session:
+        file = await session.get(LibraryFile, file_id)
+        assert file is not None
+        library_id, item_id = file.library_id, file.media_item_id
+    share = _create_share(client, library_id, item_id)["data"]
+    _anonymous(client)
+
+    target = {"file_id": file_id} if by_file else {"media_item_id": item_id}
+    decided = client.post(
+        f"{_SHARE}/{share['slug']}/playback/decide",
+        json={**target, "capability": CAPABILITY},
+    )
+    assert decided.status_code == 200, decided.text
+    assert decided.json()["data"]["tier"] == 0
+
+
 # ---------------------------------------------------------------------------
 # 5. 访客视图投影
 # ---------------------------------------------------------------------------
