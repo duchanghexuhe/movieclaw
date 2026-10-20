@@ -60,11 +60,12 @@
 
 | 档位 | H.264（默认） | HEVC |
 |---|---|---|
-| **省流**（默认 `saver`） | 480p / H.264 / AAC 192k / **1.5 Mbps**（= 播放页 480p 档） | 1080p / HEVC Main / AAC 192k / **1.5 Mbps**（原省流档原样） |
-| 高清 `premium` | 720p / H.264 High / AAC 256k / **3 Mbps**（= 播放页 720p 档） | 1080p / HEVC Main / AAC 256k / **4 Mbps**（原高清档换编码，码率不动） |
+| **省流**（默认 `saver`） | 480p / H.264 / 立体声 AAC 128k / **1.5 Mbps**（= 播放页 480p 档） | 1080p / HEVC Main / 立体声 AAC 128k / **1.5 Mbps**（原省流档原样） |
+| 高清 `premium` | 720p / H.264 High / 立体声 AAC 192k / **3 Mbps**（= 播放页 720p 档） | 1080p / HEVC Main / 立体声 AAC 192k / **4 Mbps**（原高清档换编码，码率不动） |
 
-- **编码器随格式**：HEVC= hevc_nvenc，H.264= h264_nvenc（软编回退恒 libx264，
-  见下方"被否"——HEVC + 无 NVENC 的 Worker 会因产物编码不符被登记闸拒收）。
+- **编码器随格式**：HEVC= hevc_nvenc（NAS 本地为 QSV/VAAPI 的 HEVC 编码器），H.264=
+  h264_nvenc（无硬件时 libx264 软编）。HEVC 没有软编回退：执行者没有 HEVC 硬件编码器时
+  装命令阶段就判不可执行，这一单只派给能转它的执行者（§7）。
 - **格式在下单时快照到任务行**（`preload_task.video_format`）：改全局设置不影响
   在途任务，重试/断点续转按下单时格式装配命令。
 - **HEVC 的卖点**：省流档同等流量（1.5M）下清晰度更高（1080p 对 H.264 的 480p）；

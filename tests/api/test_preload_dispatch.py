@@ -230,8 +230,9 @@ def test_local_executor_picks_up_when_no_worker_online(client, tmp_path, monkeyp
     assert ran == [created["id"]]
 
 
-def test_busy_worker_leaves_task_to_local(client, tmp_path, monkeypatch):
-    """Worker 在线但有播放在跑（预算 0）：任务落回本地槽，Worker 不收到 job.start。"""
+def test_busy_worker_keeps_task_queued_until_playback_ends(client, tmp_path, monkeypatch):
+    """Worker 在线但有播放在跑（预算 0）：NAS 也不接（有能转这一单的 Worker 在线），任务留在
+    队列；播放结束后派给这台 Worker——「有人在看就不做预转码」两个执行者同一条规则。"""
     import movieclaw_api.services.preload.dispatcher as dispatcher
 
     monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
@@ -256,9 +257,15 @@ def test_busy_worker_leaves_task_to_local(client, tmp_path, monkeypatch):
         assert ws.receive_json()["type"] == "worker.heartbeat.ack"
         # create 触发的派单是后台任务，这里同步补一轮再断言
         client.portal.call(dispatcher.dispatch_queued_tasks)
-        assert ran == [created["id"]]
+        assert ran == []
+        assert created["id"] in _queued_task_ids(client)
+        # 播放结束：再派一轮，任务推给这台 Worker（结束即续派的触发点见 test_preload_yield）
         with registry._lock:
             registry._workers["win-full"].jobs.discard("job-rt-1")
+        client.portal.call(dispatcher.dispatch_queued_tasks)
+        message = ws.receive_json()
+        assert message["type"] == "job.start" and message["task_id"] == created["id"]
+        assert ran == []
 
 
 def test_local_video_copy_never_reaches_queue(client, tmp_path, monkeypatch):

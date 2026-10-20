@@ -423,7 +423,7 @@ def library_subtitle_indexes(file: LibraryFile, context: TrackContext = NO_CONTE
     if not library:
         return []
     indexes: list[int] = []
-    for subtitle in _subtitles(file):
+    for subtitle in _subtitles(file, _owner(file, context)):
         if subtitle.external or subtitle.commentary or library not in subtitle.languages:
             continue
         index = parse_embedded_track(subtitle.ref)
