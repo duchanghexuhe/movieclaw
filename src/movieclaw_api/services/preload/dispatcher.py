@@ -106,12 +106,13 @@ async def _dispatch_round() -> None:
             if await _dispatch_one_remote(session) is None:
                 break
             dispatched += 1
-    # NAS 本地：只在本机有硬件时接单（没有硬件就不跑，免得 NAS 用 CPU 软编拖死机器）；播放在跑
-    # 时容量为 0；能转哪一类单由「有没有能转它的 Worker 在线」决定
-    if _hardware_available():
-        _ensure_watchdog()  # 播放让位后要续派，看门狗负责这一步
+    # NAS 本地：有硬件走硬件链，没有硬件时 H.264 用 libx264 软编（慢，但 NAS 本地是基石——
+    # 不是每家都有 Worker，Worker 也不总在线；HEVC 仍要硬件）。播放在跑时容量为 0；能转哪一类
+    # 单由「有没有能转它的 Worker 在线」决定
+    _ensure_watchdog()  # 播放让位后要续派，看门狗负责这一步
     if _local_capacity() > 0:
         local = await _local_hardware()
+        software_caps = None if local is not None else await asyncio.to_thread(_software_caps)
         workers = get_remote_worker_registry().preload_workers()
         allow_h264 = not workers
         allow_hevc = local is not None and local.hevc_encoder is not None and not any(
@@ -127,7 +128,7 @@ async def _dispatch_round() -> None:
                 task, file = claimed
                 plan = await preload_service.plan_for(session, file)
                 command = preload_service.build_task_command(
-                    task, file, local=local, plan=plan
+                    task, file, worker_caps=software_caps, local=local, plan=plan
                 )
                 if command["unusable_reason"]:
                     # 本机装不出正确命令（如 HDR 没有任何 tone-map）：回队等远程，循环必须就此停，
@@ -338,16 +339,18 @@ def _playback_transcoding() -> bool:
     )
 
 
-def _hardware_available() -> bool:
-    """本机有没有 NAS 本地能用的硬件后端（只看探测结论，不触发探测）。"""
-    from movieclaw_api.services.playback.hwprobe import available_local_backends
+def _software_caps() -> dict | None:
+    """没有硬件时 NAS 走软编链：本机 ffmpeg 有 tonemapx（镜像里的 jellyfin-ffmpeg）时 HDR 也能
+    在 CPU 上做色调映射；没有就只转 SDR，HDR 单留给 Worker。阻塞：调用方放线程池。"""
+    from movieclaw_api.services.playback.hwprobe import local_filter_available
 
-    return bool(available_local_backends())
+    return {"filters": ["tonemapx"]} if local_filter_available("tonemapx") else None
 
 
 def _local_capacity() -> int:
-    """NAS 还能同时跑几个预转码。没有硬件、或播放在跑时为 0（播放优先，NAS 不接新单）。"""
-    if not _hardware_available() or _playback_transcoding():
+    """NAS 还能同时跑几个预转码。播放在跑时为 0（播放优先，NAS 不接新单）；没有硬件不再是 0——
+    软编也接（见 :func:`_dispatch_round`）。"""
+    if _playback_transcoding():
         return 0
     return max(0, _LOCAL_MAX_CONCURRENCY - len(_LOCAL_RUNNING))
 

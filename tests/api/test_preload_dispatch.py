@@ -18,6 +18,7 @@ from tests.api.test_preload_transcode import (  # noqa: I001
     _make_client,
     _pair_worker,
     _seed_file,
+    _set_format,
     _worker_headers,
 )
 
@@ -303,18 +304,66 @@ def test_local_avoids_running_playback_sessions(client, tmp_path, monkeypatch):
         assert message["type"] == "job.start" and message["task_id"] == created["id"]
 
 
-def test_local_capacity_is_zero_without_hardware(monkeypatch):
-    """NAS 无硬件（available_local_backends 空）：本地容量恒 0，不接预转码。"""
+@pytest.mark.preload_local
+def test_local_capacity_allows_software_without_hardware(monkeypatch):
+    """NAS 无硬件（available_local_backends 空）也接预转码：libx264 软编，只要没有播放在跑。"""
     import movieclaw_api.services.preload.dispatcher as dispatcher
     from movieclaw_api.services.playback import hwprobe
 
     monkeypatch.setattr(hwprobe, "available_local_backends", lambda: ())
-    monkeypatch.setattr(
-        dispatcher, "_LOCAL_RUNNING", {}
-    )
-    assert dispatcher._local_capacity() == 0
+    monkeypatch.setattr(dispatcher, "_LOCAL_RUNNING", {})
+    monkeypatch.setattr(dispatcher, "_playback_transcoding", lambda: False)
+    assert dispatcher._local_capacity() == 1
 
 
+@pytest.mark.preload_local
+def test_nas_without_hardware_takes_h264_in_software(client, tmp_path, monkeypatch):
+    """NAS 无硬件、没有 Worker 在线：SDR 单由 NAS 用 libx264 接走；HDR 单要本机 ffmpeg 有
+    tonemapx（有就 CPU 色调映射，没有就留在队列等 Worker）；HEVC 格式没有软编，NAS 不接。"""
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+
+    monkeypatch.setattr(dispatcher, "detect_local_hw", lambda: None)
+    monkeypatch.setattr(dispatcher, "_software_caps", lambda: None)
+    monkeypatch.setattr(dispatcher, "_playback_transcoding", lambda: False)
+    monkeypatch.setattr(dispatcher, "_ensure_watchdog", lambda: None)
+    commands: dict[int, dict] = {}
+
+    def fake_run(task, file, command):  # 同步签名对齐真 _run_local
+        commands[task.id] = command
+
+    monkeypatch.setattr(dispatcher, "_run_local", fake_run)
+
+    sdr = client.post(
+        f"{_PRELOAD}/tasks",
+        json={"file_id": _seed_file(client, tmp_path, hdr=None, codec="hevc", resolution="2160p")},
+    ).json()["data"]
+    assert commands[sdr["id"]]["unusable_reason"] is None
+    assert "libx264" in commands[sdr["id"]]["argv"]
+    assert commands[sdr["id"]]["hw_backend"] is None
+
+    # HDR、本机 ffmpeg 没有 tonemapx：装不出命令，留在队列
+    hdr = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": _seed_file(client, tmp_path, hdr="HDR10")}
+    ).json()["data"]
+    assert hdr["id"] not in commands
+    assert hdr["id"] in _queued_task_ids(client)
+
+    # 换成有 tonemapx 的 ffmpeg（jellyfin-ffmpeg）：同一单由 NAS 在 CPU 上做色调映射
+    monkeypatch.setattr(dispatcher, "_software_caps", lambda: {"filters": ["tonemapx"]})
+    client.portal.call(dispatcher.dispatch_queued_tasks)
+    argv = commands[hdr["id"]]["argv"]
+    assert "libx264" in argv and any("tonemapx" in arg for arg in argv)
+
+    # HEVC 格式：没有硬件编码器就没有软编回退，NAS 不领
+    _set_format(client, "hevc")
+    hevc = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": _seed_file(client, tmp_path, hdr=None)}
+    ).json()["data"]
+    assert hevc["id"] not in commands
+    assert hevc["id"] in _queued_task_ids(client)
+
+
+@pytest.mark.preload_local
 def test_local_capacity_is_zero_while_playback_transcodes(monkeypatch):
     """播放转码会话在跑：本地预转码让路。"""
     import movieclaw_api.services.preload.dispatcher as dispatcher

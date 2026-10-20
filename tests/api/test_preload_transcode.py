@@ -19,6 +19,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 from functools import partial
 from pathlib import Path
 
@@ -1695,6 +1696,34 @@ def test_policy_end_to_end_real_ffmpeg(client, tmp_path, monkeypatch, no_local):
     for (sp, _), (op, _) in zip(src_ass, out_ass, strict=True):
         assert abs(sp - op) < 0.05, (src_ass, out_ass)
     assert len(_packet_times(str(final), "s:1")) == len(_packet_times(str(source), "s:1"))
+
+
+@pytest.mark.preload_local
+def test_nas_without_hardware_runs_order_end_to_end(client, tmp_path, monkeypatch):
+    """没有硬件、没有 Worker 的 NAS：下单后由调度器交给本地执行者，libx264 软编分段转完、拼接
+    登记为版本（§7：本地是基石，没有 Worker 的家庭也能用预转码）。走真调度、真 ffmpeg。"""
+    from movieclaw_api.services.preload import dispatcher as _dispatcher
+    from movieclaw_api.services.preload import service as _svc
+
+    monkeypatch.setattr(_dispatcher, "detect_local_hw", lambda: None)
+    monkeypatch.setattr(_dispatcher, "_software_caps", lambda: None)
+    monkeypatch.setattr(_dispatcher, "_playback_transcoding", lambda: False)
+    monkeypatch.setattr(_svc, "SEGMENT_SECONDS", 4)
+    file_id = _seed_rich_media(client, tmp_path)
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+
+    deadline = time.monotonic() + 120
+    view: dict = {}
+    while time.monotonic() < deadline:
+        view = client.get(f"{_PRELOAD}/tasks/{task_id}").json()["data"]
+        if view["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.5)
+    assert view["status"] == "completed", view
+    info = _probe_streams(str(_path_of(client, view["result_file_id"])))
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert video["codec_name"] == "h264"
+    assert abs(float(info["format"]["duration"]) - 20.0) < 0.5
 
 
 def test_local_segments_resume_after_playback_preemption(client, tmp_path, monkeypatch, no_local):

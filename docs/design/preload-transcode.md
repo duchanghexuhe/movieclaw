@@ -188,8 +188,10 @@ Worker 跑同一套分段协议。有能转这一单的 Worker 在线时，NAS �
 - **执行者**
   - **NAS 本地**：命令走 NAS 实测的硬件链（QSV / VAAPI，能力来自 `hwprobe` 自检：原生 tone-map、
     HEVC 编码器、`tonemapx` 是否可用），解码留在 GPU。HDR 有原生 tone-map 就用原生，没有就走 CPU
-    `tonemapx`（解码帧下载→映射→回传 GPU 编码）。只有本机硬件链自检通过时才接单；没有硬件则 NAS 不跑
-    预转码，免得 CPU 软编把机器拖死。
+    `tonemapx`（解码帧下载→映射→回传 GPU 编码）。没有硬件也接单（2026-10-20 拍板：NAS 本地是基石，
+    不是每家都有 Worker，Worker 也不总在线）：H.264 用 libx264 软编，本机 ffmpeg 有 `tonemapx` 时 HDR
+    也在 CPU 上做色调映射，没有就留给 Worker。慢（进度与剩余时间在活动页可见），但播放优先照旧——
+    有人播放就让位，所以不会拖慢家里看片。
   - **Windows Worker**（外置，GPU）：NVENC 链，协议与 NAS 相同（`worker/*`）。Worker 自身设置（并发、
     仅接通电源时执行、开机自启）在它自己的界面里。
 - **分段协议**（两端一致）：视频与音频按 `SEGMENT_SECONDS` 分段，每段一个 ffmpeg 进程（`-ss` 插在
