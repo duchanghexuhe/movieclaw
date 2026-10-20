@@ -49,7 +49,11 @@ CONFIG_FILE = (
 )
 #: 预转码的本地工作目录（源文件与分段）：取消时整目录删掉，让位时原样保留
 WORK_DIR = Path(__file__).with_name("work")
-PROGRESS_SECONDS = 60
+#: 预转码进度上报周期（顺带续约）。2026-10-20 从 60 秒收紧到 15 秒：边下边转
+#: 之后一集 37 分钟的视频十几分钟就转完，60 秒一拍会让活动页的段号/速度
+#: 半分钟才动一次、看着像卡住；而一次上报只是一个很小的 POST，压力可忽略。
+#: 与活动页的 15 秒轮询同频，端到端最坏延迟 ≈ 30 秒。
+PROGRESS_SECONDS = 15
 PART_BYTES_DEFAULT = 64 * 1024 * 1024
 # ffmpeg 子进程不弹控制台窗：pythonw 启动时子进程无可继承的控制台，
 # 不加这个每段 ffmpeg 都会自建黑窗。常量仅 Windows 有，其它平台取 0
@@ -524,15 +528,24 @@ def process_task(
     seg_times: list[float] = []
     progress_stop = threading.Event()
 
-    def reporter() -> None:
-        while not progress_stop.wait(PROGRESS_SECONDS):
+    def report_once() -> None:
+        """立刻发一次进度快照（不等周期、失败不抛）。
+
+        阶段切换这种「只发生一次」的状态（收尾）必须靠它——按上报周期轮，
+        收尾那几分钟活动页会一直挂着最后一段，看着像卡死。
+        """
+        with contextlib.suppress(Exception):
             api.request(
                 "POST",
                 f"/api/v1/preload-worker/tasks/{task_id}/progress",
                 json_body=dict(progress),
             )
 
-    thread = threading.Thread(target=reporter, daemon=True)
+    def reporter() -> None:
+        while not progress_stop.wait(PROGRESS_SECONDS):
+            report_once()
+
+    thread = threading.Thread(target=reporter, name="progress-reporter", daemon=True)
     thread.start()
     try:
         # 2) 取源。**默认边下边转**：ffmpeg 的 -i 直接指向 NAS 的取源端点，
@@ -676,33 +689,38 @@ def process_task(
                 # 预计剩余：已完成段的平均耗时 × 剩余段数
                 progress["eta_seconds"] = int(sum(seg_times) / len(seg_times) * remaining)
             print(f"[{task_id}] 第 {part + 1}/{total_parts} 段完成")
-        # 段全部传完：拼接+校验+登记由服务端做（约 1 分钟），UI 标收尾
+        # 段全部传完：拼接+校验+登记由服务端做（约 1 分钟），UI 标收尾。
+        # **立刻上报一次**：收尾是只发生一次的状态，按 60 秒周期轮的话它基本
+        # 发不出去，活动页会一直挂着最后一段，看着像卡死（2026-10-20 实测）
         progress["phase"] = "finalizing"
         progress["eta_seconds"] = 0
+        report_once()
+
+        # 4) 完成（服务端 concat + 校验 + 登记）。上报线程**此刻还活着**：
+        # 拼接是分钟级的大活（最长 1 小时），期间持续续约才不会被 10 分钟
+        # 租约回收——否则大片的收尾会被判超时、任务重排，白拼一次
+        status, view = api.request(
+            "POST", f"/api/v1/preload-worker/tasks/{task_id}/complete", json_body={}
+        )
+        if status != 200:
+            if stop is not None and stop.is_set():
+                print(f"[{task_id}] 停止中断于 complete（断点保留）")
+                return False
+            if status == 400:
+                shutil.rmtree(workdir, ignore_errors=True)  # 任务已终态：本地半成品一并清
+            api.request(
+                "POST",
+                f"/api/v1/preload-worker/tasks/{task_id}/fail",
+                json_body={"error": f"complete 被拒：{status} {view}"},
+            )
+            print(f"[{task_id}] complete 失败：{status}")
+            return False
+        print(f"[{task_id}] 完成：登记为 file #{view['data']['file_id']}")
+        source.unlink(missing_ok=True)
+        return True
     finally:
         progress_stop.set()
         thread.join()
-
-    # 4) 完成（服务端 concat + 校验 + 登记）
-    status, view = api.request(
-        "POST", f"/api/v1/preload-worker/tasks/{task_id}/complete", json_body={}
-    )
-    if status != 200:
-        if stop is not None and stop.is_set():
-            print(f"[{task_id}] 停止中断于 complete（断点保留）")
-            return False
-        if status == 400:
-            shutil.rmtree(workdir, ignore_errors=True)  # 任务已终态：本地半成品一并清
-        api.request(
-            "POST",
-            f"/api/v1/preload-worker/tasks/{task_id}/fail",
-            json_body={"error": f"complete 被拒：{status} {view}"},
-        )
-        print(f"[{task_id}] complete 失败：{status}")
-        return False
-    print(f"[{task_id}] 完成：登记为 file #{view['data']['file_id']}")
-    source.unlink(missing_ok=True)
-    return True
 
 
 

@@ -443,6 +443,15 @@ async def _execute_local_task(task_id: int, command: dict) -> None:
                         "segment_seconds_taken": round(time.monotonic() - seg_started, 1),
                     },
                 )
+        # 段全部转完、进入拼接+校验+登记（分钟级大活）：先把这个阶段写进台账，
+        # 活动页才不会一直挂着最后一段以为卡死。Worker 端同一口径
+        async with get_database().session() as session:
+            await _set_local_progress(
+                session,
+                task_id,
+                {"phase": "finalizing", "segment_total": total, "segment_index": total,
+                 "eta_seconds": 0},
+            )
         async with get_database().session() as session:
             task = await session.get(PreloadTask, task_id)
             derived = await preload_service.finalize_artifact(

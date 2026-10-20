@@ -423,6 +423,54 @@ def test_segment_argv_puts_t_after_the_input_and_ss_before_it(tmp_path, monkeypa
     assert "-t" not in last
 
 
+def test_process_task_reports_finalizing_before_complete(tmp_path, monkeypatch):
+    """收尾阶段必须真被上报出去，而且是在 complete 之前。
+
+    2026-10-20 实测缺陷：`finalizing` 写完就 `progress_stop.set()`，上报线程
+    按 60 秒周期轮——收尾只有一个瞬间，基本发不出去，活动页一直挂着最后一段
+    看着像卡死。这里钉死三件事：finalizing 发过、发在 complete 之前、
+    上报线程活到 complete 返回（拼接是分钟级，要靠它续约）。
+    """
+    monkeypatch.delenv("MOVIECLAW_WORKER_STREAM_SOURCE", raising=False)
+    events: list[tuple[str, str]] = []
+    alive_at_complete: list[bool] = []
+
+    def fake_run_ffmpeg(ffmpeg, argv, workdir, *, stop=None, register=None, env=None):
+        Path(argv[-1]).write_bytes(b"seg")
+        return 0, ""
+
+    class RecordingApi(_FakeApi):
+        def request(self, method, path, **kwargs):  # noqa: ANN001
+            body = kwargs.get("json_body") or {}
+            if path.endswith("/complete"):
+                # complete 是分钟级大活，期间必须有上报线程在续约，
+                # 否则 10 分钟租约会把任务判超时、重排，白拼一次
+                alive_at_complete.append(
+                    any(
+                        t.name == "progress-reporter" and t.is_alive()
+                        for t in threading.enumerate()
+                    )
+                )
+                events.append(("complete", ""))
+            elif path.endswith("/progress"):
+                events.append(("progress", str(body.get("phase"))))
+            return super().request(method, path, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "run_ffmpeg", fake_run_ffmpeg)
+    ok = worker_mod.process_task(
+        RecordingApi(), "ffmpeg", _preload_task(segment_seconds=0),
+        tmp_path / "work" / "7", progress={},
+    )
+
+    assert ok is True
+    phases = [phase for kind, phase in events if kind == "progress"]
+    assert "finalizing" in phases, f"收尾阶段没上报出去：{events}"
+    # finalizing 必须早于 complete——complete 之后任务就进终态了
+    assert events.index(("progress", "finalizing")) < events.index(("complete", ""))
+    # 上报线程活到 complete 返回
+    assert alive_at_complete == [True]
+
+
 def test_process_task_streams_source_without_downloading(tmp_path, monkeypatch):
     """默认边下边转：ffmpeg 的 -i 直接指向取源端点，本地不落整文件。
 
@@ -450,9 +498,12 @@ def test_process_task_streams_source_without_downloading(tmp_path, monkeypatch):
     assert first[first.index("-i") + 1].startswith("http://nas:3000/api/v1/preload-worker/")
     # 网络自愈选项贴在 -i 之前
     assert "-reconnect" in first and first.index("-reconnect") < first.index("-i")
-    # 没有任何整文件下载（服务端只收到分段 PUT 与 complete）
+    # 没有整文件下载：服务端只收到分段 PUT、进度上报与 complete
     assert not (workdir / "source.mkv").exists()
-    assert all(method == "PUT" or path.endswith("/complete") for method, path in api.calls)
+    assert all(
+        method == "PUT" or path.endswith(("/complete", "/progress"))
+        for method, path in api.calls
+    )
 
 
 def test_process_task_falls_back_to_download_when_stream_cannot_open(tmp_path, monkeypatch):

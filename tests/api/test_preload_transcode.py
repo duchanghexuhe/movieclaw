@@ -1726,6 +1726,37 @@ def test_nas_without_hardware_runs_order_end_to_end(client, tmp_path, monkeypatc
     assert abs(float(info["format"]["duration"]) - 20.0) < 0.5
 
 
+def test_local_executor_reports_finalizing_before_merging(client, tmp_path, monkeypatch, no_local):
+    """NAS 本地执行者在拼接前也要把 finalizing 写进台账。
+
+    Worker 端 2026-10-20 修过同样的缺陷（收尾状态写进去但没人看得见）；
+    本地执行者原来压根不写，活动页会一直挂着最后一段。两边口径必须一致。
+    """
+    from movieclaw_api.services.preload import dispatcher as _dispatcher
+    from movieclaw_api.services.preload import service as _svc
+
+    file_id = _seed_rich_media(client, tmp_path)
+    task_id = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]["id"]
+    command = _local_command(client, task_id, seconds=4, monkeypatch=monkeypatch)
+
+    seen: list[str] = []
+    original = _svc.finalize_artifact
+
+    async def spy_finalize(session, task, *, probe):  # noqa: ANN001
+        # 拼接真正开始前，台账里应该已经是 finalizing
+        async with get_database().session() as probe_session:
+            row = await probe_session.get(PreloadTask, task_id)
+            seen.append((row.progress or {}).get("phase"))
+        return await original(session, task, probe=probe)
+
+    monkeypatch.setattr(_svc, "finalize_artifact", spy_finalize)
+    client.portal.call(partial(_dispatcher._execute_local_task, task_id, command))  # type: ignore[attr-defined]
+
+    assert seen == ["finalizing"], seen
+    view = client.get(f"{_PRELOAD}/tasks/{task_id}").json()["data"]
+    assert view["status"] == "completed", view
+
+
 def test_local_segments_resume_after_playback_preemption(client, tmp_path, monkeypatch, no_local):
     """本地分段续转（真 ffmpeg）：播放开始 → 正在转的段被杀、半截段删掉、任务回队且断点保留；
     播放结束 → 从断点续转，最终拼成完整产物。"""
