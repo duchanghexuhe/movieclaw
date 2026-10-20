@@ -61,6 +61,55 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 #: _NO_PROXY_OPENER 同一取缔：全部内网请求显式直连。
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+#: HTTP 直读取源时给 ffmpeg 的网络选项（与实时路径 ffmpeg_args 同一口径）：
+#: 断线重连 + 读超时。不加的话一次网络抖动整段失败，边下边转反而更脆。
+_HTTP_INPUT_OPTIONS = (
+    "-reconnect", "1",
+    "-reconnect_on_network_error", "1",
+    "-reconnect_delay_max", "15",
+    "-rw_timeout", "30000000",
+)
+
+#: 边下边转的开关（默认开）：环境变量置 0 可退回「先整文件下载再转」，排查用
+_STREAM_SOURCE_ENV = "MOVIECLAW_WORKER_STREAM_SOURCE"
+
+#: 内部地址（NAS / 本机回环）的 no_proxy 口径：ffmpeg 会认这两个变量，
+#: 让内网直连、其余流量照旧走进程环境里的代理。
+_INTERNAL_HOSTS_SUFFIX = "192.168.31.10,127.0.0.1,localhost"
+
+
+def stream_source_enabled() -> bool:
+    """是否走「ffmpeg 直接 HTTP 读源、边下边转」。
+
+    2026-10-20 实测（真实 argv：HDR 源 + tonemap_cuda + NVENC 480p）经 HTTP
+    直读 NAS 源端点做整段转码，speed=5.93x —— 取源远不是瓶颈，而整文件下载
+    与转码串行要多花「源体积 ÷ 千兆」那几分钟。关掉它只用于排查。
+    """
+    return os.environ.get(_STREAM_SOURCE_ENV, "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def ffmpeg_env() -> dict[str, str]:
+    """给 ffmpeg 子进程的环境：内网直连、外网照旧走代理。
+
+    ffmpeg 的 http 协议会读 ``http_proxy``——挂机机器常带着 Clash 的代理变量，
+    不处理就会把 NAS 内网地址送去代理（实测直接连接失败 + 吞吐掉到 1.7MB/s）。
+    """
+    env = dict(os.environ)
+    no_proxy = ",".join(
+        part for part in (env.get("no_proxy") or env.get("NO_PROXY"), _INTERNAL_HOSTS_SUFFIX)
+        if part
+    )
+    env["no_proxy"] = no_proxy
+    env["NO_PROXY"] = no_proxy
+    return env
+
+
+def stream_source_url(api_server: str, source_url: str) -> str:
+    """取源的绝对 URL（claim 给的是协议相对路径）。"""
+    return api_server + "/" + source_url
+
 
 class Api:
     """NAS 控制面/数据面客户端（设备令牌鉴权）。"""
@@ -202,16 +251,18 @@ def run_ffmpeg(
     *,
     stop: threading.Event | None = None,
     register=None,  # Callable[[subprocess.Popen], None] | None
+    env: dict[str, str] | None = None,
 ) -> int:
     """执行 ffmpeg（argv 不含 ffmpeg 本身），返回退出码。
 
     ``stop`` 是停止钩子：置位后立即杀掉在跑的进程（抢占/取消/退出不等
     600s 的段跑完）。``register`` 在进程起来时交出句柄——调用方据此能在
-    停止路径之外（进程退出兜底）杀掉它。
+    停止路径之外（进程退出兜底）杀掉它。``env`` 覆盖子进程环境（缺省继承，
+    见 :func:`ffmpeg_env`）。
     """
     proc = subprocess.Popen(
         [ffmpeg, *argv], cwd=workdir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        creationflags=_NO_WINDOW,
+        creationflags=_NO_WINDOW, env=env,
     )
     if register is not None:
         register(proc)
@@ -375,6 +426,55 @@ def copy_source_stream(
     return received
 
 
+def download_source(
+    api: Api,
+    task_id: int,
+    url: str,
+    source: Path,
+    progress: dict,
+    *,
+    expected: int,
+    stop: threading.Event | None = None,
+) -> bool:
+    """整文件下载源到 ``source``；成功返回 True（失败已上报/已停止返回 False）。
+
+    整文件下载是边下边转的**回落路径**：ffmpeg 读不了这个端点（凭据过期、
+    服务端不支持 Range 之类）时退回「先下完再转」。下载带 3 次重试——
+    17GB 源一次网络抖动就整任务 FAILED、断点归零，太脆。
+    """
+    progress.update(phase="downloading", downloaded_bytes=0, total_bytes=expected)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if stop is not None and stop.is_set():
+            print(f"[{task_id}] 停止中断于下载（断点保留）")
+            return False
+        try:
+            req = urllib.request.Request(url)
+            with _NO_PROXY_OPENER.open(req, timeout=600) as resp, open(source, "wb") as out:
+                copy_source_stream(resp, out, progress, expected=expected)
+            last_error = None
+            # 下载收尾：速度归零，ETA 交给转码段重新计算（否则页面会一直
+            # 挂着下载期算出的剩余时间）
+            progress["speed_bps"] = 0
+            progress.pop("eta_seconds", None)
+            break
+        except (urllib.error.URLError, OSError) as exc:
+            last_error = exc
+            source.unlink(missing_ok=True)
+            progress["downloaded_bytes"] = 0
+            progress["speed_bps"] = 0
+            print(f"[{task_id}] 源下载失败（第 {attempt + 1}/3 次）：{exc}")
+            time.sleep(2 * (attempt + 1))
+    if last_error is None:
+        return True
+    api.request(
+        "POST",
+        f"/api/v1/preload-worker/tasks/{task_id}/fail",
+        json_body={"error": f"源文件下载失败（重试 3 次）：{last_error}"},
+    )
+    return False
+
+
 def process_task(
     api: Api,
     ffmpeg: str,
@@ -435,52 +535,69 @@ def process_task(
     thread = threading.Thread(target=reporter, daemon=True)
     thread.start()
     try:
-        # 2) 取源（签名 URL；整文件下载对断线重试与 NAS 磁盘更友好）。
-        # 已下载且大小与台账一致才复用；中断的半截文件直接重下。
-        # 下载带重试：17GB 源一次网络抖动就整任务 FAILED、断点归零，太脆
+        # 2) 取源。**默认边下边转**：ffmpeg 的 -i 直接指向 NAS 的取源端点，
+        #    转码与网络传输并行，省掉「先下完再转」的串行等待（大源上就是
+        #    「源体积 ÷ 千兆」那几分钟）。实测真实 argv 经 HTTP 直读 source
+        #    端点做整段转码 speed=5.93x，取源远不是瓶颈。
+        #    本地已有完整源（上次下载完/续转）时照旧直接用本地文件。
         expected = task.get("source_size_bytes") or 0
         if source.exists() and (not expected or source.stat().st_size != expected):
             source.unlink()
-        if not source.exists():
-            url = api.server + "/" + task["source_url"]
-            progress.update(phase="downloading", downloaded_bytes=0, total_bytes=expected)
-            last_error: Exception | None = None
-            for attempt in range(3):
-                if stop is not None and stop.is_set():
-                    print(f"[{task_id}] 停止中断于下载（断点保留）")
+        streaming = stream_source_enabled() and not source.exists()
+        if streaming:
+            input_spec = stream_source_url(api.server, task["source_url"])
+            # 边下边转没有独立的下载阶段：不写 downloaded/total，免得活动页
+            # 按「0/N 字节」画出一条永远不动的取源进度条
+            progress.update(phase="transcoding")
+        else:
+            if not source.exists():
+                url = stream_source_url(api.server, task["source_url"])
+                if not download_source(
+                    api, task_id, url, source, progress, expected=expected, stop=stop
+                ):
                     return False
-                try:
-                    req = urllib.request.Request(url)
-                    with _NO_PROXY_OPENER.open(req, timeout=600) as resp, open(source, "wb") as out:
-                        copy_source_stream(resp, out, progress, expected=expected)
-                    last_error = None
-                    # 下载收尾：速度归零，ETA 交给转码段重新计算（否则页面会一直
-                    # 挂着下载期算出的剩余时间）
-                    progress["speed_bps"] = 0
-                    progress.pop("eta_seconds", None)
-                    break
-                except (urllib.error.URLError, OSError) as exc:
-                    last_error = exc
-                    source.unlink(missing_ok=True)
-                    progress["downloaded_bytes"] = 0
-                    progress["speed_bps"] = 0
-                    print(f"[{task_id}] 源下载失败（第 {attempt + 1}/3 次）：{exc}")
-                    time.sleep(2 * (attempt + 1))
-            if last_error is not None:
-                api.request(
-                    "POST",
-                    f"/api/v1/preload-worker/tasks/{task_id}/fail",
-                    json_body={"error": f"源文件下载失败（重试 3 次）：{last_error}"},
-                )
-                return False
-        progress.update(phase="transcoding", downloaded_bytes=expected, total_bytes=expected)
-        progress["speed_bps"] = 0
+            input_spec = "source.mkv"
+            progress.update(
+                phase="transcoding", downloaded_bytes=expected, total_bytes=expected
+            )
+            progress["speed_bps"] = 0
 
         # 3) 计算段数并跳过已收段
         # 向上取整；无分段（直拷/单段）就是 1 段
         total_parts = -(-duration // segment_seconds) if segment_seconds and duration else 1
         progress["segment_total"] = total_parts
         print(f"[{task_id}] 共 {total_parts} 段，断点在第 {resume} 段后")
+
+        def run_segment(
+            part: int, segment_input: str, from_network: bool, seg_path: Path
+        ) -> tuple[int, str]:
+            """按 Worker 的段装配方式跑一段 ffmpeg，返回 (退出码, stderr 尾巴)。"""
+            seg_argv = list(base_argv)
+            # argv 尾部是 [-f, matroska, output] → 输出改为本段文件
+            seg_argv[-1] = str(seg_path)
+            input_idx = seg_argv.index("-i")
+            # -i 的值：边下边转时指向 NAS 的取源端点，否则是本地落盘的源文件
+            seg_argv[input_idx + 1] = segment_input
+            # 输入侧选项（都必须在 -i 之前）：网络自愈 + 段起点
+            pre_input: list[str] = list(_HTTP_INPUT_OPTIONS) if from_network else []
+            seek = part * segment_seconds
+            if segment_seconds and seek > 0:
+                # -ss 插在 -i 前做快速寻址
+                pre_input += ["-ss", str(seek)]
+            if pre_input:
+                seg_argv[input_idx:input_idx] = pre_input
+            if segment_seconds and part < total_parts - 1:
+                # 每段都要截时长（含第 0 段！漏了会把整部片转进第一段）。
+                # **-t 必须插在 -i 的值之后（输出选项）**：输入侧 -t 切不动
+                # 字幕包，每段的 SRT 轨会带上整部片的时间戳，concat 时长直接
+                # 爆表（2026-10-14 真机实测 514% 偏差）。只有末段转到 EOF
+                out_at = seg_argv.index("-i") + 2  # 跳过 -i 与其取值
+                seg_argv[out_at:out_at] = ["-t", str(segment_seconds)]
+            code, stderr_tail = run_ffmpeg(
+                ffmpeg, seg_argv, workdir, stop=stop, register=register,
+                env=ffmpeg_env() if from_network else None,
+            )
+            return code, stderr_tail
 
         for part in range(total_parts):
             if stop is not None and stop.is_set():
@@ -491,26 +608,26 @@ def process_task(
             progress["segment_index"] = part + 1  # 正在转的第几段（1 起）
             seg_started = time.monotonic()
             seg_path = workdir / f"seg{part:05d}.mkv"
-            seg_argv = list(base_argv)
-            # argv 尾部是 [-f, matroska, output] → 输出改为本段文件
-            seg_argv[-1] = str(seg_path)
-            input_idx = seg_argv.index("-i")
-            url_idx = input_idx + 1  # -i 的值（源文件）所在位置
-            seek = part * segment_seconds
-            if segment_seconds:
-                # 每段都要截时长（含第 0 段！漏了会把整部片转进第一段）。
-                # -ss 插在 -i 前做快速寻址；**-t 必须插在 -i 的值之后（输出
-                # 选项）**：输入侧 -t 切不动字幕包，每段的 SRT 轨会带上整部片
-                # 的时间戳，concat 时长直接爆表（2026-10-14 真机实测 514% 偏差）。
-                # 只有末段转到 EOF
-                if seek > 0:
-                    seg_argv[input_idx:input_idx] = ["-ss", str(seek)]
-                    url_idx += 2
-                if part < total_parts - 1:
-                    seg_argv[url_idx + 1:url_idx + 1] = ["-t", str(segment_seconds)]
-            code, stderr_tail = run_ffmpeg(
-                ffmpeg, seg_argv, workdir, stop=stop, register=register
-            )
+            code, stderr_tail = run_segment(part, input_spec, streaming, seg_path)
+            if (
+                code != 0
+                and streaming
+                and not (stop is not None and stop.is_set())
+                # 只在输入打不开时退——编码/滤镜错误退回下载也是白下十几 GB
+                and "Error opening input" in stderr_tail
+            ):
+                # 边下边转读不动这个端点（凭据过期、服务端不支持 Range…）：
+                # 退回整文件下载再转，别把「读不了源」变成任务终态失败
+                print(f"[{task_id}] 直读取源失败，退回整文件下载后重转：{stderr_tail[-200:]}")
+                streaming = False
+                input_spec = "source.mkv"
+                url = stream_source_url(api.server, task["source_url"])
+                if not download_source(
+                    api, task_id, url, source, progress,
+                    expected=expected, stop=stop,
+                ):
+                    return False
+                code, stderr_tail = run_segment(part, input_spec, streaming, seg_path)
             if code != 0:
                 if stop is not None and stop.is_set():
                     # 停止中断（抢占/取消/退出）杀掉了 ffmpeg：不是任务失败，

@@ -359,3 +359,161 @@ def test_copy_source_stream_without_speed_leaves_eta_absent(tmp_path):
         )
     assert received == 4
     assert "speed_bps" not in progress and "eta_seconds" not in progress
+
+
+class _FakeApi:
+    """只记账、不触网的 Api 替身。"""
+
+    def __init__(self, server: str = "http://nas:3000") -> None:
+        self.server = server
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method, path, **_kwargs):  # noqa: ANN001
+        self.calls.append((method, path))
+        return 200, {"data": {"file_id": 1}}
+
+
+def _preload_task(**overrides) -> dict:
+    task = {
+        "task_id": 7,
+        "display_name": "a.mkv",
+        "argv": ["-hide_banner", "-i", "source.mkv", "-c:v", "copy",
+                 "-f", "matroska", "artifact.mkv"],
+        "source_url": "api/v1/preload-worker/preload-source/7?token=t",
+        "artifact_url": "api/v1/preload-worker/tasks/7/artifacts/artifact.mkv?token=t",
+        "segment_seconds": 600,
+        "duration_seconds": 1200,
+        "source_size_bytes": 1000,
+        "resume_parts": 0,
+    }
+    task.update(overrides)
+    return task
+
+
+def test_segment_argv_puts_t_after_the_input_and_ss_before_it(tmp_path, monkeypatch):
+    """`-t` 必须落在 -i 的取值之后（输出侧），`-ss` 在 -i 之前。
+
+    2026-10-14 真机实测：输入侧 -t 切不动字幕包，每段的 SRT 轨带上整部片的
+    时间戳，concat 后时长 514% 偏差。边下边转给 -i 前插了网络选项，位置一旦
+    算错就会把它推回输入侧——这里把两个位置钉死。
+    """
+    monkeypatch.delenv("MOVIECLAW_WORKER_STREAM_SOURCE", raising=False)
+    seen: list[list[str]] = []
+
+    def fake_run_ffmpeg(ffmpeg, argv, workdir, *, stop=None, register=None, env=None):
+        seen.append(list(argv))
+        Path(argv[-1]).write_bytes(b"seg")
+        return 0, ""
+
+    monkeypatch.setattr(worker_mod, "run_ffmpeg", fake_run_ffmpeg)
+    worker_mod.process_task(
+        _FakeApi(), "ffmpeg", _preload_task(segment_seconds=600, duration_seconds=1800),
+        tmp_path / "work" / "7", progress={},
+    )
+
+    assert len(seen) == 3
+    first, middle, last = seen
+    # 第 0 段 seek=0 不出 -ss；-t 必须落在 -i 的取值之后
+    assert "-ss" not in first
+    assert first.index("-t") == first.index("-i") + 2
+    # 中间段：-ss 在 -i 之前，-t 紧贴 -i 的取值之后
+    assert middle.index("-ss") < middle.index("-i") < middle.index("-t")
+    assert middle.index("-t") == middle.index("-i") + 2
+    # 末段转到 EOF：不出 -t
+    assert "-t" not in last
+
+
+def test_process_task_streams_source_without_downloading(tmp_path, monkeypatch):
+    """默认边下边转：ffmpeg 的 -i 直接指向取源端点，本地不落整文件。
+
+    2026-10-20 实测真实 argv 经 HTTP 直读该端点做整段转码 speed=5.93x——
+    取源不是瓶颈，串行的整文件下载阶段纯属浪费。
+    """
+    monkeypatch.delenv("MOVIECLAW_WORKER_STREAM_SOURCE", raising=False)
+    seen: list[list[str]] = []
+
+    def fake_run_ffmpeg(ffmpeg, argv, workdir, *, stop=None, register=None, env=None):
+        seen.append(list(argv))
+        # 模拟 ffmpeg 产出本段
+        Path(argv[-1]).write_bytes(b"seg")
+        return 0, ""
+
+    monkeypatch.setattr(worker_mod, "run_ffmpeg", fake_run_ffmpeg)
+    workdir = tmp_path / "work" / "7"
+    api = _FakeApi()
+    ok = worker_mod.process_task(api, "ffmpeg", _preload_task(), workdir, progress={})
+
+    assert ok is True
+    assert len(seen) == 2  # 1200s / 600s = 2 段
+    # -i 的取值是 HTTP 端点，不是本地 source.mkv
+    first = seen[0]
+    assert first[first.index("-i") + 1].startswith("http://nas:3000/api/v1/preload-worker/")
+    # 网络自愈选项贴在 -i 之前
+    assert "-reconnect" in first and first.index("-reconnect") < first.index("-i")
+    # 没有任何整文件下载（服务端只收到分段 PUT 与 complete）
+    assert not (workdir / "source.mkv").exists()
+    assert all(method == "PUT" or path.endswith("/complete") for method, path in api.calls)
+
+
+def test_process_task_falls_back_to_download_when_stream_cannot_open(tmp_path, monkeypatch):
+    """直读打不开输入时退回整文件下载，不把「读不了源」变成任务终态失败。"""
+    monkeypatch.delenv("MOVIECLAW_WORKER_STREAM_SOURCE", raising=False)
+    seen: list[list[str]] = []
+
+    def fake_run_ffmpeg(ffmpeg, argv, workdir, *, stop=None, register=None, env=None):
+        seen.append(list(argv))
+        input_value = argv[argv.index("-i") + 1]
+        if input_value.startswith("http"):
+            return 1, "[in#0] Error opening input: Server returned 404"
+        Path(argv[-1]).write_bytes(b"seg")
+        return 0, ""
+
+    monkeypatch.setattr(worker_mod, "run_ffmpeg", fake_run_ffmpeg)
+
+    class _Resp:
+        def __init__(self) -> None:
+            self._done = False
+
+        def read(self, _size: int) -> bytes:
+            if self._done:
+                return b""
+            self._done = True
+            return b"x" * 1000
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(worker_mod._NO_PROXY_OPENER, "open", lambda *a, **k: _Resp())
+    workdir = tmp_path / "work" / "7"
+    ok = worker_mod.process_task(
+        _FakeApi(), "ffmpeg", _preload_task(segment_seconds=0), workdir, progress={}
+    )
+
+    assert ok is True
+    # 第一次是 HTTP 直读失败，第二次已经是本地文件
+    assert seen[0][seen[0].index("-i") + 1].startswith("http")
+    assert seen[-1][seen[-1].index("-i") + 1] == "source.mkv"
+    # 任务成功后源文件照常清理，说明中途确实下过整文件（下载走 _NO_PROXY_OPENER）
+    assert not (workdir / "source.mkv").exists()
+
+
+def test_ffmpeg_env_keeps_internal_hosts_off_the_proxy(monkeypatch):
+    """ffmpeg 会认 http_proxy：内网 NAS 地址必须进 no_proxy，否则被绕去代理。"""
+    monkeypatch.setenv("no_proxy", "example.com")
+    env = worker_mod.ffmpeg_env()
+    assert "192.168.31.10" in env["no_proxy"]
+    assert "example.com" in env["no_proxy"]  # 原有条目保留
+    assert env["NO_PROXY"] == env["no_proxy"]
+
+
+def test_stream_source_can_be_switched_off(monkeypatch):
+    """排查时可用环境变量退回「先整文件下载再转」。"""
+    monkeypatch.setenv("MOVIECLAW_WORKER_STREAM_SOURCE", "0")
+    assert worker_mod.stream_source_enabled() is False
+    monkeypatch.setenv("MOVIECLAW_WORKER_STREAM_SOURCE", "1")
+    assert worker_mod.stream_source_enabled() is True
+    monkeypatch.delenv("MOVIECLAW_WORKER_STREAM_SOURCE")
+    assert worker_mod.stream_source_enabled() is True  # 默认开
