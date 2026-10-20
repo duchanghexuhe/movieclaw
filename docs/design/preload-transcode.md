@@ -208,6 +208,16 @@ Worker 跑同一套分段协议。有能转这一单的 Worker 在线时，NAS �
 - **播放优先（让位）**：看门狗每 2 秒看一次本机播放转码会话（档 ≥ 音频转码；远程会话与离线导出不算）。
   有播放在跑，本地预转码立即让位：杀掉当前段的 ffmpeg，删掉半截段，任务回队（断点保留、不计失败次数）；
   段与段之间也先检查。播放全部结束后，看门狗续派。
+- **让位后立即回队并立刻重派（2026-10-18）**：让位**不是**「等租约到期再回收」。两端各自负责一半：
+  - **Worker 端**：让位时停掉分段并向服务端上报 `preload.yielded`，本地工作目录原样保留；
+  - **服务端**：收到 `preload.yielded` → 当场把任务退回队列（`_requeue_yielded_preload`，在途记账同步
+    释放）→ 立即 `trigger_dispatch()` 派一轮。让位的这台此刻余量为 0，派单自然跳过它，任务由别的
+    Worker 接手；**本机播放结束时** `_release_job` 发现这台 Worker 空出来了，再触发一次派单，把任务
+    派回来从断点续转。
+
+  所以「播放结束 → 预转码续转」的等待是**两次派单触发之间**（毫秒级），而不是 `LEASE_SECONDS`
+  （10 分钟）或 `preload_maintenance`（每小时）——那两条只是 Worker 卡死、没上报 `preload.yielded`
+  时的兜底路径。判据在 `tests/api/test_preload_yield.py::test_yield_requeues_task_at_once_and_releases_account`。
 - **取源：边下边转（2026-10-20）**。Worker 的 `-i` 直接指向 NAS 的取源端点，转码与网络传输并行，
   不再先整文件下完再转——省掉的就是「源体积 ÷ 内网带宽」那段串行等待（29GB 源在千兆上约 4~5 分钟）。
   可行性实测：**服务端真实 argv**（HDR 源 → `tonemap_cuda` + `h264_nvenc` 480p）经 HTTP 直读该端点
