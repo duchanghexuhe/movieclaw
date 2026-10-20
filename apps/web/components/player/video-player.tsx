@@ -7,7 +7,6 @@ import { ChevronLeftIcon, LockIcon, PlayIcon, XIcon } from "@/components/icons";
 
 import { ConsentDialog } from "@/components/player/consent-dialog";
 import { DiagnosticsPanel } from "@/components/player/diagnostics-panel";
-import { UplinkDialog } from "@/components/player/uplink-dialog";
 import { PlayerCenterControls, PlayerControls } from "@/components/player/player-controls";
 import { SubtitleLayer, useVideoContentBox } from "@/components/player/subtitle-layer";
 import {
@@ -87,18 +86,23 @@ import {
   readLabScenario,
 } from "@/lib/player/playback-record";
 import {
+  type PlaybackNetwork,
+  lastPlaybackNetwork,
   loadQualityFor,
   qualityChangeNeedsRestart,
   qualityLimits,
+  rememberPlaybackNetwork,
   rememberQualityFor,
   sourceHeight,
 } from "@/lib/player/quality";
 import {
   type QualityOffer,
   QualitySuggestion,
+  bandwidthRestartNotice,
   transcodeBitrateBps,
 } from "@/lib/player/quality-suggestion";
 import { rememberedChoicesNotice, shortTrackLabel } from "@/lib/player/remembered-choices";
+import { type SaverBadge, saverBadge } from "@/lib/player/saver-badge";
 import {
   browserReportStorage,
   clearActive,
@@ -452,13 +456,20 @@ export function VideoPlayer(props: VideoPlayerProps) {
   // 惰性初始化从 localStorage 读：字幕调好的字号/位置不该每次进来都重调
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(loadSubtitleStyle);
   /**
-   * 画质上限（max_height）。null = 自动。按片记（lib/player/quality.ts，与 iOS 同口径）：
+   * 画质上限（max_height）。null = 自动。按「片 × 在家 / 外网」记（lib/player/quality.ts，与 iOS 同口径）：
    * 进入每一集时从这部片的记忆里取，选过就记住；原来是全局一个值，路上选一次 720p，
    * 之后所有片子、回到家也都在转码。
    */
   const [quality, setQuality] = useState<number | null>(null);
   /** 这次的画质上限来自记忆（不是用户这次亲手选的）：开播提示「已沿用上次的选择」要提它 */
   const qualityFromMemoryRef = useRef(false);
+  /** 本单元用户亲手选过画质（含选回「自动」）：之后不再按网络换记忆 */
+  const qualityPickedRef = useRef(false);
+  /**
+   * `quality` 取的是哪个网络的记忆。开会话之前不知道这次算不算外网，先按上一次会话的网络猜；
+   * 服务端判的对不上、两边记的又不一样，起播 effect 按对的那份重开（只在换了网络后的第一次起播发生）。
+   */
+  const qualityNetworkRef = useRef<PlaybackNetwork>("lan");
   const [trickplay, setTrickplay] = useState<TrickplayIndex | null>(null);
   /** 供冻结帧读最新索引：写进依赖会让 freezeFrame 换身份，牵连挂引擎的 effect */
   const trickplayRef = useRef<TrickplayIndex | null>(null);
@@ -496,22 +507,18 @@ export function VideoPlayer(props: VideoPlayerProps) {
   const [qualityOffer, setQualityOffer] = useState<QualityOffer | null>(null);
   const qualityOfferTimerRef = useRef<number | null>(null);
   /**
-   * 外网画质确认（弹窗而不是自动降档）：服务端判定源码率超出上行/外网上限后，
-   * 装得下的低档会话照常返回并带 uplink_step_down 标记——拦在这里问一次。
-   * 「就这样播」直接认领这份会话（零等待）；「仍用原画质」置 uplinkOriginalRef
-   * 后重开（带画质上限=跳过上行判定，服务端顺带停掉这路转码）。
+   * 外网省流自动生效、不弹窗问（lib/player/saver-badge.ts）：顶栏标「省流 · 1080p」，用户点
+   * 「切到原画」才置这个标记重开——请求带画质上限，服务端据此跳过上行判定、原片照常直连。
+   * 只对当前这一集生效，同一集里之后的每次重开（断线、换轨、降档）都带着它。
    */
-  const [uplinkChoice, setUplinkChoice] = useState<{
-    session: PlaybackSession;
-    recommendedHeight: number | null;
-    reason: string;
-  } | null>(null);
   const uplinkOriginalRef = useRef(false);
   /**
-   * 「切到原画」：放的是便携版时，用户要原片。带着原片的文件 id 重开会话——服务端只按这个文件
-   * 判定（配了上行照常问降档，与直接放原片一样）。只对当前这一集生效，换集回到服务端自动择优。
+   * 「切到原画」：放的是便携版时，用户要原片。带着原片的文件 id 重开会话，同时置
+   * uplinkOriginalRef——不然原片又会被上行省流成一路转码。只对当前这一集生效，换集回到服务端自动择优。
    */
   const [originalFileId, setOriginalFileId] = useState<number | null>(null);
+  /** 播放中按带宽自动重开了（见 feedQualitySuggestion）：新会话就位时提示一句调到了哪一档 */
+  const bandwidthNoticeRef = useRef<{ fromHeight: number | null } | null>(null);
   /** 「已沿用上次的选择」只在打开播放器后的第一集判一次（切到下一集不再提示，与 iOS 一致） */
   const rememberedNoticeDoneRef = useRef(false);
   /** 每秒循环的计数：每 10 秒刷新一次「正在播放」标记（异常退出补报用） */
@@ -1264,13 +1271,18 @@ export function VideoPlayer(props: VideoPlayerProps) {
     sessionRetryTimerRef.current = null;
     suggestionRef.current = new QualitySuggestion();
     bandwidthRestartedRef.current = false;
+    bandwidthNoticeRef.current = null;
     dismissQualityOffer();
-    // 外网画质弹窗按播放单元算：换集/换片清掉挂着的弹窗与「选了原画质」标记
+    // 「切到原画」按播放单元算：换集/换片回到服务端自动省流
     uplinkOriginalRef.current = false;
-    setUplinkChoice(null);
     setOriginalFileId(null);
-    // 画质按片记：影片分享的访客不读不写（与 iOS 的分享场景一致）
-    const remembered = apiRef.current.telemetry ? loadQualityFor(unit.media_item_id) : null;
+    // 画质按「片 × 在家 / 外网」记，网络先按上一次会话猜（起播 effect 纠正）。
+    // 影片分享的访客不读不写（与 iOS 的分享场景一致）
+    qualityPickedRef.current = false;
+    qualityNetworkRef.current = lastPlaybackNetwork();
+    const remembered = apiRef.current.telemetry
+      ? loadQualityFor(unit.media_item_id, qualityNetworkRef.current)
+      : null;
     qualityFromMemoryRef.current = remembered !== null;
     setQuality(remembered);
     setSubtitlesArmed(false);
@@ -1316,8 +1328,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
     // 指纹必须覆盖**全部**会影响请求参数的依赖（quality 也在内）：漏一项的
     // 后果是该项单独变化时 effect 重跑却撞上相同指纹被去重跳过，而上一次
     // 在途请求已被 cancelled——响应回来没人认领，起播就永远停在转圈里。
-    // uplinkOriginalRef 是「外网弹窗里选了原画质」的一次性标记：带上它重开
-    // 时请求会带画质上限（跳过上行判定），指纹不含它的话重开会被去重跳过。
+    // uplinkOriginalRef 是「切到原画」的标记：带上它重开时请求会带画质上限
+    // （跳过上行判定），指纹不含它的话重开会被去重跳过。
     const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}|${lockedFileId ?? ""}|${uplinkOriginalRef.current ? "orig" : ""}|${originalFileId ?? ""}`;
     if (startedKeyRef.current === key) return;
     startedKeyRef.current = key;
@@ -1342,8 +1354,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
             // null = 服务端接续播点；显式值（seek 重开 / 换轨 / ?t=）原样发。
             // null = 服务端接续播点；显式值（seek 重开 / 换轨 / ?t=）原样发
             start_ms: state.startMs ?? undefined,
-            // 外网弹窗选了「仍用原画质」时带 2160：非 None 画质上限让服务端
-            // 跳过上行判定，源片照常直连——这是用户对外网弹窗的显式回答
+            // 点了「切到原画」时带 2160：非 None 画质上限让服务端跳过上行判定，
+            // 源片照常直连——这是用户对省流标识的显式回答
             max_height: quality ?? (uplinkOriginalRef.current ? 2160 : undefined),
             audio_track: requestedAudio ?? undefined,
             subtitle_track: requestedSubtitle ?? undefined,
@@ -1369,6 +1381,29 @@ export function VideoPlayer(props: VideoPlayerProps) {
             void stopPlaybackSession(session.session_id, apiRef.current).catch(() => undefined);
           }
           return;
+        }
+        // 画质记忆按「片 × 在家 / 外网」：服务端判的网络与开会话前猜的对不上、两边记的画质
+        // 又不一样，这份会话作废、按对的那份重开（setQuality 让本 effect 带着新指纹重跑）。
+        // 本单元亲手选过画质、点过「切到原画」的不动——那是用户对这一集的明确选择
+        if (session.external !== undefined && apiRef.current.telemetry) {
+          const network: PlaybackNetwork = session.external ? "external" : "lan";
+          rememberPlaybackNetwork(network);
+          if (
+            network !== qualityNetworkRef.current &&
+            !qualityPickedRef.current &&
+            !uplinkOriginalRef.current
+          ) {
+            qualityNetworkRef.current = network;
+            const remembered = loadQualityFor(unit.media_item_id, network);
+            if (remembered !== quality) {
+              if (session.session_id) {
+                void stopPlaybackSession(session.session_id, apiRef.current).catch(() => undefined);
+              }
+              qualityFromMemoryRef.current = remembered !== null;
+              setQuality(remembered);
+              return;
+            }
+          }
         }
         startupRef.current?.mark("会话");
         sessionBackoffRef.current.reset();
@@ -1398,21 +1433,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
         }
         // 观看状态随响应带回：时间轴兜底片长、字幕记忆轨都从这里来
         if (session.watch) setResume(session.watch);
-        if (
-          session.decision.uplink_step_down &&
-          quality === null &&
-          !uplinkOriginalRef.current
-        ) {
-          // 外网画质弹窗：拦下起播让用户选。会话先不认领——「就这样播」直接
-          // 认领这份（服务端已备好低档转码，零等待）；「仍用原画质」置标记后
-          // restart 重开（请求带画质上限、服务端跳过上行判定并停掉这路转码）。
-          // 手选过画质（quality 非 null）说明用户已表过态，不弹。
-          setUplinkChoice({
-            session,
-            recommendedHeight: session.decision.video?.height ?? null,
-            reason: session.decision.reason,
-          });
-          return;
+        // 外网省流不再拦下起播问：计划直接播，顶栏标「省流」给「切到原画」（saverBadge）。
+        // 播放中按带宽自动重开的，新会话就位时说一句调到了哪一档
+        const bandwidthNotice = bandwidthNoticeRef.current;
+        bandwidthNoticeRef.current = null;
+        if (bandwidthNotice && session.decision.outcome === "plan") {
+          flashNotice(
+            bandwidthRestartNotice(bandwidthNotice.fromHeight, session.decision.video?.height ?? null),
+          );
         }
         dispatch({ type: "session", session });
       } catch (error) {
@@ -1457,22 +1485,6 @@ export function VideoPlayer(props: VideoPlayerProps) {
     quality,
     originalFileId,
   ]);
-
-  /**
-   * 外网弹窗挂着时这份会话没人认领：弹窗收起（选了哪边）或组件卸载（弹窗还
-   * 挂着就退出了播放器）都停掉它——转码名额不能空烧到服务端超时回收。选了
-   * 「就这样播」的已认领会话不停（uplinkClaimedRef），后续播放还要用它。
-   */
-  const uplinkClaimedRef = useRef(false);
-  useEffect(() => {
-    if (!uplinkChoice) return;
-    uplinkClaimedRef.current = false;
-    const parked = uplinkChoice.session;
-    return () => {
-      if (uplinkClaimedRef.current || !parked.session_id) return;
-      void stopPlaybackSession(parked.session_id, apiRef.current).catch(() => undefined);
-    };
-  }, [uplinkChoice]);
 
   /**
    * 自动播放：试一次，被拒绝了按原因决定重试还是降级。
@@ -1835,11 +1847,19 @@ export function VideoPlayer(props: VideoPlayerProps) {
       if (qualityOfferRef.current || suggestion.offered) return;
       const sourceH = sourceHeight(session.source?.resolution);
       const cap = qualityRef.current;
-      const currentHeight = cap !== null ? (sourceH !== null ? Math.min(sourceH, cap) : cap) : sourceH;
+      const transcoding = session.decision.video?.action === "transcode";
+      // 现在放的高度：转码流按计划的目标高度算（省流 / 自动重开后它可能已经低于片源和上限），
+      // 不然提示卡会建议「改用 720p」，而放的本来就是 720p
+      const planHeight = transcoding ? (session.decision.video?.height ?? null) : null;
+      const currentHeight = [sourceH, cap, planHeight].reduce<number | null>(
+        (low, h) => (h === null ? low : low === null ? h : Math.min(low, h)),
+        null,
+      );
       const offer = suggestion.offer({ streamBitrateBps: bitrate, currentHeight });
       if (!offer) return;
-      const transcoding = session.decision.video?.action === "transcode";
-      const autoRestart = transcoding && cap === null && !bandwidthRestartedRef.current;
+      // 点了「切到原画」的不自动调：那一集用户要的就是原画质，交给提示卡
+      const autoRestart =
+        transcoding && cap === null && !uplinkOriginalRef.current && !bandwidthRestartedRef.current;
       reportPlaybackClientLog(
         "quality-suggestion",
         {
@@ -1859,8 +1879,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
       if (autoRestart) {
         // 已经在转码、用户没限画质：码率本来就是服务端按线路定的，按实测带宽同档重开压码率，
         // 不必打扰用户（原「缺粮按带宽重开」，docs/design/player-pipeline-optimization.md §C）。
+        // 自动调也要看得见：新会话就位时提示调到了哪一档（起播 effect），外网的顶栏标「省流」。
         // 每集只一次；重开后仍跟不上，换成提示卡交给用户
         bandwidthRestartedRef.current = true;
+        bandwidthNoticeRef.current = { fromHeight: planHeight };
         suggestionRef.current = new QualitySuggestion();
         lastDownlinkRef.current = offer.measuredBps;
         freezeFrame();
@@ -1895,8 +1917,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
       // 而重开请求恰恰要在那个空档里发出
       if (stats.downlinkBps !== null) lastDownlinkRef.current = stats.downlinkBps;
       recordRef.current?.noteDownlink(stats.downlinkBps);
-      // 线路跟不上时提示一次换低画质（不自动降，与 iOS 一致；原来直出档只弹一句小字、
-      // 直通档缺粮时直接自动改转码）
+      // 线路跟不上时：放的是原画 → 提示一次换低画质（不自动降，与 iOS 一致）；放的已是转码
+      // → 按实测带宽自动重开一次并提示（见 feedQualitySuggestion）
       feedQualitySuggestionRef.current(engine, stats);
       // 每 10 秒刷新一次「正在播放」标记：标签页崩溃、浏览器被杀时下次补报「异常退出」
       activeTickRef.current += 1;
@@ -2891,12 +2913,20 @@ export function VideoPlayer(props: VideoPlayerProps) {
     (maxHeight: number | null) => {
       setQuality(maxHeight);
       qualityFromMemoryRef.current = false;
+      qualityPickedRef.current = true;
       dismissQualityOffer();
-      // 按片记：上限不低于片源等于没限，记成「自动」（下次打开照样原画直通）。分享的访客不记
+      // 按「片 × 在家 / 外网」记：上限不低于片源等于没限，记成「自动」（下次打开照样原画直通）。
+      // 网络以当前会话服务端判的为准，旧版服务端没带就用开会话前猜的。分享的访客不记
       const session = state.session;
       if (apiRef.current.telemetry) {
         const limiting = qualityLimits(maxHeight, sourceHeight(session?.source?.resolution));
-        rememberQualityFor(unit.media_item_id, limiting ? maxHeight : null);
+        const network: PlaybackNetwork =
+          session?.external === undefined
+            ? qualityNetworkRef.current
+            : session.external
+              ? "external"
+              : "lan";
+        rememberQualityFor(unit.media_item_id, network, limiting ? maxHeight : null);
       }
       if (maxHeight === quality) return;
       const record = recordRef.current;
@@ -2928,6 +2958,29 @@ export function VideoPlayer(props: VideoPlayerProps) {
   /** 换画质提示卡的「改用」按钮定义在它前面，走 ref 拿最新的 */
   const selectQualityRef = useRef(selectQuality);
   selectQualityRef.current = selectQuality;
+
+  /**
+   * 顶栏「切到原画」（lib/player/saver-badge.ts）：便携版带原片文件 id 重开；两种都置
+   * uplinkOriginalRef——请求带画质上限、服务端跳过上行判定，原片照常直连，不会又被省流成
+   * 一路转码。只对这一集生效。从**当前位置**接着放（不是会话起点）。
+   */
+  const switchToOriginal = useCallback(
+    (target: NonNullable<SaverBadge["toOriginal"]>) => {
+      uplinkOriginalRef.current = true;
+      if (target.kind === "portable") setOriginalFileId(target.fileId);
+      dismissQualityOffer();
+      const record = recordRef.current;
+      const from = quality === null ? "auto" : String(quality);
+      record?.noteBehavior("quality_change", from, "original");
+      record?.beginSwitch("quality", from, "original");
+      freezeFrame();
+      video?.pause();
+      wantsPlayRef.current = true;
+      pendingFileMsRef.current = positionRef.current;
+      dispatch({ type: "request", startMs: positionRef.current });
+    },
+    [quality, video, freezeFrame, dismissQualityOffer],
+  );
 
   /**
    * 跳转。转码会话是「从 start_ms 起、边转边给」的单向流：拖出已转区间必须
@@ -4338,8 +4391,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
   const overrideMs =
     seekPreview && !seekPreview.leaving ? seekPreview.targetMs : pendingSeekMs;
 
-  /** 当前放的是便携版时它的源文件 id（顶栏的「切到原画」用）；放的是原片为 null */
-  const portableSourceId = state.session?.decision.portable_source_file_id ?? null;
+  /** 放的不是原画时顶栏的标识（便携版 / 外网省流）；放的是原画为 null */
+  const badge = saverBadge(state.session);
 
   return (
     <div
@@ -4500,30 +4553,30 @@ export function VideoPlayer(props: VideoPlayerProps) {
             {episodeLabel ? (
               <p className="truncate text-[13px] text-white/65">{episodeLabel}</p>
             ) : null}
-            {/* 便携版（预转码的省流副本）：标明放的是哪一版，并给一键切回原画。
-                切回是带原片文件 id 重开会话，走原片的判定（配了上行照常问降档）。 */}
-            {portableSourceId !== null ? (
+            {/* 放的不是原画（便携版 / 外网省流）：标明放的是哪一版，原画放得了的给一键切回。
+                省流自动生效、不弹窗问，所以这块必须看得见（AGENTS.md §5）。 */}
+            {badge ? (
               <div
+                data-testid="saver-badge"
                 className={`mt-1.5 flex items-center gap-2 whitespace-nowrap text-[12px] ${
                   chromeVisible ? "pointer-events-auto" : "pointer-events-none"
                 }`}
               >
                 <span className="rounded-full bg-white/[0.12] px-2 py-0.5 text-white/85">
-                  便携版
-                  {state.session?.decision.portable_resolution
-                    ? ` · ${state.session.decision.portable_resolution}`
-                    : null}
+                  {badge.label}
+                  {badge.detail ? ` · ${badge.detail}` : null}
                 </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setOriginalFileId(portableSourceId);
-                    dispatch({ type: "restart", startMs: pendingFileMsRef.current });
-                  }}
-                  className="rounded-full px-2 py-0.5 text-white/80 underline-offset-4 transition hover:text-white hover:underline pointer-coarse:px-3 pointer-coarse:py-2"
-                >
-                  切到原画
-                </button>
+                {badge.toOriginal ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (badge.toOriginal) switchToOriginal(badge.toOriginal);
+                    }}
+                    className="rounded-full px-2 py-0.5 text-white/80 underline-offset-4 transition hover:text-white hover:underline pointer-coarse:px-3 pointer-coarse:py-2"
+                  >
+                    切到原画
+                  </button>
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -4856,27 +4909,6 @@ export function VideoPlayer(props: VideoPlayerProps) {
               dispatch({ type: "consent-granted" });
             }}
             onCancel={onExit}
-          />
-        ) : null}
-
-        {uplinkChoice ? (
-          <UplinkDialog
-            recommendedHeight={uplinkChoice.recommendedHeight}
-            reason={uplinkChoice.reason}
-            onUseRecommended={() => {
-              // 推荐档的会话在弹窗期间已就绪：直接认领，不重开（零等待）
-              uplinkClaimedRef.current = true;
-              const chosen = uplinkChoice;
-              setUplinkChoice(null);
-              dispatch({ type: "session", session: chosen.session });
-            }}
-            onUseOriginal={() => {
-              // 带画质上限重开拿原画质；弹窗收起时未认领的转码会话由上面的
-              // 清理停掉，重开请求的 stop_for_file 也会再兜一层
-              uplinkOriginalRef.current = true;
-              setUplinkChoice(null);
-              dispatch({ type: "restart", startMs: pendingFileMsRef.current });
-            }}
           />
         ) : null}
 

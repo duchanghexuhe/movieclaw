@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   GRACE_SECONDS,
   QualitySuggestion,
+  bandwidthRestartNotice,
   recommendedHeight,
   transcodeBitrateBps,
 } from "../lib/player/quality-suggestion.ts";
@@ -151,4 +152,11 @@ test("按线路压过码率的转码流，线路够了就不再提示", () => {
   const bitrate = transcodeBitrateBps({ height: 480, bitrate_cap_bps: 1.5 * mbps });
   assert.equal(s.offer({ streamBitrateBps: bitrate, currentHeight: 480 }), null);
   assert.notEqual(s.offer({ streamBitrateBps: 90 * mbps, currentHeight: 2160 }), null);
+});
+
+test("按带宽自动重开后的提示：降了分辨率说降到几 p，只压了码率说压了码率", () => {
+  assert.equal(bandwidthRestartNotice(1080, 720), "线路较慢，已调到 720p");
+  assert.equal(bandwidthRestartNotice(1080, 1080), "线路较慢，已调低码率");
+  // 转码计划没带目标高度（按 1080p 阶梯）：服务端只压码率
+  assert.equal(bandwidthRestartNotice(null, null), "线路较慢，已调低码率");
 });

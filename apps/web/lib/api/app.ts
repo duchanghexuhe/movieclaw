@@ -16,7 +16,7 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
 export interface AppConfigPayload {
   /** 网络可访问到本应用的完整地址（http/https）；空 = 未配置 */
   external_url: string;
-  /** 家宽上行带宽（Mbps），填套餐真实值：外网播放超过它（或 1080p 上限）会在起播前询问切换画质；空 = 不启用 */
+  /** 家宽上行带宽（Mbps），填套餐真实值：外网播放超过它（或 1080p 档上限）会自动省流到装得下的画质；空 = 不启用 */
   uplink_mbps: number | null;
 }
 

@@ -936,7 +936,8 @@ async def _uplink_bps_for(request: Request) -> int | None:
     """外网会话的前置降档预算（bps）：内网 / 未配置 / 地址不可判 → None。
 
     「外网 + 家宽上行装不下源片码率」时把直通档在起播前换成低档转码——不等
-    卡了再让用户手动换（用户拍板：不弹提示，直接降档）。判据是连接来源：
+    卡了再让用户手动换（用户拍板：不弹提示，直接降档；网页顶栏标「省流」、
+    一键切回原画）。判据是连接来源：
     内网来源走的是局域网速度，永远直通；公网来源才按上行收。Docker 桥接把
     来源 NAT 成网关时拿不到真实地址（``client_address`` 返回空），诚实按
     「不降档」处理，退回既有的卡顿后提示兜底。用户手动选了画质上限时调用方
@@ -1169,7 +1170,7 @@ async def start_playback_session(
             view = playback_plan.to_view(decision)
     if view.outcome != "plan":
         attempt_started(view.file_id, -1, view, decide=decide_ms)
-        return ok(PlaybackSessionView(decision=view, watch=watch_view))
+        return ok(PlaybackSessionView(decision=view, watch=watch_view, external=external))
 
     file = await session.get(LibraryFile, view.file_id)
     if file is None:
@@ -1194,7 +1195,7 @@ async def start_playback_session(
             view = playback_plan.to_view(decision)
             if view.outcome != "plan":
                 attempt_started(view.file_id, -1, view, decide=decide_ms)
-                return ok(PlaybackSessionView(decision=view, watch=watch_view))
+                return ok(PlaybackSessionView(decision=view, watch=watch_view, external=external))
             file = await session.get(LibraryFile, view.file_id)
             if file is None:
                 raise NotFoundException("文件已不在台账中")
@@ -1270,6 +1271,7 @@ async def start_playback_session(
         return ok(
             PlaybackSessionView(
                 decision=view,
+                external=external,
                 matroska_cues=matroska_cues,
                 # 目录直推（disc-direct-play.md）：地址是目录清单，引擎按清单逐个文件取字节
                 stream_url=(
@@ -1370,7 +1372,7 @@ async def start_playback_session(
         view = playback_plan.to_view(decision)
         if view.outcome != "plan":
             attempt_started(view.file_id, -1, view, decide=decide_ms)
-            return ok(PlaybackSessionView(decision=view, watch=watch_view))
+            return ok(PlaybackSessionView(decision=view, watch=watch_view, external=external))
         file = await session.get(LibraryFile, view.file_id)
         if file is None:
             raise NotFoundException("文件已不在台账中")
@@ -1541,6 +1543,7 @@ async def start_playback_session(
     return ok(
         PlaybackSessionView(
             decision=view,
+            external=external,
             session_id=transcode.id,
             stream_url=(f"/api/v1/playback/sessions/{transcode.id}/index.m3u8?token={token}"),
             progressive_segments=transcode.progressive,
