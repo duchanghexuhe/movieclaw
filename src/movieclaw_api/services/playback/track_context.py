@@ -23,12 +23,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from movieclaw_api.services.scrape_config import effective_language, merge_for_library
-from movieclaw_db.models import Library, LibraryFile, MediaMetadata
+from movieclaw_db.models import FileState, Library, LibraryFile, MediaMetadata
 from movieclaw_playback import state as playback_state
 from movieclaw_playback.track_policy import NO_CONTEXT, TrackContext
 
@@ -40,7 +40,7 @@ _LANGUAGE_FIELDS = frozenset({"language_priority"})
 
 def _with_context_columns(stmt: Select) -> Select:
     """给以 LibraryFile 为主的查询接上库的刮削覆盖、条目的原始语言，以及便携版的源文件行
-    （都是一对一或零对一，文件行不会变多）。"""
+    （都是一对一或零对一，文件行不会变多）。源行不在位时连不上，归属行为空。"""
     source = aliased(LibraryFile)
     return (
         stmt.add_columns(
@@ -48,7 +48,13 @@ def _with_context_columns(stmt: Select) -> Select:
         )
         .outerjoin(Library, Library.id == LibraryFile.library_id)
         .outerjoin(MediaMetadata, MediaMetadata.media_item_id == LibraryFile.media_item_id)
-        .outerjoin(source, source.id == LibraryFile.derives_from_file_id)
+        .outerjoin(
+            source,
+            and_(
+                source.id == LibraryFile.derives_from_file_id,
+                source.state == FileState.IN_PLACE,
+            ),
+        )
     )
 
 
@@ -69,13 +75,15 @@ async def metadata_owner(session: AsyncSession, file: LibraryFile) -> LibraryFil
     """外挂字幕与片头片尾标记的归属行：便携版没有自己的，借用源文件的；其余就是文件自己。
 
     便携版是源文件的转码副本（``derives_from_file_id``），同一部片的外挂字幕与片头区间都挂在
-    源文件上——引用而不复制，源文件后补的字幕便携版下次起播就能用。源行已不在时退回自己，
+    源文件上——引用而不复制，源文件后补的字幕便携版下次起播就能用。源行不在位时退回自己，
     不下发借来的东西。
     """
     if file.derives_from_file_id is None:
         return file
     source = await session.get(LibraryFile, file.derives_from_file_id)
-    return source or file
+    if source is None or source.state != FileState.IN_PLACE:
+        return file
+    return source
 
 
 def library_track_context(library: Library, original_language: str | None) -> TrackContext:

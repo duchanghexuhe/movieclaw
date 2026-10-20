@@ -192,6 +192,14 @@ async def _add_source_subtitle(source_id: int, source_dir: Path) -> None:
         await session.commit()
 
 
+async def _set_source_state(source_id: int, state: FileState) -> None:
+    async with get_database().session() as session:
+        row = await session.get(LibraryFile, source_id)
+        assert row is not None
+        row.state = state
+        await session.commit()
+
+
 async def _seed_source_segments(source_id: int, size_bytes: int) -> None:
     from movieclaw_api.services.library.skip_segments import ALGO_VERSION
     from movieclaw_db.models import utcnow
@@ -237,6 +245,20 @@ def test_subtitle_added_to_source_later_is_used_by_the_portable_copy(client, tmp
     assert track_refs(data) == [f"external:{_CHS}", f"external:{_ENG}"]
     eng_url = data["subtitle_urls"][track_refs(data).index(f"external:{_ENG}")]
     assert "Added to the source later" in subtitle_body(client, eng_url)
+
+
+def test_portable_borrows_no_subtitles_while_its_source_is_not_in_place(
+    client, tmp_path, monkeypatch
+):
+    """源文件失联（或进了回收站）：便携版不借它的外挂字幕，与详情页同一口径，只剩便携版自己的。"""
+    ids = call(client, _seed, tmp_path)
+    _external(monkeypatch)
+    call(client, _set_source_state, ids["source"], FileState.MISSING)
+
+    data = session_for(client, ids)
+
+    assert data["decision"]["file_id"] == ids["portable"]
+    assert track_refs(data) == []
 
 
 def test_portable_skip_intro_comes_from_the_source_segments(client, tmp_path, monkeypatch):
