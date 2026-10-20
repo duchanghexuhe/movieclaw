@@ -23,7 +23,7 @@ import logging
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -262,6 +262,7 @@ def _source_spec(file: LibraryFile) -> dict:
         "video_codec": file.video_codec,
         "hdr": file.hdr,
         "dv_profile": file.dv_profile,
+        "dv_bl_compatible": file.dv_bl_compatible,
         "color_space": file.color_space,
         "bit_depth": file.bit_depth,
         "duration_seconds": file.duration_seconds,
@@ -608,7 +609,11 @@ async def claim_next_task(
 
 
 async def claim_local_task(
-    session: AsyncSession, *, allow_h264: bool, allow_hevc: bool
+    session: AsyncSession,
+    *,
+    allow_h264: bool,
+    allow_hevc: bool,
+    skip_task_ids: Collection[int] | None = None,
 ) -> tuple[PreloadTask, LibraryFile] | None:
     """NAS 本机领单（§7）：队列里本机能转、且该本机领的第一单。
 
@@ -616,6 +621,7 @@ async def claim_local_task(
     - 从未出过段的新单：只在**没有能转它的 Worker 在线**时才接——有 Worker 就让 GPU 清队，
       NAS 留给家里播放。``allow_h264`` / ``allow_hevc`` 由调用方按「有没有能转它的 Worker」给出；
     - HEVC 单还要求本机真跑过 HEVC 硬件编码（``allow_hevc``）。
+    - ``skip_task_ids``：本机刚失败、还在退避期的单（见 dispatcher 的重派退避）。
     """
     await reclaim_expired_leases(session)
     pinned = and_(PreloadTask.resume_parts > 0, PreloadTask.worker_device_id.is_(None))  # type: ignore[union-attr]
@@ -624,13 +630,13 @@ async def claim_local_task(
         usable.append(and_(PreloadTask.resume_parts == 0, _not_hevc()))  # type: ignore[operator]
     if allow_hevc:
         usable.append(and_(PreloadTask.resume_parts == 0, _is_hevc()))  # type: ignore[operator]
+    query = select(PreloadTask).where(
+        PreloadTask.status == PreloadTaskStatus.QUEUED, or_(*usable)
+    )
+    if skip_task_ids:
+        query = query.where(PreloadTask.id.not_in(skip_task_ids))  # type: ignore[union-attr]
     row = (
-        await session.execute(
-            select(PreloadTask)
-            .where(PreloadTask.status == PreloadTaskStatus.QUEUED, or_(*usable))
-            .order_by(PreloadTask.created_at.asc())
-            .limit(1)
-        )
+        await session.execute(query.order_by(PreloadTask.created_at.asc()).limit(1))
     ).scalar_one_or_none()
     if row is None:
         return None

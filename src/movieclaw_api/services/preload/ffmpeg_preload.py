@@ -192,6 +192,24 @@ def _source_color_convert(color_space: str | None) -> str | None:
     return f"colorspace={spec}:all=bt709:format=yuv420p" if spec else None
 
 
+def _dolby_vision_treatment(source: dict) -> str | None:
+    """这一单要不要靠杜比视界的动态元数据还原色彩（``dolby_vision="apply"``）。
+
+    与播放端 ``decide._transcode_dolby_vision`` 同一口径：基础层能直接解读（P7/P8 带 HDR10
+    基础层）吃不吃都行，交给滤镜默认；P5（以及 profile 未知）的基础层是 IPTPQc2，不按 RPU
+    还原就是整片偏紫/发绿——这类必须 ``apply``，本机核显的硬件色调映射做不到。
+
+    台账的 ``dv_bl_compatible`` 是关键：探测层没探到的老行是 NULL，按「不知道」保守算作
+    不能直接解读（和播放端一致）。
+    """
+    hdr = source.get("hdr")
+    if hdr != "Dolby Vision" and source.get("dv_profile") is None:
+        return None
+    if source.get("dv_bl_compatible"):
+        return None  # 基础层本身是 HDR10，吃不吃 RPU 都对
+    return "apply"
+
+
 @dataclass(frozen=True)
 class LocalHw:
     """NAS 本机的硬件能力快照（由 ``hwprobe`` 自检得出，装配层只读它，不跑 ffmpeg）。"""
@@ -316,30 +334,46 @@ def _local_hw_video(
     needs_tone_map: bool,
     needs_scale: bool,
     color_space: str | None,
-) -> tuple[list[str], list[str], list[str], str | None]:
+    dolby_vision: str | None = None,
+) -> tuple[list[str], list[str], list[str], str | None, bool]:
     """NAS 本地的硬件链（QSV / VAAPI）。
 
-    返回 (编码前的设备参数, 输入侧 -hwaccel 参数, 视频参数, 不可行原因)。
+    返回 (编码前的设备参数, 输入侧 -hwaccel 参数, 视频参数, 不可行原因, 是否纯硬件帧链)。
 
     解码留在 GPU（和播放同一套 ``-hwaccel`` 参数）。原生 tone-map 与缩放都在 GPU 上做；
     遇到只有 CPU 能做的步骤（色彩空间转换、没有原生滤镜的 HDR）时，解码帧下载回内存，
     CPU 滤镜处理完再 ``hwupload`` 回 GPU 编码——与 NVENC 的慢路同形。
+
+    ``dolby_vision="apply"``（P5 这类基础层不能直接解读的片）本机不接：VAAPI/QSV 的原生
+    tone-map 不认 RPU，硬转出来整片偏紫/偏绿（播放端同一条判定见 ``plan.py``）。
     """
     codec = preset.get("video_codec", "h264")
     if codec == "hevc" and local.hevc_encoder is None:
         return [], [], [], (
             "HEVC 格式需要本机的 HEVC 硬件编码器（QSV/VAAPI 自检未通过）；"
             "请交给带 NVENC 的 Worker，或在设置里改用 H.264"
-        )
+        ), False
     if needs_tone_map and local.native_tonemap is None and not local.has_tonemapx:
         return [], [], [], (
             "HDR 源需要原生 tone-map 或 jellyfin-ffmpeg 的 tonemapx 滤镜，本机都没有"
-        )
+        ), False
+    if dolby_vision == "apply" and local.native_tonemap is not None:
+        return [], [], [], (
+            "这部片是杜比视界（基础层不能直接解读），需要按动态元数据还原色彩；"
+            "本机核显的硬件色调映射不认杜比视界元数据，转出来会偏色"
+        ), False
     backend: HwBackend = HW_BACKENDS[local.backend]
     encoder = local.hevc_encoder if codec == "hevc" else backend.encoder
     height = int(preset["height"])
-    software = bool(_source_color_convert(color_space)) or (
-        needs_tone_map and local.native_tonemap is None
+    # 帧要不要下载回内存走 CPU 滤镜，只有两个来源：
+    # ① 要 tone-map 但本机没有原生滤镜（只能用 tonemapx）；② SDR 源要做色彩空间转换。
+    # **tone-map 在的时候不算 ②**：原生滤镜（tonemap_vaapi 的 t/m/p、vpp_qsv 的 out_color_*）
+    # 本身就把画面落到 BT.709 了，再叠一个 colorspace 转换既多余又致命——它是软件滤镜，
+    # 必须先把硬件帧 hwdownload 回来，整条链就从「GPU 直通」退化成 CPU 转码。
+    # 真机 4K HDR10（BT.2020）因此只有 0.05× 实时（2026-10-20）；NVENC 那条链 10-14 就修过
+    # 同一个坑（`_gpu_filters` 的 tone-map 分支不插 colorspace），本地 VAAPI 这条漏了。
+    software = (needs_tone_map and local.native_tonemap is None) or (
+        not needs_tone_map and bool(_source_color_convert(color_space))
     )
 
     hwaccel = ["-hwaccel", backend.hwaccel]
@@ -385,7 +419,11 @@ def _local_hw_video(
     else:
         args += ["-profile:v", "high", "-level:v", "4.1"]
     args += ["-b:v", "0", "-maxrate", preset["maxrate"], "-bufsize", preset["bufsize"]]
-    return pre_input, hwaccel, args, None
+    # 纯硬件帧链（帧从不落回内存）不能在输出侧写色彩三件套/range：ffmpeg 7.1 在首帧发现源
+    # 色彩属性与声明不符时重建滤镜图，重建插进来的软件 auto_scale 接不上硬件帧，整链以
+    # 「Impossible to convert … / Function not implemented」当场崩（真机 4K DV P5 复现，
+    # 与实时链 cbf8475d 同一根因）。原生 tone-map 已在滤镜内声明输出色彩，标签不受影响
+    return pre_input, hwaccel, args, None, not software
 
 
 def build_preload_command(
@@ -445,12 +483,14 @@ def build_preload_command(
     video_args: list[str]
     hw_backend_used: str | None = None
     unusable_reason: str | None = None
+    hw_frames = False
     if video_copy:
         video_args = ["-c:v", "copy"]
     elif local is not None and hw_backend is None:
-        pre_input, input_args, video_args, unusable_reason = _local_hw_video(
+        pre_input, input_args, video_args, unusable_reason, hw_frames = _local_hw_video(
             preset=preset, local=local, needs_tone_map=needs_tone_map,
             needs_scale=needs_scale, color_space=color_space,
+            dolby_vision=_dolby_vision_treatment(source),
         )
         hw_backend_used = None if unusable_reason else local.backend
     else:
@@ -542,10 +582,15 @@ def build_preload_command(
     # 分段只含视频与音频：字幕与章节在拼接时从源文件一次拷入（见模块说明）
     argv += ["-sn", "-map_chapters", "-1", "-map_metadata", "-1"]
     argv += video_args
-    if not video_copy and unusable_reason is None and (
-        needs_tone_map
-        or color_space == "BT.709"
-        or color_space in _COLOR_CONVERT_INPUT
+    if (
+        not video_copy
+        and unusable_reason is None
+        and not hw_frames  # 纯硬件帧链不写输出侧色彩标签，理由见 _local_hw_video 末尾
+        and (
+            needs_tone_map
+            or color_space == "BT.709"
+            or color_space in _COLOR_CONVERT_INPUT
+        )
     ):
         argv += _BT709_OUTPUT_TAGS
     argv += ["-f", "matroska", output_path]

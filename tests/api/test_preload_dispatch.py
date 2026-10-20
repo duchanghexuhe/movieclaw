@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import pytest
 from fastapi.testclient import TestClient
 from tests.api.test_preload_transcode import (  # noqa: I001
@@ -361,6 +363,90 @@ def test_nas_without_hardware_takes_h264_in_software(client, tmp_path, monkeypat
     ).json()["data"]
     assert hevc["id"] not in commands
     assert hevc["id"] in _queued_task_ids(client)
+
+
+@pytest.mark.preload_local
+def test_local_failure_backs_off_before_retrying(client, tmp_path, monkeypatch):
+    """本地执行失败后先退避再重派：看门狗每 2 秒派一轮，不退避的话确定性故障会在几秒内
+    烧满熔断线（2026-10-20 真机：三次失败发生在 21:24:36/38/40，共 5 秒），瞬时抖动也会
+    被当成坏源直接判死。退避只拦 NAS 本地，远程 Worker 的派单不受影响。
+    """
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+    from movieclaw_db.engine import get_database
+
+    monkeypatch.setattr(dispatcher, "_LOCAL_RETRY_AT", {})
+    monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
+    monkeypatch.setattr(dispatcher, "_ensure_watchdog", lambda: None)
+    dispatched: list[int] = []
+
+    def fake_run(task, file, command):  # 同步签名对齐真 _run_local
+        dispatched.append(task.id)
+
+    monkeypatch.setattr(dispatcher, "_run_local", fake_run)
+    file_id = _seed_file(client, tmp_path, hdr=None, codec="hevc", resolution="1080p")
+    created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    assert dispatched == [created["id"]]  # 第一次派出去了
+
+    async def _fail() -> None:
+        async with get_database().session() as session:
+            await dispatcher.return_task_or_fail(
+                session, created["id"], reason="ffmpeg 退出码 218"
+            )
+
+    client.portal.call(partial(_fail))  # type: ignore[attr-defined]
+    # 回队成功、且记了退避
+    assert created["id"] in _queued_task_ids(client)
+    assert created["id"] in dispatcher._local_backing_off()
+
+    # 退避期内再派一轮：本机不领，任务留在队列，也没被记成熔断失败
+    client.portal.call(dispatcher.dispatch_queued_tasks)
+    assert dispatched == [created["id"]]
+    assert created["id"] in _queued_task_ids(client)
+    task_view = client.get(f"{_PRELOAD}/tasks/{created['id']}").json()["data"]
+    assert task_view["status"] == PreloadTaskStatus.QUEUED.value
+
+    # 退避到期（把截止时刻拨到过去）后本机重新接单
+    monkeypatch.setitem(dispatcher._LOCAL_RETRY_AT, created["id"], 0.0)
+    client.portal.call(dispatcher.dispatch_queued_tasks)
+    assert dispatched == [created["id"], created["id"]]
+
+
+@pytest.mark.preload_local
+def test_unusable_local_command_does_not_count_as_failure(client, tmp_path, monkeypatch):
+    """「本机装不出这条命令」（如杜比视界 P5、HDR 缺 tone-map）不是失败：一次 ffmpeg 都
+    没跑。回队必须以 yielded 语义记，不累加熔断计数——否则等 Worker 的这几分钟里，
+    看门狗每 2 秒拎它一次，几分钟就攒到熔断线，真失败一次任务就判死。
+    """
+    import movieclaw_api.services.preload.dispatcher as dispatcher
+
+    monkeypatch.setattr(dispatcher, "_LOCAL_RETRY_AT", {})
+    monkeypatch.setattr(dispatcher, "_local_capacity", lambda: 1)
+    monkeypatch.setattr(dispatcher, "_ensure_watchdog", lambda: None)
+    monkeypatch.setattr(dispatcher, "detect_local_hw", lambda: None)
+    monkeypatch.setattr(dispatcher, "_software_caps", lambda: None)  # 没有 tonemapx
+    dispatched: list[int] = []
+    monkeypatch.setattr(
+        dispatcher, "_run_local", lambda task, file, command: dispatched.append(task.id)
+    )
+
+    file_id = _seed_file(client, tmp_path, hdr="HDR10", codec="hevc", resolution="2160p")
+    created = client.post(f"{_PRELOAD}/tasks", json={"file_id": file_id}).json()["data"]
+    assert dispatched == []  # 装不出命令，本机没跑
+    assert created["id"] in _queued_task_ids(client)
+
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import PreloadTask
+
+    async def _attempts() -> int:
+        async with get_database().session() as session:
+            row = await session.get(PreloadTask, created["id"])
+            return int(row.attempts)
+
+    # 连续几轮重派（模拟看门狗每 2 秒巡检）后 attempts 不该往上堆
+    for _ in range(5):
+        client.portal.call(dispatcher.dispatch_queued_tasks)
+    assert client.portal.call(partial(_attempts)) == 0  # type: ignore[attr-defined]
+    assert dispatched == []
 
 
 @pytest.mark.preload_local

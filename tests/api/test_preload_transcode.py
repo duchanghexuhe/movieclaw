@@ -1429,7 +1429,8 @@ def test_hevc_command_needs_nvenc_and_says_so():
         id=1, preset_id="saver", video_format="hevc", resume_parts=0, part_bytes=0
     )
     file = SimpleNamespace(
-        resolution="2160p", video_codec="hevc", hdr=None, dv_profile=None, color_space=None,
+        resolution="2160p", video_codec="hevc", hdr=None, dv_profile=None,
+        dv_bl_compatible=None, color_space=None,
         bit_depth=10, duration_seconds=7200, size_bytes=1, audio_streams=[{"codec": "eac3"}],
         subtitle_streams=[], chapters=[],
     )
@@ -1866,7 +1867,8 @@ def test_hevc_needs_local_hevc_hardware(client, tmp_path):  # type: ignore[no-un
         id=1, preset_id="saver", video_format="hevc", resume_parts=0, part_bytes=0
     )
     file = SimpleNamespace(
-        resolution="1080p", video_codec="hevc", hdr=None, dv_profile=None, color_space=None,
+        resolution="1080p", video_codec="hevc", hdr=None, dv_profile=None,
+        dv_bl_compatible=None, color_space=None,
         bit_depth=10, duration_seconds=7200, size_bytes=1, audio_streams=[{"codec": "eac3"}],
         subtitle_streams=[], chapters=[], file_path="x.mkv",
     )
@@ -1937,7 +1939,8 @@ def test_local_hdr_paths_use_hardware_chain(monkeypatch):  # type: ignore[no-unt
         id=1, preset_id="premium", video_format="h264", resume_parts=0, part_bytes=0
     )
     file = SimpleNamespace(
-        resolution="2160p", video_codec="hevc", hdr="HDR10", dv_profile=None, color_space=None,
+        resolution="2160p", video_codec="hevc", hdr="HDR10", dv_profile=None,
+        dv_bl_compatible=None, color_space=None,
         bit_depth=10, duration_seconds=7200, size_bytes=1, audio_streams=[{"codec": "eac3"}],
         subtitle_streams=[], chapters=[], file_path="x.mkv",
     )
@@ -1961,3 +1964,126 @@ def test_local_hdr_paths_use_hardware_chain(monkeypatch):  # type: ignore[no-unt
 
     none = _svc.build_task_command(task, file, local=LocalHw(backend="vaapi", has_tonemapx=False))
     assert none["argv"] == [] and "tonemapx" in none["unusable_reason"]
+
+
+def test_local_hw_frames_skip_output_color_tags(monkeypatch):  # type: ignore[no-untyped-def]
+    """纯硬件帧链不写输出侧色彩三件套/range——2026-10-20 真机：4K DV P5 源走
+    tonemap_vaapi 全 GPU 链时，这组标签让 ffmpeg 7.1 在首帧重建滤镜图，插进来的软件
+    auto_scale 接不上硬件帧，整链以「Impossible to convert … / -38」当场崩（退出码 218）。
+    与实时链 cbf8475d 同一根因，那条守卫当时没跟进预转码。
+
+    软件段（帧落回内存）不受影响，标签照打；产物的色彩标签由帧属性继承，颜色不变。
+    """
+    from types import SimpleNamespace
+
+    from movieclaw_api.services.preload import service as _svc
+    from movieclaw_api.services.preload.ffmpeg_preload import LocalHw
+
+    task = SimpleNamespace(
+        id=1, preset_id="saver", video_format="h264", resume_parts=0, part_bytes=0
+    )
+    file = SimpleNamespace(
+        resolution="2160p", video_codec="hevc", hdr="HDR10", dv_profile=None,
+        dv_bl_compatible=None, color_space=None,
+        bit_depth=10, duration_seconds=7200, size_bytes=1, audio_streams=[{"codec": "eac3"}],
+        subtitle_streams=[], chapters=[], file_path="x.mkv",
+    )
+    native = LocalHw(
+        backend="vaapi", native_tonemap="tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709",
+        has_tonemapx=True,
+    )
+    gpu = _svc.build_task_command(task, file, local=native)
+    assert gpu["unusable_reason"] is None
+    for flag in ("-colorspace", "-color_primaries", "-color_trc", "-color_range"):
+        assert flag not in gpu["argv"], gpu["argv"]
+
+    # 软件段（没有原生 tone-map → 下载回内存跑 tonemapx）：标签照打
+    cpu = _svc.build_task_command(task, file, local=LocalHw(backend="vaapi", has_tonemapx=True))
+    assert cpu["unusable_reason"] is None
+    assert cpu["argv"][cpu["argv"].index("-colorspace") + 1] == "bt709"
+
+
+def test_hdr_bt2020_source_keeps_full_gpu_chain(monkeypatch):  # type: ignore[no-untyped-def]
+    """HDR 源即使标着 BT.2020，也不能因为「要色彩空间转换」退回 CPU 软件段。
+
+    原生 tone-map（``tonemap_vaapi=...:t=bt709:m=bt709:p=bt709``）本身就把画面落到 BT.709，
+    再叠一层 ``colorspace`` 是多余的；而 ``colorspace`` 是软件滤镜，必须先把硬件帧下载回来，
+    整链就从 GPU 直通退化成 CPU 转码。2026-10-20 真机：4K HDR10 因此只有 0.05× 实时；
+    去掉多余转换后是 2.2×（约 40 倍），DV P8 1.4×。
+
+    NVENC 那条链 10-14 就修过同一个坑（``_gpu_filters`` 的 tone-map 分支不插 colorspace），
+    本地 VAAPI/QSV 这条一直漏着。
+    """
+    from types import SimpleNamespace
+
+    from movieclaw_api.services.preload import service as _svc
+    from movieclaw_api.services.preload.ffmpeg_preload import LocalHw
+
+    task = SimpleNamespace(
+        id=1, preset_id="saver", video_format="h264", resume_parts=0, part_bytes=0
+    )
+    file = SimpleNamespace(
+        resolution="2160p", video_codec="hevc", hdr="HDR10", dv_profile=None,
+        dv_bl_compatible=None, color_space="BT.2020",  # HDR 源几乎都是这个组合
+        bit_depth=10, duration_seconds=7200, size_bytes=1, audio_streams=[{"codec": "eac3"}],
+        subtitle_streams=[], chapters=[], file_path="x.mkv",
+    )
+    native = LocalHw(
+        backend="vaapi", native_tonemap="tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709",
+        has_tonemapx=True,
+    )
+    gpu = _svc.build_task_command(task, file, local=native)
+    assert gpu["unusable_reason"] is None
+    vf = gpu["argv"][gpu["argv"].index("-vf") + 1]
+    assert vf.startswith("tonemap_vaapi="), vf
+    assert "colorspace=" not in vf, vf          # 多余的转换会强制下载
+    assert "hwupload" not in vf, vf             # 帧不该回内存再上传
+    assert "tonemapx" not in vf, vf             # 不该用 CPU 色调映射
+    assert "-hwaccel_output_format" in gpu["argv"]  # 硬解直接输出硬件帧
+
+    # 没有原生 tone-map 时才该退软件段（那时 colorspace + tonemapx 是必须的）
+    cpu = _svc.build_task_command(task, file, local=LocalHw(backend="vaapi", has_tonemapx=True))
+    cpu_vf = cpu["argv"][cpu["argv"].index("-vf") + 1]
+    assert "colorspace=" in cpu_vf and "tonemapx" in cpu_vf
+
+
+def test_local_refuses_dolby_vision_profile5(monkeypatch):  # type: ignore[no-untyped-def]
+    """杜比视界 P5（基础层是 IPTPQc2）：本机核显的 tonemap_vaapi 不认 RPU，硬转出来整片
+    偏紫/发绿（2026-10-20 真机实测同帧 RGB 差一个数量级）。装配层直接判本机不可执行，
+    任务留在队列等带 NVENC + tonemapx 的 Worker；P7/P8（基础层就是 HDR10）照常放行。
+    """
+    from types import SimpleNamespace
+
+    from movieclaw_api.services.preload import service as _svc
+    from movieclaw_api.services.preload.ffmpeg_preload import LocalHw
+
+    task = SimpleNamespace(
+        id=1, preset_id="saver", video_format="h264", resume_parts=0, part_bytes=0
+    )
+    native = LocalHw(
+        backend="vaapi", native_tonemap="tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709",
+        has_tonemapx=True,
+    )
+
+    def source(**extra):  # type: ignore[no-untyped-def]
+        base = dict(
+            resolution="2160p", video_codec="hevc", hdr="Dolby Vision", dv_profile=5,
+            dv_bl_compatible=False, color_space=None, bit_depth=10, duration_seconds=7200,
+            size_bytes=1, audio_streams=[{"codec": "eac3"}], subtitle_streams=[], chapters=[],
+            file_path="x.mkv",
+        )
+        base.update(extra)
+        return SimpleNamespace(**base)
+
+    p5 = _svc.build_task_command(task, source(), local=native)
+    assert p5["argv"] == [] and "杜比视界" in p5["unusable_reason"]
+
+    # P8：基础层就是 HDR10，吃不吃 RPU 都对，本机照常接——而且整链留在 GPU
+    p8 = _svc.build_task_command(
+        task, source(dv_profile=8, dv_bl_compatible=True, color_space="BT.2020"), local=native
+    )
+    assert p8["unusable_reason"] is None
+    flat_p8 = " ".join(p8["argv"])
+    assert "tonemap_vaapi" in flat_p8
+    assert "-hwaccel_output_format" in p8["argv"]  # 帧没落回内存
+    assert "tonemapx" not in flat_p8

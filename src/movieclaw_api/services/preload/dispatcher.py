@@ -58,6 +58,15 @@ _WATCH_INTERVAL = 2.0
 #: 回队重转会无限烧算力（推送失败回队不受此限——那是环境问题不是任务问题）
 _LOCAL_FAIL_MAX_ATTEMPTS = 3
 
+#: 本地失败后重派的退避（秒），按 attempts 递增，末项兜底。没有它，看门狗每 2 秒重派一次，
+#: 确定性故障 5 秒就烧满熔断线——快速止损是对的，但同一份 60 秒的故障日志只能说明「试过」，
+#: 说明不了「反复试过」；而且瞬时抖动也会被当成坏源直接判死。
+_LOCAL_RETRY_DELAYS = (30.0, 120.0)
+
+#: 本地退避截止时刻（task_id → monotonic 秒）。进程内足够：重启后丢了这个表，
+#: 最坏也只是提前重试一次，不会无限烧
+_LOCAL_RETRY_AT: dict[int, float] = {}
+
 _dispatch_lock: asyncio.Lock | None = None
 _dispatch_lock_loop: asyncio.AbstractEventLoop | None = None
 _dispatch_rerun = False
@@ -121,7 +130,10 @@ async def _dispatch_round() -> None:
         while _local_capacity() > 0:
             async with get_database().session() as session:
                 claimed = await preload_service.claim_local_task(
-                    session, allow_h264=allow_h264, allow_hevc=allow_hevc
+                    session,
+                    allow_h264=allow_h264,
+                    allow_hevc=allow_hevc,
+                    skip_task_ids=_local_backing_off(),
                 )
                 if claimed is None:
                     break
@@ -131,9 +143,13 @@ async def _dispatch_round() -> None:
                     task, file, worker_caps=software_caps, local=local, plan=plan
                 )
                 if command["unusable_reason"]:
-                    # 本机装不出正确命令（如 HDR 没有任何 tone-map）：回队等远程，循环必须就此停，
-                    # 否则队首就是它，会原样再抢一次
-                    await return_task(session, task.id, reason="本地不可执行，转远程")
+                    # 本机装不出正确命令（HDR 缺 tone-map、杜比视界基础层本机还原不了）：
+                    # 回队等远程，循环必须就此停，否则队首就是它，会原样再抢一次。
+                    # 这条路一次 ffmpeg 都没跑，**不算失败**：yielded 让这次领取不计入
+                    # 熔断次数（否则等 Worker 的这几分钟会把它攒到熔断线，真失败一次就判死）
+                    await return_task(
+                        session, task.id, reason="本地不可执行，转远程", yielded=True
+                    )
                     break
                 _run_local(task, file, command)
                 dispatched += 1
@@ -257,6 +273,9 @@ async def return_task_or_fail(session: AsyncSession, task_id: int, *, reason: st
     回队重转对「播放抢占 / 服务重启」这类环境中断是正确语义，但对坏源是
     无限重转——每次触发点都会把整部电影重新烧一遍。attempts 在每次抢占时
     +1，连续超过熔断线就置 FAILED 交给用户处置（可重试）。
+
+    回队时记一条退避：看门狗每 2 秒就会再派一轮，不退避的话确定性故障会在几秒内
+    烧满熔断线，瞬时抖动也会被当成坏源判死（见 :data:`_LOCAL_RETRY_DELAYS`）。
     """
     task = await session.get(PreloadTask, task_id)
     if task is None:
@@ -267,8 +286,30 @@ async def return_task_or_fail(session: AsyncSession, task_id: int, *, reason: st
         await preload_service.fail_task(
             session, task, f"连续失败 {task.attempts} 次，已熔断：{reason}"
         )
-    else:
-        await return_task(session, task_id, reason=reason)
+        return
+    _postpone_local(task)
+    await return_task(session, task_id, reason=reason)
+
+
+def _postpone_local(task: PreloadTask, *, seconds: float | None = None) -> None:
+    """给这个任务记一段「本机先别领」的退避（进程内，默认按 attempts 递增）。"""
+    delay = _local_retry_delay(task.attempts) if seconds is None else seconds
+    _LOCAL_RETRY_AT[task.id] = time.monotonic() + delay
+
+
+def _local_retry_delay(attempts: int) -> float:
+    """第 ``attempts`` 次尝试失败后攒多久再让本机领（末项兜底）。"""
+    index = min(max(attempts - 1, 0), len(_LOCAL_RETRY_DELAYS) - 1)
+    return _LOCAL_RETRY_DELAYS[index]
+
+
+def _local_backing_off() -> set[int]:
+    """仍在退避期、本机这轮不该领的任务 id（顺手回收到期的项）。"""
+    now = time.monotonic()
+    for task_id, deadline in list(_LOCAL_RETRY_AT.items()):
+        if deadline <= now:
+            _LOCAL_RETRY_AT.pop(task_id, None)
+    return set(_LOCAL_RETRY_AT)
 
 
 def trigger_dispatch() -> None:

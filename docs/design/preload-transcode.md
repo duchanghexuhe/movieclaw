@@ -194,6 +194,31 @@ Worker 跑同一套分段协议。有能转这一单的 Worker 在线时，NAS �
     有人播放就让位，所以不会拖慢家里看片。
   - **Windows Worker**（外置，GPU）：NVENC 链，协议与 NAS 相同（`worker/*`）。Worker 自身设置（并发、
     仅接通电源时执行、开机自启）在它自己的界面里。
+- **本机的三条禁忌（2026-10-20 真机踩实，前两条与实时链同一口径）**
+  - **HDR 源不要因为 BT.2020 就退回软件段**：原生 tone-map（`tonemap_vaapi=…:t=bt709:m=bt709:p=bt709`）
+    本身就把画面落到 BT.709，再叠 `colorspace` 转换既多余又致命——它是软件滤镜，必须先把硬件帧
+    `hwdownload` 回来，整链从 GPU 直通退化成 CPU 转码。真机 4K HDR10 因此只有 **0.05× 实时**；
+    去掉多余转换后 **2.2×**（约 40 倍），DV P8 1.4×。NVENC 链 10-14 就修过同一个坑
+    （`_gpu_filters` 的 tone-map 分支不插 colorspace），本地 VAAPI/QSV 一直漏着。
+    软件段只该在「要 tone-map 但本机没有原生滤镜」或「SDR 源要色彩空间转换」时出现。
+  - **纯硬件帧链不写输出侧色彩标签**：`-colorspace/-color_primaries/-color_trc/-color_range` 只加在
+    帧落回内存的软件段上。4K DV P5 源走 `tonemap_vaapi → scale_vaapi → h264_vaapi` 时，这组标签会让
+    ffmpeg 7.1 在首帧重建滤镜图、插进来的软件 `auto_scale` 接不上硬件帧，整链以「Impossible to
+    convert … / -38」当场崩（退出码 218，工程上表现为三次秒失败后熔断）。产物的色彩标签由帧属性
+    继承，颜色不受影响（实测去掉标签后产物仍是 bt709 三件套）。
+  - **杜比视界 P5 本机不接**：VAAPI/QSV 的 `tonemap_vaapi` 不认 RPU，P5 的 IPTPQc2 基础层硬转出来
+    整片偏紫/发绿（同帧 RGB 实测与 `tonemapx` 差一个数量级）。装配层直接判「本机不可执行」回队等
+    带 NVENC + `tonemapx` 的 Worker——与播放端 `plan.py` 的 `dolby_vision == "apply"` 同一判定。
+    P7/P8（基础层就是 HDR10）不受影响，走整链 GPU。
+- **这台 NAS 的实测速度（4K 源，省流档 480p/H.264）**：SDR 1080p ~14×、HDR10 4K **2.2×**、
+  DV P8 4K **1.4×**、仅缩放不 tone-map 5.1×（即瓶颈是硬件 tone-map，不是解码）。
+  DV P5 本机不接。2 小时电影在 4K HDR 上约 55–85 分钟转完，符合「闲时后台干」的定位。
+
+- **失败要退避，不能立刻重派**：本地执行失败回队后按 attempts 退避（30s → 120s）。看门狗每 2 秒派
+  一轮，不退避的话确定性故障 5 秒就烧满三次熔断线（2026-10-20 真机：21:24:36/38/40），瞬时抖动也
+  会被当成坏源判死。「本机装不出命令」不算失败（一次 ffmpeg 都没跑），以 `yielded` 语义回队、
+  不累加熔断计数，否则等 Worker 的几分钟会把它攒到熔断线。
+
 - **分段协议**（两端一致）：视频与音频按 `SEGMENT_SECONDS` 分段，每段一个 ffmpeg 进程（`-ss` 插在
   `-i` 前，`-t` 插在输入之后，末段转到 EOF）。段文件直接落进任务目录，推进 `resume_parts`，中断后
   续转。拼接、字幕内封、探测、登记由服务端的 `finalize_artifact` 统一完成，两端共用。

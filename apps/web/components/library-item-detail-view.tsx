@@ -506,7 +506,7 @@ export function LibraryItemDetailView({
   useEffect(() => {
     refreshPreloadTasks();
   }, [refreshPreloadTasks]);
-  // 任务在 Worker 侧推进，设置页/任务中心各自轮询；本页是下单主路径，
+  // 任务在后台执行者侧推进（NAS 本地或远程 Worker），设置页/任务中心各自轮询；本页是下单主路径，
   // 同节奏跟随（转码是分钟级任务，15 秒足够），页面隐藏时自动暂停
   useVisiblePolling(refreshPreloadTasks, 15_000);
   const handlePreloadCreate = useCallback(
@@ -519,13 +519,13 @@ export function LibraryItemDetailView({
             : "占用体积未知（源缺少时长信息）";
         const ok = await confirm({
           title: `把「${file.file_name}」预转码？`,
-          description: `${sizeNote}（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码由 Worker 在后台闲时完成，完成后文件区会出现一个低码率的可选版本。`,
+          description: `${sizeNote}（当前剩余 ${(est.free_bytes / 1024 ** 3).toFixed(1)} GB）。转码在后台闲时完成（有转码 Worker 时用它的显卡，没有就由 NAS 自己转），完成后文件区会出现一个低码率的可选版本。`,
           confirmLabel: "加入转码队列",
           cancelLabel: "先不",
         });
         if (!ok) return;
         const task = await createPreloadTask(file.id, presetId);
-        toast.success(`已加入转码队列（任务 #${task.id}），等 Worker 领取`);
+        toast.success(`已加入转码队列（任务 #${task.id}），等后台领取`);
         refreshPreloadTasks();
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "下单失败，请稍后重试");
@@ -551,7 +551,7 @@ export function LibraryItemDetailView({
             : "占用体积未知（源缺少时长信息）";
         const ok = await confirm({
           title: `把这一季的 ${files.length} 个文件预转码？`,
-          description: `${sizeNote}（当前剩余 ${(freeBytes / 1024 ** 3).toFixed(1)} GB）。转码由 Worker 在后台闲时完成，完成后各集文件区会出现低码率的可选版本。`,
+          description: `${sizeNote}（当前剩余 ${(freeBytes / 1024 ** 3).toFixed(1)} GB）。转码在后台闲时完成（有转码 Worker 时用它的显卡，没有就由 NAS 自己转），完成后各集文件区会出现低码率的可选版本。`,
           confirmLabel: "加入转码队列",
           cancelLabel: "先不",
         });
@@ -566,7 +566,7 @@ export function LibraryItemDetailView({
             firstError = firstError ?? (e instanceof Error ? e.message : "下单失败");
           }
         }
-        if (done > 0) toast.success(`已加入转码队列 ${done} 个，等 Worker 领取`);
+        if (done > 0) toast.success(`已加入转码队列 ${done} 个，等后台领取`);
         if (firstError) toast.error(`${files.length - done} 个未能下单：${firstError}`);
         refreshPreloadTasks();
       } catch (e) {
@@ -2649,7 +2649,7 @@ function PreloadDialog({
         </h3>
         <p className="mt-2 text-sub leading-6 text-[var(--text-muted)]">
           提前转好的 <span className="text-white/80">低码率版本</span>：外网播放直接发小文件，
-          NAS 不用实时转码。由转码 Worker 在后台闲时完成（设置 → 转码），完成后文件区多出一个可选版本。
+          NAS 不用实时转码。在后台闲时完成（有转码 Worker 时用它，没有就由 NAS 自己转），完成后文件区多出一个可选版本。
         </p>
         {presets && presets.length > 1 && (
           // 胶囊底材与发现页 SourceSwitcher 逐类一致；选中态白系语言原样

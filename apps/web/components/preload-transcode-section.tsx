@@ -224,7 +224,7 @@ export function TranscodeSection() {
   return (
       <SettingsSection
         title="预转码"
-        description="转码 Worker 闲时把指定影片提前转成小体积版本，档位只有省流/高清两档；播放时选了对应清晰度就直接发预转文件，不用实时转码。同一个 Worker 播放时接实时单、闲时接预转码单，在「设备」分区配对；任务进度看「活动」页。"
+        description="转码 Worker 闲时把指定影片提前转成小体积版本，档位只有省流/高清两档；播放时选了对应清晰度就直接发预转文件，不用实时转码。同一个 Worker 播放时接实时单、闲时接预转码单，在「设备」分区配对。没有 Worker 在线时由 NAS 自己转（慢一些，有人播放会先让路）；任务进度看「活动」页。"
       >
       {overview && (
         <div className="mb-4">
