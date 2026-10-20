@@ -303,3 +303,59 @@ def test_yield_keeps_local_work_but_cancel_removes_it(monkeypatch, tmp_path):
         rt.api = object()
         _run_until_stopped(rt, task_id, cancel=cancel)
         assert (tmp_path / "work" / str(task_id) / "source.mkv").exists() is kept
+
+
+class _ChunkedResp:
+    """假响应：按块吐字节，读空即结束（对应 urllib 的 read 语义）。"""
+
+    def __init__(self, total: int, chunk: int) -> None:
+        self._left = total
+        self._chunk = chunk
+
+    def read(self, _size: int) -> bytes:
+        take = min(self._chunk, self._left)
+        self._left -= take
+        return b"x" * take
+
+
+class _FakeClock:
+    """每次取时间前进固定步长，让 1 秒测速窗口在确定块数后落值。"""
+
+    def __init__(self, step: float) -> None:
+        self._now = 0.0
+        self._step = step
+
+    def __call__(self) -> float:
+        self._now += self._step
+        return self._now
+
+
+def test_copy_source_stream_reports_speed_and_eta(tmp_path):
+    """取源时上报滑动平均速度与预计完成时间（页面的「速度 + 剩余」就靠这条链）。"""
+    chunk = 1024
+    total = 10 * chunk
+    # 时钟每取一次前进 1 秒 ≈ 每块耗时 1 秒：窗口稳定落在 1 块/秒
+    clock = _FakeClock(1.0)
+    progress: dict = {}
+    dest = tmp_path / "source.mkv"
+    with open(dest, "wb") as out:
+        received = worker_mod.copy_source_stream(
+            _ChunkedResp(total, chunk), out, progress, expected=total, clock=clock
+        )
+    assert received == total and dest.stat().st_size == total
+    assert progress["downloaded_bytes"] == total
+    assert progress["speed_bps"] == chunk  # 1 秒窗口正好收到 1 块
+    # ETA 每个窗口按「剩余字节 ÷ 当时速度」重算，最后一窗只剩 1 块 = 1 秒
+    assert progress["eta_seconds"] == 1
+
+
+def test_copy_source_stream_without_speed_leaves_eta_absent(tmp_path):
+    """源太短（不到一个测速窗口）时不编造速度：页面只显示「取源中」。"""
+    progress: dict = {}
+    dest = tmp_path / "source.mkv"
+    with open(dest, "wb") as out:
+        received = worker_mod.copy_source_stream(
+            _ChunkedResp(4, 4), out, progress, expected=4, clock=_FakeClock(0.0)
+        )
+    assert received == 4
+    assert "speed_bps" not in progress and "eta_seconds" not in progress

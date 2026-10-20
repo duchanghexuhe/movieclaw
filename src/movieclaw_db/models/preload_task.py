@@ -123,8 +123,8 @@ class PreloadTask(TimestampMixin, table=True):
     )
 
     # -- 实时进度（Worker 进度上报落台账）--------------------------------------
-    # {phase, downloaded_bytes, total_bytes, segment_index, segment_total,
-    #  eta_seconds}：活动页进行中卡片据此显示下载量/第几段/剩余时间。
+    # {phase, downloaded_bytes, total_bytes, speed_bps, segment_index,
+    #  segment_total, eta_seconds}：活动页进行中卡片据此显示下载量/速度/第几段/剩余时间。
     # 领取与租约回队时清零——旧执行的最后进度不属于新执行
     progress: dict | None = Field(
         default=None,

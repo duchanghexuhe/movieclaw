@@ -44,7 +44,7 @@ import {
   type DownloadTaskSource,
 } from "@/lib/api/downloaders";
 import { useDownloadTasks } from "@/lib/download-tasks";
-import { formatBytes, formatDuration } from "@/lib/format";
+import { formatBytes, formatDuration, formatSpeed } from "@/lib/format";
 import { imageUrl } from "@/lib/image-proxy";
 import { summarizeEpisodeUnits } from "@/lib/episode-units";
 import {
@@ -1044,10 +1044,16 @@ function preloadProgressText(task: PreloadTaskView): string | null {
   if (!p) return null;
   const parts: string[] = [];
   if (p.phase === "downloading") {
+    const speed = formatSpeed(p.speed_bps);
     parts.push(
-      (p.total_bytes ?? 0) > 0
-        ? `取源中 ${formatBytes(p.downloaded_bytes ?? 0)} / ${formatBytes(p.total_bytes ?? 0)}`
-        : "取源中",
+      [
+        (p.total_bytes ?? 0) > 0
+          ? `取源中 ${formatBytes(p.downloaded_bytes ?? 0)} / ${formatBytes(p.total_bytes ?? 0)}`
+          : "取源中",
+        speed,
+      ]
+        .filter(Boolean)
+        .join(" · "),
     );
   } else if (p.phase === "finalizing") {
     parts.push("拼接登记中");
@@ -2875,9 +2881,12 @@ function preloadProgressShort(task: PreloadTaskView): string | null {
   const p = task.progress;
   if (!p) return null;
   if (p.phase === "downloading") {
-    return (p.total_bytes ?? 0) > 0
-      ? `取源中 ${Math.min(99, Math.round(((p.downloaded_bytes ?? 0) / (p.total_bytes ?? 1)) * 100))}%`
-      : "取源中";
+    const speed = formatSpeed(p.speed_bps);
+    const base =
+      (p.total_bytes ?? 0) > 0
+        ? `取源中 ${Math.min(99, Math.round(((p.downloaded_bytes ?? 0) / (p.total_bytes ?? 1)) * 100))}%`
+        : "取源中";
+    return speed ? `${base} · ${speed}` : base;
   }
   if (p.phase === "finalizing") return "拼接登记中";
   if (p.segment_index != null && (p.segment_total ?? 0) > 0) {

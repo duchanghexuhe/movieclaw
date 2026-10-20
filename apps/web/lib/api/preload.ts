@@ -18,10 +18,12 @@ export interface PreloadProgress {
   phase?: string;
   downloaded_bytes?: number;
   total_bytes?: number;
+  /** 取源速度（字节/秒，Worker 按 1 秒窗口滑动平均；非下载阶段为 0/缺省） */
+  speed_bps?: number;
   /** 正在转的第几段（1 起） */
   segment_index?: number;
   segment_total?: number;
-  /** 预计剩余秒数（已完成段平均耗时 × 剩余段数） */
+  /** 预计剩余秒数（下载期按速度算，转码期按已完成段平均耗时 × 剩余段数） */
   eta_seconds?: number;
 }
 

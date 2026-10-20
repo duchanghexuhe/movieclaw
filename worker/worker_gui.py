@@ -245,10 +245,61 @@ def _fmt_eta(seconds: object) -> str:
     return f"剩余约 {minutes // 60} 时 {minutes % 60} 分"
 
 
+def _fmt_speed(bps: object) -> str:
+    """取源速度：MB/s（Worker 上报的是字节/秒）。无值返回空串。"""
+    try:
+        value = float(bps or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    return f"{value / 1024 ** 2:.1f}MB/s"
+
+
 def _fmt_bytes(nbytes: float) -> str:
     if nbytes >= 1024 ** 3:
         return f"{nbytes / 1024 ** 3:.1f}GB"
     return f"{nbytes / 1024 ** 2:.0f}MB"
+
+
+def task_progress_rows(view: list[tuple[str, dict]]) -> list[str]:
+    """进度台账 → 状态栏任务行（纯函数：GUI 与会话外的单测共用一套口径）。
+
+    取源阶段带速度和剩余时间（大源在千兆上也要几分钟，没有这两项用户只会觉得
+    「卡住了」）；转码阶段按段位进度 + 已完成段的平均耗时估剩余。
+    """
+    rows: list[str] = []
+    for name, prog in view:
+        phase = prog.get("phase")
+        if phase == "downloading":
+            done = int(prog.get("downloaded_bytes") or 0)
+            total = int(prog.get("total_bytes") or 0)
+            tail = "，".join(
+                part for part in (_fmt_speed(prog.get("speed_bps")),
+                                  _fmt_eta(prog.get("eta_seconds"))) if part
+            )
+            detail = f"，{tail}" if tail else ""
+            if total:
+                rows.append(
+                    f"· {name} — 下载源 {done / total * 100:.0f}%"
+                    f"（{_fmt_bytes(done)}/{_fmt_bytes(total)}{detail}）"
+                )
+            else:
+                rows.append(
+                    f"· {name} — 下载源文件{('（' + tail + '）') if tail else '…'}"
+                )
+        elif phase == "transcoding":
+            idx = max(int(prog.get("segment_index") or 0), 1)
+            total_seg = int(prog.get("segment_total") or 0)
+            pct = (idx - 1) / total_seg * 100 if total_seg else 0
+            eta = _fmt_eta(prog.get("eta_seconds"))
+            eta_text = f"，{eta}" if eta else ""
+            rows.append(f"· {name} — 转码 {pct:.0f}%（第 {idx}/{total_seg} 段{eta_text}）")
+        elif phase == "finalizing":
+            rows.append(f"· {name} — 拼接收尾（服务端校验登记）")
+        else:
+            rows.append(f"· {name} — 准备中")
+    return rows
 
 
 class WorkerGUI:
@@ -627,30 +678,7 @@ class WorkerGUI:
         """状态栏的任务行：轮询 progress_view，显示每个在跑任务的实时进度。"""
         if self.runtime is None:
             return
-        rows: list[str] = []
-        for name, prog in self.runtime.progress_view():
-            phase = prog.get("phase")
-            if phase == "downloading":
-                done = int(prog.get("downloaded_bytes") or 0)
-                total = int(prog.get("total_bytes") or 0)
-                if total:
-                    rows.append(
-                        f"· {name} — 下载源 {done / total * 100:.0f}%"
-                        f"（{_fmt_bytes(done)}/{_fmt_bytes(total)}）"
-                    )
-                else:
-                    rows.append(f"· {name} — 下载源文件…")
-            elif phase == "transcoding":
-                idx = max(int(prog.get("segment_index") or 0), 1)
-                total_seg = int(prog.get("segment_total") or 0)
-                pct = (idx - 1) / total_seg * 100 if total_seg else 0
-                eta = _fmt_eta(prog.get("eta_seconds"))
-                eta_text = f"，{eta}" if eta else ""
-                rows.append(f"· {name} — 转码 {pct:.0f}%（第 {idx}/{total_seg} 段{eta_text}）")
-            elif phase == "finalizing":
-                rows.append(f"· {name} — 拼接收尾（服务端校验登记）")
-            else:
-                rows.append(f"· {name} — 准备中")
+        rows = task_progress_rows(self.runtime.progress_view())
         text = "任务：\n" + "\n".join(rows) if rows else "任务：—"
         if text != self.lbl_slots.cget("text"):
             self.lbl_slots.configure(text=text)

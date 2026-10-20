@@ -82,7 +82,7 @@ def _task_view(
         "error": task.error,
         "result_file_id": task.result_file_id,
         # 实时进度（Worker 进度上报落台账）：{phase, downloaded_bytes, total_bytes,
-        # segment_index, segment_total, eta_seconds}，活动页进行中卡片渲染
+        # speed_bps, segment_index, segment_total, eta_seconds}，活动页进行中卡片渲染
         "progress": task.progress,
         "created_at": utc_isoformat(task.created_at) if task.created_at else None,
         "completed_at": utc_isoformat(task.completed_at) if task.completed_at else None,

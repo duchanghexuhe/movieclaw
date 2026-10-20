@@ -170,6 +170,7 @@ async def report_preload_progress(
     for key in (
         "downloaded_bytes",
         "total_bytes",
+        "speed_bps",
         "segment_index",
         "segment_total",
         "eta_seconds",

@@ -334,6 +334,47 @@ def _total_memory() -> int:
     return int(status.ullTotalPhys)
 
 
+def copy_source_stream(
+    resp,
+    dest,
+    progress: dict,
+    *,
+    expected: int,
+    clock=time.monotonic,
+    chunk_bytes: int = 4 * 1024 * 1024,
+) -> int:
+    """把源文件的响应流写进 ``dest``，边写边维护进度台账。
+
+    台账里维护三个键（服务端白名单同名字段，网页/GUI 都读它）：
+
+    - ``downloaded_bytes``：累计已收字节；
+    - ``speed_bps``：**滑动平均**速度，不是瞬时值——4MiB 块在千兆上约 35ms，
+      瞬时值按块算会剧烈抖动，页面 15 秒轮询一次只会看到乱跳的数字。窗口
+      取 1 秒，窗口满才落一次值，顺带算 ``eta_seconds``；
+    - ``eta_seconds``：按最近一个窗口的速度估的剩余秒数。
+
+    ``clock`` 可注入，测试里用假时钟免等真实秒数。
+    """
+    received = 0
+    window_start = clock()
+    window_bytes = 0
+    while chunk := resp.read(chunk_bytes):
+        dest.write(chunk)
+        received += len(chunk)
+        window_bytes += len(chunk)
+        progress["downloaded_bytes"] = received
+        elapsed = clock() - window_start
+        if elapsed < 1.0:
+            continue
+        speed_bps = window_bytes / elapsed
+        window_start = clock()
+        window_bytes = 0
+        progress["speed_bps"] = int(speed_bps)
+        if expected > received and speed_bps > 0:
+            progress["eta_seconds"] = int((expected - received) / speed_bps)
+    return received
+
+
 def process_task(
     api: Api,
     ffmpeg: str,
@@ -411,17 +452,18 @@ def process_task(
                 try:
                     req = urllib.request.Request(url)
                     with _NO_PROXY_OPENER.open(req, timeout=600) as resp, open(source, "wb") as out:
-                        received = 0
-                        while chunk := resp.read(4 * 1024 * 1024):
-                            out.write(chunk)
-                            received += len(chunk)
-                            progress["downloaded_bytes"] = received
+                        copy_source_stream(resp, out, progress, expected=expected)
                     last_error = None
+                    # 下载收尾：速度归零，ETA 交给转码段重新计算（否则页面会一直
+                    # 挂着下载期算出的剩余时间）
+                    progress["speed_bps"] = 0
+                    progress.pop("eta_seconds", None)
                     break
                 except (urllib.error.URLError, OSError) as exc:
                     last_error = exc
                     source.unlink(missing_ok=True)
                     progress["downloaded_bytes"] = 0
+                    progress["speed_bps"] = 0
                     print(f"[{task_id}] 源下载失败（第 {attempt + 1}/3 次）：{exc}")
                     time.sleep(2 * (attempt + 1))
             if last_error is not None:
@@ -432,6 +474,7 @@ def process_task(
                 )
                 return False
         progress.update(phase="transcoding", downloaded_bytes=expected, total_bytes=expected)
+        progress["speed_bps"] = 0
 
         # 3) 计算段数并跳过已收段
         # 向上取整；无分段（直拷/单段）就是 1 段

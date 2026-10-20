@@ -24,6 +24,13 @@ export function formatBytes(bytes: number): string {
   return `${rounded.toFixed(rounded >= 100 || i === 0 ? 0 : 2)} ${units[i]}`;
 }
 
+/** 速率（字节/秒）→ 可读文本，如「113.09 MB/s」；无值/0 给空串（调用方自己省略）。 */
+export function formatSpeed(bytesPerSecond: number | undefined | null): string {
+  const value = bytesPerSecond ?? 0;
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return `${formatBytes(value)}/s`;
+}
+
 /**
  * 分享率 → 展示文本。null 表示站点未提供（与 0.00 —— 真实无上传 —— 含义不同），
  * 显示为「—」。

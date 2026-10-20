@@ -325,3 +325,47 @@ def test_gui_refuses_chinese_name_before_it_silently_becomes_hostname(gui, monke
     app.var_name.set("study-pc")
     app._start()
     assert started[-1]["name"] == "study-pc"
+
+
+def test_task_progress_rows_show_speed_and_eta_while_downloading():
+    """取源阶段的状态行要带速度和剩余时间：大源在千兆上也要跑几分钟，
+    只显示百分比用户会以为卡住了（2026-10-20 用户反馈的直接诉求）。"""
+    import worker_gui
+
+    rows = worker_gui.task_progress_rows(
+        [
+            (
+                "痴迷 (2026).mkv",
+                {
+                    "phase": "downloading",
+                    "downloaded_bytes": 15 * 1024**3,
+                    "total_bytes": 20 * 1024**3,
+                    "speed_bps": int(113.09 * 1024**2),
+                    "eta_seconds": 300,
+                },
+            )
+        ]
+    )
+    assert len(rows) == 1
+    assert "下载源 75%" in rows[0]
+    assert "113.1MB/s" in rows[0]
+    assert "剩余约 5 分" in rows[0]
+
+
+def test_task_progress_rows_fall_back_when_worker_has_no_speed():
+    """旧版 Worker 不发速度/ETA 时不能显示空括号——退回原来的纯百分比口径。"""
+    import worker_gui
+
+    rows = worker_gui.task_progress_rows(
+        [
+            (
+                "a.mkv",
+                {
+                    "phase": "downloading",
+                    "downloaded_bytes": 5 * 1024**2,
+                    "total_bytes": 10 * 1024**2,
+                },
+            )
+        ]
+    )
+    assert rows == ["· a.mkv — 下载源 50%（5MB/10MB）"]
