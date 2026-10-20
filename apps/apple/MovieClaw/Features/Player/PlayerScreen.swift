@@ -542,7 +542,19 @@ private struct PlayerContent: View {
                     .padding(.horizontal, PlayerLayout.edge)
                     .padding(.bottom, PlayerLayout.gap)
                 }
-                if let segment = controller.skipSegment {
+                // 自动跳过的提示和跳过按钮占同一个角落，提示优先（撤回后回到片头里，提示收起才轮到按钮）
+                if let notice = controller.skipNotice {
+                    HStack {
+                        Spacer()
+                        PlayerSkipNotice(notice: notice, undo: controller.undoAutoSkip, decline: controller.declineIntroAutoSkip)
+                    }
+                    .padding(.horizontal, PlayerLayout.edge)
+                    .padding(.bottom, PlayerLayout.gap)
+                    .task(id: notice.id) {
+                        try? await Task.sleep(for: .milliseconds(notice.durationMs))
+                        controller.expireSkipNotice(notice.id)
+                    }
+                } else if let segment = controller.skipSegment {
                     HStack {
                         Spacer()
                         PlayerSkipButton(segment: segment, action: controller.skipCurrentSegment)
@@ -617,7 +629,8 @@ private struct PlayerContent: View {
             case .none: EmptyView()
             case .audio: AudioMenu(controller: controller) { menu = .none }.transition(menuTransition(.audio))
             case .subtitles: SubtitleMenu(controller: controller) { menu = .none }.transition(menuTransition(.subtitles))
-            case .settings: SettingsMenu(controller: controller) { menu = .none }.transition(menuTransition(.settings))
+            // ⋯ 是系统菜单（PlayerSettingsMenu），自己弹出；这里只记着它开着，让控制层常显
+            case .settings: EmptyView()
             }
         }
         .animation(.spring(duration: 0.32, bounce: 0.18), value: menu)

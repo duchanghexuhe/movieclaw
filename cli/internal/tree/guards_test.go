@@ -28,6 +28,12 @@ var knownNonGenerated = []string{
 	"session.attachments.download",
 	// 技能清单：Web composer 数据源；Agent 侧技能走系统提示词注入
 	"skills.list",
+	// 插件网页（docs/design/plugin-web-pages.md）：侧边栏数据源与 iframe 加载的静态文件，
+	// 都是 Web 基础设施；命令行看插件网页走 app plugins pages list
+	"ui.apps.list",
+	"ui.apps.root",
+	"ui.apps.file",
+	"ui.apps.errors.report",
 	"auth.device.authorize",
 	"auth.device.token",
 	// 原生 App 的账号密码登录：客户端之间的协议端点，mclaw 走配对码
@@ -108,6 +114,9 @@ var knownNonGenerated = []string{
 	"playback.metric.report",
 	// 清观看记录是 Web 个人数据入口（destructive，见 library-access.md 2.6），不进命令树
 	"playback.history.clear",
+	// 自动跳过的个人偏好（skip-intro.md §5）：播放器在用户跳过 / 撤回时写，不进命令树
+	"playback.auto-skip.set",
+	"playback.auto-skip.intro.set",
 	// 待处理事项 → Agent 诊断工单：Web 活动页专用，命令行用户直接开会话即可
 	"session.handoff.prompt",
 	"playback.client-log",

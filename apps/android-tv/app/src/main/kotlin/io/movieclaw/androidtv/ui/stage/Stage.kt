@@ -42,8 +42,10 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.LinearGradientShader
 import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.Shadow
@@ -86,7 +88,7 @@ data class StageBadge(val text: String, val filled: Boolean)
  * 这一层铺满整屏、还在不停地动，所以任何时候都不离屏合成（docs/perf/androidtv-home-scroll-2026-10.md）：
  * - 首页往下滚时的整层淡出：底下正好是纯色页面底，改为在上面盖一层「页面底色 × (1 − 透明度)」，与整层离屏淡出逐像素相同；
  *   详情页底下是模糊图，仍按整层透明度淡出（这时才离屏）；
- * - 首页托字的黑用一个合成着色器一遍画完，不再离屏画横向渐变再用纵向渐隐 DstIn；
+ * - 首页托字的黑用一个合成着色器一遍画完，不再离屏画横向渐变再用纵向渐隐 DstIn（Android 9 及以下仍离屏，见 [scrimInOnePass]）；
  * - 换片时新旧剧照的交叉淡入，透明度直接乘到图片上（单张图，与整层淡入相同）。
  */
 @Composable
@@ -168,7 +170,7 @@ fun StageBackdrop(
                             ),
                         )
                     }
-                } else {
+                } else if (scrimInOnePass(Build.VERSION.SDK_INT)) {
                     // 横向托字黑 × 剧照下沿渐隐：两条渐变用 DstIn 合成成一个着色器，深浅用整笔的透明度给
                     // （原先是离屏先画横向渐变、再用纵向渐隐 DstIn，结果相同）
                     Spacer(
@@ -183,11 +185,24 @@ fun StageBackdrop(
                             onDrawBehind { drawRect(brush, alpha = animatedStrength.value) }
                         },
                     )
+                } else {
+                    // 同一块托字黑的老画法：离屏先画横向渐变，再用纵向渐隐当遮罩（DstIn），多一遍全屏离屏
+                    Canvas(Modifier.fillMaxWidth().height(1080.pt).graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }) {
+                        drawRect(Brush.horizontalGradient(*EasedFade.stops(Color.Black.copy(alpha = animatedStrength.value), 0.1f, 0.65f)))
+                        drawRect(Brush.verticalGradient(*EasedFade.stops(Color.Black, fadeFrom, 1f)), blendMode = BlendMode.DstIn)
+                    }
                 }
             }
         }
     }
 }
+
+/**
+ * 首页托字黑能否用合成着色器一遍画完（[sdk] 传 Build.VERSION.SDK_INT）。
+ * 两条线性渐变是同类着色器，文档说硬件加速下要 Android 9（API 28）起才支持合成；但 Android 9 的真机（极米 H3S，芯片 m7642）上
+ * 这一笔整块画成白色，盖住剧照和字。所以 Android 10 起才一遍画，更老的系统退回离屏 + DstIn。
+ */
+internal fun scrimInOnePass(sdk: Int) = sdk >= 29
 
 /** 从原点到 [to] 的线性渐变着色器（与 Brush.horizontalGradient / verticalGradient 铺满整块时一致） */
 private fun gradient(stops: Array<Pair<Float, Color>>, to: Offset) =

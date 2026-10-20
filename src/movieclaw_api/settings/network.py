@@ -47,18 +47,18 @@ BUILTIN_EGRESS_SERVICES: list[dict[str, str]] = [
     {
         "id": "telegram",
         "label": "Telegram 推送",
-        "description": "Telegram bot 收发消息(api.telegram.org),国内网络需代理",
+        "description": "Telegram bot 收发消息（api.telegram.org），国内网络需代理",
     },
     {
         "id": "discord",
         "label": "Discord 推送",
-        "description": "Discord bot 收发消息(discord.com / gateway),国内网络需代理",
+        "description": "Discord bot 收发消息（discord.com / gateway），国内网络需代理",
     },
     {
         "id": "feishu",
         "label": "飞书推送",
-        "description": "飞书群自定义机器人 Webhook(open.feishu.cn),国内网络通常可直连;"
-        "国际版 Lark(open.larksuite.com)可能需要代理",
+        "description": "飞书群自定义机器人 Webhook（open.feishu.cn），国内网络通常可直连；"
+        "国际版 Lark（open.larksuite.com）可能需要代理",
     },
     {
         "id": "webhook",

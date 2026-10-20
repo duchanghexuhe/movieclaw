@@ -1713,9 +1713,78 @@ def test_base_layer_needs_an_hdr_display():
     assert decision.video.tone_map is True
 
 
-def test_profile_7_falls_back_only_where_the_client_declares_it():
-    # ExoPlayer 只对 P8（和 P4）改用 HEVC 解码器解基础层，P7 不在申报里：照旧转码
-    assert decide_playback(dv(7, True), HDR10_TV, WITH_GPU).tier is PlaybackTier.HARDWARE_TRANSCODE
+#: 真机快照（Android 9 投影仪，ExoPlayer）：屏幕报 HDR10 / HLG，HEVC 硬解到 2176p，
+#: 没有杜比视界解码器——ExoPlayer 只对 P4 / P8 退回 HEVC 解码器，申报里没有 P7
+PROJECTOR = _replace(
+    EXOPLAYER,
+    video=(VideoSupport("h264"), VideoSupport("hevc", max_height=2176)),
+    hdr_passthrough=True,
+    dolby_vision_base_layer_profiles=frozenset({4, 8}),
+)
+
+
+@pytest.mark.parametrize("policy", [NO_GPU, WITH_GPU])
+def test_profile_7_remuxes_to_the_hdr10_base_layer(policy):
+    """P7 的基础层就是 HDR10：没有显卡也不该拒绝（真机曾被「需要显卡做色调映射」拒播）。
+    原文件 ExoPlayer 放不了，只给剥掉增强层与 RPU 的换封装，不给直出"""
+    decision = decide_playback(dv(7, True), PROJECTOR, policy)
+    assert isinstance(decision, PlaybackPlan), decision
+    assert decision.tier is PlaybackTier.REMUX, decision.reason
+    assert decision.video.action == "copy"
+    assert decision.video.dolby_vision == "strip"
+    assert "HDR10 基础层" in decision.reason
+    assert needs_keyframe_probe(dv(7, True), PROJECTOR, policy)
+
+
+def test_profile_7_base_layer_survives_an_audio_transcode():
+    """音轨要转码时视频照样 copy，同样只给基础层"""
+    source = media(**{**vars(dv(7, True)), "audio_tracks": (DTS_51,)})
+    decision = decide_playback(source, PROJECTOR, NO_GPU)
+    assert decision.tier is PlaybackTier.AUDIO_TRANSCODE, decision.reason
+    assert decision.video.dolby_vision == "strip"
+
+
+def test_profile_7_base_layer_needs_an_hdr_display_and_a_compatible_base_layer():
+    """屏幕不能直出 HDR、或基础层不兼容：照旧色调映射，没有显卡就拒绝"""
+    sdr = _replace(PROJECTOR, hdr_passthrough=False)
+    rejected = decide_playback(dv(7, True), sdr, NO_GPU)
+    assert isinstance(rejected, PlaybackRejected)
+    assert "Dolby Vision" in rejected.reason
+    transcoded = decide_playback(dv(7, True), sdr, WITH_GPU)
+    assert transcoded.tier is PlaybackTier.HARDWARE_TRANSCODE and transcoded.video.tone_map
+    for compatible in (False, None):
+        assert isinstance(decide_playback(dv(7, compatible), PROJECTOR, NO_GPU), PlaybackRejected)
+
+
+def test_profile_7_follows_what_the_client_declares():
+    """播放器自己申报能退回 P7 基础层的，照原来直出原文件，不剥层"""
+    declared = _replace(PROJECTOR, dolby_vision_base_layer_profiles=frozenset({4, 7, 8}))
+    decision = decide_playback(dv(7, True), declared, NO_GPU)
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.video.dolby_vision is None
+
+
+def test_profile_5_is_not_stripped_to_its_base_layer():
+    """P5 的基础层是 IPTPQc2，剥掉 RPU 当 HDR10 放就是绿紫画面：仍要色调映射"""
+    assert isinstance(decide_playback(dv(5, False), PROJECTOR, NO_GPU), PlaybackRejected)
+    assert decide_playback(dv(5, False), PROJECTOR, WITH_GPU).video.dolby_vision == "apply"
+
+
+def test_profile_7_bluray_clips_go_through_the_server_remux():
+    """原盘按剪辑直推时播放器读的是原码流：P7 也走服务端换封装，LPCM 不补直通能力"""
+    player = _replace(PROJECTOR, bluray_clips=True)
+    disc = media(
+        **{
+            **vars(dv(7, True)),
+            "container": "bluray",
+            "disc_clips": 1,
+            "disc_format": "bluray",
+            "audio_tracks": (BLURAY_LPCM,),
+        },
+    )
+    decision = decide_playback(disc, player, NO_GPU)
+    assert decision.disc is None and decision.video.dolby_vision == "strip"
+    assert decision.audio.action == "transcode"
 
 
 def test_unknown_profile_and_old_clients_keep_transcoding():
@@ -1814,6 +1883,92 @@ def test_remux_for_a_dolby_vision_decoder_keeps_the_record():
     # 设备解不了杜比视界、只放基础层的不保留记录
     p8 = _replace(dv(8, True), audio_tracks=(DTS_51,))
     assert decide_playback(p8, HDR10_TV, WITH_GPU).video.dolby_vision is None
+
+
+# ---------------------------------------------------------------------------
+# 降档后的音轨（#906）：失败过的档位原样输出过它，降下来就不能再照抄
+# ---------------------------------------------------------------------------
+
+#: 小米 MiTV4X 的片：H.264 1080p MKV + 英语 AC3 5.1；电视申报能解 AC3，实际一放就停滞
+_MITV_AC3 = media(
+    audio_tracks=(
+        AudioTrack(ref="embedded:0", codec="ac3", channels=6, language="eng", is_default=True),
+    )
+)
+
+
+def test_audio_tier_after_failures_really_transcodes_the_audio():
+    """档 0、1 都失败后落到档 2「音频单转」：音轨必须真的转，固定为 AAC-LC 双声道。
+    以前档位号推到 2，音频计划却沿用「AC3 可直通」照样 copy，档 2 只是档 1 换了个编号。"""
+    decision = decide_playback(
+        _MITV_AC3, ANDROID_TRUEHD, WITH_GPU,
+        failed_tiers=frozenset({PlaybackTier.DIRECT_PLAY, PlaybackTier.REMUX}),
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.AUDIO_TRANSCODE
+    assert decision.video.action == "copy"
+    assert decision.audio.action == "transcode"
+    audio = decision.audio
+    assert (audio.codec, audio.channels, audio.downmix) == ("aac", 2, True)
+    assert decision.audio.track_ref == "embedded:0"
+    assert decision.degraded_from is PlaybackTier.DIRECT_PLAY
+    assert "AAC-LC 双声道" in decision.reason and "已自动降档" in decision.reason
+    assert "可直通；" not in decision.reason.split("；", 1)[1]
+
+
+def test_transcode_tiers_after_failures_keep_the_safe_audio():
+    """连档 2 也失败、视频改转码时，音轨同样不回到原样 copy（报告里档 4 仍是 AC3 6 声道）。"""
+    decision = decide_playback(
+        _MITV_AC3, ANDROID_TRUEHD, NO_GPU_SOFT_ON,
+        failed_tiers=frozenset(
+            {PlaybackTier.DIRECT_PLAY, PlaybackTier.REMUX, PlaybackTier.AUDIO_TRANSCODE}
+        ),
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.SOFTWARE_TRANSCODE
+    assert decision.audio.action == "transcode"
+    assert (decision.audio.codec, decision.audio.channels) == ("aac", 2)
+
+
+def test_audio_already_transcoded_before_the_failure_also_falls_back_to_aac():
+    """TrueHD 在档 2 转成 E-AC-3 5.1 仍然失败：降下来也换 AAC 双声道，别再交给同一个解码器。"""
+    profile = media(audio_tracks=(TRUEHD_71,))
+    no_truehd = ClientCapability(
+        **{
+            **vars(ANDROID_TRUEHD),
+            "audio": tuple(AudioSupport(c, 8) for c in ("aac", "ac3", "eac3")),
+        }
+    )
+    first = decide_playback(profile, no_truehd, WITH_GPU)
+    assert first.tier is PlaybackTier.AUDIO_TRANSCODE and first.audio.codec == "eac3"
+    decision = decide_playback(
+        profile, no_truehd, WITH_GPU, failed_tiers=frozenset({PlaybackTier.AUDIO_TRANSCODE})
+    )
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    audio = decision.audio
+    assert (audio.action, audio.codec, audio.channels) == ("transcode", "aac", 2)
+
+
+def test_stereo_aac_is_not_reencoded_after_failures():
+    """源轨本来就是 AAC 双声道：已是最稳的格式，降档也照样 copy，不白编一路。"""
+    decision = decide_playback(
+        media(audio_tracks=(AAC_STEREO,)), ANDROID_TRUEHD, WITH_GPU,
+        failed_tiers=frozenset({PlaybackTier.DIRECT_PLAY, PlaybackTier.REMUX}),
+    )
+    assert decision.tier is PlaybackTier.AUDIO_TRANSCODE
+    assert decision.audio.action == "copy"
+
+
+def test_failure_history_without_a_degrade_keeps_the_audio():
+    """没被失败顶下来的会话（带着档 1 失败的历史开烧录会话）不动音轨，同降档标记的口径。"""
+    decision = decide_playback(
+        media(**PGS_MEDIA_KW, audio_tracks=(AC3_51,)), ANDROID_TRUEHD, WITH_GPU,
+        preferred_subtitle="embedded:1",
+        failed_tiers=frozenset({PlaybackTier.REMUX}),
+    )
+    assert decision.tier is PlaybackTier.HARDWARE_TRANSCODE
+    assert decision.degraded_from is None
+    assert (decision.audio.action, decision.audio.codec) == ("copy", "ac3")
 
 
 # ---------------------------------------------------------------------------

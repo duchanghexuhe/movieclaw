@@ -61,6 +61,8 @@ data class PlayerState(
     val episodes: List<EpisodeView> = emptyList(),
     val hasSession: Boolean = false,
     val segments: List<PlaybackSegmentView>? = null,
+    /** 自动跳过的提示，与跳过按钮占同一个角落、优先显示 */
+    val skipNotice: SkipNotice? = null,
     val errorMessage: String? = null,
     val errorSuggestion: String? = null,
     /** 等用户拍板的决策（需要软件转码的同意弹窗） */
@@ -84,6 +86,8 @@ data class PlayerState(
     val currentAudio: String? = null,
     /** 画质上限（null = 原画） */
     val quality: Int? = null,
+    /** 菜单选的倍速（按片记，换集保持）；长按倍速只是临时盖住它，不改这里 */
+    val speed: Float = 1f,
     /** 叠加层要画的服务端文本字幕（已带 `&format=vtt`）；Exo 自己画、烧录、图形字幕时为 null */
     val overlaySubtitleUrl: String? = null,
     /** 当前字幕由 Exo 画（画面里的 cue 走 [PlaybackController.cues]） */

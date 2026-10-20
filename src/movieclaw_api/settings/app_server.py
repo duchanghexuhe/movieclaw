@@ -5,8 +5,8 @@
 ``https://movie.example.com``），供生成通知链接、回调地址等绝对 URL 的场景
 使用（Agent 系统提示词的环境段也注入它来拼页面链接）；家宽上行带宽
 （``uplink_mbps``）：外网播放的前置降档预算。Docker 桥接部署下，
-Jellyfin 兼容层的 UDP 自动发现探测到容器内网 IP 时也改用 ``external_url``
-应答（见 ``movieclaw_jellyfin/udp.py``）。
+局域网自动发现探测到容器内网 IP 时它也是候选地址之一（见
+``services/lan_discovery.py``）。
 
 为什么端口不在这个配置域里：对外端口（前端监听口）确实可以在应用内改，但它
 的事实源是 data 卷上的端口文件而不是数据库——真正读它的是 entrypoint 与

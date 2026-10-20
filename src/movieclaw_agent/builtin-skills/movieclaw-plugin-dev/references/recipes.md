@@ -658,3 +658,40 @@ audience = "admins"
   ```
 - 用户在「账号 → 通知」的「插件 · <插件名>」分组里逐条开关；插件卸载时这些开关一并删掉。
 
+
+## 18. 网盘后端：接一家网盘做媒体库的存储
+
+契约与骨架以 `$SRC/movieclaw_sdk/drives.py` 文件头为准（`DriveBackend` 的每个方法都有说明），完整的真实插件是插件仓库的
+`plugins/cloud-115/`（<https://github.com/movieclaw/movieclaw-plugins>）。主程序本身不带任何网盘：`mclaw drives status`
+的 `active` 为假就是还没有插件提供网盘后端，`drives backends list` 列出已能接的。
+
+**动手前先跟用户讲清的几件事**：
+
+- **登录有三种**：扫码（`Login(scan=True)`，实现 `begin_login` / `login_state`，扫码前要选的项用 `options`）、浏览器扩展把网页
+  Cookie 推过来（`cookie_domains`，实现 `login_with_cookie`）、填表（`Login(form=<pydantic 模型>)`，实现 `login_with_form`）。
+  开放平台的 Client ID / 密钥、WebDAV 的地址与密码都走填表：密钥字段用 `SecretStr`（界面按密码框画、不回显），
+  `login_with_form` 里**真去网盘换一次令牌、读一次用户信息**，交回真实的网盘用户 id；密钥不对抛 `AuthExpired`，限流照常抛 `RateLimited`。
+  令牌由长期密钥换来的，把密钥、令牌、过期时间一起放进凭据，快过期时在调用里重新换、赋给 `account.credentials`。
+  不要拿插件设置存网盘密钥（设置是全局一份，网盘账号是每个一份，对不上），也不要把密钥伪装成 Cookie。
+- **只支持能写的网盘**（`Capabilities(writable=True)`，只读网盘这一期不支持）：上传（`ensure_dir` / `begin_upload` /
+  `upload_part` / `finish_upload`）和删除（`delete`）都要实现。
+- **建库时网盘有两种用法**（`mclaw library create --help`）：`--cloud-folders-json` 挂上已有的网盘文件夹即纳管（按文件名识别入库，
+  不下载、不改动网盘上的文件，播放时从网盘取）；主根放在网盘则新入库的文件整理后上传，核验后腾空本地（`--keep-local` 保留本地一份）。
+- 账号与凭据加密、限速与每日预算、同时播放数、超时与重试、错误归类、设置页都是主程序的：插件里**不要自己睡眠重试、不要自己限速**，
+  每个 HTTP 请求设超时，只抛 `movieclaw_sdk.drives` 里的异常（`RateLimited`、`RiskControl`、`NotFound`……），
+  **只有确认登录失效才抛 `AuthExpired`**（会让用户重新登录）。
+
+**写的时候**：
+
+- 连网盘**必须**走 `httpx.AsyncClient(transport=movieclaw_sdk.net.http_transport("<条目 id>"), timeout=…)`，清单写
+  `network = true`：主程序的限速就在这个出口上，一次调用里翻几十页也逐个请求排队、计预算；直连的话翻页会连发，
+  网盘按请求计频率，很快就限流（#907），主程序日志也会警告「没经 SDK 网络出口」。把 transport 做成构造参数（缺省用
+  `http_transport`），测试时注入假服务；客户端建一个长期复用，别每个请求 `async with` 一个（退出时会关掉共享的 transport）。
+- 网盘的社区协议库常带 GPL 等传染性许可证（PyPI 页面写的不一定准），选依赖要看轮子里的 LICENSE（见 `manifest.md`「第三方依赖」）。
+
+**验证**：
+
+1. 先离线：照 cloud-115 的 `tests/`（`fake115.py` 仿网盘服务 + `httpx.MockTransport`）写单元测试，覆盖登录、列目录、直链、上传分片、
+   限流 / 失效的异常归类。
+2. 再请用户配合：装好后在网页「设置 → 网盘」用自己的账号登录，给一个可以随便动的测试文件夹；你用 `drives accounts list` 确认账号在、
+   `drives accounts dirs <账号 id>` 能列出目录，再建一个只挂这个文件夹的测试库，让用户播放一集确认取流。上传要单独征得同意再测。

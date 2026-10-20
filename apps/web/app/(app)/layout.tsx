@@ -3,6 +3,7 @@ import { AuthGate } from "@/components/auth-gate";
 import { LlmCapabilityProvider } from "@/components/llm-gate";
 import { DownloadTasksProvider } from "@/lib/download-tasks";
 import { JobsProvider } from "@/lib/jobs";
+import { PluginAppsProvider } from "@/lib/plugin-apps-context";
 import { PreloadTasksProvider } from "@/lib/preload-tasks";
 
 /**
@@ -17,9 +18,11 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       <LlmCapabilityProvider>
         <JobsProvider>
           <DownloadTasksProvider>
-            <PreloadTasksProvider>
-              <AppShell>{children}</AppShell>
-            </PreloadTasksProvider>
+            <PluginAppsProvider>
+              <PreloadTasksProvider>
+                <AppShell>{children}</AppShell>
+              </PreloadTasksProvider>
+            </PluginAppsProvider>
           </DownloadTasksProvider>
         </JobsProvider>
       </LlmCapabilityProvider>

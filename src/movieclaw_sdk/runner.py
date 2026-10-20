@@ -1068,6 +1068,16 @@ class Runner:
         account = dv.account_from(payload["account"]) if payload.get("account") else None
         before = dict(account.credentials) if account is not None else None
         envelope: dict[str, Any] = {}
+        if account is not None:
+            from movieclaw_sdk import net
+
+            async def pace() -> None:
+                # 限速器在宿主：带着调用号回去领名额（cloud-storage.md §8）
+                error = await self.service("net").pace()
+                if error:
+                    raise dv.error_from(error)
+
+            net.pacer.set(pace)
         try:
             assert self.ctx is not None
             backend = self.ctx._drives[message["listener"]]
@@ -1080,6 +1090,8 @@ class Runner:
             elif method == "login_with_cookie":
                 result = await backend.login_with_cookie(args["cookie_header"])
                 envelope["value"] = dv.result_dict(result)
+            elif method == "login_with_form":
+                envelope["value"] = dv.result_dict(await backend.login_with_form(args["values"]))
             elif method == "account_info":
                 envelope["value"] = dv.info_dict(await backend.account_info(account))
             elif method == "list_dir":

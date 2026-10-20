@@ -235,6 +235,56 @@ nonisolated extension API {
         }
     }
 
+    struct AppEntry: Codable, Hashable, Sendable {
+        /// 侧边栏文字（manifest 的 short_name / name）
+        var label: String
+        /// 落点：相对插件网页根目录的子路径，主入口通常为空
+        var path: String
+        /// 图标地址；没有则用默认图标
+        var icon: String?
+        /// manifest 标了 purpose: monochrome：按遮罩用当前文字颜色着色
+        var monochrome: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case label
+            case path
+            case icon
+            case monochrome
+        }
+    }
+
+    struct AppErrorReport: Codable, Hashable, Sendable {
+        /// 报错信息（error.message）
+        var message: String
+        /// 出处与调用栈
+        var detail: String?
+
+        enum CodingKeys: String, CodingKey {
+            case message
+            case detail
+        }
+    }
+
+    struct AppView: Codable, Hashable, Sendable {
+        /// 插件 id；主程序地址是 /apps/<id>/
+        var id: String
+        var name: String
+        /// 用户同意加到侧边栏
+        var nav: Bool
+        /// iframe 加载的地址前缀
+        var base: String
+        /// 侧边栏项：主入口在前，manifest shortcuts 依次在后
+        var entries: [API.AppEntry]
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case name
+            case nav
+            case base
+            case entries
+        }
+    }
+
     /// 外观设置的对外视图。
     /// 背景图是按账号隔离的「图库」：用户上传的图全部保留（``backdrops``，按上传
     /// 时间升序），其中至多一张为当前生效图（``active_id`` / ``active_url``）。
@@ -3177,7 +3227,7 @@ nonisolated extension API {
         var backendAvailable: Bool
         var accentColor: String
         var name: String
-        /// scan / cookie
+        /// scan / cookie / form
         var loginMethod: String
         /// 登录细节（如扫码选的登录端）
         var loginDetail: String?
@@ -3289,10 +3339,13 @@ nonisolated extension API {
         var backend: String
         /// 整页 Cookie（name=value; name2=value2）
         var cookie: String
+        /// 从这个账号的卡片上重新登录：登进来的必须是同一个网盘用户
+        var relogin: Int?
 
         enum CodingKeys: String, CodingKey {
             case backend
             case cookie
+            case relogin
         }
     }
 
@@ -3319,6 +3372,20 @@ nonisolated extension API {
             case videoCount = "video_count"
             case libraryId = "library_id"
             case libraryName = "library_name"
+        }
+    }
+
+    struct DriveFormLoginPayload: Codable, Hashable, Sendable {
+        var backend: String
+        /// 按后端声明的 login.form 填的值
+        var values: [String: API.JSONValue]
+        /// 从这个账号的卡片上重新登录：登进来的必须是同一个网盘用户
+        var relogin: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case backend
+            case values
+            case relogin
         }
     }
 
@@ -3354,10 +3421,13 @@ nonisolated extension API {
         var backend: String
         /// 扫码前选的项
         var options: [String: String]?
+        /// 从这个账号的卡片上重新登录：登进来的必须是同一个网盘用户
+        var relogin: Int?
 
         enum CodingKeys: String, CodingKey {
             case backend
             case options
+            case relogin
         }
     }
 
@@ -3367,6 +3437,8 @@ nonisolated extension API {
         /// 支持用浏览器扩展导入或粘贴 Cookie 登录
         var cookie: Bool
         var cookieDomains: [String]
+        /// 填表登录的字段（JSON Schema 子集，同插件设置）；null = 不支持填表登录
+        var form: [String: API.JSONValue]?
         /// 扫码前要选的项（如登录端）
         var options: [API.DriveLoginOptionView]
         var hint: String
@@ -3375,6 +3447,7 @@ nonisolated extension API {
             case scan
             case cookie
             case cookieDomains = "cookie_domains"
+            case form
             case options
             case hint
         }
@@ -4911,6 +4984,8 @@ nonisolated extension API {
         var replacesBuiltin: Bool
         /// 批准安装的第三方依赖；没有则为空
         var dependencies: API.InstalledDependenciesView?
+        /// 插件网页的同意；不带网页或没同意为空
+        var web: API.WebConsentView?
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -4928,6 +5003,7 @@ nonisolated extension API {
             case watching
             case replacesBuiltin = "replaces_builtin"
             case dependencies
+            case web
         }
     }
 
@@ -7440,13 +7516,16 @@ nonisolated extension API {
     /// - 版本升级新增的导航入口，在存过排序的老用户那里也一定会出现（追加在后），
     /// 不会因为不在这个列表里而永远消失——这是这类"存死一份顺序"功能最常见的事故；
     /// - 已经不存在的 id（导航项被删）读取时直接忽略，无需迁移。
-    /// 上限 32 只是防脏数据无限增长的安全阀，不是产品限制（主导航实际只有个位数项）。
+    /// 上限 64 只是防脏数据无限增长的安全阀，不是产品限制（内置项个位数，另加插件网页的项）。
     struct NavUiPrefs: Codable, Hashable, Sendable {
         /// 侧栏主导航的展示顺序（导航项 id）；空列表 = 用内置默认顺序
         var order: [String]
+        /// 从侧栏移出的导航项 id（只有插件网页的项能移出，docs/design/plugin-web-pages.md §4.2）；空 = 都显示
+        var hidden: [String]?
 
         enum CodingKeys: String, CodingKey {
             case order
+            case hidden
         }
     }
 
@@ -7459,13 +7538,16 @@ nonisolated extension API {
     /// - 版本升级新增的导航入口，在存过排序的老用户那里也一定会出现（追加在后），
     /// 不会因为不在这个列表里而永远消失——这是这类"存死一份顺序"功能最常见的事故；
     /// - 已经不存在的 id（导航项被删）读取时直接忽略，无需迁移。
-    /// 上限 32 只是防脏数据无限增长的安全阀，不是产品限制（主导航实际只有个位数项）。
+    /// 上限 64 只是防脏数据无限增长的安全阀，不是产品限制（内置项个位数，另加插件网页的项）。
     struct NavUiPrefsInput: Codable, Hashable, Sendable {
         /// 侧栏主导航的展示顺序（导航项 id）；空列表 = 用内置默认顺序
         var order: [String]?
+        /// 从侧栏移出的导航项 id（只有插件网页的项能移出，docs/design/plugin-web-pages.md §4.2）；空 = 都显示
+        var hidden: [String]?
 
         enum CodingKeys: String, CodingKey {
             case order
+            case hidden
         }
     }
 
@@ -7886,6 +7968,12 @@ nonisolated extension API {
         var allowMemberNotifications: Bool?
         /// 同意安装的第三方依赖：填待批准包的 dependencies.lock_digest；锁文件与已安装版本相同时不用填
         var dependencies: String?
+        /// 插件带网页时须显式确认：网页以正在使用它的人的身份运行（管理员打开时拥有管理员的全部权限）
+        var allowWeb: Bool?
+        /// 带网页时：加到侧边栏
+        var webNav: Bool?
+        /// 带网页时：成员也能看到
+        var webMembers: Bool?
 
         enum CodingKeys: String, CodingKey {
             case version
@@ -7894,6 +7982,9 @@ nonisolated extension API {
             case paths
             case allowMemberNotifications = "allow_member_notifications"
             case dependencies
+            case allowWeb = "allow_web"
+            case webNav = "web_nav"
+            case webMembers = "web_members"
         }
     }
 
@@ -7964,6 +8055,8 @@ nonisolated extension API {
         var dependencies: API.PackageDependenciesView?
         /// 批准后正在安装依赖时的进度
         var dependencyProgress: API.DependencyProgressView?
+        /// 带网页：侧边栏入口预览。批准时须 allow_web（网页以使用者的身份运行）
+        var web: API.PendingWebView?
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -7987,6 +8080,7 @@ nonisolated extension API {
             case replacesBuiltin = "replaces_builtin"
             case dependencies
             case dependencyProgress = "dependency_progress"
+            case web
         }
     }
 
@@ -8117,6 +8211,24 @@ nonisolated extension API {
             case appPublishedAt = "app_published_at"
             case modelTag = "model_tag"
             case checkedAt = "checked_at"
+        }
+    }
+
+    /// 待批准的包带网页：批准页预览侧边栏入口，并须单独同意授信运行。
+    struct PendingWebView: Codable, Hashable, Sendable {
+        var id: String
+        var name: String
+        var source: String
+        /// iframe 加载的地址前缀
+        var base: String
+        var entries: [API.WebEntryView]
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case name
+            case source
+            case base
+            case entries
         }
     }
 
@@ -8372,6 +8484,28 @@ nonisolated extension API {
             case endedAt = "ended_at"
             case detail
             case logTail = "log_tail"
+        }
+    }
+
+    /// 改自动跳过：总开关，或某部剧的片头。
+    struct PlaybackAutoSkipRequest: Codable, Hashable, Sendable {
+        var enabled: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case enabled
+        }
+    }
+
+    /// 这个人的自动跳过设定（docs/design/skip-intro.md §5），跟账号走。
+    /// 客户端按它决定进了区间是直接跳还是只给按钮：广告、预告在 ``enabled`` 时直接跳；
+    /// 片头还要 ``intro``（用户在这部剧里手动跳过过一次片头）；其他类型永远只给按钮。
+    struct PlaybackAutoSkipView: Codable, Hashable, Sendable {
+        var enabled: Bool
+        var intro: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case enabled
+            case intro
         }
     }
 
@@ -9048,6 +9182,7 @@ nonisolated extension API {
         var source: API.PlaybackSourceView?
         var chapters: [API.PlaybackChapterMarkView]
         var segments: [API.PlaybackSegmentView]?
+        var autoSkip: API.PlaybackAutoSkipView?
         var matroskaCues: API.MatroskaCuesView?
 
         enum CodingKeys: String, CodingKey {
@@ -9064,6 +9199,7 @@ nonisolated extension API {
             case source
             case chapters
             case segments
+            case autoSkip = "auto_skip"
             case matroskaCues = "matroska_cues"
         }
     }
@@ -14243,6 +14379,73 @@ nonisolated extension API {
             case selectionState = "selection_state"
             case selectionVersion = "selection_version"
             case provisional
+        }
+    }
+
+    struct WebConsentUpdate: Codable, Hashable, Sendable {
+        /// 加到侧边栏
+        var nav: Bool?
+        /// 成员也能看到
+        var members: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case nav
+            case members
+        }
+    }
+
+    struct WebConsentView: Codable, Hashable, Sendable {
+        /// 加到侧边栏
+        var nav: Bool
+        /// 成员也能看到（管理员总能看到）
+        var members: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case nav
+            case members
+        }
+    }
+
+    struct WebEntryView: Codable, Hashable, Sendable {
+        /// 侧边栏文字（manifest 的 short_name / name）
+        var label: String
+        /// 落点：相对插件网页根目录的子路径，主入口通常为空
+        var path: String
+        /// 图标地址；待批准的包是内嵌的 SVG data URL；没有则由前端用默认图标
+        var icon: String?
+        /// manifest 标了 purpose: monochrome：按遮罩用当前文字颜色着色
+        var monochrome: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case label
+            case path
+            case icon
+            case monochrome
+        }
+    }
+
+    /// 一个带网页的插件（插件包或本地插件），不论是否已同意。
+    struct WebPageView: Codable, Hashable, Sendable {
+        var id: String
+        var name: String
+        /// package：插件包；local：本地插件
+        var source: String
+        /// 用户已同意授信运行；没同意的不托管、不进侧边栏
+        var approved: Bool
+        var nav: Bool
+        var members: Bool
+        var base: String
+        var entries: [API.WebEntryView]
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case name
+            case source
+            case approved
+            case nav
+            case members
+            case base
+            case entries
         }
     }
 

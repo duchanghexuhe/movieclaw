@@ -4,6 +4,7 @@ import android.app.Application
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithText
 import io.movieclaw.core.model.generated.LibraryView
 import io.movieclaw.core.model.generated.UpNextItemView
 import io.movieclaw.core.model.generated.UpNextView
@@ -21,6 +22,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+
+private const val EXIT_HINT = "再按一次返回键退出"
 
 /**
  * 侧边栏 ↔ 首页的焦点（用户真机：首页按左弹出菜单，选「首页」或收起菜单后方向键全失灵，只剩按左再弹菜单）。
@@ -92,9 +95,9 @@ class ShellFocusTest {
         assertEquals("返回", rule.focusedText())
     }
 
-    private fun back() {
+    private fun back(settleMs: Long = 400) {
         rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }
-        rule.mainClock.advanceTimeBy(400)
+        rule.mainClock.advanceTimeBy(settleMs)
         rule.waitForIdle()
     }
 
@@ -108,10 +111,56 @@ class ShellFocusTest {
         assertEquals("继续播放", rule.focusedText())
         rule.press(KeyEvent.KEYCODE_DPAD_RIGHT)
         assertEquals("详情", rule.focusedText())
-        // 首页内容区（菜单收起）再按返回才退出
+        // 首页内容区（菜单收起）再按返回：先提示，连按第二下才退出
+        back()
+        assertFalse(rule.activity.isFinishing)
+        rule.onNodeWithText(EXIT_HINT).assertExists()
         back()
         assertTrue(rule.activity.isFinishing)
     }
+
+    @Test
+    fun backOnHomeRootExitsOnlyWhenPressedTwiceInARow() {
+        back()
+        assertFalse(rule.activity.isFinishing)
+        rule.onNodeWithText(EXIT_HINT).assertExists()
+        // 提示不抢焦点
+        assertEquals("继续播放", rule.focusedText())
+        // 等过了时限：提示自己消失，再按只是重新提示
+        rule.mainClock.advanceTimeBy(EXIT_WINDOW_MS + 500)
+        rule.waitForIdle()
+        rule.onNodeWithText(EXIT_HINT).assertDoesNotExist()
+        back()
+        assertFalse(rule.activity.isFinishing)
+        rule.onNodeWithText(EXIT_HINT).assertExists()
+        back()
+        assertTrue(rule.activity.isFinishing)
+    }
+
+    /** 从侧边栏切到 [tabTitle] 页签的根页，按返回：回到首页，焦点落在「继续播放」上，不退出 */
+    private fun backOnTabRootGoesHome(tabTitle: String, upPresses: Int) {
+        rule.press(KeyEvent.KEYCODE_DPAD_LEFT)
+        assertEquals("首页", rule.focusedText())
+        repeat(upPresses) { rule.press(KeyEvent.KEYCODE_DPAD_UP) }
+        assertEquals(tabTitle, rule.focusedText())
+        rule.press(KeyEvent.KEYCODE_DPAD_CENTER, settleMs = 1_000)
+        back(settleMs = 1_000)
+        assertFalse(rule.activity.isFinishing)
+        rule.onNodeWithText(EXIT_HINT).assertDoesNotExist()
+        assertEquals("继续播放", rule.focusedText())
+        // 回到首页之后照常：先提示、连按才退出
+        back()
+        assertFalse(rule.activity.isFinishing)
+        back()
+        assertTrue(rule.activity.isFinishing)
+    }
+
+    @Test
+    fun backOnSearchRootGoesHome() = backOnTabRootGoesHome("搜索", upPresses = 1)
+
+    /** 用户真机：「谁在看？」左上角挂着「‹ 账号名」，按返回却直接退出了 App */
+    @Test
+    fun backOnAccountRootGoesHome() = backOnTabRootGoesHome("我", upPresses = 2)
 
     @Test
     fun sidebarKeepsFocusAtItsEnds() {

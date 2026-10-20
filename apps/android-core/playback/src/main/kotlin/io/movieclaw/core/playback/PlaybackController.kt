@@ -35,11 +35,13 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecDecoderException
 import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.session.MediaSession
+import io.movieclaw.core.model.generated.PlaybackAutoSkipView
 import io.movieclaw.core.model.generated.PlaybackBlurayView
 import io.movieclaw.core.model.generated.PlaybackClientLogPayload
 import io.movieclaw.core.model.generated.PlaybackDecisionView
 import io.movieclaw.core.model.generated.PlaybackMetricPayload
 import io.movieclaw.core.model.generated.PlaybackProgressRequest
+import io.movieclaw.core.model.generated.PlaybackSegmentView
 import io.movieclaw.core.model.generated.PlaybackSessionRequest
 import io.movieclaw.core.model.generated.PlaybackSessionView
 import io.movieclaw.core.model.generated.PlaybackStateView
@@ -246,6 +248,13 @@ class PlaybackController(
     private var tracksKnown = false
     private val qualityMemory = QualityMemory(prefs)
     private var qualityFromMemory = false
+    private val speedMemory = SpeedMemory(prefs)
+    /** 倍速是这次打开时从记忆里取的、用户还没动过：开播提示要点明 */
+    private var speedFromMemory = false
+    /** 长按倍速生效中：这期间 Exo 的速度不是 [PlayerState.speed] */
+    private var holdSpeedActive = false
+    /** 从加速降下来后视频还要丢几秒帧才追平：这之前不判直通掉帧 */
+    private var frameDropGraceUntil = 0L
     private var memoryNoticeChecked = false
     val network: PlaybackNetwork = PlaybackNetwork.current(server.origin.host)
 
@@ -288,6 +297,14 @@ class PlaybackController(
         val remembered = qualityMemory.quality(target.mediaItemId, network)
         set { copy(quality = remembered) }
         qualityFromMemory = remembered != null
+        // 倍速同样按片记（访客不记）；Exo 换集时沿用同一个速度
+        if (backend !is ShareBackend) {
+            speedMemory.speed(target.mediaItemId)?.let { speed ->
+                set { copy(speed = speed) }
+                exo.setPlaybackSpeed(speed)
+                speedFromMemory = true
+            }
+        }
         exo.addListener(ExoListener())
         exo.addAnalyticsListener(engineFacts)
         this.scope.launch {
@@ -486,7 +503,7 @@ class PlaybackController(
         }
         set {
             copy(
-                unit = next, speedLabel = null, hasSession = false, segments = null, pendingDecision = null,
+                unit = next, speedLabel = null, hasSession = false, segments = null, skipNotice = null, pendingDecision = null,
                 subtitles = SubtitleTracks(), selectedSubtitle = null, audioOptions = emptyList(), currentAudio = null,
                 trickplay = null, durationMs = null, bufferedEndMs = null, nextDismissed = false, autoNextProgress = 0.0,
                 qualityOffer = null, wantsPlay = true, positionMs = start ?: 0, overlaySubtitleUrl = null,
@@ -494,6 +511,7 @@ class PlaybackController(
             )
         }
         loadingBps = null
+        skipHandled.clear()
         beginRecord("tap")
         resetWatchdogs()
         request(startMs = start, next = Phase.Deciding)
@@ -564,10 +582,93 @@ class PlaybackController(
     /** 返回键收起「下一集」卡片：这一集里不再出现 */
     fun dismissUpNext() = set { copy(nextDismissed = true, autoNextProgress = 0.0) }
 
+    /**
+     * 点「跳过」：直接跳到这一段结束处。片头是这部剧第一次手动跳，就记下来、以后自动跳（§5），
+     * 同时给「本剧以后自动跳过片头 · 不用」；服务端记不住（旧版本）、访客就不学、不给这句话
+     */
     fun skipCurrentSegment() {
         noteUserActivity()
         val segment = s.skipSegment ?: return
         seekTo(segment.endMs, exact = true, source = "skip")
+        if (segment.type == "intro" && autoSkipEnabled && canLearnIntro && !introAutoSkip && backend !is ShareBackend) {
+            setIntroAutoSkip(true)
+            showSkipNotice(SkipNotice.Kind.Learned)
+        }
+    }
+
+    // ---- 自动跳过（docs/design/skip-intro.md §5，与 Apple 端 PlaybackController 同一套） ----
+
+    /** 自动跳过总开关（跟账号走，随会话下发；旧服务端没有就按默认开） */
+    private var autoSkipEnabled = true
+    /** 这部剧的片头自动跳 */
+    private var introAutoSkip = false
+    /** 服务端能不能记住片头选择：会话带回了 `auto_skip` 才能；旧服务端没有，学了下一集也带不回来 */
+    private var canLearnIntro = false
+    /** 本次播放里改过的片头选择：保存请求还没落库时下一集的会话可能带回旧值，以这里为准 */
+    private var introAutoSkipOverride: Boolean? = null
+    /** 本集已经决定过的段（按起点记）：自然播进去自动跳一次；用户拖进去、跳回去、撤回过的只给按钮 */
+    private val skipHandled = mutableSetOf<Long>()
+    private var skipNoticeSeq = 0L
+
+    private fun showSkipNotice(kind: SkipNotice.Kind, segment: PlaybackSegmentView? = null) {
+        skipNoticeSeq += 1
+        set { copy(skipNotice = SkipNotice(skipNoticeSeq, kind, segment)) }
+    }
+
+    /** 进度推进时调用：自然播进了区间、这一段还没决定过，就按 [SkipSegments.autoSkips] 跳或只给按钮 */
+    private fun evaluateAutoSkip() {
+        if (s.phase != Phase.Playing || s.paused) return
+        val segment = s.skipSegment ?: return
+        if (!skipHandled.add(segment.startMs)) return
+        if (!SkipSegments.autoSkips(segment, autoSkipEnabled, introAutoSkip)) return
+        seekTo(segment.endMs, exact = true, source = "auto", marksSkipHandled = false)
+        showSkipNotice(SkipNotice.Kind.Skipped, segment)
+    }
+
+    /** 落点所在的段算「用户自己去的」：不自动跳，只给按钮 */
+    private fun markSkipHandled(fileMs: Long) {
+        s.segments?.firstOrNull { fileMs >= it.startMs && fileMs < it.endMs }?.let { skipHandled.add(it.startMs) }
+    }
+
+    /** 「撤回」：回到这一段起点接着看；撤回的是片头就忘掉这部剧的片头自动跳 */
+    fun undoAutoSkip() {
+        noteUserActivity()
+        val notice = s.skipNotice ?: return
+        val segment = notice.segment?.takeIf { notice.kind == SkipNotice.Kind.Skipped } ?: return
+        seekTo(segment.startMs, exact = true, source = "skip")
+        if (segment.type == "intro" && introAutoSkip) {
+            setIntroAutoSkip(false)
+            showSkipNotice(SkipNotice.Kind.Forgot)
+        } else {
+            set { copy(skipNotice = null) }
+        }
+    }
+
+    /** 学会时的「不用」：这部剧的片头还是只给按钮 */
+    fun declineIntroAutoSkip() {
+        noteUserActivity()
+        setIntroAutoSkip(false)
+        set { copy(skipNotice = null) }
+    }
+
+    /** 提示到时间收起（id 对得上才收：期间换了新提示就不动） */
+    fun expireSkipNotice(id: Long) {
+        if (s.skipNotice?.id == id) set { copy(skipNotice = null) }
+    }
+
+    private fun setIntroAutoSkip(enabled: Boolean) {
+        introAutoSkip = enabled
+        introAutoSkipOverride = enabled
+        val item = unit.mediaItemId
+        scope.launch { runCatching { backend.setIntroAutoSkip(item, enabled) } }
+    }
+
+    /** 新会话带回的设定；本次播放里改过的片头选择优先 */
+    private fun applyAutoSkip(view: PlaybackAutoSkipView?) {
+        canLearnIntro = view != null
+        if (view == null) return
+        autoSkipEnabled = view.enabled
+        introAutoSkip = introAutoSkipOverride ?: view.intro
     }
 
     // ======================================================================
@@ -769,6 +870,7 @@ class PlaybackController(
                 durationMs = opened.watch?.durationMs ?: durationMs, phase = Phase.Buffering,
             )
         }
+        applyAutoSkip(opened.autoSkip)
         Log.i(TAG, "起播 item=${unit.mediaItemId} 档=${decision.tier} ${if (original) "原文件直连" else "服务端流"} start=${opened.startMs}")
 
         // 起播音轨：直连原文件时服务端计划里的那条一律落下（Exo 读到轨后显式选它，已经选中就不动）。
@@ -885,6 +987,9 @@ class PlaybackController(
     /** 能不能在同意弹窗里直接开启软件转码（访客没有设置权，只能看说明） */
     val canGrantConsent: Boolean get() = backend !is ShareBackend
 
+    /** 访客分享：不能选画质（服务端按分享的设定给流），倍速不记 */
+    val isGuest: Boolean get() = backend is ShareBackend
+
     /** 同意弹窗「开启并播放」：写入全局开关后重新决策。失败抛出，弹窗显示原因 */
     suspend fun grantConsent() {
         val saved = backend.enableSoftwareTranscode() ?: throw IllegalStateException("分享观看不能开启软件转码，请联系分享者")
@@ -1000,6 +1105,12 @@ class PlaybackController(
         if (s.phase == Phase.Playing) {
             // 卡顿不看引擎报不报缓冲，按播放头判（tickPosition → PlaybackRecord.samplePlayhead）
             set { copy(phase = Phase.Buffering) }
+            // 菜单选的加速供不上（线路或转码跟不上这个速度）：退回正常速度并记下，下一集不再卡（长按倍速由界面自己退）
+            val buffered = exo.bufferedPosition - exo.currentPosition
+            if (s.speed > 1f && !holdSpeedActive && seekStartedAt == null && buffered < 1_000) {
+                selectSpeed(1f)
+                flash("缓冲跟不上，已回到正常速度")
+            }
         }
     }
 
@@ -1304,12 +1415,16 @@ class PlaybackController(
     /** 相对跳转（左右键、媒体键）：按关键帧，快 */
     fun seekBy(deltaMs: Long) = seekTo(s.positionMs + deltaMs, exact = false, source = "dpad")
 
-    /** 跳到文件时间（毫秒）。[source] 记进播放记录：scrub（拖动）/ dpad / skip / media_key */
-    fun seekTo(raw: Long, exact: Boolean = true, source: String = "scrub") {
+    /**
+     * 跳到文件时间（毫秒）。[source] 记进播放记录：scrub（拖动）/ dpad / skip / media_key / auto（自动跳过）。
+     * [marksSkipHandled]：落点所在的可跳过段算「用户自己去的」，不再自动跳（自动跳过自己的跳转不算）
+     */
+    fun seekTo(raw: Long, exact: Boolean = true, source: String = "scrub", marksSkipHandled: Boolean = true) {
         // 先夹进片长之内：越过片尾的落点会开出一个什么也转不出来的会话
         var targetMs = raw.coerceAtLeast(0)
         val duration = s.durationMs
         if (duration != null && duration > 1000) targetMs = minOf(targetMs, duration - 1000)
+        if (marksSkipHandled) markSkipHandled(targetMs)
         scrubFollowJob?.cancel()
         val phase = s.phase
         if (!mediaLoaded || session == null || phase == Phase.SessionStarting || phase == Phase.Deciding || phase == Phase.Degrading) {
@@ -1346,6 +1461,8 @@ class PlaybackController(
 
     /** 拖动途中让画面跟着走：落点在缓冲里时 10Hz 跟随，原文件直连拖出缓冲时停住 60ms 后跟一次，其余松手才跳 */
     fun scrubFollow(fileMs: Long) {
+        // 拖动途中画面跟到哪段里，哪段就是用户自己去的：别在手指还没松开时自动跳走
+        markSkipHandled(fileMs)
         val phase = s.phase
         if (!mediaLoaded || session == null || (phase != Phase.Playing && phase != Phase.Buffering && phase != Phase.Ended)) return
         val cheap = fileMs >= s.positionMs - 1000 && fileMs <= (s.bufferedEndMs ?: 0)
@@ -1376,13 +1493,34 @@ class PlaybackController(
         scrubFollowJob?.cancel()
     }
 
-    /** 播放速度（手机的倍速菜单与长按倍速；换会话、换集都保持） */
-    fun setSpeed(speed: Float) {
+    /** 菜单选倍速：按这部片记（访客不记），换会话、换集都保持；长按倍速期间只改记着的那档，松手回到它 */
+    fun selectSpeed(speed: Float) {
         noteUserActivity()
+        speedFromMemory = false
+        set { copy(speed = speed) }
+        if (!holdSpeedActive) applySpeed(speed)
+        if (backend !is ShareBackend) speedMemory.remember(speed, unit.mediaItemId)
+    }
+
+    /** 长按倍速：临时盖住所选的速度 */
+    fun beginHoldSpeed(speed: Float) {
+        noteUserActivity()
+        holdSpeedActive = true
         exo.setPlaybackSpeed(speed)
     }
 
-    val speed: Float get() = exo.playbackParameters.speed
+    /** 松手（或缓冲跟不上）：回到菜单选的那档 */
+    fun endHoldSpeed() {
+        if (!holdSpeedActive) return
+        holdSpeedActive = false
+        applySpeed(s.speed)
+    }
+
+    private fun applySpeed(speed: Float) {
+        exo.setPlaybackSpeed(speed)
+        frameDrops.reset()
+        frameDropGraceUntil = SystemClock.elapsedRealtime() + 8_000
+    }
 
     /** 当前这份播放计划（档位、判据原文、字幕压制）：界面上的档位标签用；还没开出会话时 null */
     val decision: PlaybackDecisionView? get() = session?.decision
@@ -1678,6 +1816,7 @@ class PlaybackController(
             )
         }
         if (phase == Phase.Playing && exo.isPlaying) record?.let { it.watchedMs += 250 }
+        evaluateAutoSkip()
     }
 
     /**
@@ -1740,6 +1879,9 @@ class PlaybackController(
             "offer" to JsonPrimitive(st.qualityOffer != null),
             "stall" to JsonPrimitive(record?.stalling == true),
             "q" to (st.quality?.let(::JsonPrimitive) ?: JsonNull),
+            // 实际播放速度（菜单选的或长按临时的）与菜单选的那档
+            "rate" to JsonPrimitive(exo.playbackParameters.speed),
+            "speed" to JsonPrimitive(st.speed),
             "bps" to (loadingBps?.let { JsonPrimitive(it.toLong()) } ?: JsonNull),
         )
         Log.i(PROBE_TAG, JsonObject(fields).toString())
@@ -1782,6 +1924,12 @@ class PlaybackController(
         // 掉帧只在视频直通时判：转码档已经是 h264，再掉帧说明连转码产物都放不动，继续降档只会更糟
         val copying = playsOriginalFile || session?.decision?.video?.action == "copy"
         if (!copying || phase != Phase.Playing || !exo.playWhenReady || seekStartedAt != null) return
+        // 加速时 Exo 按音频节奏主动丢帧跟上（4K 60 帧 2 倍就是每秒 120 帧），掉帧是预期内的，不能判成「直通放不动」；
+        // 降回来后还要几秒才追平
+        if (exo.playbackParameters.speed > 1f || SystemClock.elapsedRealtime() < frameDropGraceUntil) {
+            frameDrops.reset()
+            return
+        }
         val counters = exo.videoDecoderCounters ?: return
         counters.ensureUpdated()
         val dropped = counters.droppedBufferCount.toLong()
@@ -1844,7 +1992,7 @@ class PlaybackController(
     /** 当前文件时间（毫秒）：叠加层字幕 10Hz 读 */
     fun currentFileMs(): Long = originMs + exo.currentPosition
 
-    /** 这次沿用了哪些**不是默认**的记忆（画质、音轨、字幕），拼成开播提示；都是默认的返回 null */
+    /** 这次沿用了哪些**不是默认**的记忆（画质、音轨、字幕、倍速），拼成开播提示；都是默认的返回 null */
     private fun rememberedChoiceNotice(): String? {
         val session = session ?: return null
         val qualityLimit = if (qualityFromMemory && qualityLimited) s.quality else null
@@ -1863,7 +2011,7 @@ class PlaybackController(
                 s.subtitles.options.firstOrNull { it.ref == ref }?.let { RememberedChoices.shortLabel(it.label, s.subtitles.options.map { o -> o.label }) }
             } ?: "关闭"
         }
-        return RememberedChoices.notice(qualityLimit, network, audio, subtitle)
+        return RememberedChoices.notice(qualityLimit, network, audio, subtitle, s.speed.takeIf { speedFromMemory })
     }
 
     fun flash(message: String) {

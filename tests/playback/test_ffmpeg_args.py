@@ -1390,3 +1390,59 @@ def test_remux_for_a_dolby_vision_decoder_keeps_the_record():
     plain = argv_of(plan(PlaybackTier.REMUX, video=VideoPlan(action="copy", codec="hevc")))
     assert pair(plain, "-tag:v") == "hvc1"
     assert "-strict" not in plain
+
+
+def test_remux_of_profile_7_strips_the_enhancement_layer_and_rpu():
+    """P7 只给基础层：增强层（NAL 63）与 RPU（NAL 62）都剥掉，封装打 hvc1、不写杜比视界记录"""
+    strip = argv_of(
+        plan(
+            PlaybackTier.REMUX,
+            video=VideoPlan(action="copy", codec="hevc", dolby_vision="strip"),
+        )
+    )
+    assert pair(strip, "-bsf:v") == "filter_units=remove_types=62|63"
+    assert pair(strip, "-tag:v") == "hvc1"
+    assert "-strict" not in strip
+    plain = argv_of(plan(PlaybackTier.REMUX, video=VideoPlan(action="copy", codec="hevc")))
+    assert "-bsf:v" not in plain
+
+
+def test_profile_7_decision_reaches_the_command_as_a_stripping_remux():
+    """从决策到命令一条链：真机快照（HDR10 屏、无杜比视界解码器）+ 无显卡，P7 原盘 remux 出来
+    就是剥层的换封装，而不是被拒绝或转码"""
+    from movieclaw_playback.capability import AudioSupport, ClientCapability, VideoSupport
+    from movieclaw_playback.decide import (
+        AudioTrack,
+        MediaProfile,
+        PlaybackPolicy,
+        decide_playback,
+    )
+
+    projector = ClientCapability(
+        video=(VideoSupport("h264"), VideoSupport("hevc", max_height=2176)),
+        audio=(AudioSupport("aac"), AudioSupport("ac3"), AudioSupport("eac3")),
+        containers=frozenset({"mp4", "mkv", "webm", "ts", "hls-fmp4"}),
+        hdr_passthrough=True,
+        mse="none",
+        native_hls=True,
+        local_tracks=True,
+        dolby_vision_base_layer_profiles=frozenset({4, 8}),
+    )
+    source = MediaProfile(
+        file_id=1,
+        container="mkv",
+        video_codec="hevc",
+        resolution="2160p",
+        hdr="Dolby Vision",
+        dv_profile=7,
+        dv_bl_compatible=True,
+        bit_depth=10,
+        audio_tracks=(AudioTrack(ref="embedded:1", codec="ac3", channels=6, is_default=True),),
+        keyframe_interval_s=1.0,
+    )
+    decision = decide_playback(source, projector, PlaybackPolicy(hardware_available=False))
+    assert isinstance(decision, PlaybackPlan) and decision.tier is PlaybackTier.REMUX
+    argv = argv_of(decision)
+    assert pair(argv, "-c:v") == "copy"
+    assert pair(argv, "-bsf:v") == "filter_units=remove_types=62|63"
+    assert pair(argv, "-tag:v") == "hvc1"

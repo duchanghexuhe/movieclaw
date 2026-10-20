@@ -7,6 +7,7 @@ FTS 只减少候选，最终在单个名称上核验。未索引/待更新的名
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 import time
 from collections import OrderedDict, defaultdict
@@ -33,6 +34,7 @@ from movieclaw_api.services.library.search_matching import (
     compact,
     match_name,
     normalized,
+    prepare_names,
     query_tokens,
 )
 from movieclaw_api.services.people_images import avatar_url
@@ -160,6 +162,26 @@ def _eligible(library_ids: set[int], member_id: int, limit: ContentLimit | None,
         .where(*conditions)
         .distinct()
     )
+
+
+@contextlib.asynccontextmanager
+async def _one_snapshot(session: AsyncSession):
+    """让几条读语句看到同一个数据库快照。
+
+    pysqlite 不为 SELECT 开事务，每条语句各读各的最新提交。名称候选分两步读：先查
+    索引（跳过待更新的），再按待更新标记读最新名称；后台索引若恰好在两步之间处理完
+    一个条目并清掉标记，它两头都会漏掉。会话里已有未提交的写时本来就在一个事务里。
+    """
+    connection = await session.connection()
+    driver = (await connection.get_raw_connection()).driver_connection
+    if driver.in_transaction:
+        yield
+        return
+    await connection.exec_driver_sql("BEGIN")
+    try:
+        yield
+    finally:
+        await connection.exec_driver_sql("COMMIT")
 
 
 async def _name_candidates(session, query, eligible):
@@ -353,7 +375,14 @@ async def search_candidates(session, query, library_ids, member_id, content_limi
             [],
             False,
         )
-    rows, pending = await _name_candidates(session, query, eligible)
+    async with _one_snapshot(session):
+        rows, pending = await _name_candidates(session, query, eligible)
+    # 走匹配内核的行（混输、词组、待更新原名）可能要逐字读音：先备进记忆（pinyin.py）
+    await prepare_names(
+        normalized_name if normalized_name is not None else compact(raw)
+        for _, _, _, raw, normalized_name, _, _, tier in rows
+        if tier is None
+    )
     matched = await asyncio.to_thread(_match_rows, query, rows)
     people = []
     people_ids = list(matched["person"])

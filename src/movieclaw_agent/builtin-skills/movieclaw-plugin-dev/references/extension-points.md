@@ -66,7 +66,7 @@ tests 守着：契约有增删时本文必须同步）。都是实验级；清�
 | `subscription.candidates.rank` | 洋葱 | 重排候选（必须是原集合的重排） | `… import CANDIDATES_RANK` | — |
 | `dl.downloader.select` | 第一个说了算 | 没指定下载器时按站点 / 体积 / 类型选一个已接入的下载器（各场景能拿到的字段见 `recipes.md` 第 2 节） | `… import DOWNLOADER_SELECT` | — |
 | `dl.torrent.before-delete` | 第一个说了算 | 否决删种（如 H&R 没达标），否决后删除返回 409 | `… import TORRENT_BEFORE_DELETE` | — |
-| `playback.strm.direct-link` | 第一个说了算 | strm 指向服务器挂载目录里的文件（CloudDrive2 / rclone）时，给播放器换一个网盘直链，播放器被 302 过去、视频流量不经服务器。载荷有文件路径与播放器 UA（115 直链与 UA 绑定）；可以给内网 302 服务地址（alist `/d/…`），系统会带播放器的 UA 替它跟跳转；`ttl_s` 是可复用多久。不认领返回 `None`，没认领 / 出错 / 播放器连不上一律照旧由服务器出字节。只管播放器去哪取，服务器自己读（探测、转码、字幕）照旧读挂载 | `… import STRM_DIRECT_LINK, DirectLink` | 插件仓库 movieclaw-plugins 的 `plugins/openlist-direct-link/` |
+| `playback.strm.direct-link` | 第一个说了算 | strm 指向服务器挂载目录里的文件（CloudDrive2 / rclone）时，给播放器换一个网盘直链，播放器被 302 过去、视频流量不经服务器。载荷有文件路径与播放器 UA（115 直链与 UA 绑定）；可以给内网 302 服务地址（alist `/d/…`），系统会带播放器的 UA 替它跟跳转；`ttl_s` 是可复用多久。不认领返回 `None`，没认领 / 出错 / 播放器连不上一律照旧由服务器出字节。只管播放器去哪取，服务器自己读（探测、转码、字幕）照旧读挂载 | `… import STRM_DIRECT_LINK, DirectLink` | 钩子定义 `$SRC/movieclaw_api/hooks.py` 的 `STRM_DIRECT_LINK`；插件仓库 movieclaw-plugins 的 PR #2（openlist-direct-link，尚未合并）是完整例子 |
 
 ## 3. 注册表：给系统加一种新实现
 
@@ -77,7 +77,7 @@ tests 守着：契约有增删时本文必须同步）。都是实验级；清�
 |---|---|---|---|
 | `im-channels` | 接一个新的消息平台（收发、绑定），账号 / 白名单 / AI 对话 / 推送由主程序负责 | `from movieclaw_sdk.channels import IM_CHANNELS` | `examples/ntfy-channel/`、`$SRC/movieclaw_plugins/` |
 | `downloader-adapters` | 接一款新的下载软件（Deluge、Aria2……）：继承 `BaseDownloader` 实现提交 / 查询 / 删除等方法，登记 `DownloaderAdapter`（`connection=` 给连接参数模型，字段只能取 url / username / password，决定添加下载器表单各栏的叫法与要不要，写法见 `movieclaw_sdk/downloaders.py` 文件头）；配置、路径映射、订阅投递、做种同步由主程序负责，独立进程也能跑 | `from movieclaw_sdk.downloaders import DOWNLOADER_ADAPTERS, BaseDownloader, DownloaderAdapter` | `$SRC/movieclaw_plugins/qbittorrent/`、`$SRC/movieclaw_plugins/transmission/` |
-| `drive-backends` | 接一家网盘（115、123……）：继承 `DriveBackend` 实现登录（扫码 `begin_login` / `login_state`，或 `login_with_cookie`）与 `account_info`，取流实现 `stat` / `direct_link`，纳管实现 `list_dir` / `list_tree`（有操作动态再实现 `changes`），上传实现 `ensure_dir` / `begin_upload` / `upload_part` / `finish_upload`（读本地字节、限速、续传状态都由主程序管），删除实现 `delete`（进网盘回收站），声明 `type` / `capabilities` / `login`（写法见 `movieclaw_sdk/drives.py` 文件头）；账号与凭据加密、限速与每日预算、超时、错误归类、设置页都由主程序负责，独立进程也能跑。只抛 `movieclaw_sdk.drives` 里的异常，只有确认登录失效才抛 `AuthExpired` | `from movieclaw_sdk.drives import DRIVE_BACKENDS, DriveBackend` | `tests/api/test_drives.py`、`test_drive_library.py`、`test_drive_upload.py` 里的假网盘 |
+| `drive-backends` | 接一家网盘（115、123……）：继承 `DriveBackend` 实现登录（扫码 `begin_login` / `login_state`、`login_with_cookie`，或填表 `login_with_form`）与 `account_info`，取流实现 `stat` / `direct_link`，纳管实现 `list_dir` / `list_tree`（有操作动态再实现 `changes`），上传实现 `ensure_dir` / `begin_upload` / `upload_part` / `finish_upload`（读本地字节、限速、续传状态都由主程序管），删除实现 `delete`（进网盘回收站），声明 `type` / `capabilities` / `login`（写法见 `movieclaw_sdk/drives.py` 文件头；登录有扫码、Cookie、填表三种，只支持能写的网盘，见 `recipes.md` 第 18 节）；账号与凭据加密、限速与每日预算、超时、错误归类、设置页都由主程序负责，独立进程也能跑。只抛 `movieclaw_sdk.drives` 里的异常，只有确认登录失效才抛 `AuthExpired` | `from movieclaw_sdk.drives import DRIVE_BACKENDS, DriveBackend` | 插件仓库 movieclaw-plugins 的 `plugins/cloud-115/`（真实的 115 插件，带第三方依赖） |
 | `site-classes` | 新的站点框架（`BaseSite` 子类），站点 YAML 的 `custom_class` 引用它 | `from movieclaw_api.plugins.keys import SITE_CLASSES` | `$SRC/movieclaw_tracker/sites/custom/` |
 | `site-data-packs` | 一批站点 YAML 打成插件分发（同 site_id 覆盖内置） | `… import SITE_DATA_PACKS` | `examples/site_pack/` |
 | `scheduled-tasks` | 周期任务（出现在「定时任务」里，用户可调周期）；可 override 整段替换内置任务（如订阅缺口搜索 `search_wanted`） | `from movieclaw_scheduler import SCHEDULED_TASKS` | — |
@@ -108,7 +108,7 @@ tests 守着：契约有增删时本文必须同步）。都是实验级；清�
 
 | 用户想要 | 现状 | 替代办法 |
 |---|---|---|
-| 给网页 / App 加界面（按钮、页面、首页卡片、播放器按钮） | 插件不能带前端代码；唯一的界面是配置模型自动生成的「设置」表单（`recipes.md` 第 13 节） | 先找现成功能：首页自定义行（`mclaw ui prefs show`，每个库有「最近添加」）、订阅页「刚刚入库」、消息推送、播放器的片头片尾 / 广告识别（剧集库 `--detect-media-segments`）。插件能补的：开接口让 AI 助手随问随答、推送到 IM 通道、结果写进订阅动态或系统通知；配置见 `recipes.md` 第 13 节 |
+| 在主程序已有页面里加按钮或卡片（首页卡片、详情页按钮、播放器按钮）、给 App 加界面 | 插件不能往主程序的页面里插东西；插件自己的**整页**可以（插件网页，`web-pages.md`），配置用「设置」表单（`recipes.md` 第 13 节） | 要一个看得见的东西：做插件网页，放进左侧栏。先找现成功能：首页自定义行（`mclaw ui prefs show`，每个库有「最近添加」）、订阅页「刚刚入库」、消息推送、播放器的片头片尾 / 广告识别（剧集库 `--detect-media-segments`）。插件还能：开接口让 AI 助手随问随答、推送到 IM 通道、结果写进订阅动态或系统通知 |
 | 新的元数据来源（替代 TMDB / 豆瓣） | 不能 | — |
 | 新的 Webhook 推送格式 | 不能新增格式 | 监听可靠事件，自己向外部服务发请求（`network = true`） |
 | 新的站点认证方式 | 认证方式是固定的 | 先读 `$SRC/movieclaw_tracker/sites/custom/` 现有站点类，看能否在站点类里处理；不能就直说 |

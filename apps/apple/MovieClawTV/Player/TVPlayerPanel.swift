@@ -113,6 +113,9 @@ struct TVPlayerPanel: View {
                     .padding(.horizontal, -40)
             }
             .focusSection()
+            // 左右换栏时落在这一栏已选中的那一项上，而不是位置最近的一行：画质选了 720p（第三行）时，
+            // 从音轨栏按右会落到第一行「原画」，顺手按确认就误改了
+            .defaultFocus(focus, .panelOption(activeOptionID(tab)), priority: .userInitiated)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .animation(.easeOut(duration: 0.2), value: active)

@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -19,6 +20,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -45,6 +47,7 @@ import io.movieclaw.androidtv.ui.library.RowWallScreen
 import io.movieclaw.androidtv.ui.player.PlayerScreen
 import io.movieclaw.androidtv.ui.search.SearchScreen
 import io.movieclaw.androidtv.ui.theme.McColors
+import io.movieclaw.androidtv.ui.theme.pt
 import kotlinx.coroutines.delay
 
 /** 页面告诉外壳：左上角「‹ 首页」胶囊要不要显示（页签根页滚到顶时才显示，同 tvOS 往下滚时收起） */
@@ -73,7 +76,8 @@ val LocalStagePreview = compositionLocalOf<io.movieclaw.androidtv.ui.stage.Stage
  * - 左侧可收起的侧边栏（账号 / 搜索 / 首页）。平时只有左上角一枚「‹ 当前页」胶囊；在页面最左边再按左、
  *   展开侧边栏并把焦点交给它。侧边栏里上下移动不换页，按确认才切过去；选当前页签退回根页。
  * - 每个页签一个导航栈，各自记住浏览位置；二级页盖满整屏、不显示胶囊。
- * - 返回键：侧边栏开着先收起它、焦点还给页面（同选当前页签）；页面里有二级页就退一层；页签根页上退出 App。
+ * - 返回键：侧边栏开着先收起它、焦点还给页面（同选当前页签）；页面里有二级页就退一层；账号 / 搜索页签的根页回首页；
+ *   首页根页上先提示「再按一次返回键退出」，2 秒内再按才退出 App（[backAction]）。
  * - 播放器盖在整个界面之上，有自己的返回键处理。
  */
 @OptIn(ExperimentalComposeUiApi::class)
@@ -148,11 +152,26 @@ fun MainShell(args: LaunchArgs) {
         }
     }
 
+    // 首页根页按过一次返回键的时刻（正显示「再按一次返回键退出」），过了 EXIT_WINDOW_MS 自动清掉
+    var exitArmedAt by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(exitArmedAt) {
+        if (exitArmedAt != null) {
+            delay(EXIT_WINDOW_MS)
+            exitArmedAt = null
+        }
+    }
+
     BackHandler(enabled = router.player == null) {
-        when {
-            sidebarOpen -> closeSidebar()
-            router.pop() -> Unit
-            else -> activity?.finish()
+        val now = android.os.SystemClock.uptimeMillis()
+        val action = backAction(sidebarOpen, router.stack.isEmpty(), router.tab, exitArmedAt, now)
+        exitArmedAt = if (action == BackAction.ArmExit) now else null
+        when (action) {
+            BackAction.CloseSidebar -> closeSidebar()
+            BackAction.Pop -> router.pop()
+            // 同「谁在看」里选自己回首页：首页根页重新摆出来时自己把焦点放到「继续播放」上
+            BackAction.GoHome -> router.select(MainTab.Home)
+            BackAction.ArmExit -> Unit
+            BackAction.Exit -> activity?.finish()
         }
     }
 
@@ -251,6 +270,13 @@ fun MainShell(args: LaunchArgs) {
                     onClose = ::closeSidebar,
                 )
             }
+            // 首页根页按一次返回键：顶部一句提示（同播放器的提示胶囊），不挡操作、到时自己消失
+            AnimatedVisibility(
+                visible = exitArmedAt != null,
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 48.pt),
+                enter = fadeIn(tween(200)),
+                exit = fadeOut(tween(200)),
+            ) { io.movieclaw.androidtv.ui.player.NoticeCapsule("再按一次返回键退出") }
             router.player?.let { request ->
                 PlayerScreen(request, onClose = {
                     router.closePlayer()

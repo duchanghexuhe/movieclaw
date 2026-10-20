@@ -317,6 +317,33 @@ final class TVFlowUITests: XCTestCase {
         TVRemote.press(.menu)
     }
 
+    /// 控制层顶部的小箭头提示能往下拉出面板（写着有哪几栏）；面板里左右换栏落在那一栏已选中的那项，
+    /// 而不是位置最近的一行（多字幕片源默认选中的字幕在第二行，按位置会落到第一行「关闭」）
+    @MainActor
+    func testPlayerPanelHintAndColumnFocus() {
+        let app = launchSignedIn(["-mcRoute", "/play/\(mkvItem)"])
+        waitForPlayback(app)
+        // 等起播那一轮控制层收起再按上唤出：免得读到一半它自己收了
+        let hint = app.element("tv-player-panel-hint")
+        _ = app.element("tv-player-transport").waitForNonExistence(timeout: 8)
+        XCTAssertFalse(hint.exists, "提示应跟控制层一起收起")
+        TVRemote.press(.up)
+        XCTAssertTrue(hint.waitForExistence(timeout: 3), "控制层顶部没有下拉面板的提示")
+        XCTAssertTrue(hint.label.contains("音轨"), "多音轨片源的提示里没有音轨：\(hint.label)")
+        snapshot("52-panel-hint")
+        TVRemote.press(.down)
+        XCTAssertTrue(app.element("tv-player-panel").waitForExistence(timeout: 10))
+        let focused = app.descendants(matching: .any).matching(NSPredicate(format: "hasFocus == true")).firstMatch
+        TVRemote.press(.right)
+        usleep(500_000)
+        XCTAssertEqual(focused.value as? String, "已选中", "进音轨栏没落在已选中的音轨上：\(focused.label)")
+        TVRemote.press(.left)
+        usleep(500_000)
+        XCTAssertEqual(focused.value as? String, "已选中", "回字幕栏没落在已选中的字幕上：\(focused.label)")
+        TVRemote.press(.menu)
+        TVRemote.press(.menu)
+    }
+
     /// 隔离字幕夹具：完整标题、空白兜底、同名轨序号、强制标记与遥控选轨。
     @MainActor
     func testSubtitleMetadata() throws {
@@ -374,8 +401,11 @@ final class TVFlowUITests: XCTestCase {
     // MARK: 播放器：跳过片头、下一集
 
     /// 剧集从头放：片头时段出现「跳过片头」并自动拿到焦点，按一下就跳过
+    /// （按过一次这部剧就学会自动跳，开测前先忘掉，用例可重跑）
     @MainActor
-    func testSkipIntroButton() {
+    func testSkipIntroButton() async throws {
+        let token = try await TestBackend.login(server: server, username: username, password: password)
+        try await TestBackend.setIntroAutoSkip(server: server, token: token, item: Int(showItem) ?? 0, enabled: false)
         let app = launchSignedIn(["-mcRoute", "/play/\(showItem)/s01e03?t=0"])
         waitForPlayback(app)
         let skip = app.element("tv-player-skip")
@@ -463,6 +493,15 @@ enum TestBackend {
 
     static func approve(server: String, token: String, userCode: String) async throws {
         _ = try await call(server, "POST", "/api/v1/auth/devices/requests/\(userCode)/approve", body: nil, token: token)
+    }
+
+    /// 自动跳过：记下 / 忘掉这部剧的片头（docs/design/skip-intro.md §5）
+    static func setIntroAutoSkip(server: String, token: String, item: Int, enabled: Bool) async throws {
+        _ = try await call(server, "PUT", "/api/v1/playback/auto-skip/intro/\(item)", body: ["enabled": enabled], token: token)
+    }
+
+    static func setAutoSkip(server: String, token: String, enabled: Bool) async throws {
+        _ = try await call(server, "PUT", "/api/v1/playback/auto-skip", body: ["enabled": enabled], token: token)
     }
 
     static func logout(server: String, token: String) async throws {

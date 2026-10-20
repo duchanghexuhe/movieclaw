@@ -346,28 +346,3 @@ struct AIChip: View {
             .background(LinearGradient(colors: [.purple, .blue], startPoint: .leading, endPoint: .trailing), in: .capsule)
     }
 }
-
-// MARK: - ⋯ 设置
-
-struct SettingsMenu: View {
-    let controller: PlaybackController
-    let close: () -> Void
-
-    var body: some View {
-        // 面板标题直接用第一节的「画质」：点的就是 ⋯ 设置，再叠一行「设置」只是重复
-        PlayerMenuPanel(title: "画质") {
-            // 画质：语义是上限——源不超所选档就照常直通（无损），超了才转码降下去
-            ForEach(QualityOption.all) { option in
-                PlayerMenuRow(title: option.label, hint: option.hint, active: controller.quality == option.maxHeight, identifier: "quality-\(option.label)") {
-                    controller.selectQuality(option.maxHeight)
-                    close()
-                }
-            }
-            MenuDivider()
-            PlayerMenuRow(title: "播放诊断", active: controller.diagnosticsOpen, systemImage: "waveform.path.ecg", identifier: "menu-diagnostics") {
-                controller.diagnosticsOpen.toggle()
-                close()
-            }
-        }
-    }
-}

@@ -394,9 +394,13 @@ def test_new_local_files_upload_rapid_or_in_parts_and_verify(client, tmp_path):
     # 秒传：回答了区间校验，没有传分片；真传：按 64 KB 一片传了 4 片
     assert ["begin", "海边.mp4", True, True] in state["calls"]
     assert sorted(i for u, i in state["parts"]) == [0, 1, 2, 3]
-    # 库行：任务跑完不再显示上传进度；文件区标「本地 + 假网盘」
-    view = client.get(f"/api/v1/libraries/{library_id}").json()["data"]
-    assert view["cloud_upload"] is None
+
+    # 库行：任务跑完不再显示上传进度（副本核验后任务还要再查一轮候选才收尾）
+    def finished():
+        data = client.get(f"/api/v1/libraries/{library_id}").json()["data"]
+        return data if data["cloud_upload"] is None else None
+
+    view = _wait(finished)
     assert view["cloud_folders"][0]["is_primary"] is True
 
 
@@ -568,6 +572,59 @@ def test_recheck_keeps_uploaded_local_rows_and_reuploads_lost_ones(client, tmp_p
     assert rows["a.mkv"]["state"] == "verified" and rows["a.mkv"]["remote_id"] != gone
 
 
+async def _verified_replica(file_id: int, account_id: int) -> None:
+    """模拟修复前已经被传上去并核验过的副本。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import LibraryFileReplica
+    from movieclaw_db.models.base import utcnow
+
+    async with get_database().session() as session:
+        session.add(
+            LibraryFileReplica(
+                library_file_id=file_id,
+                account_id=account_id,
+                remote_id="r-strm",
+                origin="uploaded",
+                state="verified",
+                verified_at=utcnow(),
+            )
+        )
+        await session.commit()
+
+
+def test_strm_placeholders_never_upload_or_release(client, tmp_path, monkeypatch):
+    """strm 认路径不认容器列：探过规格后容器列是直链的真实容器、改写后被清空（#921）。"""
+    from movieclaw_api.services.drives import release, uploads
+
+    enqueue = uploads.enqueue
+    _pause_auto_uploads(client, monkeypatch)
+    library_id = _library(
+        client,
+        tmp_path,
+        {"a.mkv": _blob(13, PART), "纪录片/b.strm": b"https://example.com/b.mkv\n"},
+    )
+    _wait(lambda: len(replicas(client, library_id)) == 2)
+    _wait(lambda: not client.get(f"/api/v1/libraries/{library_id}").json()["data"]["scanning"])
+    strm_id = replicas(client, library_id)["b.strm"]["id"]
+    # 刚入账（容器 strm）、探过规格（容器 mkv）、strm 被改写（规格清空）：都只有 a.mkv 要传
+    for container in ("strm", "mkv", None):
+        call(client, _set_probed, strm_id, container=container)
+        assert call(client, _candidates, library_id) == 1, container
+    _progress, outcome = call(client, _run_job, library_id)
+    assert isinstance(outcome, dict) and outcome["uploaded"] == 1, outcome
+    rows = replicas(client, library_id)
+    assert rows["a.mkv"]["state"] == "verified" and rows["b.strm"]["state"] is None
+    assert {meta["path"] for meta in drive_state(client)["files"].values()} == {"影视/a.mkv"}
+    # 只剩 strm 没传：巡检不再排任务
+    assert call(client, enqueue, library_id) == []
+
+    # 修复前已经被传上去的 strm：腾空巡检不挑它，直接腾空也不删本地那份
+    call(client, _verified_replica, strm_id, client.account_id)  # type: ignore[attr-defined]
+    assert strm_id not in call(client, release.candidates)
+    assert call(client, release.try_release, strm_id) == "strm 占位文件不腾空"
+    assert (tmp_path / "staging" / "纪录片" / "b.strm").exists()
+
+
 # ---------------------------------------------------------------------- 腾空本地（§6）
 
 
@@ -633,6 +690,8 @@ def test_release_waits_for_gates_then_frees_local_bytes(client, tmp_path, monkey
     assert call(client, release.try_release, row["id"]) is None
     rows = replicas(client, library_id)
     assert rows["a.mkv"]["local_bytes"] is False and not local.exists()
+    # 搬空的目录跟着清掉，库根留着
+    assert not local.parent.exists() and (tmp_path / "staging").is_dir()
     # 之后读网盘：登记进了读字节入口
     assert sources.cloud_file(str(local)) is not None
     # 实时监控 / 对账看到本地没了：不标缺失
@@ -643,10 +702,43 @@ def test_release_waits_for_gates_then_frees_local_bytes(client, tmp_path, monkey
     assert replicas(client, library_id)["a.mkv"]["local_bytes"] is False
 
     # 用户把文件拷回原位：字节回到本地，播放读本地
+    local.parent.mkdir()
     local.write_bytes(data)
     call(client, scan_library, library_id, backfill_existing_specs=False)
     assert replicas(client, library_id)["a.mkv"]["local_bytes"] is True
     assert sources.cloud_file(str(local)) is None
+
+
+def test_release_prunes_only_directories_it_empties(client, tmp_path, monkeypatch):
+    from movieclaw_api.services.drives import release
+
+    library_id = _uploaded(
+        client,
+        tmp_path,
+        monkeypatch,
+        {
+            "剧集/Season 01/e1.mkv": _blob(14, PART),
+            "剧集/Season 01/e2.mkv": _blob(15, PART),
+            "纪录片/Season 01/d1.mkv": _blob(16, PART),
+        },
+    )
+    show = tmp_path / "staging" / "剧集"
+    (show / "tvshow.nfo").write_text("<tvshow/>")
+    rows = replicas(client, library_id)
+    for row in rows.values():
+        call(client, _set_probed, row["id"])
+
+    # 同一季还有别的集：季目录留着
+    assert call(client, release.try_release, rows["e1.mkv"]["id"]) is None
+    assert (show / "Season 01").is_dir()
+    # 最后一集腾空：季目录空了清掉，剧目录还有旁车，留着
+    assert call(client, release.try_release, rows["e2.mkv"]["id"]) is None
+    assert not (show / "Season 01").exists()
+    assert (show / "tvshow.nfo").exists()
+    # 整棵目录都空了：一路清到库根为止
+    assert call(client, release.try_release, rows["d1.mkv"]["id"]) is None
+    assert not (tmp_path / "staging" / "纪录片").exists()
+    assert (tmp_path / "staging").is_dir()
 
 
 def test_release_rechecks_local_and_remote_and_times_out_gates(client, tmp_path, monkeypatch):

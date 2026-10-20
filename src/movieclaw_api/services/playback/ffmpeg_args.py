@@ -838,6 +838,11 @@ def _video_args(
                 args += ["-tag:v", "dvh1", "-strict", "unofficial"]
             else:
                 args += ["-tag:v", "hvc1"]
+            if plan.video.dolby_vision == "strip":
+                # P7 只留 HDR10 基础层：剥掉 RPU（NAL 62）与增强层（NAL 63）。不用
+                # dovi_rpu=strip=1：它只删 RPU、增强层原样留着（FFmpeg 7.1 源码）；filter_units
+                # 自 FFmpeg 4.0 就有，不用探测。杜比视界记录不写（hvc1、没有 -strict unofficial）
+                args += ["-bsf:v", "filter_units=remove_types=62|63"]
         return args
 
     # 烧录时滤镜已在 filter_complex 图里（-vf 与 filter_complex 互斥）

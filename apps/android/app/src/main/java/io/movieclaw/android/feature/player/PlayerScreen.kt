@@ -47,7 +47,7 @@ import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PictureInPictureAlt
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -79,6 +79,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -95,6 +96,7 @@ import androidx.media3.ui.compose.ContentFrame
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.movieclaw.android.core.designsystem.Accent
 import io.movieclaw.android.core.designsystem.AccentStrong
+import io.movieclaw.android.core.designsystem.Skippable
 import io.movieclaw.android.core.designsystem.GlassCard
 import androidx.compose.foundation.layout.heightIn
 import io.movieclaw.android.core.designsystem.McFormat
@@ -111,8 +113,9 @@ import io.movieclaw.android.core.session.SessionRepository
 import io.movieclaw.core.model.generated.PlaybackDecisionView
 import io.movieclaw.core.playback.Phase
 import io.movieclaw.core.playback.PlaybackController
-import io.movieclaw.core.playback.QualityOption
+import io.movieclaw.core.playback.PlaybackSpeeds
 import io.movieclaw.core.playback.QualitySuggestion
+import io.movieclaw.core.playback.SkipNotice
 import io.movieclaw.core.playback.SkipSegments
 import javax.inject.Inject
 import kotlinx.coroutines.delay
@@ -313,6 +316,7 @@ private fun PlayingSurface(
     // 菜单跟着消失——表现就是"没动它自己突然隐藏了"（用户反馈）
     var menuOpen by remember { mutableStateOf(false) }
     var episodePickerOpen by remember(controller) { mutableStateOf(false) }
+    var settingsOpen by remember(controller) { mutableStateOf(false) }
     var diagnosticsOpen by remember(controller) { mutableStateOf(false) }
     LaunchedEffect(controller, diagnosticsOpen) { controller.setDiagnosticsOpen(diagnosticsOpen) }
     val diagnostics by controller.diagnostics.collectAsState()
@@ -356,7 +360,7 @@ private fun PlayingSurface(
     }
 
     // 控制层常显条件(iOS):暂停中 / 拖动中 / 调节中
-    val mustStayVisible = !playing || scrubbing || adjusting || menuOpen || episodePickerOpen
+    val mustStayVisible = !playing || scrubbing || adjusting || menuOpen || episodePickerOpen || settingsOpen
     var chromeActivity by remember { mutableLongStateOf(0L) }
     LaunchedEffect(chromeVisible, mustStayVisible, chromeActivity) {
         if (chromeVisible && !mustStayVisible) {
@@ -497,13 +501,13 @@ private fun PlayingSurface(
                     },
                     onHoldStart = {
                         holdSpeed = true
-                        controller.setSpeed(HOLD_SPEED)
+                        controller.beginHoldSpeed(HOLD_SPEED)
                         localNotice = "${HOLD_SPEED.toInt()}× 快进中"
                     },
                     onHoldEnd = {
                         if (holdSpeed) {
                             holdSpeed = false
-                            controller.setSpeed(1f)
+                            controller.endHoldSpeed()
                             localNotice = null
                         }
                     },
@@ -519,7 +523,7 @@ private fun PlayingSurface(
                 val buffered = (current.bufferedEndMs ?: 0L) - current.positionMs
                 if (buffered in 0..1_000) {
                     holdSpeed = false
-                    controller.setSpeed(1f)
+                    controller.endHoldSpeed()
                     localNotice = "缓冲跟不上,已退出倍速"
                     break
                 }
@@ -664,9 +668,47 @@ private fun PlayingSurface(
         }
 
         // ── 跳过片头/片尾（docs/design/skip-intro.md §5，判定在引擎 SkipSegments）──
-        // 位置进区间（终点前 3s 前）出按钮，点了跳到区间尾；与「下一集」卡片不同时出现。不自动跳过（v1 拍板）。
+        // 位置进区间（终点前 3s 前）出按钮，点了跳到区间尾；与「下一集」卡片不同时出现。
+        // 自动跳过（广告直接跳、片头按剧学）的提示占同一个位置、优先显示：撤回后回到片头里，提示收起才轮到按钮
+        val skipNotice = state.skipNotice
         val skip = state.skipSegment
-        if (skip != null && !locked) {
+        if (skipNotice != null && !locked) {
+            LaunchedEffect(skipNotice.id) {
+                delay(skipNotice.durationMs)
+                controller.expireSkipNotice(skipNotice.id)
+            }
+            val action: Pair<String, () -> Unit>? = when (skipNotice.kind) {
+                SkipNotice.Kind.Skipped -> "撤回" to controller::undoAutoSkip
+                SkipNotice.Kind.Learned -> "不用" to controller::declineIntroAutoSkip
+                SkipNotice.Kind.Forgot -> null
+            }
+            Row(
+                Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = 96.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(GlassCapsule)
+                    .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(999.dp))
+                    .padding(start = 16.dp, end = if (action == null) 16.dp else 5.dp, top = 5.dp, bottom = 5.dp)
+                    .heightIn(min = 30.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(skipNotice.text, style = McType.subheadlineSemibold, color = Color.White)
+                if (action != null) {
+                    Text(
+                        action.first,
+                        style = McType.subheadlineSemibold,
+                        color = Color.Black,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(Color.White)
+                            .clickable(onClick = action.second)
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                    )
+                }
+            }
+        } else if (skip != null && !locked) {
             Text(
                 SkipSegments.label(skip),
                 style = McType.subheadlineSemibold,
@@ -776,14 +818,10 @@ private fun PlayingSurface(
                             Text(it, style = McType.caption, color = Color.White.copy(alpha = 0.65f), maxLines = 1)
                         }
                     }
-                    QualityMenuButton(
-                        current = state.quality,
-                        reason = decision?.reason.orEmpty(),
-                        onSelect = controller::selectQuality,
-                        onExpandedChange = { menuOpen = it },
-                        onDiagnostics = { diagnosticsOpen = !diagnosticsOpen },
-                        diagnosticsOpen = diagnosticsOpen,
-                    )
+                    // ⋮：画质 / 倍速 / 播放诊断，从右侧滑出（PlayerSettingsPanel）
+                    IconButton(onClick = { settingsOpen = true; controller.noteUserActivity() }, modifier = Modifier.testTag("player-more")) {
+                        Icon(Icons.Rounded.MoreVert, contentDescription = "更多", tint = Color.White)
+                    }
                     IconButton(onClick = {
                         val aspect = if (state.videoWidth > 0 && state.videoHeight > 0) {
                             Rational(state.videoWidth, state.videoHeight)
@@ -849,7 +887,6 @@ private fun PlayingSurface(
                                 },
                             )
                         },
-                        speed = { SpeedChip(controller) },
                     )
                     Spacer(Modifier.height(10.dp))
                     // 进度条（实测：左右内距 35、轨 3px 白 30%、句柄 11 白点）
@@ -910,16 +947,18 @@ private fun PlayingSurface(
                                 .clip(RoundedCornerShape(3.dp))
                                 .background(AccentStrong),
                         )
-                        // 片头结束点与播放位置使用相同的文件时间和条宽；没有识别结果就不画。
+                        // 可跳过的段（片头、广告等，同 Apple 端）：琥珀色，画在已播放部分之上，与播放位置同一套文件时间和条宽
                         if (totalMs > 0) {
-                            state.segments.orEmpty().filter {
-                                it.type == "intro" && it.startMs >= 0 && it.endMs > it.startMs && it.endMs < totalMs
-                            }.forEach { segment ->
-                                val markerSize = 5.dp
+                            state.segments.orEmpty().filter { it.endMs > it.startMs }.forEach { segment ->
+                                val from = segment.startMs.coerceIn(0L, totalMs).toFloat() / totalMs
+                                val to = segment.endMs.coerceIn(0L, totalMs).toFloat() / totalMs
                                 Box(
                                     Modifier.align(Alignment.CenterStart)
-                                        .offset(x = travel * (segment.endMs.toFloat() / totalMs) + (handleSize - markerSize) / 2)
-                                        .size(markerSize).clip(CircleShape).background(Color.White),
+                                        .offset(x = maxWidth * from)
+                                        .width((maxWidth * (to - from)).coerceAtLeast(2.dp))
+                                        .height(3.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(Skippable.copy(alpha = 0.9f)),
                                 )
                             }
                         }
@@ -939,6 +978,15 @@ private fun PlayingSurface(
                     ) {
                         Text(McFormat.clock(shownMs), style = McType.caption, color = Color.White.copy(alpha = 0.7f))
                         Spacer(Modifier.weight(1f))
+                        // 不是正常速度时常驻一个角标，免得忘了自己开着倍速（长按倍速另有提示）
+                        if (state.speed != 1f && !holdSpeed) {
+                            Text(
+                                PlaybackSpeeds.short(state.speed),
+                                style = McType.caption,
+                                color = Color.White,
+                                modifier = Modifier.padding(end = 8.dp).testTag("player-speed-badge"),
+                            )
+                        }
                         Text(
                             McFormat.clock(totalMs),
                             style = McType.caption,
@@ -957,6 +1005,19 @@ private fun PlayingSurface(
                 )
             }
         }
+
+        PlayerSettingsPanel(
+            visible = settingsOpen && !locked,
+            quality = state.quality,
+            qualityReason = controller.decision?.reason.orEmpty(),
+            canPickQuality = !controller.isGuest,
+            speed = state.speed,
+            diagnosticsOpen = diagnosticsOpen,
+            onSelectQuality = controller::selectQuality,
+            onSelectSpeed = controller::selectSpeed,
+            onToggleDiagnostics = { diagnosticsOpen = !diagnosticsOpen },
+            onDismiss = { settingsOpen = false },
+        )
 
         // 错误页 / 要开启软件转码：盖在画面之上（引擎的错误都带原因与建议）
         when {
@@ -1048,7 +1109,6 @@ internal fun PlayerBottomControls(
     onNext: () -> Unit,
     onEpisodes: () -> Unit,
     tracks: @Composable () -> Unit,
-    speed: @Composable () -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 35.dp),
@@ -1056,8 +1116,9 @@ internal fun PlayerBottomControls(
     ) {
         GlassPill { tracks() }
         Spacer(Modifier.weight(1f))
-        GlassPill {
-            if (series) {
+        // 倍速在右上角 ⋮ 里（PlayerSettingsPanel）；电影这边就没有按钮了
+        if (series) {
+            GlassPill {
                 IconButton(onClick = onNext, enabled = hasNext) {
                     Icon(Icons.Rounded.SkipNext, contentDescription = "下一集",
                         tint = Color.White.copy(alpha = if (hasNext) 1f else 0.35f))
@@ -1066,7 +1127,6 @@ internal fun PlayerBottomControls(
                     Icon(Icons.AutoMirrored.Rounded.PlaylistPlay, contentDescription = "选集", tint = Color.White)
                 }
             }
-            speed()
         }
     }
 }
@@ -1247,75 +1307,6 @@ private fun QualityOfferCard(
             ) {
                 Text("改用 ${offer.maxHeight}p", style = McType.footnote)
             }
-        }
-    }
-}
-
-/** 画质菜单(iOS SettingsMenu):标题「画质」+ 四档上限 + 分隔线 + 这一档的判据原文 */
-@Composable
-private fun QualityMenuButton(
-    /** 当前画质上限（null = 原画） */
-    current: Int?,
-    /** 服务端的判据原文 */
-    reason: String,
-    onSelect: (Int?) -> Unit,
-    onExpandedChange: (Boolean) -> Unit = {},
-    /** 菜单底部的「播放诊断」开关（iOS 在 ⋯ 菜单里） */
-    onDiagnostics: () -> Unit = {},
-    diagnosticsOpen: Boolean = false,
-) {
-    var expanded by remember { mutableStateOf(false) }
-    LaunchedEffect(expanded) { onExpandedChange(expanded) }
-    Box {
-        IconButton(onClick = { expanded = true }) {
-            Icon(Icons.Rounded.Tune, contentDescription = "画质", tint = Color.White)
-        }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            Text(
-                "画质",
-                style = McType.caption,
-                color = io.movieclaw.android.core.designsystem.TextFaint,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-            )
-            QualityOption.ALL.forEach { option ->
-                DropdownMenuItem(
-                    text = {
-                        Column {
-                            Text(
-                                option.label,
-                                style = McType.subheadline,
-                                color = if (option.maxHeight == current) Accent else Color.Unspecified,
-                            )
-                            Text(option.hint, style = McType.caption2, color = io.movieclaw.android.core.designsystem.TextFaint)
-                        }
-                    },
-                    onClick = {
-                        expanded = false
-                        if (option.maxHeight != current) onSelect(option.maxHeight)
-                    },
-                )
-            }
-            // 服务端的判据原文：档位标签只说得清"结果"，说不清"是谁顶上去的"
-            // （容器 / 视频编码 / HDR / 音轨 / 画质上限），这一行是排"为什么在转码"的入口
-            if (reason.isNotBlank()) {
-                androidx.compose.material3.HorizontalDivider(color = io.movieclaw.android.core.designsystem.LineColor)
-                Text(
-                    reason,
-                    style = McType.caption2,
-                    color = io.movieclaw.android.core.designsystem.TextFaint,
-                    modifier = Modifier
-                        .width(268.dp)
-                        .padding(horizontal = 14.dp, vertical = 6.dp),
-                )
-            }
-            androidx.compose.material3.HorizontalDivider(color = io.movieclaw.android.core.designsystem.LineColor)
-            DropdownMenuItem(
-                text = { TrackRow("播放诊断", diagnosticsOpen) },
-                onClick = {
-                    expanded = false
-                    onDiagnostics()
-                },
-            )
         }
     }
 }
@@ -1533,29 +1524,6 @@ private fun TierChip(decision: PlaybackDecisionView) {
         )
         Spacer(Modifier.size(5.dp))
         Text(label, style = McType.caption2, color = Color.White)
-    }
-}
-
-@Composable
-private fun SpeedChip(controller: PlaybackController) {
-    var expanded by remember { mutableStateOf(false) }
-    var speed by remember { mutableStateOf(controller.speed) }
-    Box {
-        TextButton(onClick = { expanded = true }) {
-            Text("${speed}×", style = McType.caption, color = Color.White)
-        }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 3.0f).forEach { value ->
-                DropdownMenuItem(
-                    text = { Text("${value}×") },
-                    onClick = {
-                        speed = value
-                        controller.setSpeed(value)
-                        expanded = false
-                    },
-                )
-            }
-        }
     }
 }
 

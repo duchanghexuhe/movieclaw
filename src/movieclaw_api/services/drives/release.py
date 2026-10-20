@@ -10,7 +10,8 @@
 4. 再核一遍：本地大小与修改时间和算指纹时一样，网盘上的文件还在、大小一样。
 
 动作**先记台账再删文件**：先提交 ``local_bytes = false``，再删库内文件（旁车不删），删失败改回来。
-顺序反过来，实时监控收到删除事件触发的扫描会把还标着本地在的行判成缺失。腾空后发事件
+顺序反过来，实时监控收到删除事件触发的扫描会把还标着本地在的行判成缺失。删掉后从它所在的目录往上
+清掉变空的目录（非空即停、到库根即停），旁车还在的目录原样留着。腾空后发事件
 ``library.file.local-released``，下载模块据此清掉做完使命的下载任务（硬链接入库时空间要等那份
 也删了才回来）。
 """
@@ -35,6 +36,7 @@ from movieclaw_db.models.library_file import FileState, LibraryFile
 from movieclaw_db.models.library_file_replica import REPLICA_VERIFIED, LibraryFileReplica
 from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_db.repositories.library_cloud_repo import LibraryCloudRepository
+from movieclaw_playback.streaming import is_strm
 from movieclaw_scheduler.registry import register_task
 from movieclaw_sdk import drives as dv
 
@@ -112,11 +114,14 @@ def _stat(path: Path) -> os.stat_result | None:
 async def try_release(file_id: int) -> str | None:
     """腾空一个文件的本地副本。腾空了返回 None，没动返回原因。"""
     from movieclaw_api.services.drives import gateway, sources
+    from movieclaw_api.services.library.organize import _prune_emptied_dirs
 
     async with get_database().session() as session:
         file = await session.get(LibraryFile, file_id)
         if file is None or file.state != FileState.IN_PLACE or not file.local_bytes:
             return "不是在位的本地文件"
+        if is_strm(file.file_path):
+            return "strm 占位文件不腾空"
         library = await session.get(Library, file.library_id)
         repo = LibraryCloudRepository(session)
         folder = await repo.primary_folder(file.library_id)
@@ -139,6 +144,7 @@ async def try_release(file_id: int) -> str | None:
                 if reason is not None:
                     return reason
         path = Path(file.file_path)
+        roots = [r.rstrip("/") for r in library.root_paths]
         account_id, remote_id = replica.account_id, replica.remote_id
         remote_size = replica.size_bytes
     if _in_use(file_id):
@@ -180,6 +186,8 @@ async def try_release(file_id: int) -> str | None:
                 await session.commit()
         logger.warning("腾空本地失败（已改回本地在）：%s（%s）", path, exc)
         return f"删不掉本地文件：{exc}"
+    # 只清变空的目录：还有旁车或别的文件就非空，rmdir 不动它
+    await asyncio.to_thread(_prune_emptied_dirs, {path.parent}, roots)
     await sources.refresh_file(file_id)
     await _publish(library_id, file_id, stat.st_size, hardlinked)
     logger.info("已腾空本地（网盘上有核验过的副本）：%s", path.name)
@@ -214,6 +222,7 @@ async def candidates(limit: int = SWEEP_BATCH) -> list[int]:
                     LibraryFile.library_id.in_(library_ids),  # type: ignore[attr-defined]
                     LibraryFile.local_bytes.is_(True),  # type: ignore[attr-defined]
                     LibraryFile.state == FileState.IN_PLACE,
+                    ~LibraryFile.strm_path(),
                     LibraryFileReplica.state == REPLICA_VERIFIED,
                     Library.keep_local.is_(False),  # type: ignore[attr-defined]
                 )

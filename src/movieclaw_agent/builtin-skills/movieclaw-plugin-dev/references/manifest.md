@@ -10,6 +10,7 @@ plugins/media-stats/
 ├── movieclaw-plugin.toml      ← 清单（必须在根部）
 ├── media_stats.py             ← 入口模块（或 media_stats/__init__.py 的包）
 ├── media_stats_helpers.py     ← 其他模块随意
+├── web/                       ← 插件网页（可选）：index.html 是入口，manifest.webmanifest 定侧边栏，见 web-pages.md
 ├── vendor/                    ← 依赖（可选）：纯 Python 包原样放进来，运行时自动加进 sys.path
 ├── requirements.in            ← 第三方依赖（可选）：每行一个直接依赖，如 p115cipher[full]
 └── requirements.lock          ← 由它生成的锁文件，清单 [dependencies] lock 指向它
@@ -28,7 +29,7 @@ plugins/media-stats/
 id = "media-stats"          # 必填。小写字母开头，字母、数字、连字符，不含点；= @plugin 的名字
 title = "媒体统计"              # 必填。1～60 字，管理页显示
 version = "0.1.0"              # 必填。主.次.修订，可带 -后缀（开发循环自动加 -dev.<时间戳>）
-entry = "media_stats"          # 必填。入口模块名（不是路径，不带 .py）
+entry = "media_stats"          # 必填（只带网页的插件不写）。入口模块名（不是路径，不带 .py）
 runtime = "process"            # process（默认）| inline（需单独批准）| exec（非 Python 插件，见下）
 sdk = "^1.0"                   # 要求的 movieclaw_sdk 版本区间
 description = "一句话说明"       # 可选，500 字以内；展示在「设置 → 插件」详情页给用户看，写它能做什么，别写文档路径、开发备注
@@ -66,6 +67,9 @@ open = "plugin"                # 点开去哪：plugin（插件页）| media（�
 清单不允许出现未知字段（写错字段名会被拒）。会通知到普通成员的（`member:` / `media:`）批准时要单独勾选；
 通知上会标「来自 插件名」。
 
+
+**只带网页的插件**：不写 `entry`，包里有 `web/index.html` 即可（`new_plugin.py --web` 生成），没有后端进程。
+批准时要单独同意网页授信运行（`plugin dev … --allow-web`），见 `web-pages.md`。
 
 **非 Python 插件**（Go、Rust 等，`runtime = "exec"`）：不写 `entry`，改写包里的可执行文件和它支持的平台。
 宿主先经可信启动器降权，再执行它；协议见 `$SRC/movieclaw_sdk/protocol/`（`gateway.json`、`control.json`），
@@ -125,7 +129,8 @@ platforms = ["linux/amd64", "linux/arm64"]    # 必填；与服务器平台不�
 ## 第三方依赖（`[dependencies]`）
 
 带本机代码的包（pycryptodome、lz4……）放不进 `vendor/`，在清单里声明锁文件，管理员批准安装时由服务器下载
-（设计：`docs/design/plugin-dependencies.md`）。
+（设计：`docs/design/plugin-dependencies.md`）。选依赖先看**轮子里的 LICENSE**：PyPI 页面写的许可证不一定准
+（如 p115cipher 页面写 MIT，轮子里是 GPLv3），带 GPL 的要在插件 README 里讲清，并告诉用户。
 
 1. 把直接依赖写进插件目录的 `requirements.in`（每行一个）；
 2. `python scripts/check_plugin.py plugins/<目录> --lock`：按主程序的 `host-constraints.txt`（最新服务器版本的 Release 附件；

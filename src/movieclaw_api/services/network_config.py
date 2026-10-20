@@ -246,6 +246,47 @@ async def _probe_target(service: str, session: AsyncSession) -> tuple[str, dict[
         if service == "telegram":
             return f"https://api.telegram.org/bot{token}/getMe", {}
         return "https://discord.com/api/v10/users/@me", {"Authorization": f"Bot {token}"}
+    if service == "feishu":
+        # 只探测线路：不 POST、不带 hook 令牌——往 Webhook 发请求就是往群里发消息。
+        # 接入了机器人就测它所在的主机（国际版 Lark 是 open.larksuite.com），
+        # 没接入测默认的 open.feishu.cn
+        host = "open.feishu.cn"
+        accounts = await ChannelAccountRepository(session).list_by_channel("feishu")
+        if accounts:
+            try:
+                creds = ChannelAccountRepository.credentials(accounts[0])
+            except Exception as exc:  # noqa: BLE001 -- 凭据损坏时返回可操作的中文错误
+                raise BadRequestException("飞书机器人凭据不可用，请重新接入") from exc
+            # 旧行的裸 URL 落在 token 里（见 feishu_channel.client.parse_credentials）
+            webhook_url = creds.get("webhook_url") or creds.get("token") or ""
+            host = urlsplit(webhook_url).hostname or host
+        return f"https://{host}/", {}
+    if service == "movieclaw_cloud":
+        # 用户点测试就是明确要发请求；探测连接第一步读的公开发现文档，不带任何凭据
+        from movieclaw_api.services.cloud import get_cloud_service
+
+        return f"{get_cloud_service().cloud_url()}/.well-known/movieclaw-cloud", {}
+    if service == "movieclaw_push":
+        # 测这个开关管得着的中继：官方中继（启用时），否则第一个公网上的自建中继。
+        # 局域网里的自建中继真实推送时总是直连、不受这个开关影响，不拿来测。
+        # 只读公开的 /v1/info，不带凭证（带凭证会被官方中继记作一次连接）
+        from movieclaw_api.services.cloud import get_cloud_service
+        from movieclaw_api.services.push.relay import is_lan_url
+        from movieclaw_api.settings.cloud import CloudSetting, PushChannelsSetting
+
+        store = get_setting_store()
+        channels = await store.get(PushChannelsSetting)
+        urls = (
+            get_cloud_service().push_endpoints(await store.get(CloudSetting))
+            if channels.official_enabled
+            else []
+        )
+        urls += [r.url for r in channels.relays if r.enabled and r.url and not is_lan_url(r.url)]
+        if not urls:
+            raise BadRequestException(
+                "没有走这个出口的推送中继（局域网里的自建中继总是直连，不受此开关影响），无法测试"
+            )
+        return f"{urls[0]}/v1/info", {}
     if service == "webhook":
         setting = await get_setting_store().get(WebhookSetting)
         endpoint = next(
@@ -330,6 +371,10 @@ def _classify_probe(service: str, status_code: int) -> NetworkTestResult:
         else:
             message = f"网络连通（HTTP {status_code}）"
         return NetworkTestResult(ok=True, message=message)
+    if service == "movieclaw_cloud" and status_code == 200:
+        return NetworkTestResult(ok=True, message="网络连通，可正常访问 MovieClaw Cloud")
+    if service == "movieclaw_push" and status_code == 200:
+        return NetworkTestResult(ok=True, message="网络连通，可正常访问推送中继")
     if service in ("telegram", "discord") and status_code in (401, 403, 404):
         channel_name = "Telegram" if service == "telegram" else "Discord"
         return NetworkTestResult(ok=True, message=f"网络连通，但 {channel_name} bot Token 无效")
