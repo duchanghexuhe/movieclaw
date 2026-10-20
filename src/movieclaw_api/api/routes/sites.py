@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.exceptions import (
+    BadRequestException,
+    ConflictException,
+    NotFoundException,
+    ServiceUnavailableException,
+)
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.site import (
     BoostCleanupRequest,
@@ -15,14 +25,25 @@ from movieclaw_api.schemas.site import (
     SiteConfigCreate,
     SiteConfigUpdate,
     SiteProtectionUpdate,
+    SiteProxyRequest,
+    SiteProxyResponse,
     SiteRatioBoostUpdate,
     SiteStatusUpdate,
     SiteSyncStatsView,
+    join_proxy_url,
+    proxy_base_url,
+    proxy_path_error,
+    proxy_response_text,
+    proxy_same_origin,
+    sanitize_proxy_headers,
+    sanitize_proxy_response_headers,
 )
 from movieclaw_api.services import SiteCatalogService, SiteConfigService, verify_site
+from movieclaw_api.services.site_access import SiteUnavailableError, get_site_access
 from movieclaw_db.engine import get_session
 from movieclaw_db.models.site_credential import SiteCredential
 from movieclaw_db.repositories.torrent_repo import TorrentRepository
+from movieclaw_tracker.exceptions import TrackerAuthError
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -338,6 +359,85 @@ async def reverify_site(
     row = await service.start_verification(site_id)  # 404/409/占位一步到位
     background_tasks.add_task(verify_site, site_id)
     return ok(await _to_view(service, row), message="已重新发起验证")
+
+
+@router.post(
+    "/{site_id}/proxy",
+    response_model=ApiResponse[SiteProxyResponse],
+    summary="借宿主已认证会话对站点发一个请求（凭据不出宿主）",
+    operation_id="site.proxy.request",
+)
+async def proxy_site_request(
+    site_id: str,
+    payload: SiteProxyRequest,
+) -> ApiResponse[SiteProxyResponse]:
+    """站点代请求：调用方（插件）声明想对站点发什么请求，宿主用它自己的已认证
+    会话执行并回传脱敏后的响应。给保活/签到类插件复用站点登录态用。
+
+    安全边界：``path`` 只能是站内相对路径（完整 URL 由宿主按站点注册的域名拼接，
+    防 SSRF）；``headers`` 里认证相关头（cookie / authorization / x-api-key）被剥除，
+    由宿主会话统一附加；响应剥掉 set-cookie 等凭据头、正文按上限截断。
+
+    行为：站点未配置 / 停用 / 未验证通过 → 409（可读中文原因）；认证失败 → 409
+    （凭据已失效）；网络错误 → 502。
+    """
+    from movieclaw_tracker.exceptions import SiteNotFoundError
+    from movieclaw_tracker.registry import get_site_config
+
+    if (reason := proxy_path_error(payload.path)) is not None:
+        raise BadRequestException(reason)
+    try:
+        config = get_site_config(site_id)
+    except SiteNotFoundError:
+        raise NotFoundException(f"未知站点：{site_id}") from None
+    base = proxy_base_url(config, payload.base)
+    url = join_proxy_url(base, payload.path)
+    if not proxy_same_origin(base, url):
+        raise BadRequestException("路径不允许指定主机（只能给站内相对路径）")
+
+    try:
+        site = await get_site_access().get(site_id)
+    except SiteUnavailableError as exc:
+        raise ConflictException(str(exc)) from exc
+    except TrackerAuthError as exc:
+        raise ConflictException(f"认证失败：{exc.message}") from exc
+
+    headers = sanitize_proxy_headers(payload.headers)
+    # POST 体：字典按 JSON 发；字符串按原始内容发（调用方自带 content-type）
+    json_body: Any = payload.body if isinstance(payload.body, dict) else None
+    content: str | None = payload.body if isinstance(payload.body, str) else None
+
+    try:
+        response = await site.client.raw_request(
+            payload.method,
+            url,
+            headers=headers or None,
+            json=json_body,
+            content=content,
+            timeout=payload.timeout,
+        )
+    except httpx.TimeoutException as exc:
+        raise ServiceUnavailableException(f"站点响应超时（{payload.timeout:g}s）") from exc
+    except httpx.TransportError as exc:
+        raise ServiceUnavailableException(f"无法连接站点：{exc}") from exc
+
+    content_type = str(response.headers.get("content-type", ""))
+    text, truncated = proxy_response_text(response.content, content_type)
+    parsed: Any = None
+    if text is not None and "json" in content_type.lower():
+        try:
+            parsed = json.loads(text) if not truncated else None
+        except ValueError:
+            parsed = None
+    return ok(
+        SiteProxyResponse(
+            status_code=response.status_code,
+            headers=sanitize_proxy_response_headers(response.headers),
+            text=text,
+            json_body=parsed,
+            truncated=truncated,
+        )
+    )
 
 
 @router.delete(
