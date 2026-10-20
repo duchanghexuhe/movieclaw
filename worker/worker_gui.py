@@ -20,6 +20,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -27,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from worker import (  # noqa: E402
     WorkerRuntime,
+    check_ffmpeg,
     load_config,
     on_battery,
     save_config,
@@ -256,6 +259,9 @@ class WorkerGUI:
         self._start_thread: threading.Thread | None = None
         self._exiting = False
         self._exit_at = 0.0
+        #: 连接状态行的文字（不含电池提示，电池条件每次刷新现算）；批准页地址只在配对时有
+        self._conn_text = "未启动"
+        self._approve_url: str | None = None
         self.ui_queue: queue.Queue[tuple] = queue.Queue()
         self.tray: TrayIcon | None = None
         self._build_ui()
@@ -264,6 +270,10 @@ class WorkerGUI:
         self._install_tray()
         root.after(120, self._poll_queue)
         _append_log_file(f"—— GUI 启动（PID {os.getpid()}）——")
+        if "--autostart" in sys.argv and self.config.get("server") and self.config.get("token"):
+            # 开机自启且已配对：直接收进托盘、开始工作，不弹窗打扰
+            root.withdraw()
+            self._start()
 
     # -- UI 构建 -------------------------------------------------------------
 
@@ -274,7 +284,7 @@ class WorkerGUI:
 
         status = ttk.LabelFrame(frame, text="状态")
         status.pack(fill=tk.X, **pad)
-        self.lbl_connection = ttk.Label(status, text="未启动")
+        self.lbl_connection = ttk.Label(status, text="未启动", wraplength=640)
         self.lbl_connection.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=8, pady=4)
         self.lbl_slots = ttk.Label(status, text="任务：—")
         self.lbl_slots.grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 6))
@@ -295,7 +305,7 @@ class WorkerGUI:
         ttk.Spinbox(config, from_=1, to=8, width=5, textvariable=self.var_concurrency).grid(
             row=2, column=1, sticky=tk.W)
         ttk.Label(
-            config, text="（播放转码优先，预转码占并发−1）",
+            config, text="（播放优先：有人播放时预转码暂停，空闲时用满并发）",
             foreground="#666",
         ).grid(row=2, column=1, sticky=tk.W, padx=(52, 0))
         self.var_ac_only = tk.BooleanVar(value=False)
@@ -311,6 +321,11 @@ class WorkerGUI:
         self.btn_start.pack(side=tk.LEFT, padx=(10, 4))
         self.btn_stop = ttk.Button(buttons, text="停止", command=self._stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=4)
+        # 配对等待时才可点：打开批准页（地址来自 runtime 的配对事件）
+        self.btn_approve = ttk.Button(
+            buttons, text="打开批准页", command=self._open_approve_page, state=tk.DISABLED
+        )
+        self.btn_approve.pack(side=tk.LEFT, padx=4)
 
         log_frame = ttk.LabelFrame(frame, text="日志")
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
@@ -350,15 +365,19 @@ class WorkerGUI:
             return
         config = self._collect_config()
         if not config["server"]:
-            messagebox.showwarning(APP_TITLE, "请先填服务器地址（如 http://192.168.31.10:8096）")
+            self._refuse_start("请先填服务器地址（如 http://192.168.31.10:8096）")
             return
         save_config({**self.config, **config})
         self.config = load_config()
+        problem = check_ffmpeg(config["ffmpeg"] or "ffmpeg")
+        if problem:
+            self._refuse_start(problem)
+            return
         runtime = WorkerRuntime(
             server=config["server"],
             token=self.config.get("token"),
             ffmpeg=config["ffmpeg"] or "ffmpeg",
-            name=self.config.get("name") or "Preload Worker",
+            name=self.config.get("name"),
             concurrency=config["concurrency"],
             ac_only=config["ac_only"],
             on_token=lambda token: save_config({**self.config, "token": token}),
@@ -367,9 +386,30 @@ class WorkerGUI:
         self.runtime = runtime
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
-        self.lbl_connection.configure(text="连接中…")
-        self._start_thread = threading.Thread(target=runtime.start, daemon=True)
+        self._set_conn("启动中…")
+        self._start_thread = threading.Thread(
+            target=self._run_runtime, args=(runtime,), daemon=True
+        )
         self._start_thread.start()
+
+    def _refuse_start(self, reason: str) -> None:
+        """启动前校验不过：不启动，给出原因（窗口可能正收在托盘里，先唤出来）。"""
+        self.root.deiconify()
+        self._log(reason)
+        messagebox.showwarning(APP_TITLE, reason)
+
+    def _run_runtime(self, runtime: WorkerRuntime) -> None:
+        try:
+            runtime.start()
+        except Exception as exc:
+            # 线程里的异常在 pythonw 下会静默消失，界面就卡在「连接中」；用户主动停止时
+            # 的取消（如配对等待中点了停止）不算故障
+            if not runtime.stop_event.is_set():
+                self._on_runtime_event("error", reason=str(exc), trace=traceback.format_exc())
+
+    def _open_approve_page(self) -> None:
+        if self._approve_url:
+            webbrowser.open(self._approve_url)
 
     def _stop(self) -> None:
         if self.runtime is not None and not self.runtime.stop_event.is_set():
@@ -407,6 +447,46 @@ class WorkerGUI:
 
     def _on_runtime_event(self, kind: str, **fields: object) -> None:
         self.ui_queue.put((kind, fields))
+
+    def _on_event(self, kind: str, fields: dict) -> None:
+        """runtime 事件 → 界面。连接状态以 runtime 报告的为准，不靠猜。"""
+        if kind == "log":
+            self._log(fields["line"])
+        elif kind == "pairing":
+            self._log(fields["line"])
+            self._set_conn(
+                f"等待配对：配对码 {fields['user_code']}（{fields['expires_in']} 秒内有效），"
+                "请在浏览器批准",
+                approve_url=fields["verify_url"],
+            )
+        elif kind == "connecting":
+            self._set_conn(f"连接中 {fields['server']}…")
+        elif kind == "online":
+            self._set_conn(f"已连接 {fields['server']}")
+        elif kind == "offline":
+            retry = int(fields.get("retry_seconds") or 0)
+            tail = f"，{retry} 秒后重试" if retry else "，正在重连"
+            self._set_conn(f"连接断开：{fields['reason']}{tail}")
+        elif kind == "stopped":
+            self._set_conn("已停止")
+        elif kind == "error":
+            self._log(f"启动失败：{fields['reason']}")
+            _append_log_file(fields["trace"])
+            self._set_conn(f"启动失败：{fields['reason']}")
+
+    def _set_conn(self, text: str, approve_url: str | None = None) -> None:
+        self._conn_text = text
+        self._approve_url = approve_url
+        self.btn_approve.configure(state=tk.NORMAL if approve_url else tk.DISABLED)
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        """连接行 + 电池提示。电池条件每次刷新现算（拔电、接电都要跟上），不再只算一次。"""
+        text = self._conn_text
+        if self.runtime is not None and self.runtime.ac_only and on_battery():
+            text += "（使用电池，预转码已暂停）"
+        if text != self.lbl_connection.cget("text"):
+            self.lbl_connection.configure(text=text)
 
     def _log(self, line: str) -> None:
         _append_log_file(line)
@@ -466,32 +546,19 @@ class WorkerGUI:
                     self._exit_at = time.monotonic()
                     break
                 else:
-                    kind, fields = item
-                    if kind == "log":
-                        self._log(fields["line"])
-                    elif kind == "pairing":
-                        self.lbl_connection.configure(text="等待配对：请在浏览器批准配对码")
+                    self._on_event(*item)
         except queue.Empty:
             pass
         # 运行态刷新
         if self.runtime is not None:
-            if self.runtime.token and self.lbl_connection["text"].startswith(("未启动", "连接中")):
-                self.lbl_connection.configure(
-                    text=f"已连接 {self.runtime.server}"
-                         + ("（使用电池，已暂停）" if self.runtime.ac_only and on_battery() else "")
-                )
+            self._refresh_status()
             self._refresh_tasks_label()
-            # 停止收尾完成：复位按钮与标签，允许再次启动
-            if (
-                self.runtime.stop_event.is_set()
-                and self._start_thread is not None
-                and not self._start_thread.is_alive()
-            ):
+            # 运行线程收尾完成（正常停止或启动失败）：复位按钮，允许再次启动
+            if self._start_thread is not None and not self._start_thread.is_alive():
                 self.runtime = None
                 self._start_thread = None
                 self.btn_start.configure(state=tk.NORMAL)
                 self.btn_stop.configure(state=tk.DISABLED)
-                self.lbl_connection.configure(text="已停止")
                 self.lbl_slots.configure(text="任务：—")
         # 退出等待：收尾完成（或 30s 兜底）后真正关窗
         if self._exiting and (self.runtime is None or time.monotonic() - self._exit_at > 30):

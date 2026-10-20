@@ -517,11 +517,8 @@ class RemoteWorkerRegistry:
             connection = self._select_worker(
                 backend, segment_type, disc=disc, plan=plan, source_id=source_id
             )
-            if connection is None:
-                # 全员满员时看能不能抢占一个在跑的预转码任务让位（T2 预算只
-                # 约束派单时刻；实时任务后到时这里是「realtime 永远优先」的
-                # 兜底执行点）
-                connection = self._preempt_preload_for_realtime(backend, segment_type, disc=disc)
+            # 预转码不占实时的位：播放到来时在跑的预转码由 Worker 自己让位（见
+            # handle_message 的 preload.yielded），这里不再抢占
             if connection is None:
                 if disc and self._select_worker(backend, segment_type) is not None:
                     raise RemoteWorkerUnavailable(
@@ -552,17 +549,17 @@ class RemoteWorkerRegistry:
     # -- 预转码推送派单（v2 统一调度）-------------------------------------
 
     def preload_capacity(self, connection: WorkerConnection) -> int:
-        """这台 Worker 现在还能接几个预转码任务（realtime 永远优先）。
+        """这台 Worker 现在还能接几个预转码任务（播放优先）。
 
-        预算 = max_concurrency − 1 − 在跑的实时任务数 − 在途的预转码任务数，
-        最小 0：并发=1 的机器只服务实时；空闲出来的并发位才允许预转码占用。
-        实时任务在连接断开时全部判失败释放；预转码的已推送任务由
-        ``preload_jobs`` 记账直到终态（complete/fail/取消/回队时释放），
-        推送成功一个记一个，派单循环不会重复计数。
+        有任何实时任务（播放转码、离线导出）在跑就是 0：预转码整体让位；空闲时整个并发
+        都可以转预转码，即 max_concurrency 减去在途的预转码数。在途的推送记账在
+        ``preload_jobs`` 里，直到终态（complete/fail/取消/回队）才释放，推送成功一个记一个，
+        派单循环不会重复计数。
         """
         with self._lock:
-            busy = len(connection.jobs) + len(connection.preload_jobs)
-        return max(0, connection.max_jobs - 1 - busy)
+            if connection.jobs:
+                return 0
+            return max(0, connection.max_jobs - len(connection.preload_jobs))
 
     def preload_workers(self) -> list[WorkerConnection]:
         """带 preload 角色、不在排空、心跳新鲜的在线连接（按余量排序）。"""
@@ -637,10 +634,10 @@ class RemoteWorkerRegistry:
         return True
 
     async def send_preload_stop(self, device_id: int, task_id: int) -> None:
-        """实时任务抢占并发位时，通知该设备在跑的预转码任务停止。
+        """服务端取消预转码任务时，通知该设备上执行中的 Worker 停下。
 
-        与实时 job.stop 的区别：只按 login_device_id 找连接、消息带
-        ``class=preload`` 与 ``task_id``（Worker 用它停对应的分段 ffmpeg）。
+        ``reason=cancel``：Worker 据此删掉本地半成品（几十 GB 的源文件）。播放让位不走这里——
+        Worker 自己停掉分段并上报 ``preload.yielded``，断点与本地文件都保留。
         发送失败不打紧——租约到 10 分钟自然回收，断点台账保留。
         """
         with self._lock:
@@ -656,11 +653,11 @@ class RemoteWorkerRegistry:
             return
         try:
             await connection.send(
-                {"type": "job.stop", "class": "preload", "task_id": task_id}
+                {"type": "job.stop", "class": "preload", "task_id": task_id, "reason": "cancel"}
             )
         except Exception:  # noqa: BLE001
             logger.info(
-                "预转码抢占停止消息发送失败（租约会兜底）：device=%s task=%s",
+                "预转码取消停止消息发送失败（租约会兜底）：device=%s task=%s",
                 device_id,
                 task_id,
             )
@@ -812,7 +809,21 @@ class RemoteWorkerRegistry:
             if isinstance(task_id, int):
                 # 记账释放放在回队协程里（归属校验通过之后）：伪造的拒单
                 # 不能提前释放他机的在途账
-                asyncio.create_task(self._requeue_rejected_preload(connection, task_id))
+                asyncio.create_task(
+                    self._requeue_preload(
+                        connection, task_id, reason="Worker 拒收（角色未开或并发已满）"
+                    )
+                )
+            return None
+        if message_type == "preload.yielded":
+            # Worker 为播放让位（实时任务进来）停掉了预转码：记账释放、任务当场回队，
+            # 不挂到 10 分钟租约到期。归属校验在协程里做（同拒收）
+            task_id = message.get("task_id")
+            logger.info(
+                "预转码让位：worker=%s task=%s（播放优先，断点保留）", connection.worker_id, task_id
+            )
+            if isinstance(task_id, int):
+                asyncio.create_task(self._requeue_yielded_preload(connection, task_id))
             return None
         if (
             message_type
@@ -865,8 +876,13 @@ class RemoteWorkerRegistry:
 
     # -- 内部 ------------------------------------------------------------
 
-    async def _requeue_rejected_preload(self, connection: WorkerConnection, task_id: int) -> None:
-        """被拒收的预转码任务立即回队（归属校验后）。失败等租约兜底。"""
+    async def _requeue_preload(
+        self, connection: WorkerConnection, task_id: int, *, reason: str
+    ) -> bool:
+        """预转码任务当场回队（归属校验后）：在途记账释放、断点台账保留。返回是否回队。
+
+        校验在释放记账之前：伪造的回队消息不能释放他机的在途账。失败等租约兜底。
+        """
         try:
             from movieclaw_api.services.preload.dispatcher import return_task
             from movieclaw_db.engine import get_database
@@ -876,11 +892,22 @@ class RemoteWorkerRegistry:
                 task = await session.get(PreloadTask, task_id)
                 if task is not None and task.worker_device_id == connection.login_device_id:
                     self.release_preload_task(task_id, connection.worker_id)
-                    await return_task(
-                        session, task_id, reason="Worker 拒收（角色未开或并发已满）"
-                    )
+                    await return_task(session, task_id, reason=reason)
+                    return True
         except Exception:  # noqa: BLE001
-            logger.warning("拒收任务回队失败（租约兜底）：task=%s", task_id, exc_info=True)
+            logger.warning("预转码任务回队失败（租约兜底）：task=%s", task_id, exc_info=True)
+        return False
+
+    async def _requeue_yielded_preload(self, connection: WorkerConnection, task_id: int) -> None:
+        """播放让位的预转码当场回队，并立刻派一轮。
+
+        让位的 Worker 此刻余量为 0（有实时任务在跑），派单会跳过它，任务由别的 Worker 接手；
+        本机播放结束后（``_release_job``）再派回来，从断点续转。
+        """
+        if await self._requeue_preload(connection, task_id, reason="播放让位"):
+            from movieclaw_api.services.preload.dispatcher import trigger_dispatch
+
+            trigger_dispatch()
 
     def _select_worker(
         self,
@@ -944,58 +971,6 @@ class RemoteWorkerRegistry:
                 )
 
             return min(candidates, key=rank)
-
-    def _preempt_preload_for_realtime(
-        self, backend: str, segment_type: str, *, disc: bool
-    ) -> WorkerConnection | None:
-        """实时接单全员满员时，抢一台 Worker 的一个在跑预转码任务让位。
-
-        T2 预算（预转码最多占并发−1）只约束推送时刻——实时任务是在预转码
-        之后到的。抢占 = 记账立即释放 + 给 Worker 发 job.stop(class=preload)
-        （Worker 停掉分段 ffmpeg，断点台账在服务端）；任务本身保持 CLAIMED，
-        10 分钟租约到期自动回队重派。返回被抢占的连接供实时任务直接接单。
-        """
-        with self._lock:
-            victim: WorkerConnection | None = None
-            victim_task: int | None = None
-            for connection in self._workers.values():
-                if (
-                    backend not in connection.capabilities.backends
-                    or segment_type not in connection.capabilities.segment_types
-                    or (disc and not connection.capabilities.disc_sources)
-                    or "realtime" not in connection.capabilities.roles
-                    or connection.draining
-                    or not self._is_fresh(connection)
-                    or not connection.preload_jobs
-                ):
-                    continue
-                if victim is None or len(connection.jobs) < len(victim.jobs):
-                    victim = connection
-                    victim_task = min(connection.preload_jobs, key=connection.preload_jobs.get)  # type: ignore[type-var]
-            if victim is None or victim_task is None:
-                return None
-            task_id: int = victim_task
-            self.release_preload_task(task_id)
-        logger.warning(
-            "实时任务抢占预转码并发位：worker=%s task=%s（断点保留，租约到期回队）",
-            victim.worker_id,
-            task_id,
-        )
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return victim  # 无事件循环（同步测试上下文）：记账已释放，停止消息由重连后的派单兜底
-        loop.create_task(self._send_preload_stop_message(victim, task_id))
-        return victim
-
-    @staticmethod
-    async def _send_preload_stop_message(connection: WorkerConnection, task_id: int) -> None:
-        try:
-            await connection.send(
-                {"type": "job.stop", "class": "preload", "task_id": task_id}
-            )
-        except Exception:  # noqa: BLE001
-            logger.info("预转码抢占停止消息发送失败（租约会兜底）：task=%s", task_id)
 
     @staticmethod
     def _profile(plan: PlaybackPlan, source_id: int) -> tuple[Any, ...]:
@@ -1080,6 +1055,7 @@ class RemoteWorkerRegistry:
             connection.speed_samples[profile] = connection.speed_samples.get(profile, 0) + 1
 
     def _release_job(self, job_id: str) -> None:
+        idle_preload_worker = False
         with self._lock:
             worker_id = self._job_workers.pop(job_id, None)
             self._job_attempts.pop(job_id, None)
@@ -1092,6 +1068,15 @@ class RemoteWorkerRegistry:
                 connection = self._workers.get(worker_id)
                 if connection is not None:
                     connection.jobs.discard(job_id)
+                    idle_preload_worker = (
+                        not connection.jobs and "preload" in connection.capabilities.roles
+                    )
+        if idle_preload_worker:
+            # 播放结束、这台 Worker 余量回来了：立刻派一轮（让位过的预转码从断点续转）。
+            # 延迟导入：dispatcher 依赖本模块，反向导入会循环
+            from movieclaw_api.services.preload.dispatcher import trigger_dispatch
+
+            trigger_dispatch()
 
     def _mark_jobs_lost(self, connection: WorkerConnection, error: str) -> list[str]:
         """把某条连接上的任务统一标为失败，并释放 Worker 槽位。"""

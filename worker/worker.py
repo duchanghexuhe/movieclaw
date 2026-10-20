@@ -25,7 +25,9 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -45,6 +47,8 @@ _LEGACY_CONFIG_FILE = Path(__file__).with_name("preload_worker.json")
 CONFIG_FILE = (
     _LEGACY_CONFIG_FILE if _LEGACY_CONFIG_FILE.exists() else Path(__file__).with_name("worker.json")
 )
+#: 预转码的本地工作目录（源文件与分段）：取消时整目录删掉，让位时原样保留
+WORK_DIR = Path(__file__).with_name("work")
 PROGRESS_SECONDS = 60
 PART_BYTES_DEFAULT = 64 * 1024 * 1024
 # ffmpeg 子进程不弹控制台窗：pythonw 启动时子进程无可继承的控制台，
@@ -107,16 +111,15 @@ class Api:
 
     # -- 配对 ---------------------------------------------------------------
 
-    def pair(self, name: str, *, status_cb=None) -> str:
+    def pair(self, name: str, *, status_cb=None, stop: threading.Event | None = None) -> str:
         """设备配对流：拿配对码 → 轮询兑换（scope=transcode 凭证）。
 
-        ``status_cb(kind, **fields)``：GUI 接管展示时传入；CLI 缺省打印。
+        ``status_cb(kind, **fields)``：GUI 接管展示时传入；CLI 缺省打印。配对码以
+        ``pairing`` 事件交出（GUI 据此显示配对码并提供「打开批准页」）。``stop`` 置位即
+        取消——点了「停止」就不能干等到配对码过期。
         """
 
         emit = status_cb or (lambda kind, **fields: print(fields.get("line") or f"（{kind}）"))
-
-        def log(line: str) -> None:
-            emit("log", line=line)
 
         status, view = self.request(
             "POST",
@@ -131,11 +134,21 @@ class Api:
         if status != 200 or not view:
             raise RuntimeError(f"配对发起失败：{status} {view}")
         data = view["data"]
-        log(f"请在浏览器打开并批准：{data['verification_uri_complete']}")
-        log(f"配对码：{data['user_code']}（{data['expires_in']} 秒内有效）")
+        emit(
+            "pairing",
+            user_code=data["user_code"],
+            verify_url=data["verification_uri_complete"],
+            expires_in=data["expires_in"],
+            line=(
+                f"请在浏览器打开并批准：{data['verification_uri_complete']}"
+                f"（配对码 {data['user_code']}，{data['expires_in']} 秒内有效）"
+            ),
+        )
+        wait = (stop or threading.Event()).wait
         interval = data.get("interval", 5)
         while True:
-            time.sleep(interval)
+            if wait(interval):
+                raise RuntimeError("已取消配对")
             status, view = self.request(
                 "POST",
                 "/api/v1/auth/device/token",
@@ -143,7 +156,7 @@ class Api:
             )
             if status == 200 and view and view.get("data"):
                 token = view["data"]["token"]
-                log("配对成功。")
+                emit("log", line="配对成功。")
                 return token
             if status == 202:
                 continue
@@ -251,6 +264,26 @@ def probe_caps(ffmpeg: str) -> dict:
     with contextlib.suppress(OSError):
         caps_file.write_text(json.dumps(caps))
     return caps
+
+
+def check_ffmpeg(ffmpeg: str) -> str | None:
+    """点「启动」时校验 ffmpeg：跑一次 ``-version``。None = 可用，否则是给人看的原因。
+
+    probe_caps 对失败是静默的（探测不到能力照常上线），不在这里拦住的话，用户只会看到
+    任务一单单失败、却不知道是 ffmpeg 没找到。
+    """
+    try:
+        subprocess.run(
+            [ffmpeg, "-hide_banner", "-version"], capture_output=True, timeout=10,
+            creationflags=_NO_WINDOW, check=True,
+        )
+    except FileNotFoundError:
+        return f"找不到 ffmpeg：{ffmpeg}。请在配置里指定 ffmpeg.exe 的路径（推荐 jellyfin-ffmpeg）"
+    except subprocess.CalledProcessError as exc:
+        return f"ffmpeg 无法运行（退出码 {exc.returncode}）：{ffmpeg}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"ffmpeg 无法运行：{exc}"
+    return None
 
 
 def _total_memory() -> int:
@@ -512,6 +545,20 @@ def save_config(config: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
+def worker_id_for(name: str | None) -> str:
+    """WS hello 的 worker_id。服务端只认 ``[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}``（_WORKER_ID）。
+
+    配置里填过 name 就沿用它（老部署的 id 不变）；没填取本机主机名——每台机器各一个，
+    两台同名 Worker 会在服务端按 worker_id 互相顶号（1012）。非法字符换成 "-"；
+    净化后什么都不剩（如纯中文名）就退到主机名。
+    """
+    for raw in (name, socket.gethostname()):
+        clean = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw or "")[:64].strip("-_.:")
+        if clean:
+            return clean
+    return "windows-worker"
+
+
 def on_battery() -> bool:
     """Windows：是否在用电池（未接电源）。非 Windows 恒 False。"""
     if sys.platform != "win32":
@@ -534,6 +581,25 @@ def on_battery() -> bool:
     return status.ACLineStatus == 0
 
 
+#: SetThreadExecutionState 的标志（WinBase.h）；ES_CONTINUOUS 让要求保持到下一次调用收回
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def keep_system_awake(on: bool) -> None:
+    """Windows：``on`` 时挡住系统睡眠，否则释放（Mac 转码器用 beginActivity 做的就是这件事）。
+
+    要求挂在调用线程上，所以只由 WorkerRuntime.start() 的主循环调用——那条线程活到收尾，
+    不在任务线程里调，免得任务线程退出后要求悬空。非 Windows 无操作。
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0)
+    ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint32(flags))
+
+
 class WorkerRuntime:
     """预转码运行时：WS 推送派单 + 电源策略 + 状态回调（v2 统一调度）。
 
@@ -542,7 +608,9 @@ class WorkerRuntime:
     ``process_task``；数据面（分段上传/续约/complete/fail）照旧走 REST。
 
     ``status_cb(kind, **fields)`` 是 GUI/CLI 的唯一状态出口（线程安全：回调
-    里只入队，不碰 Tk）。kind ∈ log/task/pairing/stopped。
+    里只入队，不碰 Tk）。kind：log（line）；连接状态 connecting / online /
+    offline（reason、retry_seconds）；pairing（user_code、verify_url、expires_in）；
+    stopped。
     """
 
     def __init__(
@@ -551,7 +619,7 @@ class WorkerRuntime:
         server: str,
         token: str | None,
         ffmpeg: str,
-        name: str = "Preload Worker",
+        name: str | None = None,
         concurrency: int = 1,
         ac_only: bool = False,
         on_token=None,  # Callable[[str], None] | None
@@ -560,7 +628,9 @@ class WorkerRuntime:
         self.server = server
         self.token = token
         self.ffmpeg = ffmpeg
-        self.name = name
+        # name 是配对时给人看的设备名；worker_id 是 WS hello 里的机器标识（见 worker_id_for）
+        self.name = name or f"Preload Worker（{socket.gethostname()}）"[:64]
+        self.worker_id = worker_id_for(name)
         self.concurrency = max(1, min(int(concurrency), 8))
         self.ac_only = ac_only
         self.on_token = on_token
@@ -573,11 +643,12 @@ class WorkerRuntime:
         # 在跑任务的进度台账（task_id -> process_task 原地更新的 dict）：
         # progress_view() 给 GUI 状态栏轮询
         self._progress: dict[int, dict] = {}
-        # 预转码并发闸：同时在跑的分段转码数。注意这是**本机**闸（电源/停止
-        # 之外的唯一本地限制）——服务端按 max_concurrency−1 派单，这里再拦
-        # 一道防派单与断线重连交错时短暂超发
-        self._preload_slots = threading.Semaphore(max(1, self.concurrency - 1) or 1)
+        # 预转码并发闸：同时在跑的分段转码数，空闲时用满并发。播放优先——实时任务一进来
+        # 在跑的预转码全部让位（不占这里的位）；服务端按余量派单，这里再拦一道防竞态
+        self._preload_slots = threading.Semaphore(self.concurrency)
         self._preload_stop: dict[int, threading.Event] = {}
+        # 服务端取消（job.stop reason=cancel）的任务：收尾时删掉本地工作目录
+        self._preload_cancelled: set[int] = set()
         # 在跑分段 ffmpeg 的句柄（task_id → 最近一段的进程）：停止/退出路径
         # 用来立即杀进程，不等 600s 的段自然跑完
         self._preload_procs: dict[int, subprocess.Popen] = {}
@@ -597,30 +668,38 @@ class WorkerRuntime:
             return
         # 无令牌：先空 Api 发起配对，拿到令牌后必须把**带令牌的 Api** 装回
         # （否则槽位循环一直 401、无限重新配对——2026-10-14 本地流程实测）
-        self._emit("pairing")
         api = Api(self.server, None)
-        self.token = api.pair(self.name, status_cb=self._emit)
+        self.token = api.pair(self.name, status_cb=self._emit, stop=self.stop_event)
         self.api = Api(self.server, self.token)
         if self.on_token is not None:
             self.on_token(self.token)
 
     def start(self) -> None:
-        """阻塞直到 stop_event 置位。"""
-        self.ensure_token()
-        self.caps = probe_caps(self.ffmpeg)
-        nvenc = "h264_nvenc" in self.caps["encoders"]
-        self.log(
-            f"Worker 已连接 {self.server}（并发 {self.concurrency}，"
-            f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}）"
-        )
-        # v2 统一调度：一条 WS 连接同时报 realtime+preload 角色（预转码与实时
-        # 播放都是本程序的主职）。REST 轮询 claim 已删除，任务由服务端推送。
-        client = self._start_realtime()
+        """阻塞直到 stop_event 置位；配对或启动失败时抛异常（GUI 线程负责展示）。"""
+        client = None
         try:
+            self.ensure_token()
+            self.caps = probe_caps(self.ffmpeg)
+            nvenc = "h264_nvenc" in self.caps["encoders"]
+            self.log(
+                f"Worker 启动：服务器 {self.server}（并发 {self.concurrency}，"
+                f"NVENC: {'有' if nvenc else '无'}，仅接电: {'开' if self.ac_only else '关'}）"
+            )
+            # v2 统一调度：一条 WS 连接同时报 realtime+preload 角色（预转码与实时
+            # 播放都是本程序的主职）。REST 轮询 claim 已删除，任务由服务端推送。
+            client = self._start_realtime()
+            awake = False
             while not self.stop_event.is_set():
+                # 有任务在跑就挡住睡眠，空闲即释放（每半秒看一次）
+                busy = self._busy()
+                if busy != awake:
+                    keep_system_awake(busy)
+                    awake = busy
                 self.stop_event.wait(0.5)
         finally:
-            client.stop()
+            keep_system_awake(False)
+            if client is not None:
+                client.stop()
             # 退出不留后事：杀掉所有在跑的分段 ffmpeg（否则进程退了、ffmpeg
             # 成孤儿继续烧 GPU，还锁着源文件），等任务线程收尾
             self._stop_all_preloads()
@@ -643,6 +722,21 @@ class WorkerRuntime:
             with contextlib.suppress(OSError):
                 proc.kill()
 
+    def _busy(self) -> bool:
+        """有实时或预转码任务正在跑（此刻要挡住系统睡眠）。"""
+        with self._tasks_lock:
+            if self.tasks:
+                return True
+        return self._realtime_busy()
+
+    def _realtime_busy(self) -> bool:
+        """本机有实时任务（播放转码、离线导出）在跑：预转码此刻一个都不该跑。"""
+        client = self._realtime_client
+        if client is None:
+            return False
+        with client.jobs_lock:
+            return bool(client.jobs)
+
     def _start_realtime(self):
         """拉起统一 WS 客户端（实时任务 + 预转码推送派单同一条连接）。"""
         from engine import RealtimeClient
@@ -650,12 +744,13 @@ class WorkerRuntime:
         client = RealtimeClient(
             server=self.server,
             token=self.token or "",
-            worker_id=self.name,
+            worker_id=self.worker_id,
             ffmpeg=self.ffmpeg,
             caps=self.caps,
             max_jobs=self.concurrency,
             log=lambda line: self.log(f"[WS] {line}"),
             preload=self._run_preload,
+            status=self._emit,
         )
         client.preload_stop = self._stop_preload_task
         # 实时任务进入时让位钩子：本机预转码占用超出「并发 − 实时任务数」的
@@ -687,7 +782,12 @@ class WorkerRuntime:
             # 后自动回队。本地记一条，GUI 能看到为什么没在转
             self.log(f"[{task_id}] 使用电池中，跳过执行（任务将回队）")
             return False
-        # 停止钩子**先注册再等槽位**：等槽位期间服务端抢占/取消经
+        if self._realtime_busy():
+            # 播放优先：推送与播放抢位的竞态（推送时还没看到这台在播）——当场让位回队
+            self.log(f"[{task_id}] 播放中，预转码让位（回队）")
+            self._realtime_client.send_preload_yielded(task_id)
+            return False
+        # 停止钩子**先注册再等槽位**：等槽位期间服务端取消/让位经
         # _stop_preload_task 才找得到这个任务（查不到的叫停会被静默丢掉）
         stop = threading.Event()
         with self._tasks_lock:
@@ -707,6 +807,11 @@ class WorkerRuntime:
                 if self._preload_stop.get(task_id) is stop:
                     self._preload_stop.pop(task_id, None)
                 self._preload_procs.pop(task_id, None)
+                cancelled = task_id in self._preload_cancelled
+                self._preload_cancelled.discard(task_id)
+            if cancelled:
+                # 服务端取消：源文件与分段（几十 GB）一并删掉。让位不走这里，断点原样留着
+                shutil.rmtree(WORK_DIR / str(task_id), ignore_errors=True)
 
     def _run_preload_locked(self, task: dict, task_id: int, stop: threading.Event) -> bool:
         with self._preload_slots:
@@ -727,7 +832,7 @@ class WorkerRuntime:
                 # 停止看门狗立即杀掉在跑的分段，断点台账在服务端，重派自动续转
                 ok = process_task(
                     self.api, self.ffmpeg, task,
-                    Path(__file__).parent / "work" / str(task_id),
+                    WORK_DIR / str(task_id),
                     stop=stop,
                     register=_register_proc,
                     progress=progress,
@@ -746,11 +851,13 @@ class WorkerRuntime:
                     )
                 return False
 
-    def _stop_preload_task(self, task_id) -> None:
-        """服务端抢占/取消时停掉对应任务：置位停止钩子并杀掉在跑的分段。"""
+    def _stop_preload_task(self, task_id, cancel: bool = False) -> None:
+        """停掉对应预转码：置位停止钩子并杀掉在跑的分段。``cancel`` 时收尾删本地半成品。"""
         with self._tasks_lock:
             stop = self._preload_stop.get(task_id)
             proc = self._preload_procs.get(task_id)
+            if cancel and stop is not None:
+                self._preload_cancelled.add(task_id)
         if stop is not None:
             stop.set()
         if proc is not None:
@@ -758,13 +865,18 @@ class WorkerRuntime:
                 proc.kill()
 
     def _yield_preload_slots(self, keep: int) -> None:
-        """实时任务进入时让位：预转码占用超出 keep 的部分（按开始先后）停掉。"""
+        """实时任务进入时让位：预转码占用超出 keep 的部分（按开始先后）停掉，并告诉服务端。
+
+        服务端收到 preload.yielded 后任务当场回队；本地工作目录保留，播放结束后续转。
+        """
         with self._tasks_lock:
             running = list(self._preload_stop)
             over = running[: max(0, len(running) - keep)]
         for task_id in over:
-            self.log(f"[实时优先] 预转码 {task_id} 让出并发位（断点保留，稍后续转）")
+            self.log(f"[播放优先] 预转码 {task_id} 让位（断点保留，播放结束后续转）")
             self._stop_preload_task(task_id)
+            if self._realtime_client is not None:
+                self._realtime_client.send_preload_yielded(task_id)
 
     def progress_view(self) -> list[tuple[str, dict]]:
         """GUI 状态栏轮询：在跑任务的 [(显示名, 进度快照)]，按接单先后。
@@ -778,6 +890,12 @@ class WorkerRuntime:
                 (name, dict(self._progress.get(task_id) or {}))
                 for task_id, name in self.tasks.items()
             ]
+
+
+def _print_status(kind: str, **fields: object) -> None:
+    """CLI 的状态出口：只打印带 line 的事件（连接状态的文字同时经 log 行输出）。"""
+    if fields.get("line"):
+        print(fields["line"])
 
 
 def main() -> None:
@@ -815,6 +933,10 @@ def main() -> None:
         config["ac_only"] = True
     if args.reset_token:
         config.pop("token", None)
+    problem = check_ffmpeg(config.get("ffmpeg") or "ffmpeg")
+    if problem:
+        print(problem)
+        sys.exit(1)
     save_config(config)
 
     if args.once:
@@ -825,11 +947,11 @@ def main() -> None:
         server=config["server"],
         token=config.get("token"),
         ffmpeg=config.get("ffmpeg") or "ffmpeg",
-        name=config.get("name") or "Preload Worker",
+        name=config.get("name"),
         concurrency=config.get("concurrency") or 1,
         ac_only=bool(config.get("ac_only")),
         on_token=lambda token: save_config({**config, "token": token}),
-        status_cb=lambda kind, **fields: print(fields.get("line") or f"（{kind}）"),
+        status_cb=_print_status,
     )
     try:
         runtime.start()
