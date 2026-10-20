@@ -79,6 +79,17 @@ export function transcodeBitrateBps(video: { height: number | null; bitrate_cap_
   return cap !== null && cap !== undefined && cap > 0 ? Math.min(ladder, cap) : ladder;
 }
 
+/**
+ * 正在转码时线路跟不上，播放器不出提示卡、直接按实测带宽同档重开（服务端顺带可能降分辨率）。
+ * 自动调整也要看得见：重开后的一句提示——分辨率降了说降到几 p，只压了码率就说压了码率。
+ */
+export function bandwidthRestartNotice(fromHeight: number | null, toHeight: number | null): string {
+  if (fromHeight !== null && toHeight !== null && toHeight < fromHeight) {
+    return `线路较慢，已调到 ${toHeight}p`;
+  }
+  return "线路较慢，已调低码率";
+}
+
 export class QualitySuggestion {
   /** 观看秒数：只在用户想看（没暂停）的时候走 */
   private clock = 0;

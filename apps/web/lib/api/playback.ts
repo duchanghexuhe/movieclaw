@@ -598,8 +598,8 @@ export interface PlaybackDecision {
   setting_key: string | null;
   reason: string;
   suggestion: string | null;
-  /** 计划是外网线路降档的结果：网页端拦下起播、弹窗确认「降档播还是原画质播」。
-   *  推荐档就是计划本身的 video.height；不认这个字段的客户端直接播＝自动降档 */
+  /** 计划是外网省流的结果（原片能直连，按家宽上行 / 外网上限转成了低档）：顶栏标
+   *  「省流 · 1080p」并给「切到原画」（lib/player/saver-badge.ts）。省流档就是 video.height */
   uplink_step_down?: boolean;
   /** 所放的是预转码便携版：源文件 id（「切到原画」带它重开会话）；放的是原片为 null */
   portable_source_file_id?: number | null;
@@ -694,6 +694,9 @@ export interface PlaybackSegment {
 
 export interface PlaybackSession {
   decision: PlaybackDecision;
+  /** 服务端按连接来源判的「这次在外网」：画质记忆分在家 / 外网记、外网转码被线路压低时标「省流」。
+   *  旧版服务端没有这个字段 */
+  external?: boolean;
   /** 档 0 没有会话（原文件直出），此处为 null */
   session_id: string | null;
   /** 可直接喂给 <video src> 或 hls.js 的地址，已带签名 token */

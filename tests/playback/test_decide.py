@@ -1822,7 +1822,7 @@ def test_remux_for_a_dolby_vision_decoder_keeps_the_record():
 
 
 def test_uplink_too_small_forces_transcode():
-    """外网会话源片码率超出家宽上行：直通档换成转码并透出 uplink_forced（网页端弹窗确认用）。"""
+    """外网会话源片码率超出家宽上行：直通档换成转码并透出 uplink_forced（网页端标「省流」用）。"""
     decision = decide_playback(
         media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
         uplink_bps=5_000_000,
@@ -1920,6 +1920,50 @@ def test_upline_budget_skips_keyframe_probe():
     # 没有上行预算时照旧要采样
     assert needs_keyframe_probe(
         media(bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+    )
+
+
+def test_uplink_step_down_without_transcoder_keeps_direct_play():
+    """省流转码做不成（没硬件、软转没开）：省流作废、照常直连——不能为了省流把本来能
+    直连的片变成「要开软件转码」（NAS 没硬件、Worker 离线时外网每部高码率片都撞上）。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, NO_GPU,
+        uplink_bps=30_000_000, external=True,
+    )
+    assert isinstance(decision, PlaybackPlan), f"期望出计划，实际 {decision}"
+    assert decision.tier is PlaybackTier.DIRECT_PLAY, decision.reason
+    assert decision.uplink_forced is False
+
+
+def test_uplink_step_down_uses_software_transcode_when_enabled():
+    """开了软转就是转码做得成：省流照常生效（软件档）。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, NO_GPU_SOFT_ON,
+        uplink_bps=30_000_000, external=True,
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.tier is PlaybackTier.SOFTWARE_TRANSCODE
+    assert decision.uplink_forced is True
+
+
+def test_uplink_step_down_after_hardware_failure_keeps_direct_play():
+    """硬件转码失败过一次（降档回路带着 failed_tiers 回来）：剩下的只有要同意的软件档，
+    省流同样作废，回到原片直连——原片本身没失败过。"""
+    decision = decide_playback(
+        media(container="mp4", bit_rate_bps=54_000_000), CHROME_NO_HEVC, WITH_GPU,
+        failed_tiers=frozenset({PlaybackTier.HARDWARE_TRANSCODE}),
+        uplink_bps=30_000_000, external=True,
+    )
+    assert isinstance(decision, PlaybackPlan), f"期望出计划，实际 {decision}"
+    assert decision.tier is PlaybackTier.DIRECT_PLAY, decision.reason
+    assert decision.uplink_forced is False
+
+
+def test_unworkable_step_down_still_probes_keyframes():
+    """省流作废后按原片判：MKV 原片要换封装，关键帧采样不能因为上行预算被跳过。"""
+    assert needs_keyframe_probe(
+        media(bit_rate_bps=54_000_000), CHROME_NO_HEVC, NO_GPU,
+        uplink_bps=30_000_000,
     )
 
 

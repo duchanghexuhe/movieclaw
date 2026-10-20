@@ -504,8 +504,9 @@ def test_wan_source_over_uplink_transcodes_before_stalling(client, tmp_path, mon
     # 直通档在起播前换成转码：档 4（夹具固定无硬件走软件路径）
     assert decision["tier"] == 4, decision["reason"]
     assert "家宽上行" in decision["reason"], decision["reason"]
-    # 弹窗确认标记随计划透出：网页端拿它拦起播问「降档播还是原画质播」
+    # 省流标记随计划透出：网页端据此在顶栏标「省流」、给「切到原画」
     assert decision["uplink_step_down"] is True
+    assert data["external"] is True
 
     wait_for_segments(client, data, count=1)
     assembled = fetch_whole_stream(client, data, tmp_path)
@@ -575,6 +576,31 @@ def test_lan_source_ignores_uplink_and_direct_plays(client, tmp_path, monkeypatc
     )
     data = start(client, file_id)
     assert data["decision"]["tier"] == 0, data["decision"]["reason"]
+    assert data["external"] is False
+
+
+def test_wan_step_down_without_transcoder_direct_plays(client, tmp_path, monkeypatch):
+    """省流转码做不成（夹具无硬件、软转默认关）：省流作废、照常直连原片。
+
+    原来会落成「这部片需要软件转码」的同意弹窗——NAS 没硬件、远程 Worker 离线时，
+    外网每部高码率片都看不了（普通成员只能退出）。"""
+    monkeypatch.setattr(
+        "movieclaw_api.api.routes.playback.client_address",
+        _fake_client_address("1.2.3.4"),
+    )
+    resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
+    assert resp.status_code == 200, resp.text
+
+    path = make_media(tmp_path / "m", "wan-nohw", codec="h264", container="mp4")
+    file_id = client.portal.call(
+        partial(_seed, path, codec="h264", container="mp4", bit_rate=6_000_000)
+    )
+    data = start(client, file_id)
+    decision = data["decision"]
+    assert decision["outcome"] == "plan", decision["reason"]
+    assert decision["tier"] == 0, decision["reason"]
+    assert decision["uplink_step_down"] is False
+    assert data["external"] is True
 
 
 def test_unset_uplink_keeps_current_behavior(client, tmp_path, monkeypatch):

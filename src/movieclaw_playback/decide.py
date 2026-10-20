@@ -301,9 +301,9 @@ class PlaybackPlan:
     disc: str | None = None
     #: 目录直推时服务端选中的主播放列表文件名
     disc_playlist: str | None = None
-    #: 该计划是外网线路降档的结果（源码率超出上行/外网上限）。网页端拿它拦
-    #: 一下起播、弹窗让用户确认「降档播还是原画质播」；不认这个字段的客户端
-    #: （App）拿到计划直接播，等于维持自动降档。
+    #: 该计划是外网省流的结果（源码率超出上行/外网上限，本来能直连）。网页端
+    #: 据此在顶栏标「省流 · 1080p」并给「切到原画」；不认这个字段的客户端拿到
+    #: 计划照样直接播。
     uplink_forced: bool = False
     #: 所放的文件是预转码便携版时，它的源文件 id 与分辨率标签（网页端据此标「便携版 · 720p」，
     #: 并提供「切到原画」带源文件 id 重开）。由择优层（plan.decide_for_files）打上；引擎不认派生关系
@@ -371,9 +371,11 @@ def decide_playback(
 
     ``uplink_bps`` 是外网会话的家宽上行预算（bps；内网 / 未配置为 None，同
     max_height 一样不参与判定）。源片码率超出
-    min(上行, 外网天花板 1080p 档) 时直通档换成转码——但**不自动生效**：计划带
-    ``uplink_forced`` 透出，网页端拦下起播弹窗让用户确认。与 max_height 互斥地
-    生效：手选了画质上限就不传上行，用户的选择优先。universal 分支同样不受影响。
+    min(上行, 外网天花板 1080p 档) 时直通档换成转码，直接生效（不弹窗问），计划带
+    ``uplink_forced`` 透出，网页端据此标「省流」并给一键切回原画。省流只是偏好：
+    转码做不成（没有可用硬件又没开软转、或转码档都已失败）时作废，照常按原片判定。
+    与 max_height 互斥地生效：手选了画质上限就不传上行，用户的选择优先。universal
+    分支同样不受影响。
 
     ``external`` 是会话是否来自外网（按连接来源判定，与 uplink_mbps 配置无关）。
     为 True 且视频已判转码时，音轨强制 AAC-LC 双声道（省流量；见 _judge_audio），
@@ -525,6 +527,18 @@ def decide_playback(
         preferred_audio,
         force_stereo_aac=force_stereo_aac,
     )
+    if _uplink_step_down_unworkable(video_verdict, tier, policy):
+        return decide_playback(
+            media,
+            capability,
+            policy,
+            can_self_enable=can_self_enable,
+            failed_tiers=failed_tiers,
+            preferred_audio=preferred_audio,
+            preferred_subtitle=preferred_subtitle,
+            max_height=max_height,
+            external=external,
+        )
     if isinstance(tier, PlaybackRejected):
         return tier
 
@@ -688,7 +702,7 @@ class _VideoVerdict:
     reason: str
     #: 无法直通且连转码也不该做（如 HDR 需 tone-map 但没有 GPU）
     blocked: str | None = None
-    #: 是否因外网线路（上行/外网上限）放弃直通——随计划透出，供前端弹窗确认
+    #: 是否因外网线路（上行/外网上限）放弃直通——随计划透出，供前端标「省流」
     uplink_forced: bool = False
 
 
@@ -716,6 +730,20 @@ def _takes_universal_shortcut(media: MediaProfile, capability: ClientCapability)
     if not capability.universal:
         return False
     return not media.dolby_vision_ignored or capability.dolby_vision_record_audit
+
+
+def _uplink_step_down_unworkable(
+    video_verdict: _VideoVerdict,
+    tier: PlaybackTier | PlaybackRejected,
+    policy: PlaybackPolicy,
+) -> bool:
+    """外网省流的转码做不成：没有可用硬件又没开软转（会落成「要同意」），或转码档都已
+    失败（会被拒绝）。省流只是偏好，这时作废——不能让本来能直连的片变成「要开软件转码」
+    甚至放不了（NAS 没硬件、远程 Worker 离线时外网每部高码率片都会撞上）。"""
+    return video_verdict.uplink_forced and (
+        isinstance(tier, PlaybackRejected)
+        or (tier is PlaybackTier.SOFTWARE_TRANSCODE and not policy.software_transcode_enabled)
+    )
 
 
 def _no_hardware(policy: PlaybackPolicy) -> str:
@@ -838,8 +866,8 @@ def _judge_video(
     # （6 Mbps ≈ 2.7 GB/小时）跟上行无关——上行再宽也不把几十 G 的原盘原样
     # 推给手机，流量费先爆的是用户账单不是线路；源片本身 ≤ 天花板时直连，
     # 转码不会更省流量还白烧 CPU。上行窄到连 480p（1.5M）都装不下时不参与
-    # 降档，照旧直连交给卡顿后提示兜底——给了也必卡。触发后不自动生效：
-    # 随计划透出 uplink_forced，网页端弹窗让用户确认（App 不认就直接播）。
+    # 降档，照旧直连交给卡顿后提示兜底——给了也必卡。触发即生效（不弹窗问），
+    # 随计划透出 uplink_forced，网页端标「省流」并给一键切回原画。
     if uplink_bps is not None and media.bit_rate_bps:
         limit = min(uplink_bps, EXTERNAL_VIDEO_CAP_BPS)
         if media.bit_rate_bps > limit and limit >= EXTERNAL_FLOOR_BPS:
@@ -1329,6 +1357,17 @@ def needs_keyframe_probe(
         preferred_audio,
         enforce_keyframe_gate=False,
     )
+    if _uplink_step_down_unworkable(video_verdict, tier, policy):
+        # 与 decide_playback 同一口径：省流做不成就按原片判，原片可能要换封装、要采样
+        return needs_keyframe_probe(
+            media,
+            capability,
+            policy,
+            failed_tiers=failed_tiers,
+            preferred_audio=preferred_audio,
+            preferred_subtitle=preferred_subtitle,
+            max_height=max_height,
+        )
     return tier in (PlaybackTier.REMUX, PlaybackTier.AUDIO_TRANSCODE)
 
 

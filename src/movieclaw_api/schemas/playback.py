@@ -509,9 +509,9 @@ class PlaybackDecisionView(BaseModel):
     disc: str | None = None
     #: 目录直推时服务端选中的主播放列表文件名（如 ``00800.mpls``），播放器按名字选主片
     disc_playlist: str | None = None
-    #: 计划是外网线路降档的结果（源码率超出上行/外网上限）。网页端拿它拦一下
-    #: 起播、弹窗确认「降档播还是原画质播」；不认它的客户端直接播＝自动降档。
-    #: 推荐档就是计划本身的 ``video.height``，不用另带字段。
+    #: 计划是外网省流的结果（源码率超出上行/外网上限，原片本来能直连）。网页端
+    #: 据此在顶栏标「省流 · 1080p」并给「切到原画」（带画质上限重开即跳过上行判定）；
+    #: 省流档就是计划本身的 ``video.height``，不用另带字段。
     uplink_step_down: bool = False
     #: 所放的是预转码便携版时：源文件 id（「切到原画」带它重开）与分辨率标签（「便携版 · 720p」）
     #: 放的是原片为 None
@@ -737,6 +737,9 @@ class PlaybackSessionView(BaseModel):
     """
 
     decision: PlaybackDecisionView
+    #: 这次请求按外网处理（按连接来源判定，与是否填了上行无关）。网页端据此按
+    #: 「片 × 内外网」分开记画质，外网的转码被线路压低时标「省流」
+    external: bool = False
     #: 档 0 没有会话（原文件直出），此处为 None
     session_id: str | None = None
     #: 可直接喂给 <video src> 或 hls.js 的地址，已带签名 token。

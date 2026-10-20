@@ -25,22 +25,35 @@ export const QUALITY_OPTIONS: readonly QualityOption[] = [
 ] as const;
 
 /**
- * 画质按影片记（与 iOS App 的 `QualityMemory` 同一口径，apps/apple/MovieClaw/Features/Player/PlayerPreferences.swift）。
+ * 画质按「影片 × 在哪看」记（与 iOS App 的 `QualityMemory` 同一口径，apps/apple/MovieClaw/Features/Player/PlayerPreferences.swift）。
  *
  * 原来网页的画质是**全局一个值**：在外面给某部片选一次 720p，之后所有片子、回到家也都在转码。
  * 现在每部片各记各的，剧集整部剧共用一份（按条目 id）；只存限了画质的选择，选回「自动」就删掉
  * 这一条；上限不低于片源等于没限，也记成「自动」（由调用方判）。最多记 300 条，超出按最久没用的先丢。
  *
- * iOS 还按「网络环境」（在家 / 外网）分开记，网页拿不到网卡与网段信息，落在 iOS 的「分不清」那一类：
- * 只按片记、提示里不写环境。
+ * 在家与外网分开记（iOS 同样分）：外网点过一次「改用 720p」，回家照样放原画。网页拿不到网卡与网段，
+ * 「在哪看」由服务端按连接来源判定、随会话带回（`PlaybackSession.external`）。开会话之前还不知道，
+ * 播放器按上一次会话的网络（`lastPlaybackNetwork`）先猜，猜错了再纠正。
+ *
+ * 分网络之前记下的条目（键是裸条目 id）一律按外网读：换低画质的提示只在线路跟不上时出现，
+ * 那几乎都是在外面。
  */
 const MEMORY_KEY = "movieclaw.player.quality-by-title";
 /** 旧版的全局画质键：读到就删，不再沿用（理由见上） */
 const LEGACY_KEY = "movieclaw.player.quality";
+/** 上一次会话的网络（开会话前猜「在哪看」用） */
+const NETWORK_KEY = "movieclaw.player.last-network";
 export const QUALITY_MEMORY_LIMIT = 300;
 
-/** 条目 id → [画质上限, 记下的时刻（毫秒）] */
+/** 在哪看：在家（局域网来源）/ 外网。服务端按连接来源判定 */
+export type PlaybackNetwork = "lan" | "external";
+
+/** `<网络>:<条目 id>` → [画质上限, 记下的时刻（毫秒）] */
 type QualityEntries = Record<string, [number, number]>;
+
+function entryKey(mediaItemId: number, network: PlaybackNetwork): string {
+  return `${network}:${mediaItemId}`;
+}
 
 function isValidHeight(value: unknown): value is number {
   return QUALITY_OPTIONS.some((o) => o.maxHeight !== null && o.maxHeight === value);
@@ -57,7 +70,10 @@ function readEntries(): QualityEntries {
     const entries: QualityEntries = {};
     for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
       if (Array.isArray(value) && isValidHeight(value[0]) && typeof value[1] === "number") {
-        entries[key] = [value[0], value[1]];
+        // 分网络之前的条目（裸条目 id）按外网读；同一部片已有新记法的以新的为准
+        const normalized = /^\d+$/.test(key) ? `external:${key}` : key;
+        if (normalized !== key && normalized in entries) continue;
+        entries[normalized] = [value[0], value[1]];
       }
     }
     return entries;
@@ -66,23 +82,24 @@ function readEntries(): QualityEntries {
   }
 }
 
-/** 这部片记着的画质上限；没记过 / 记的值不合法 / 没有 localStorage（SSR、隐私模式）都回「自动」。 */
-export function loadQualityFor(mediaItemId: number): number | null {
-  return readEntries()[String(mediaItemId)]?.[0] ?? null;
+/** 这部片在这个网络下记着的画质上限；没记过 / 记的值不合法 / 没有 localStorage（SSR、隐私模式）都回「自动」。 */
+export function loadQualityFor(mediaItemId: number, network: PlaybackNetwork): number | null {
+  return readEntries()[entryKey(mediaItemId, network)]?.[0] ?? null;
 }
 
 /**
- * 记下这部片的画质上限；null（自动）删掉这一条。
+ * 记下这部片在这个网络下的画质上限；null（自动）删掉这一条。
  *
  * `now` 只给测试用。超过上限按记下时刻从旧到新丢。
  */
 export function rememberQualityFor(
   mediaItemId: number,
+  network: PlaybackNetwork,
   maxHeight: number | null,
   now: number = Date.now(),
 ): void {
   const entries = readEntries();
-  const key = String(mediaItemId);
+  const key = entryKey(mediaItemId, network);
   if (maxHeight === null || !isValidHeight(maxHeight)) {
     delete entries[key];
   } else {
@@ -100,6 +117,23 @@ export function rememberQualityFor(
     else window.localStorage.setItem(MEMORY_KEY, JSON.stringify(entries));
   } catch {
     // 隐私模式下写不进：本次会话内仍生效，只是不记住
+  }
+}
+
+/** 上一次会话在哪看（开会话前按它取画质记忆）；没记过、读不到按在家。 */
+export function lastPlaybackNetwork(): PlaybackNetwork {
+  try {
+    return window.localStorage.getItem(NETWORK_KEY) === "external" ? "external" : "lan";
+  } catch {
+    return "lan";
+  }
+}
+
+export function rememberPlaybackNetwork(network: PlaybackNetwork): void {
+  try {
+    window.localStorage.setItem(NETWORK_KEY, network);
+  } catch {
+    // 写不进只是下次可能多猜错一次
   }
 }
 
