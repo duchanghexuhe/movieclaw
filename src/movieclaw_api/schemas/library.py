@@ -933,6 +933,9 @@ class SubtitleStreamView(BaseModel):
     default: bool = False
     external: bool = Field(default=False, description="是否外挂字幕文件")
     file_name: str | None = Field(default=None, description="外挂字幕的文件名")
+    borrowed: bool = Field(
+        default=False, description="外挂字幕借自源文件（便携版派生行），归属源文件而非本行"
+    )
 
 
 class SubtitleCueView(BaseModel):
