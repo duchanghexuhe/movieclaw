@@ -33,6 +33,7 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     HW_BACKENDS,
     NVENC_TONEMAP,
     VAAPI_LOW_POWER,
+    encoder_options,
     register_encoder_options,
     register_native_tonemap,
 )
@@ -172,10 +173,56 @@ def hardware_available() -> bool:
     return bool(available_backends())
 
 
+#: NAS 本地预转码 HEVC 格式的编码器（§7）：后端 → 编码器名。与 H.264 同一套设备与滤镜参数
+_LOCAL_HEVC_ENCODERS = {"vaapi": "hevc_vaapi", "qsv": "hevc_qsv"}
+_local_hevc: dict[str, str | None] = {}
+_local_filters: dict[str, bool] = {}
+
+
+def local_hevc_encoder(backend: str) -> str | None:
+    """本机真跑通过 HEVC 硬件编码的编码器名（QSV/VAAPI）；不通过为 None。
+
+    与 H.264 自检同款：真跑一秒编码。设备或驱动有问题在这里就暴露，不是等整片转完才发现。
+    结果缓存，``reset_probe_cache`` 一并清掉。
+    """
+    if backend in _local_hevc:
+        return _local_hevc[backend]
+    encoder = _LOCAL_HEVC_ENCODERS.get(backend)
+    result: str | None = None
+    if encoder is not None and encoder in _list_encoders():
+        proc = _run_probe(
+            encoder,
+            _PROBE_FILTERS.get(backend, []),
+            encoder_args=list(encoder_options(HW_BACKENDS[backend])),
+        )
+        if proc is not None and proc.returncode == 0:
+            result = encoder
+    _local_hevc[backend] = result
+    return result
+
+
+def local_filter_available(name: str) -> bool:
+    """本机 ffmpeg 认不认这个滤镜（``ffmpeg -h filter=NAME``）。结果缓存。"""
+    if name not in _local_filters:
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-h", f"filter={name}"],
+                capture_output=True, timeout=_PROBE_TIMEOUT,
+            )
+            _local_filters[name] = (
+                proc.returncode == 0 and b"Unknown filter" not in proc.stdout + proc.stderr
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            _local_filters[name] = False
+    return _local_filters[name]
+
+
 def reset_probe_cache() -> None:
     """测试用：丢掉缓存。回写给装配层的 tone-map 结论也要一并撤销。"""
     global _cache
     _cache = None
+    _local_hevc.clear()
+    _local_filters.clear()
     for name in _NATIVE_TONEMAP_PROBES:
         register_native_tonemap(name, None)
     for name in HW_BACKENDS:

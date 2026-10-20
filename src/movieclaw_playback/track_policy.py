@@ -383,6 +383,47 @@ def default_audio(file: LibraryFile, context: TrackContext = NO_CONTEXT) -> Audi
     return AudioChoice(best[0], "original_language")
 
 
+def dubbed_default_original(file: LibraryFile, context: TrackContext = NO_CONTEXT) -> int | None:
+    """默认音轨是配音（标了语言、且不是原始语言）时，返回原始语言轨的下标；否则 None。
+
+    给便携版（预转码）选轨用：默认轨之外还要留一条原声，观众能切回原声。
+    注意 :func:`default_audio` 在原始语言轨存在时本来就选原声，所以这里只在它退回
+    旧规则（没有可比的原声）时才会有结果。
+    """
+    original = context.original_language
+    if not original:
+        return None
+    choice = default_audio(file, context)
+    if choice.index is None or choice.reason == "original_language":
+        return None
+    streams = [(i, raw) for i, raw in enumerate(file.audio_streams or []) if isinstance(raw, dict)]
+    usable = [s for s in streams if s[1].get("codec")] or streams
+    normal = [s for s in usable if not _audio_special(s[1])] or usable
+    wanted = _ORIGINAL_AUDIO_MATCHES.get(original, frozenset({original}))
+    current = _audio_language(file.audio_streams[choice.index])
+    if current is None or current in wanted:
+        return None
+    matched = [s for s in normal if _audio_language(s[1]) in wanted]
+    if not matched:
+        return None
+    return max(matched, key=lambda s: (*_audio_quality(s[1]), -s[0]))[0]
+
+
+def library_subtitle_indexes(file: LibraryFile, context: TrackContext = NO_CONTEXT) -> list[int]:
+    """库语言的内封字幕下标（含简繁、双语；不含评论字幕）。库语言未知时为空。"""
+    library = context.library_language
+    if not library:
+        return []
+    indexes: list[int] = []
+    for subtitle in _subtitles(file):
+        if subtitle.external or subtitle.commentary or library not in subtitle.languages:
+            continue
+        index = parse_embedded_track(subtitle.ref)
+        if index is not None:
+            indexes.append(index)
+    return indexes
+
+
 def default_subtitle(
     file: LibraryFile, context: TrackContext = NO_CONTEXT, audio_ref: str | None = None
 ) -> SubtitleChoice:

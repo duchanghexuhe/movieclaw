@@ -1115,6 +1115,13 @@ function PreloadActiveFeedItem({
       )}
       <p className="mt-2 text-caption text-white/30">
         预转码 · {preloadTaskSubtitle(task, presets)}
+        {task.executor && <span> · {task.executor} 转码中</span>}
+        {task.progress?.segment_index != null && task.progress.segment_total != null && (
+          <span>
+            {" "}
+            · 第 {task.progress.segment_index}/{task.progress.segment_total} 段
+          </span>
+        )}
         {task.created_at && (
           <>
             <span aria-hidden="true"> · </span>

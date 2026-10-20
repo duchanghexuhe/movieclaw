@@ -16,9 +16,7 @@ remote_signing 的签名 URL 域（kind 扩展 ``preload.source`` / ``preload.ar
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import subprocess
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -111,7 +109,12 @@ async def claim_preload_task(
             )
         if registry.preload_capacity(connection) <= 0:
             return ok({"task": None})
-    claimed = await preload_service.claim_next_task(session, device_id=principal.device.id)
+    caps = (payload or {}).get("caps")
+    claimed = await preload_service.claim_next_task(
+        session,
+        device_id=principal.device.id,
+        accept_hevc=preload_service.caps_accept_hevc(caps),
+    )
     if claimed is None:
         return ok({"task": None})
     task, file = claimed
@@ -120,9 +123,8 @@ async def claim_preload_task(
         task_id=task_id, file_id=file.id, ttl_seconds=GRANT_TTL_S,
         device_id=principal.device.id,
     )
-    command = preload_service.build_task_command(
-        task, file, worker_caps=(payload or {}).get("caps")
-    )
+    plan = await preload_service.plan_for(session, file)
+    command = preload_service.build_task_command(task, file, worker_caps=caps, plan=plan)
     # argv 里的 source.mkv 是 Worker 本地落盘的临时文件名；真实取源地址单独给
     # 相对路径带 API 前缀：Worker 直接 server + "/" + path 拼接
     command["source_url"] = f"api/v1/preload-worker/preload-source/{task_id}?token={grant}"
@@ -293,65 +295,13 @@ async def complete_preload_task(
     _assert_claimer(task, principal)
     if task.status not in (PreloadTaskStatus.CLAIMED, PreloadTaskStatus.RUNNING):
         raise BadRequestException("任务不在执行态")
-    directory = preload_service.artifact_dir_for(task_id)
-    # 最终名带片名与码率（complete 时按源条目定名），分段拼装到它
-    final_path = await preload_service.artifact_path_for(session, task)
-    if final_path.exists():
-        final_path.unlink()  # 重跑 complete 的兜底
-    # 按段号拼接：转码分段（§7 断点续转）每段是独立编码的 MKV，用 concat
-    # demuxer -c copy 免重编码拼回整文件；直拷/旧单段形态只有一段，同样适用
-    parts = sorted(directory.glob("seg*.mkv"))
-    if not parts:
-        raise BadRequestException("没有收到任何产物分段")
-    concat_list = directory / "concat.txt"
-    with open(concat_list, "w", encoding="utf-8") as listing:
-        for part_path in parts:
-            # 单引号转义防路径特殊字符；absolute 可读（同目录相对亦可）
-            listing.write("file '" + part_path.resolve().as_posix() + "'\n")
-
-    def _concat() -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-                "-f", "concat", "-safe", "0", "-i", str(concat_list),
-                "-c", "copy", "-map_chapters", "0", str(final_path),
-            ],
-            capture_output=True, text=True, timeout=3600,
-        )
-
-    # 2GB 级拼接不能占着事件循环：放线程池，WS 心跳/播放会话照常跑
-    concat = await asyncio.to_thread(_concat)
-    concat_list.unlink(missing_ok=True)
-    if concat.returncode != 0:
-        logger.warning("预转码 concat 失败：task=%s %s", task_id, concat.stderr[-500:])
-        raise BadRequestException("产物分段拼接失败，整件作废")
-    for part_path in parts:
-        part_path.unlink()
-    size = final_path.stat().st_size
-    if size <= 0:
-        raise BadRequestException("产物为空，整件作废")
-
-    spec = await asyncio.to_thread(probe_media, str(final_path))
-    duration = spec.duration_seconds if spec else None
-    video_codec = spec.video_codec if spec else None
-    try:
-        derived = await preload_service.complete_task(
-            session,
-            task,
-            actual_bytes=size,
-            duration_seconds=duration,
-            video_codec=video_codec,
-            spec=spec,
-        )
-    except BadRequestException:
-        # 整件作废：产物与分片一并清掉，任务置失败
-        final_path.unlink(missing_ok=True)
-        raise
+    # 拼接 + 字幕内封 + 探测 + 登记（与 NAS 本地执行共用；任何校验失败整件作废）
+    derived = await preload_service.finalize_artifact(session, task, probe=probe_media)
     # 一个任务结束，空闲出来的并发位立刻可以派下一个
     from movieclaw_api.services.preload.dispatcher import dispatch_queued_tasks
 
     await dispatch_queued_tasks()
-    return ok({"file_id": derived.id, "size_bytes": size})
+    return ok({"file_id": derived.id, "size_bytes": derived.size_bytes})
 
 
 @router.post(
