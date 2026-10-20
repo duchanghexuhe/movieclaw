@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from movieclaw_api.services.playback.track_memory import inherit_tracks, inheritance_source
 from movieclaw_db.models import LibraryFile, PlaybackState
@@ -86,17 +86,26 @@ def file_track_defaults(
     context: TrackContext,
     states: Mapping[Unit, PlaybackState],
     unit_files: Mapping[Unit, LibraryFile],
+    owners: Mapping[int, LibraryFile] | None = None,
 ) -> FileTrackDefaults | None:
     """这个文件起播时（用户不动菜单）会放的音轨与字幕，和开会话同一口径。
 
     ``states`` 是这个成员在该条目上的全部观看状态，``unit_files`` 是详情页手里各单元的
-    在位文件（找上一集的文件用）；详情页只看一个库里的一个条目，上下文共用一份。
+    在位文件（找上一集的文件用）；详情页只看一个库里的一个条目，库语言与原始语言共用一份。
+    ``owners`` 是便携版（派生行）id → 归属行（源文件，见 ``metadata_owner``）：便携版的外挂字幕
+    候选借用它的，上一集的文件也按它自己的归属行算。
     原盘、还没探测过轨道的文件返回 None（界面退回按片源标注的默认旗标展示）。
     """
     if file.is_disc() or file.audio_streams is None or file.subtitle_streams is None:
         return None
+    owners = owners or {}
+
+    def owned(item: LibraryFile) -> TrackContext:
+        return replace(context, metadata_owner=owners.get(item.id or -1))
+
     unit = (file.media_item_id or 0, file.season_number or 0, file.episode_number or 0)
     own = states.get(unit)
+    target = owned(file)
     inherited_audio = inherited_subtitle = None
     picked = inheritance_source(states, unit)
     if picked is not None:
@@ -107,14 +116,15 @@ def file_track_defaults(
                 source_row,
                 source,
                 file,
-                context,
+                owned(source),
                 need_audio=need_audio,
                 need_subtitle=need_subtitle,
+                target_context=target,
             )
-    audio = resolve_audio(file, own.audio_track if own else None, context)
+    audio = resolve_audio(file, own.audio_track if own else None, target)
     if audio.reason != "remembered" and inherited_audio is not None:
         audio = AudioChoice(parse_embedded_track(inherited_audio), "series")
-    subtitle = resolve_subtitle(file, own.subtitle_track if own else None, context, audio.ref)
+    subtitle = resolve_subtitle(file, own.subtitle_track if own else None, target, audio.ref)
     if subtitle.reason != "remembered" and inherited_subtitle is not None:
         subtitle = SubtitleChoice(inherited_subtitle, "series")
     return FileTrackDefaults(audio, subtitle)
