@@ -240,7 +240,7 @@ from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.network_egress import effective_tmdb_image_base_url
 from movieclaw_api.services.people_images import avatar_url
 from movieclaw_api.services.playback import warmup as playback_warmup
-from movieclaw_api.services.playback.track_context import library_track_context
+from movieclaw_api.services.playback.track_context import library_track_context, metadata_owner
 from movieclaw_api.services.playback.track_defaults import FileTrackDefaults, file_track_defaults
 from movieclaw_api.services.scrape_config import resolve_scrape_library
 from movieclaw_api.services.subscription import SubscriptionService
@@ -274,6 +274,7 @@ from movieclaw_db.repositories.member_repo import MemberRepository
 from movieclaw_media.genres import COUNTRY_NAMES, MOVIE_GENRES, REGION_PRESETS, TV_GENRES
 from movieclaw_media.models import MediaKind, MediaSource
 from movieclaw_playback import state as playback_state
+from movieclaw_playback.subtitles import parse_external_track
 
 router = APIRouter(prefix="/libraries", tags=["libraries"])
 search_router = APIRouter(prefix="/search", tags=["search"])
@@ -2796,6 +2797,21 @@ async def _attach_cloud_views(
         )
 
 
+def _subtitle_owners(rows: list[LibraryFile]) -> dict[int, LibraryFile]:
+    """便携版（预转码派生行）id → 归属行（源文件）：外挂字幕与默认轨上下文借用源文件的，
+    与起播同一口径（见 ``metadata_owner``）。源行得在同一批行里且在位才借；源行不在位
+    （失联、进回收站）就退回自己，不下发借来的东西。没有归属行的行不在结果里（None = 行自己）。"""
+    by_id = {row.id: row for row in rows if row.id is not None}
+    owners: dict[int, LibraryFile] = {}
+    for row in rows:
+        if row.id is None or row.derives_from_file_id is None:
+            continue
+        source = by_id.get(row.derives_from_file_id)
+        if source is not None and source.state == FileState.IN_PLACE:
+            owners[row.id] = source
+    return owners
+
+
 def _file_view(
     row: LibraryFile,
     external_subs: list[str],
@@ -2803,6 +2819,7 @@ def _file_view(
     *,
     chapters_enabled: bool,
     defaults: FileTrackDefaults | None = None,
+    subtitle_owner: LibraryFile | None = None,
 ) -> LibraryFileView:
     """台账行 → 详情页文件视图：内封字幕轨与外挂字幕文件合并成一份清单。
 
@@ -2810,7 +2827,9 @@ def _file_view(
     有落库快照的行不看它。``chapters_enabled`` 是所在库的「生成章节」开关：
     关着时章节给 None——详情页与分享页（它投影的就是这份视图）都不出章节横排，
     台账里探到的章节与已生成的图原样留着，重新打开开关即恢复。``defaults`` 是这个成员
-    起播时会放的音轨 / 字幕（``file_track_defaults``），给了才下发。"""
+    起播时会放的音轨 / 字幕（``file_track_defaults``），给了才下发。``external_subs`` 是
+    外挂字幕文件名；``subtitle_owner`` 是它们所属的视频行（便携版借用源文件的，名字按源文件
+    的 stem 解析），None = 行自己。"""
     subtitles = [
         SubtitleStreamView(
             codec=stream.get("codec"),
@@ -2821,7 +2840,7 @@ def _file_view(
         )
         for stream in (row.subtitle_streams or [])
     ]
-    stem = PurePath(row.file_path).stem
+    stem = PurePath((subtitle_owner or row).file_path).stem
     for name in external_subs:
         extra = match_subtitle_filename(stem, name)
         parsed = parse_subtitle_tokens(extra or "")
@@ -3083,20 +3102,25 @@ async def get_library_item(
     unit_files: dict[tuple[int, int, int], LibraryFile] = {}
     for row in in_place_rows:
         unit_files.setdefault((media_item_id, row.season_number, row.episode_number), row)
-    file_views = [
-        _file_view(
-            row,
-            bundle.external_subtitles.get(row.id or -1, []),
-            origins,
-            chapters_enabled=library.extract_chapter_images,
-            defaults=(
-                file_track_defaults(row, track_context, watch_states, unit_files)
-                if row.state == FileState.IN_PLACE
-                else None
-            ),
+    # 便携版的外挂字幕列表与「默认」标记借用源文件（见 _subtitle_owners），与起播同一口径
+    owners = _subtitle_owners(rows)
+    file_views: list[LibraryFileView] = []
+    for row in rows:
+        owner = owners.get(row.id or -1)
+        file_views.append(
+            _file_view(
+                row,
+                bundle.external_subtitles.get((owner or row).id or -1, []),
+                origins,
+                chapters_enabled=library.extract_chapter_images,
+                defaults=(
+                    file_track_defaults(row, track_context, watch_states, unit_files, owners)
+                    if row.state == FileState.IN_PLACE
+                    else None
+                ),
+                subtitle_owner=owner,
+            )
         )
-        for row in rows
-    ]
     await _attach_cloud_views(session, file_views, rows)
     entry_dirs = bundle.entry_dirs
     if not principal.is_admin:
@@ -3347,8 +3371,10 @@ async def preview_file_subtitle(
     if row is None:
         raise NotFoundException("台账文件不存在")
     await assert_library_visible(session, principal, row.library_id)
+    # 外挂轨按归属行读：便携版借用源文件的外挂字幕（与详情页列表、起播同一口径）；内封轨仍是行自己的
+    subject = row if parse_external_track(track) is None else await metadata_owner(session, row)
     try:
-        preview = await load_subtitle_preview(row, track)
+        preview = await load_subtitle_preview(subject, track)
     except SubtitleTrackNotFound as exc:
         raise NotFoundException(str(exc)) from exc
     except SubtitlePreviewError as exc:

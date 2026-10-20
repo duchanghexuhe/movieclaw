@@ -145,7 +145,7 @@ from movieclaw_api.services.playback.signing import (
     verify_stream_token,
 )
 from movieclaw_api.services.playback.strm_direct import mounted_redirect
-from movieclaw_api.services.playback.track_context import files_with_contexts
+from movieclaw_api.services.playback.track_context import files_with_contexts, metadata_owner
 from movieclaw_api.services.playback_activity import (
     end_playback,
     live_session_label,
@@ -1212,9 +1212,13 @@ async def start_playback_session(
     )
     chapter_marks = _chapter_marks(file)
     # 片头片尾（docs/design/skip-intro.md）：两次主键查询；这一季还没识别过就在后台
-    # 排一份优先作业（延迟开跑、去重），这一集多半赶不上，下一集就有了
+    # 排一份优先作业（延迟开跑、去重），这一集多半赶不上，下一集就有了。便携版的片头
+    # 区间挂在源文件上，按归属行取（区间是同一部片的，时间轴不变）
     segment_views = [
-        PlaybackSegmentView(**seg) for seg in await skip_segments.segments_for_file(session, file)
+        PlaybackSegmentView(**seg)
+        for seg in await skip_segments.segments_for_file(
+            session, await metadata_owner(session, file)
+        )
     ]
     if not segment_views:
         skip_segments.schedule_playback_bump(file)
@@ -2612,7 +2616,8 @@ async def get_playback_subtitle(
     file = await session.get(LibraryFile, file_id)
     if file is None:
         raise NotFoundException("文件不存在")
-    ref = resolve_external_subtitle(file, track)
+    # 外挂字幕按归属行解析：便携版借用源文件的（引用，不复制；源文件后补的也在）
+    ref = resolve_external_subtitle(await metadata_owner(session, file), track)
     if ref is None:
         index = parse_embedded_track(track)
         windowed = start_ms is not None and end_ms is not None and end_ms > start_ms

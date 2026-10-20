@@ -48,7 +48,8 @@ def media_profile_from_file(
     ``context`` 是默认轨策略的上下文（库语言、原始语言，见 track_policy），``preferred_audio`` 是
     这次要放的音轨（用户点选 / 记忆）——默认字幕要看放的是哪种语言的音轨。不给上下文时按旧规则。
     """
-    audio_choice, subtitle_choice = default_tracks(file, context or TrackContext(), preferred_audio)
+    context = context or TrackContext()
+    audio_choice, subtitle_choice = default_tracks(file, context, preferred_audio)
     return MediaProfile(
         file_id=file.id or 0,
         container=file.container,
@@ -62,7 +63,7 @@ def media_profile_from_file(
         bit_rate_bps=file.bit_rate,
         duration_ms=(file.duration_seconds * 1000) if file.duration_seconds else None,
         audio_tracks=_audio_tracks(file, audio_choice),
-        subtitle_tracks=_subtitle_tracks(file, subtitle_choice),
+        subtitle_tracks=_subtitle_tracks(file, subtitle_choice, context.metadata_owner or file),
         keyframe_interval_s=keyframe_interval_s,
         is_strm=is_strm(file.file_path),
         disc_clips=disc_clips,
@@ -89,8 +90,11 @@ def _audio_tracks(file: LibraryFile, choice: AudioChoice) -> tuple[AudioTrack, .
     )
 
 
-def _subtitle_tracks(file: LibraryFile, choice: SubtitleChoice) -> tuple[SubtitleTrack, ...]:
-    """内封轨在前、外挂轨在后——与既有中性引用的编号口径保持一致。
+def _subtitle_tracks(
+    file: LibraryFile, choice: SubtitleChoice, owner: LibraryFile
+) -> tuple[SubtitleTrack, ...]:
+    """内封轨在前、外挂轨在后——与既有中性引用的编号口径保持一致。外挂轨取自 ``owner``
+    （便携版借用源文件的外挂字幕，见 ``metadata_owner``），内封轨仍是 ``file`` 自己的。
 
     ``is_default`` 写的是**服务端裁决出的那一条**（track_policy 的默认字幕：库语言优先、再看原声），
     不是容器里的原始旗标，不开字幕时谁都不标。网页端、App 拿这个标记做首选，Jellyfin 端经
@@ -123,7 +127,7 @@ def _subtitle_tracks(file: LibraryFile, choice: SubtitleChoice) -> tuple[Subtitl
             title=entry.get("title"),
             is_forced=bool(entry.get("forced")),
         )
-        for entry in (file.external_subtitles or [])
+        for entry in (owner.external_subtitles or [])
         if isinstance(entry, dict) and entry.get("filename")
     ]
     return tuple(embedded + external)

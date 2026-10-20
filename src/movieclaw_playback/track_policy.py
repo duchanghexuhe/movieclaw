@@ -112,6 +112,9 @@ class TrackContext:
     #: 库语言是中文时的简繁：zh-CN / zh-SG → hans，zh-TW / zh-HK → hant
     library_script: str | None = None
     original_language: str | None = None
+    #: 便携版借用的外挂字幕归属行（源文件，见 ``track_context.metadata_owner``）：外挂字幕的
+    #: 列表与所在目录取它的，内封轨与音轨仍是文件自己的。None = 文件自己的外挂字幕
+    metadata_owner: LibraryFile | None = None
 
     @classmethod
     def build(cls, library_locale: str | None, original_language: str | None) -> TrackContext:
@@ -245,7 +248,12 @@ def _external_marks(file: LibraryFile, filename: str) -> str:
     return ""
 
 
-def _subtitles(file: LibraryFile) -> list[_Subtitle]:
+def _owner(file: LibraryFile, context: TrackContext) -> LibraryFile:
+    """外挂字幕的归属行：便携版是源文件，其余就是文件自己。"""
+    return context.metadata_owner or file
+
+
+def _subtitles(file: LibraryFile, owner: LibraryFile) -> list[_Subtitle]:
     result: list[_Subtitle] = []
     order = 0
     for index, raw in enumerate(file.subtitle_streams or []):
@@ -264,7 +272,7 @@ def _subtitles(file: LibraryFile) -> list[_Subtitle]:
             )
         )
         order += 1
-    for entry in file.external_subtitles or []:
+    for entry in owner.external_subtitles or []:
         if not isinstance(entry, dict) or not entry.get("filename"):
             continue
         filename = str(entry["filename"])
@@ -275,7 +283,7 @@ def _subtitles(file: LibraryFile) -> list[_Subtitle]:
                 external=True,
                 language=entry.get("language"),
                 # 文件名里的 chs / cht / 简英 这类标记入台账时被当成语言吃掉了，这里再读一遍
-                texts=[entry.get("title") or "", _external_marks(file, filename)],
+                texts=[entry.get("title") or "", _external_marks(owner, filename)],
                 default_flag=bool(entry.get("default")),
                 forced=bool(entry.get("forced")),
                 sdh=bool(entry.get("sdh")),
@@ -434,7 +442,7 @@ def default_subtitle(
     library = context.library_language
     if library:
         audio = _playing_audio(file, context, audio_ref)
-        subtitles = _subtitles(file)
+        subtitles = _subtitles(file, _owner(file, context))
         candidates = [s for s in subtitles if not s.commentary and library in s.languages]
         full = [s for s in candidates if not s.partial]
         partial = [s for s in candidates if s.partial]
@@ -442,22 +450,22 @@ def default_subtitle(
         if same_language and library != "chi":
             if partial:
                 return SubtitleChoice(_best(partial, context).ref, "forced")
-            return _off_unless_unlabeled(file, subtitles, "same_language_off")
+            return _off_unless_unlabeled(file, subtitles, "same_language_off", context)
         if full:
             return SubtitleChoice(_best(full, context).ref, "library_language")
         if same_language:
             if partial:
                 return SubtitleChoice(_best(partial, context).ref, "forced")
-            return _off_unless_unlabeled(file, subtitles, "no_language_match")
-    return _legacy_subtitle(file)
+            return _off_unless_unlabeled(file, subtitles, "no_language_match", context)
+    return _legacy_subtitle(file, context)
 
 
 def _off_unless_unlabeled(
-    file: LibraryFile, subtitles: list[_Subtitle], reason: str
+    file: LibraryFile, subtitles: list[_Subtitle], reason: str, context: TrackContext
 ) -> SubtitleChoice:
     """原声就是库语言时不开字幕——但旧规则会开的那条没标语言时照片源的来：标签没说它不对
     （NAS 实测：国产片的默认字幕常常就是没标语言的中文字幕）。"""
-    legacy = _legacy_subtitle(file)
+    legacy = _legacy_subtitle(file, context)
     unlabeled = {s.ref for s in subtitles if not s.languages}
     if legacy.ref is not None and legacy.ref in unlabeled:
         return legacy
@@ -493,7 +501,7 @@ def resolve_subtitle(
     不给按默认音轨算。"""
     if remembered == SUBTITLE_OFF:
         return SubtitleChoice(SUBTITLE_OFF, "remembered")
-    if remembered is not None and subtitle_track_exists(file, remembered):
+    if remembered is not None and subtitle_track_exists(file, remembered, context.metadata_owner):
         return SubtitleChoice(remembered, "remembered")
     return default_subtitle(file, context, audio_ref)
 
@@ -544,9 +552,9 @@ def _best(subtitles: list[_Subtitle], context: TrackContext) -> _Subtitle:
     )
 
 
-def _legacy_subtitle(file: LibraryFile) -> SubtitleChoice:
+def _legacy_subtitle(file: LibraryFile, context: TrackContext = NO_CONTEXT) -> SubtitleChoice:
     """没有库语言可比时的旧规则（外挂 > AI > 默认旗标 > 强制），原因按选中的那条说。"""
-    ref = pick_default_subtitle(file)
+    ref = pick_default_subtitle(file, context.metadata_owner)
     if ref is None:
         return SubtitleChoice(None, "none")
     if ref.startswith("external:"):

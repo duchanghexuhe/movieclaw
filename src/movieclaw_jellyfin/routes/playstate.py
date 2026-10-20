@@ -159,7 +159,7 @@ async def _visible_files(ref: EntityRef, member_id: int) -> list[LibraryFile]:
     return await _files_for_ref(ref, member_id)
 
 
-def _tracks_from_body(
+async def _tracks_from_body(
     files: list[LibraryFile], body: dict[str, Any]
 ) -> tuple[str | None, str | None, int | None]:
     """上报里的轨序号 → 中性轨引用（jellyfin-subtitle.md §4.5），外加正在放的文件 id。
@@ -173,11 +173,13 @@ def _tracks_from_body(
     -1 → "off"（用户明确关闭也要记住）；换算失败（悬空索引）返回 None
     丢弃。None = 本次没报该轨，领域层保持原值。
     """
-    from movieclaw_jellyfin.routes.playback import _select_source
+    from movieclaw_jellyfin.routes.playback import _metadata_owner_for, _select_source
 
     raw_ms = body.get("mediasourceid")
     selected = _select_source(files, str(raw_ms) if raw_ms else None, "")
     f = selected[0] if selected else files[0]
+    # 合成编号按这个版本的外挂字幕归属行数（便携版借用源文件的外挂字幕）
+    owner = await _metadata_owner_for(f)
 
     def _to_int(raw: Any) -> int | None:
         try:
@@ -188,13 +190,15 @@ def _tracks_from_body(
     audio_track = None
     audio_index = _to_int(body.get("audiostreamindex"))
     if audio_index is not None:
-        audio_track = audio_track_for_index(f, audio_index)
+        audio_track = audio_track_for_index(f, audio_index, owner)
 
     subtitle_track = None
     subtitle_index = _to_int(body.get("subtitlestreamindex"))
     if subtitle_index is not None:
         subtitle_track = (
-            SUBTITLE_OFF if subtitle_index == -1 else subtitle_track_for_index(f, subtitle_index)
+            SUBTITLE_OFF
+            if subtitle_index == -1
+            else subtitle_track_for_index(f, subtitle_index, owner)
         )
     return audio_track, subtitle_track, f.id
 
@@ -255,7 +259,7 @@ async def playing_start(
     ref = _decode_item_ref(body.get("itemid"))
     files = await _visible_files(ref, identity.device.member_id) if ref is not None else []
     if ref is not None and files:
-        audio_track, subtitle_track, file_id = _tracks_from_body(files, body)
+        audio_track, subtitle_track, file_id = await _tracks_from_body(files, body)
         await _record_start(
             ref, identity, audio_track=audio_track, subtitle_track=subtitle_track, file_id=file_id
         )
@@ -287,7 +291,7 @@ async def playing_progress(
         else:
             files = await _visible_files(ref, identity.device.member_id)
             if files:
-                audio_track, subtitle_track, file_id = _tracks_from_body(files, body)
+                audio_track, subtitle_track, file_id = await _tracks_from_body(files, body)
                 await _record_progress(
                     ref,
                     identity,
@@ -321,7 +325,7 @@ async def playing_stopped(
         # 只收口实时会话，续播点保持上一次进度上报的值
         playback_watch.end_session(identity.device.device_id)
         return Response(status_code=204)
-    audio_track, subtitle_track, file_id = _tracks_from_body(files, body)
+    audio_track, subtitle_track, file_id = await _tracks_from_body(files, body)
     await _record_progress(
         ref,
         identity,

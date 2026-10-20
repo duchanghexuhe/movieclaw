@@ -513,6 +513,10 @@ class PlaybackDecisionView(BaseModel):
     #: 起播、弹窗确认「降档播还是原画质播」；不认它的客户端直接播＝自动降档。
     #: 推荐档就是计划本身的 ``video.height``，不用另带字段。
     uplink_step_down: bool = False
+    #: 所放的是预转码便携版时：源文件 id（「切到原画」带它重开）与分辨率标签（「便携版 · 720p」）
+    #: 放的是原片为 None
+    portable_source_file_id: int | None = None
+    portable_resolution: str | None = None
 
     # outcome == "consent"
     cost_hint: str | None = None
