@@ -61,7 +61,7 @@ CRASH_WINDOW = 600.0
 CRASH_LIMIT = 5
 BACKOFF_MAX = 60.0
 #: 子进程能看到的环境变量（其余一律不给）
-_ENV_KEEP = ("PATH", "LANG", "LC_ALL", "TZ", "HOME", "TMPDIR")
+_ENV_KEEP = ("PATH", "LANG", "LC_ALL", "TZ", "HOME", "TMPDIR", "SystemRoot")
 _UNSET: Any = object()
 
 NextFn = Callable[[Any], Awaitable[Any]]
@@ -107,7 +107,11 @@ class RemoteCallError(RuntimeError):
 def _child_env() -> dict[str, str]:
     import movieclaw_sdk
 
-    env = {k: v for k, v in os.environ.items() if k in _ENV_KEEP}
+    # Windows 环境变量名大小写不敏感（本进程里可能是 SystemRoot 也可能是 SYSTEMROOT），
+    # 按小写比对；SystemRoot 不传子进程会让 winsock 初始化失败（getaddrinfo 报
+    # WinError 10106），进程外插件在 Windows 上全部起不来。
+    keep = {k.lower() for k in _ENV_KEEP}
+    env = {k: v for k, v in os.environ.items() if k.lower() in keep}
     # 与宿主同一份代码（overlay 部署时是 overlay 里的那份）
     env["PYTHONPATH"] = str(Path(movieclaw_sdk.__file__).resolve().parent.parent)
     env["PYTHONUNBUFFERED"] = "1"
