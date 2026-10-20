@@ -377,21 +377,13 @@ function PosterCardContent({
             </div>
           </>
         ) : (
-          // 海报外套一层内缩 1px 的裁切框：卡片框的圆角裁切会在最末一行把海报边缘
-          // 与页面背景做抗锯齿混色，而海报底部通常偏亮，混出来的那一行读作一道灰白
-          // 亮边（悬停上浮后底边贴在纯黑页面上尤其显眼）。让图不贴裁切边即可整条
-          // 消失。必须用包裹层而不是给 <img> 加 inset：悬停 scale-1.06 会把图重新
-          // 推出裁切边界，内缩被抵消；由包裹层自己 overflow-hidden 才能把放大后的
-          // 溢出重新裁掉。内缩只有 1px，画面看不出来。
-          <div className="absolute inset-px overflow-hidden">
-            <PosterImage
-              src={item.posterUrl}
-              width={imageWidth}
-              zoom={HOVER_ZOOM}
-              alt={`${item.title} 海报`}
-              className="size-full transition-transform duration-500 ease-out group-hover/card:scale-[1.06]"
-            />
-          </div>
+          <PosterImage
+            src={item.posterUrl}
+            width={imageWidth}
+            zoom={HOVER_ZOOM}
+            alt={`${item.title} 海报`}
+            className="absolute inset-0 size-full transition-transform duration-500 ease-out group-hover/card:scale-[1.06]"
+          />
         )}
 
         {/* 左上：资源最高清晰度徽章（无资源信息时不渲染）。
