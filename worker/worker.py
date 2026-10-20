@@ -78,6 +78,7 @@ class Api:
         data: bytes | None = None,
         headers: dict | None = None,
         raw: bool = False,
+        timeout: float = 600,
     ):
         # 控制面路径带前导 /；claim 返回的 source_url/artifact_url 是
         # 协议相对路径（无前导 /）。两者都拼到 server 上
@@ -96,7 +97,7 @@ class Api:
         try:
             # 显式直连（见 _NO_PROXY_OPENER）：预转码的大文件上行/下行同实时
             # 一样不能被代理环境变量劫持
-            with _NO_PROXY_OPENER.open(req, timeout=600) as resp:
+            with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
                 body = resp.read()
                 if raw:
                     return resp.status, body
@@ -166,6 +167,27 @@ class Api:
                 interval = min(interval + 5, 30)
                 continue
             raise RuntimeError(f"配对失败（{status}），请重新运行")
+
+
+def revoke_worker_credential(server: str, token: str | None, *, timeout: float = 5.0) -> bool:
+    """尽力在服务端注销自己这枚凭证（GUI「断开并重新配置…」用）。
+
+    与 Mac 转码器同一个动作（``DevicePairing.revokeCurrentDevice``，那边注释说得很
+    清楚）：**只删本机令牌的话，服务端那枚凭证依然有效**，「设置 → 设备」里会一直挂着
+    一台已经断开、却还能连上来的 Worker。
+
+    服务器连不上也必须能断开，所以只给几秒超时、失败返回 False 由调用方记一行日志后
+    照常清本机——真清不掉时用户还能到网页「设置 → 设备」里手动注销。
+    """
+    if not token:
+        return False
+    try:
+        status, _ = Api(server, token).request(
+            "DELETE", "/api/v1/auth/devices/current", timeout=timeout
+        )
+    except Exception:  # noqa: BLE001  连不上/超时都只是「没注销成功」，不该拦断开的收尾
+        return False
+    return 200 <= status < 300
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +579,29 @@ def worker_id_for(name: str | None) -> str:
         if clean:
             return clean
     return "windows-worker"
+
+
+#: 服务端 ``remote_worker._WORKER_ID`` 的同一条规则：worker_id 的合法形态。
+#: 两处必须一致——这里是给人填名字时的校验，那边是握手时的兜底拒绝。
+WORKER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
+
+
+def check_worker_name(name: str | None) -> str | None:
+    """名称能不能直接当 worker_id 用；不能就返回说给人听的拒绝理由，能用返回 None。
+
+    ``worker_id_for`` 对非法字符是**静默清洗**、洗没了退主机名：用户在「名称」里填
+    个中文名，界面上看着改了，网页上还是主机名，查不出为什么。所以入口处先拦一道
+    （Mac 转码器同名项的校验口径一致：「只能包含字母、数字、下划线、点、冒号和短
+    横线」）。**留空合法**：那正是「用主机名」。
+    """
+    if not name:
+        return None
+    if WORKER_ID_RE.fullmatch(name):
+        return None
+    return (
+        f"名称「{name}」不能用：只能包含字母、数字、下划线、点和短横线，"
+        "且以字母或数字开头（如 study-pc）。留空则用本机主机名。"
+    )
 
 
 def on_battery() -> bool:

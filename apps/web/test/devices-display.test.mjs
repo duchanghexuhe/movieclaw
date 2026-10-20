@@ -22,6 +22,7 @@ import {
   relativeTime,
   resolveServerAddress,
   revokeConsequence,
+  workerDisplayName,
 } from "../lib/devices-display.ts";
 
 const MINUTE = 60_000;
@@ -263,6 +264,22 @@ test("没有长连接的设备仍按最近 5 分钟有没有用过", () => {
   assert.equal(activityLabel(phone, now), "3 分钟前");
   const cli = { kind: "cli", scope: "full", connected: false, last_seen_at: "2026-09-27T10:00:00Z" };
   assert.equal(deviceLive(cli, now), false);
+});
+
+test("转码页 Worker 行跟设备页改的名字走，机器标识只是兜底", () => {
+  // worker_id 是注册表键（断线顶号判据），设备名才是人能改的那个
+  const worker = { worker_id: "yi-mac-mini", device_id: 7 };
+  const names = new Map([["ld-7", "书房那台 Mac"]]);
+  assert.equal(workerDisplayName(worker, names), "书房那台 Mac");
+  // 设备行还没拉到 / 已被注销：退回机器标识，不能显示空白或 ld-7 这种内部值
+  assert.equal(workerDisplayName(worker, new Map()), "yi-mac-mini");
+  // 手工令牌的机器标识与设备名本来就不同，同样按 device_id 对上
+  assert.equal(
+    workerDisplayName({ worker_id: "manual", device_id: 9 }, new Map([["ld-9", "headless-nas"]])),
+    "headless-nas",
+  );
+  // 没有设备行（理论上不会出现，凭证总归在某条设备行上）也别崩
+  assert.equal(workerDisplayName({ worker_id: "orphan", device_id: null }, names), "orphan");
 });
 
 test("设备图标按形态挑，转码凭证一律是转码器", () => {

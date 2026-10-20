@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -60,12 +61,54 @@ def isolation() -> Isolation:
     return Isolation(uid=uid, gid=uid)
 
 
+_ACL_XATTRS = ("system.posix_acl_access", "system.posix_acl_default")
+
+#: 这个平台有没有扩展属性（Windows 的 os 没有 removexattr；隔离本身也只在 Linux 宿主上生效）
+_HAS_XATTR = hasattr(os, "removexattr")
+
+
+def _strip_acl(path: str | os.PathLike[str]) -> None:
+    """去掉这个文件 / 目录上的 POSIX ACL：权限只由 mode 位说了算。
+
+    带 ACL 时 ``chmod`` 只改 mask 与 other，**点名某个 uid 的 ACE 原样保留**：
+    源目录上一条 ``u:<插件 uid>:---`` 会把插件自己锁在门外，一条 ``u:<某用户>:rwx``
+    又会让 ``_readable()`` 想收掉的写权限照旧存在。两种情况都是缺陷，所以复制出来
+    的副本一律不带 ACL。文件系统不支持 xattr（Windows、部分 tmpfs）时什么都不做。
+    """
+    if not _HAS_XATTR:
+        return
+    for name in _ACL_XATTRS:
+        with contextlib.suppress(OSError):  # ENODATA / ENOTSUP / EPERM：没有就没有
+            os.removexattr(path, name)
+
+
+def _copy_file(src: str, dst: str, *, follow_symlinks: bool = True) -> str:
+    """``copytree`` 用的复制函数：只复制内容，不复制权限与扩展属性。
+
+    ``shutil`` 默认的 ``copy2`` 会经 ``copystat`` 把 xattr（含 POSIX ACL）一起搬过来。
+    运行目录是给降权用户看的只读副本，属于哪个用户、谁能不能读，一律由 ``_readable()``
+    显式设定；源目录的 ACL、属主、时间戳都不该跟着进来。
+    """
+    result = shutil.copyfile(src, dst, follow_symlinks=follow_symlinks)
+    # 可执行位要留（非 Python 插件的二进制靠它），其余按 _readable 的规则重设
+    mode = os.stat(src, follow_symlinks=follow_symlinks).st_mode
+    os.chmod(dst, 0o755 if mode & 0o111 else 0o644)
+    _strip_acl(dst)
+    return result
+
+
 def _readable(root: Path) -> None:
-    """目录 0755、文件 0644：插件用户只能读，不能改。"""
+    """目录 0755、文件 0644：插件用户只能读，不能改。
+
+    逐项重设 mode，并清掉 ACL——复制过来的副本可能带着源目录的 ACL，而 ACL 会让
+    这里的 ``chmod`` 部分失效（见 ``_strip_acl``）。
+    """
     for dirpath, _dirnames, filenames in os.walk(root):
+        _strip_acl(dirpath)
         os.chmod(dirpath, 0o755)
         for name in filenames:
             path = os.path.join(dirpath, name)
+            _strip_acl(path)
             mode = os.lstat(path).st_mode
             if stat.S_ISREG(mode):
                 os.chmod(path, 0o755 if mode & 0o111 else 0o644)
@@ -89,7 +132,8 @@ def stage_source(src: Path, version: str) -> Path:
         return target
     tmp = root / f".src-{key}.{os.getpid()}.partial"
     shutil.rmtree(tmp, ignore_errors=True)
-    shutil.copytree(src, tmp, ignore=_IGNORE, symlinks=False)
+    # 用 _copy_file 而不是默认的 copy2：源目录的 ACL / 属主不能跟着进运行目录
+    shutil.copytree(src, tmp, ignore=_IGNORE, symlinks=False, copy_function=_copy_file)
     _readable(tmp)
     (tmp / ".complete").write_text(fingerprint, encoding="utf-8")
     if target.exists():
@@ -109,13 +153,19 @@ def stage_plugin(entry_id: str, path: Path, module: str) -> Path:
     os.chmod(target.parent, 0o755)
     shutil.rmtree(target, ignore_errors=True)
     if (path / "movieclaw-plugin.toml").exists():
-        shutil.copytree(path, target, ignore=_IGNORE, symlinks=False)
+        shutil.copytree(path, target, ignore=_IGNORE, symlinks=False, copy_function=_copy_file)
     else:
         target.mkdir()
         if (path / module).is_dir():
-            shutil.copytree(path / module, target / module, ignore=_IGNORE, symlinks=False)
+            shutil.copytree(
+                path / module,
+                target / module,
+                ignore=_IGNORE,
+                symlinks=False,
+                copy_function=_copy_file,
+            )
         else:
-            shutil.copy2(path / f"{module}.py", target / f"{module}.py")
+            _copy_file(str(path / f"{module}.py"), str(target / f"{module}.py"))
     _readable(target)
     return target
 
@@ -130,7 +180,7 @@ def stage_dependencies(path: Path) -> Path:
         return target
     tmp = base / f".{path.name}.{os.getpid()}.partial"
     shutil.rmtree(tmp, ignore_errors=True)
-    shutil.copytree(path, tmp, symlinks=False)
+    shutil.copytree(path, tmp, symlinks=False, copy_function=_copy_file)
     _readable(tmp)
     shutil.rmtree(target, ignore_errors=True)
     os.replace(tmp, target)

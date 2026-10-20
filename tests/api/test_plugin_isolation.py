@@ -65,6 +65,91 @@ def test_stage_plugin_copies_only_its_own_code(tmp_path, runtime_root) -> None:
     assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
 
 
+def _acl_supported(path) -> bool:
+    """这个文件系统能不能读写 POSIX ACL（tmpfs 可能不行，Windows 一定不行）。"""
+    if not sys.platform.startswith("linux") or not hasattr(os, "setxattr"):
+        return False
+    try:
+        os.setxattr(path, "system.posix_acl_access", os.getxattr(path, "system.posix_acl_access"))
+    except OSError:
+        return False
+    return True
+
+
+def _grant_acl(path, uid: int, perm: int) -> None:
+    """给 ``path`` 加一条「点名 uid」的 ACL 条目（模拟 QNAP 共享目录那种源目录）。"""
+    import struct
+
+    raw = os.getxattr(path, "system.posix_acl_access")
+    entries = [raw[:4]]
+    found = False
+    for i in range(4, len(raw), 8):
+        tag, value, ident = struct.unpack("<HHI", raw[i : i + 8])
+        if tag == 2 and ident == uid:  # ACL_USER：改名点的那条
+            value, found = perm, True
+        entries.append(struct.pack("<HHI", tag, value, ident))
+    if not found:
+        entries.insert(1, struct.pack("<HHI", 2, perm, uid))
+    os.setxattr(path, "system.posix_acl_access", b"".join(entries))
+
+
+def _acl_mentions(path, uid: int) -> bool:
+    import struct
+
+    if not hasattr(os, "getxattr"):
+        return False
+    try:
+        raw = os.getxattr(path, "system.posix_acl_access")
+    except OSError:
+        return False
+    for i in range(4, len(raw), 8):
+        tag, _value, ident = struct.unpack("<HHI", raw[i : i + 8])
+        if tag == 2 and ident == uid:
+            return True
+    return False
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="POSIX ACL 只有 Linux 文件系统支持"
+)
+def test_staged_copy_drops_source_acl(tmp_path, runtime_root) -> None:
+    """源目录带 ACL 时，复制出的运行目录不能跟着带（否则点名 65534 的禁止条目会锁死插件）。
+
+    这是 NAS 上的真实故障：QNAP 的 data 目录带 ``user:guest:---``（guest 就是 65534），
+    ``copytree`` 默认的 ``copy2`` 把它一起复制过去，插件进程连自己的目录都列不出来。
+    """
+    src = tmp_path / "src"
+    (src / "pkg").mkdir(parents=True)
+    (src / "pkg" / "mod.py").write_text("X = 1\n")
+    if not _acl_supported(src):
+        pytest.skip("这个文件系统不支持 POSIX ACL")
+
+    nobody = plugin_isolation.DEFAULT_UID
+    _grant_acl(src, nobody, 0)  # u:65534 = --- ：禁止
+
+    staged = plugin_isolation.stage_plugin("acme.acl", src, "pkg")
+    assert not _acl_mentions(staged, nobody)
+    # 去掉 ACL 之后 chmod 才真的说了算：别人能读、不能写
+    mode = stat.S_IMODE(staged.stat().st_mode)
+    assert mode == 0o755
+    assert not os.access(staged, os.W_OK, effective_ids=False) or os.geteuid() == 0
+
+
+def test_readable_strips_acl_even_if_copy_keeps_it(tmp_path) -> None:
+    """兜底：即使副本上已经有 ACL，_readable() 也要把它清掉（幂等，可重复调用）。"""
+    target = tmp_path / "code"
+    (target / "a").mkdir(parents=True)
+    (target / "a" / "x.py").write_text("X = 1\n")
+    if _acl_supported(target):
+        _grant_acl(target, plugin_isolation.DEFAULT_UID, 0)
+        assert _acl_mentions(target, plugin_isolation.DEFAULT_UID)
+    plugin_isolation._readable(target)
+    assert not _acl_mentions(target, plugin_isolation.DEFAULT_UID)
+    if sys.platform.startswith("linux"):  # Windows 上 chmod 不落权限位，只有 Linux 可断言
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+        assert stat.S_IMODE((target / "a" / "x.py").stat().st_mode) == 0o644
+
+
 PLUGIN = """
 import os
 import sys

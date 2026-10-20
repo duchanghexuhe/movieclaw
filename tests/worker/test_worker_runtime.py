@@ -85,6 +85,79 @@ def test_worker_id_falls_back_to_hostname_when_name_has_no_ascii(monkeypatch):
     assert worker_mod.worker_id_for(None) == "windows-worker"
 
 
+#: FakeApi 回给 revoke_worker_credential 的状态码（用例里逐段改）
+_STATUS = [204]
+
+
+def test_revoke_worker_credential_is_best_effort(monkeypatch):
+    """「断开并重新配置」要在服务端注销这枚凭证——只清本机的话，那枚凭证依然有效。
+
+    Mac 转码器的同一步（DevicePairing.revokeCurrentDevice）注释写了原因：不注销的话
+    「设置 → 设备」里会一直挂着一台已经断开、却还能连上来的机器。服务器连不上也必须
+    能断开，所以失败只返回 False，由调用方照常清本机。
+    """
+    calls: list[tuple] = []
+
+    class FakeApi:
+        def __init__(self, server: str, token: str | None) -> None:
+            calls.append(("init", server, token))
+
+        def request(self, method: str, path: str, **kwargs):
+            calls.append((method, path, kwargs.get("timeout")))
+            return _STATUS[0], None
+
+    monkeypatch.setattr(worker_mod, "Api", FakeApi)
+
+    # 没令牌：不用发请求
+    calls.clear()
+    assert worker_mod.revoke_worker_credential("http://nas:3000", None) is False
+    assert calls == []
+
+    # 成功：DELETE 打到「注销自己」，且用短超时（服务器连不上不能拖住断开）
+    calls.clear()
+    _STATUS[0] = 204
+    assert worker_mod.revoke_worker_credential("http://nas:3000", "mclaw_x") is True
+    assert calls == [
+        ("init", "http://nas:3000", "mclaw_x"),
+        ("DELETE", "/api/v1/auth/devices/current", 5.0),
+    ]
+
+    # 服务端说不认识这枚凭证（401）：没注销成功
+    _STATUS[0] = 401
+    assert worker_mod.revoke_worker_credential("http://nas:3000", "mclaw_x") is False
+
+    # 连不上/超时：抛异常也不能把断开的收尾带崩
+    def boom(*_a, **_k):
+        raise OSError("network down")
+
+    monkeypatch.setattr(worker_mod, "Api", boom)
+    assert worker_mod.revoke_worker_credential("http://nas:3000", "mclaw_x") is False
+
+
+def test_check_worker_name_rejects_instead_of_silently_sanitizing():
+    """名称要当 worker_id 用，就得先通过服务端那条规则——不然会被静默清洗掉。
+
+    ``worker_id_for`` 对非法字符静默清洗、洗没了退主机名：用户在 GUI「名称」里填
+    中文名，界面上看着改了，网页上还是主机名，查不出为什么。所以入口先拦一道，
+    说清楚哪里不行。留空合法（那正是「用主机名」）。
+    """
+    from movieclaw_api.services.playback.remote_worker import _WORKER_ID
+
+    # 合法：留空 = 用主机名；ASCII 名原样可用
+    assert worker_mod.check_worker_name(None) is None
+    assert worker_mod.check_worker_name("") is None
+    for good in ("study-pc", "a", "a" * 64, "Mac-mini.local", "0start", "has:colon"):
+        assert worker_mod.check_worker_name(good) is None, good
+        assert _WORKER_ID.fullmatch(good)
+
+    # 非法：会改变 worker_id 的一律拦下，并在理由里带上原名
+    for bad in ("书房那台", "中文abc", "my pc", "-lead", ".dot", "a" * 65):
+        problem = worker_mod.check_worker_name(bad)
+        assert problem and bad in problem, bad
+        # 校验规则与服务端同一条：被拒的名字确实过不了 _WORKER_ID
+        assert not _WORKER_ID.fullmatch(bad)
+
+
 def test_pairing_emits_code_and_approval_url(monkeypatch):
     """配对码与批准页地址以 pairing 事件交出（GUI 据此显示配对码、提供「打开批准页」）。"""
 

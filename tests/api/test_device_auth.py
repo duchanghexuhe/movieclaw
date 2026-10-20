@@ -717,6 +717,36 @@ def test_worker_rename_updates_only_its_paired_device(client: TestClient, paired
             }
 
 
+def test_worker_name_is_not_renamable_from_the_web(client: TestClient) -> None:
+    """配对转码器的名字由它自己上报：网页不给改名入口，接口也拒。
+
+    与 Jellyfin 播放器同一套处理（名字由客户端自报的设备不给改）。转码器每次握手
+    都会把设备名同步成它自报的机器名，网页上改的存不住——给入口等于给一个兑现不了
+    的承诺。名字照旧在自己那边改（Mac / Windows Worker 的「名称」）。
+    """
+    _pair(client, client_type="worker", name="old-mac")
+    device = _paired_devices(client)[0]
+    assert device["renamable"] is False, "配对转码器不该给网页改名入口"
+
+    resp = client.patch(f"{_AUTH}/devices/{device['id']}", json={"name": "书房那台 Mac"})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "BAD_REQUEST"
+    assert "转码器" in resp.json()["message"], "拒绝理由要说清是转码器、且指出去哪儿改"
+    # 名字没被改动
+    assert _paired_devices(client)[0]["name"] == "old-mac"
+
+
+def test_headless_transcoder_token_stays_renamable(client: TestClient) -> None:
+    """「仅限转码」的手工令牌不在握手同步范围内，名字就是人在网页起的那个，继续可改。"""
+    client.post(f"{_AUTH}/tokens", json={"name": "headless", "scope": "transcode"})
+    device = next(d for d in _paired_devices(client) if d["kind"] == "manual")
+    assert device["renamable"] is True
+
+    resp = client.patch(f"{_AUTH}/devices/{device['id']}", json={"name": "headless-nas"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["name"] == "headless-nas"
+
+
 def test_worker_messages_refresh_last_seen(client: TestClient) -> None:
     """心跳也算活跃：「最近活跃」跟得上转码器真实的在线时间，而不是停在握手那一刻。"""
     from datetime import timedelta

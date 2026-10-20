@@ -974,7 +974,11 @@ def _device_view(
         expires_at=device.expires_at,
         current=principal.device is not None and principal.device.id == device.id,
         connected=connected is not None and device.id in connected,
-        renamable=True,
+        # 名字由客户端自己上报的设备不给改名入口（与 _jellyfin_view 同理）：配对出来的
+        # 转码器每次握手都会把设备名同步成它自报的机器名，网页上改的名存不住，给了入口
+        # 就是给一个兑现不了的承诺（docs/design/login-devices.md「设备名与机器标识」）。
+        # 「仅限转码」的手工令牌不在同步范围内（同步只认 kind=worker），继续可改。
+        renamable=device.kind != "worker",
         owner_id=device.member_id,
         owner_username=username,
         owner_nickname=nickname,
@@ -1237,6 +1241,12 @@ async def rename_device(
     _assert_manageable(principal, device.member_id)
     if isinstance(device, JellyfinDevice):
         raise BadRequestException("播放器的名字由它自己上报，不能在这里修改")
+    if device.kind == "worker":
+        # 与 Jellyfin 播放器同一套：名字由客户端自报的设备不给网页改名入口
+        raise BadRequestException(
+            "转码器的名字由它自己上报，不能在这里修改——请在转码器本机的设置里改"
+            "（Mac：设置 → 这台 Mac → 名称；Windows Worker：界面上的「名称」）"
+        )
     device = await login_devices.rename(session, device, payload.name)
     return ok(
         _device_view(

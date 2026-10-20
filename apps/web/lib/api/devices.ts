@@ -78,7 +78,10 @@ export interface LoginDeviceView {
    * 凭证、之后靠心跳在线，所以在不在线以它为准，而不是 last_seen_at。
    */
   connected: boolean;
-  /** Jellyfin 播放器的名字由它自己上报，不能改名 */
+  /**
+   * 名字由客户端自己上报的设备不能改名：Jellyfin 播放器、配对出来的转码器
+   * （转码器的名字每次握手都会同步成它自报的机器名，网页改的存不住）。
+   */
   renamable: boolean;
   /** 主人：成员 id；0 = 超管 */
   owner_id: number;
@@ -167,7 +170,7 @@ export function listLoginDevices(all = false): Promise<LoginDeviceView[]> {
   );
 }
 
-/** 给设备改名（Jellyfin 播放器不可改名，服务端返回 400）。 */
+/** 给设备改名（名字由客户端自报的设备不可改：Jellyfin 播放器、配对转码器，服务端返回 400）。 */
 export function renameLoginDevice(deviceId: string, name: string): Promise<LoginDeviceView> {
   return unwrap(
     request<ApiEnvelope<LoginDeviceView>>(`/auth/devices/${encodeURIComponent(deviceId)}`, {

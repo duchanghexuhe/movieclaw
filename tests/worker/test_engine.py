@@ -493,3 +493,75 @@ def test_connect_reports_connecting_then_online(monkeypatch):
     assert events[1][1] == {"server": "http://nas:3000"}
     # hello 用的就是 runtime 交进来的 worker_id（服务端据此登记，不再是带空格的显示名）
     assert sent[0]["type"] == "worker.hello" and sent[0]["worker_id"] == "DESKTOP-1"
+
+
+def test_job_work_dir_falls_back_when_ffmpeg_cannot_write(monkeypatch, tmp_path):
+    """默认临时目录对 ffmpeg 不可写时改用下一候选（2026-10-20 真机事故）。
+
+    ffmpeg 二进制带 Low 完整性标签时写不进 Medium 的 %TEMP%，本进程却写得进——
+    判定必须由 ffmpeg 自己跑一次来出，否则任务会被派到一个必失败的中转目录。
+    """
+    import engine as rw
+
+    blocked = tmp_path / "blocked"
+    usable = tmp_path / "usable"
+    blocked.mkdir()
+    user = tmp_path / "user-home"
+    user.mkdir()
+    monkeypatch.setenv("MOVIECLAW_WORKER_WORK_DIR", str(blocked))
+    monkeypatch.setattr(rw, "_WORK_DIR_CACHE", {})
+    monkeypatch.setattr(rw.Path, "home", staticmethod(lambda: user))
+    monkeypatch.setattr(rw, "_work_dir_candidates", lambda: [blocked, usable])
+
+    def can_write(ffmpeg, directory):
+        return directory == usable
+
+    monkeypatch.setattr(rw, "_ffmpeg_can_write", can_write)
+
+    job_id = "01ABCDEFGHJKMNPQRSTVWXYZ12"
+    picked = rw._job_work_dir(job_id, "ffmpeg")
+    assert picked.parent == usable
+    # 子目录名保持旧口径（job_id 末 8 位），排障文档里的路径指引不用改
+    assert picked.name == f"mc-realtime-{job_id[-8:]}"
+    picked.mkdir(parents=True, exist_ok=True)
+    assert picked.is_dir()
+
+
+def test_job_work_dir_prefers_first_writable_candidate(monkeypatch, tmp_path):
+    """第一个写得进去的就用（默认路径不变），并且按 ffmpeg 分键缓存。"""
+    import engine as rw
+
+    first = tmp_path / "temp"
+    second = tmp_path / "worker"
+    monkeypatch.setattr(rw, "_WORK_DIR_CACHE", {})
+    monkeypatch.setattr(rw, "_work_dir_candidates", lambda: [first, second])
+    probes: list[tuple[str, str]] = []
+
+    def can_write(ffmpeg, directory):
+        probes.append((ffmpeg, str(directory)))
+        return True
+
+    monkeypatch.setattr(rw, "_ffmpeg_can_write", can_write)
+
+    a = rw._job_work_dir("01JOBAAAAAAAAAAAAAAAAAAAA1", "ffmpeg-a")
+    b = rw._job_work_dir("01JOBBBBBBBBBBBBBBBBBBBB2", "ffmpeg-a")
+    assert a.parent == first and b.parent == first
+    # 同一份 ffmpeg 只探一次，任务之间复用结论
+    assert probes == [("ffmpeg-a", str(first))]
+
+    # 换 ffmpeg（换二进制，标签可能不同）要重探，而不是沿用上一份的结论
+    rw._job_work_dir("01JOBCCCCCCCCCCCCCCCCCCCC3", "ffmpeg-b")
+    assert [probe[0] for probe in probes].count("ffmpeg-b") == 1
+
+
+def test_job_work_dir_keeps_temp_path_when_nothing_writable(monkeypatch, tmp_path):
+    """全部候选都写不进去：回落旧路径，让 ffmpeg 自己报 Permission denied。"""
+    import engine as rw
+
+    monkeypatch.setattr(rw, "_WORK_DIR_CACHE", {})
+    monkeypatch.setattr(rw, "_work_dir_candidates", lambda: [tmp_path / "a", tmp_path / "b"])
+    monkeypatch.setattr(rw, "_ffmpeg_can_write", lambda ffmpeg, directory: False)
+    monkeypatch.setenv("TEMP", str(tmp_path / "temp-root"))
+
+    picked = rw._job_work_dir("01JOBDDDDDDDDDDDDDDDDDDDD4", "ffmpeg")
+    assert picked.parent == tmp_path / "temp-root"

@@ -344,6 +344,22 @@ export function activityLabel(device: LivenessFields, now: number = Date.now()):
   return relativeTime(device.last_seen_at, now);
 }
 
+/**
+ * 「转码」页 Worker 行显示什么名字。
+ *
+ * 服务端状态里的 `worker_id` 是机器标识（注册表键、断线顶号判据），不是设备名；
+ * 人能改的是「设置 → 设备」里的那个名字。这一行原先直接显示 `worker_id`，于是在
+ * 设备页改名后转码页纹丝不动，看着像「改名没同步」。按 `device_id` 对回设备名，
+ * 拿不到设备行（手工令牌早已注销等）才退回机器标识。
+ */
+export function workerDisplayName(
+  worker: { device_id: number | null; worker_id: string },
+  deviceNames: Map<string, string>,
+): string {
+  if (worker.device_id == null) return worker.worker_id;
+  return deviceNames.get(`ld-${worker.device_id}`) ?? worker.worker_id;
+}
+
 // ---------------------------------------------------------------------------
 // 手工令牌：给无人值守环境的环境变量片段
 // ---------------------------------------------------------------------------

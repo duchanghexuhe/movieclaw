@@ -845,3 +845,117 @@ async def test_worker_disconnect_does_not_delete_foreign_registration():
     register_native_tonemap("nvenc", None)
     await registry.unregister(connection)
     assert registered_native_tonemap("nvenc") is None  # 探测的结论原样保留
+
+
+# ---------------------------------------------------------------------------
+# 连续失败熔断（2026-10-20 真机：一台 Worker 四次派单四次秒败）
+# ---------------------------------------------------------------------------
+
+
+def _videotoolbox_caps() -> dict:
+    return {"backends": ["videotoolbox"], "encoders": ["h264_videotoolbox"]}
+
+
+@pytest.mark.asyncio
+async def test_worker_paused_after_consecutive_empty_failures(monkeypatch):
+    """空跑（一张分片都没产出）连败到上限：暂停向它派播放任务，仍在线的连接
+
+    不再被选为候选。真机事故里 NAS 本地 vaapi/qsv 一直可用，坏的是执行者——
+    熔断把「这一档失败」还原成「这台机器失败」，播放器同档重开就落到本地。
+    """
+    monkeypatch.setattr(remote_worker_module, "remote_worker_enabled", lambda: True)
+    monkeypatch.setattr(remote_worker_module, "REMOTE_FAILURE_LIMIT", 2)
+    registry = RemoteWorkerRegistry()
+    connection = await registry.register(
+        FakeWebSocket(), {"worker_id": "win-a", "capabilities": _videotoolbox_caps()}
+    )
+
+    for index in range(2):
+        job_id = f"job-{index}"
+        registry.create_job_waiter(job_id)
+        await _dispatch(registry, job_id, {}, backend="videotoolbox")
+        await registry.handle_message(
+            connection, {"type": "job.failed", "job_id": job_id, "error": "Permission denied"}
+        )
+
+    assert connection.empty_failures != []
+    assert registry.worker_online("win-a") is True
+    # 在线但不该再被选：这两个判断从此分家（worker_online 管心跳，worker_usable 管派单）
+    assert registry.worker_usable("win-a") is False
+    assert registry.has_capable_worker("videotoolbox") is False
+    with pytest.raises(RemoteWorkerUnavailable):
+        registry.reserve("job-next", backend="videotoolbox")
+    # 预转码不受熔断影响：批处理会落盘重试，让它继续干活无害
+    assert [c.worker_id for c in registry.preload_workers()] in ([], ["win-a"])
+    assert registry.snapshot()[0]["paused"] is True
+    assert "Permission denied" in registry.snapshot()[0]["pause_reason"]
+
+
+@pytest.mark.asyncio
+async def test_worker_not_paused_when_jobs_did_produce_frames(monkeypatch):
+    """出过帧才失败的片子不算「装不起来」：片源坏、片尾孤儿分片都属这一类。"""
+    monkeypatch.setattr(remote_worker_module, "remote_worker_enabled", lambda: True)
+    monkeypatch.setattr(remote_worker_module, "REMOTE_FAILURE_LIMIT", 1)
+    registry = RemoteWorkerRegistry()
+    connection = await registry.register(
+        FakeWebSocket(), {"worker_id": "win-a", "capabilities": _videotoolbox_caps()}
+    )
+
+    for index in range(3):
+        job_id = f"job-{index}"
+        registry.create_job_waiter(job_id)
+        await _dispatch(registry, job_id, {}, backend="videotoolbox")
+        await registry.handle_message(
+            connection,
+            {"type": "job.progress", "job_id": job_id, "out_time_ms": 4_000},
+        )
+        await registry.handle_message(
+            connection, {"type": "job.failed", "job_id": job_id, "error": "源比台账短"}
+        )
+
+    assert connection.empty_failures == []
+    assert registry.worker_usable("win-a") is True
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_record_clears_on_finish_and_reconnect(monkeypatch):
+    """转完一次就清账：窗口里的旧记录不再指向「它坏了」。重连同理——
+
+    用户改好配置（换 ffmpeg、挪目录）第一件事就是重启 Worker，熔断不能跨连接粘住，
+    否则「改好了还要等 5 分钟」比不熔断更像故障。
+    """
+    monkeypatch.setattr(remote_worker_module, "remote_worker_enabled", lambda: True)
+    monkeypatch.setattr(remote_worker_module, "REMOTE_FAILURE_LIMIT", 2)
+    registry = RemoteWorkerRegistry()
+    websocket = FakeWebSocket()
+    connection = await registry.register(
+        websocket, {"worker_id": "win-a", "capabilities": _videotoolbox_caps()}
+    )
+
+    registry.create_job_waiter("job-1")
+    await _dispatch(registry, "job-1", {}, backend="videotoolbox")
+    await registry.handle_message(
+        connection, {"type": "job.failed", "job_id": "job-1", "error": "Permission denied"}
+    )
+    assert connection.empty_failures != []
+
+    registry.create_job_waiter("job-2")
+    await _dispatch(registry, "job-2", {}, backend="videotoolbox")
+    await registry.handle_message(connection, {"type": "job.finished", "job_id": "job-2"})
+    assert connection.empty_failures == []
+
+    # 重新攒到上限后再重连：计数与暂停一起清零
+    for index in range(2):
+        job_id = f"job-r{index}"
+        registry.create_job_waiter(job_id)
+        await _dispatch(registry, job_id, {}, backend="videotoolbox")
+        await registry.handle_message(
+            connection, {"type": "job.failed", "job_id": job_id, "error": "Permission denied"}
+        )
+    assert registry.worker_usable("win-a") is False
+
+    again = await registry.register(
+        FakeWebSocket(), {"worker_id": "win-a", "capabilities": _videotoolbox_caps()}
+    )
+    assert again.empty_failures == []
+    assert registry.worker_usable("win-a") is True

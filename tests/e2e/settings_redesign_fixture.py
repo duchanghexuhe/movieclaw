@@ -120,7 +120,8 @@ profile_devices = [
         created_at="2026-10-01T00:00:00Z",
         current=False,
         connected=True,
-        renamable=True,
+        # 转码器的名字由它自己上报，网页不给改名入口（与真实服务端一致）
+        renamable=False,
         owner_id=0,
         owner_username="admin",
         owner_nickname="家庭影迷",

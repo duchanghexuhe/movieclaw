@@ -58,6 +58,114 @@ PREFETCH_AFTER_BLOCKS = 6
 
 ARTIFACT_NAME_PATTERN_RULES = ("init.mp4", "stream.mp4", "live.m3u8", "index.m3u8", "seg")
 
+#: 中转文件的候选目录（按顺序试，第一个 ffmpeg 真写得进去的胜出）。
+#:
+#: 为什么不能直接用 ``%TEMP%``：ffmpeg 进程的完整性级别可能**低于**本进程——
+#: exe 文件自带 Low 强制标签时（工作区被沙盒工具打了 Low 标签、且 NW 强制继承，
+#: 装在这个目录里的 ffmpeg 就带着它起不来 Medium 目录），本进程写得进去不代表
+#: 子进程写得进去。2026-10-20 真机事故：``%TEMP%\mc-realtime-*\stream.frag.mp4``
+#: 报 Permission denied，远程任务连一个分片都产不出来，播放器等 45 秒判死降档。
+#: 所以判定唯一标准是「让 ffmpeg 自己写一个字节」。
+_WORK_DIR_CACHE: dict[str, Path] = {}
+_WORK_DIR_LOCK = threading.Lock()
+
+
+def _work_dir_candidates() -> list[Path]:
+    """中转目录候选：环境变量显式指定 > 系统临时目录 > Worker 目录 > 用户目录。
+
+    后两个是低完整性 ffmpeg 的救命路径：Worker 自己所在的目录一定写得进去
+    （它就在那儿跑），用户目录在正常机器上是兜底。
+    """
+    roots: list[Path] = []
+    override = os.environ.get("MOVIECLAW_WORKER_WORK_DIR")
+    if override:
+        roots.append(Path(override))
+    with contextlib.suppress(OSError):
+        import tempfile
+
+        roots.append(Path(tempfile.gettempdir()))
+    roots.append(Path(__file__).resolve().parent / "work" / ".realtime")
+    with contextlib.suppress(OSError):
+        roots.append(Path.home() / ".movieclaw-worker" / "tmp")
+    return roots
+
+
+def _ffmpeg_can_write(ffmpeg: str, directory: Path) -> bool:
+    """**让 ffmpeg 自己**在这个目录里写一个 MP4，验证它写得进去。
+
+    纯 Python 的 ``open(..., 'wb')`` 判定不成立（见 ``_WORK_DIR_CACHE`` 的说明）：
+    本进程与 ffmpeg 子进程可能是不同的完整性级别。探测失败时错误信息与真机
+    报错同源（``Permission denied``），不是另造一套口径。
+    """
+    probe = directory / "write-probe.mp4"
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:s=32x32:r=1:d=0.1",
+                "-frames:v",
+                "1",
+                "-f",
+                "mp4",
+                "-y",
+                str(probe),
+            ],
+            capture_output=True,
+            timeout=30,
+            creationflags=_NO_WINDOW,
+        )
+        return result.returncode == 0 and probe.exists()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+
+
+def _job_work_dir(job_id: str, ffmpeg: str) -> Path:
+    """给这一轮任务挑一个 ffmpeg 写得进去的中转目录（进程内只探一次）。
+
+    ``job_id`` 只参与子目录名（``mc-realtime-<末 8 位>``），与旧路径保持同名，
+    日志与 ``docs/design/remote-transcode.md`` 里的排障指引不用改。
+
+    缓存按 ffmpeg 路径分键：换 ffmpeg（换了一台机器 / 换了一份二进制，标签可能
+    不同）要重探；同一份 ffmpeg 的结论不变，不必每个任务都起一次探测进程。
+    """
+    suffix = job_id[-8:]
+    with _WORK_DIR_LOCK:
+        cached = _WORK_DIR_CACHE.get(ffmpeg)
+        if cached is not None:
+            return cached / f"mc-realtime-{suffix}"
+        candidates = _work_dir_candidates()
+        for root in candidates:
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            if not ffmpeg or _ffmpeg_can_write(ffmpeg, root):
+                _WORK_DIR_CACHE[ffmpeg] = root
+                if root != candidates[0]:
+                    # 默认临时目录对 ffmpeg 不可写（低完整性二进制是常见来路）：
+                    # 说出来，否则用户只会看到「转码失败」，不知道换到哪去了
+                    print(
+                        f"[Worker] ffmpeg 写不进 {candidates[0]}，"
+                        f"中转目录改用 {root}",
+                        flush=True,
+                    )
+                return root / f"mc-realtime-{suffix}"
+        # 一个都写不进去：仍按旧路径返回，让 ffmpeg 自己报 Permission denied，
+        # 错误信息与升级前一致，不会被这层探测改写成另一套原因。
+        fallback = Path(os.environ.get("TEMP", "."))
+        _WORK_DIR_CACHE[ffmpeg] = fallback
+        return fallback / f"mc-realtime-{suffix}"
+
+
 
 def _allowed_artifact_name(name: str) -> bool:
     """与 NAS 端 ``_ARTIFACT_NAME`` 同一批名字（issue #444 教训：白名单必须
@@ -1143,7 +1251,7 @@ class RealtimeJob:
         )
 
     def _work_dir(self) -> Path:
-        directory = Path(os.environ.get("TEMP", ".")) / f"mc-realtime-{self.job_id[-8:]}"
+        directory = _job_work_dir(self.job_id, self.ffmpeg)
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 

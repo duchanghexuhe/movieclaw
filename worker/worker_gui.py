@@ -30,9 +30,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from worker import (  # noqa: E402
     WorkerRuntime,
     check_ffmpeg,
+    check_worker_name,
     load_config,
     on_battery,
+    revoke_worker_credential,
     save_config,
+    worker_id_for,
 )
 
 APP_TITLE = "MovieClaw Worker"
@@ -262,12 +265,17 @@ class WorkerGUI:
         #: 连接状态行的文字（不含电池提示，电池条件每次刷新现算）；批准页地址只在配对时有
         self._conn_text = "未启动"
         self._approve_url: str | None = None
-        #: 点了「重新配对」、正等当前运行收尾：收尾后丢掉旧令牌重新启动
-        self._repair_pending = False
+        #: 点了「断开并重新配置…」/「重新配对」、正等当前运行收尾：收尾后注销并清本机令牌
+        self._disconnect_pending = False
+        #: 上一次断连是服务端说凭证失效（点的是「重新配对」）：断完接着配，别让用户再点一次
+        self._restart_after_disconnect = False
+        #: 凭证被服务端判失效过——按钮据此改叫「重新配对」
+        self._auth_failed = False
         self.ui_queue: queue.Queue[tuple] = queue.Queue()
         self.tray: TrayIcon | None = None
         self._build_ui()
         self._load_config_to_ui()
+        self._set_conn(self._idle_text("未启动"))
         root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
         self._install_tray()
         root.after(120, self._poll_queue)
@@ -296,26 +304,38 @@ class WorkerGUI:
         ttk.Label(config, text="服务器").grid(row=0, column=0, sticky=tk.E, padx=6, pady=3)
         self.var_server = tk.StringVar()
         ttk.Entry(config, textvariable=self.var_server, width=52).grid(row=0, column=1, sticky=tk.W)
-        ttk.Label(config, text="ffmpeg").grid(row=1, column=0, sticky=tk.E, padx=6, pady=3)
+        # 名称就是 WS hello 的 worker_id（worker.worker_id_for）：握手时服务端把它同步成
+        # 网页「设置 → 设备」里的设备名，「设置 → 转码」页的 Worker 行也显示它。Mac
+        # 转码器同一项在「这台 Mac → 名称」，两端一个口径（docs/design/login-devices.md）。
+        ttk.Label(config, text="名称").grid(row=1, column=0, sticky=tk.E, padx=6, pady=3)
+        self.var_name = tk.StringVar()
+        ttk.Entry(config, textvariable=self.var_name, width=32).grid(row=1, column=1, sticky=tk.W)
+        # 提示单独占一行：跟在输入框右侧会被窗口右边缘截断（截断的说明等于没说）
+        ttk.Label(
+            config,
+            text="显示在网页的设备列表与「转码」页；改完点「停止」再「启动」生效",
+            foreground="#666",
+        ).grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=6)
+        ttk.Label(config, text="ffmpeg").grid(row=3, column=0, sticky=tk.E, padx=6, pady=3)
         self.var_ffmpeg = tk.StringVar()
         entry_ff = ttk.Entry(config, textvariable=self.var_ffmpeg, width=52)
-        entry_ff.grid(row=1, column=1, sticky=tk.W)
+        entry_ff.grid(row=3, column=1, sticky=tk.W)
         ttk.Button(config, text="浏览…", width=8,
-                   command=self._browse_ffmpeg).grid(row=1, column=2, padx=4)
-        ttk.Label(config, text="并发").grid(row=2, column=0, sticky=tk.E, padx=6, pady=3)
+                   command=self._browse_ffmpeg).grid(row=3, column=2, padx=4)
+        ttk.Label(config, text="并发").grid(row=4, column=0, sticky=tk.E, padx=6, pady=3)
         self.var_concurrency = tk.IntVar(value=1)
         ttk.Spinbox(config, from_=1, to=8, width=5, textvariable=self.var_concurrency).grid(
-            row=2, column=1, sticky=tk.W)
+            row=4, column=1, sticky=tk.W)
         ttk.Label(
             config, text="（播放优先：有人播放时预转码暂停，空闲时用满并发）",
             foreground="#666",
-        ).grid(row=2, column=1, sticky=tk.W, padx=(52, 0))
+        ).grid(row=4, column=1, sticky=tk.W, padx=(52, 0))
         self.var_ac_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="仅接通电源时执行", variable=self.var_ac_only).grid(
-            row=3, column=0, sticky=tk.W, padx=(6, 0))
+            row=5, column=0, sticky=tk.W, padx=(6, 0))
         self.var_autostart = tk.BooleanVar(value=False)
         ttk.Checkbutton(config, text="开机自启", variable=self.var_autostart,
-                        command=self._toggle_autostart).grid(row=3, column=1, sticky=tk.W)
+                        command=self._toggle_autostart).grid(row=5, column=1, sticky=tk.W)
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill=tk.X, **pad)
@@ -328,8 +348,12 @@ class WorkerGUI:
             buttons, text="打开批准页", command=self._open_approve_page, state=tk.DISABLED
         )
         self.btn_approve.pack(side=tk.LEFT, padx=4)
-        # 只在服务端说凭证失效（这台 Worker 在网页上被注销等）时出现；平时不占位
-        self.btn_repair = ttk.Button(buttons, text="重新配对", command=self._repair)
+        # 稳态下唯一的「推倒重来」出口（与 Mac 转码器同一个动作）：断开连接，并在
+        # 服务端注销这枚凭证。凭证失效时它改叫「重新配对」——配对入口就是这个窗口的
+        # 「启动」（没令牌时启动即进配对），不给出口的话用户只能干看着。
+        self.btn_disconnect = ttk.Button(
+            buttons, text="断开并重新配置…", command=self._disconnect
+        )
 
         log_frame = ttk.LabelFrame(frame, text="日志")
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
@@ -342,6 +366,7 @@ class WorkerGUI:
 
     def _load_config_to_ui(self) -> None:
         self.var_server.set(self.config.get("server") or "")
+        self.var_name.set(self.config.get("name") or "")
         self.var_ffmpeg.set(self.config.get("ffmpeg") or "")
         self.var_concurrency.set(int(self.config.get("concurrency") or 1))
         self.var_ac_only.set(bool(self.config.get("ac_only")))
@@ -359,6 +384,9 @@ class WorkerGUI:
     def _collect_config(self) -> dict:
         return {
             "server": self.var_server.get().strip().rstrip("/"),
+            # 名称留空 = 沿用 worker_id_for 的回退（本机主机名），与 CLI 的
+            # --name 缺省同一条路；不在这里替用户编一个默认值
+            "name": self.var_name.get().strip() or None,
             "ffmpeg": self.var_ffmpeg.get().strip(),
             "concurrency": max(1, min(int(self.var_concurrency.get() or 1), 8)),
             "ac_only": bool(self.var_ac_only.get()),
@@ -370,6 +398,10 @@ class WorkerGUI:
         config = self._collect_config()
         if not config["server"]:
             self._refuse_start("请先填服务器地址（如 http://192.168.31.10:8096）")
+            return
+        problem = check_worker_name(config["name"])
+        if problem:
+            self._refuse_start(problem)
             return
         save_config({**self.config, **config})
         self.config = load_config()
@@ -415,21 +447,73 @@ class WorkerGUI:
         if self._approve_url:
             webbrowser.open(self._approve_url)
 
-    def _repair(self) -> None:
-        """凭证失效后重新配对：停掉当前运行，收尾后丢掉旧令牌、按原配置重新启动（直接进配对）。"""
-        self._repair_pending = True
-        self._set_conn("正在重新配对…")
+    def _idle_text(self, prefix: str) -> str:
+        """空闲时的状态行：把「配没配对」写在脸上。
+
+        配对入口就是这个窗口的「启动」（没令牌时启动即进配对），可此前状态行只有
+        「未启动」——用户看不出自己配没配过、更看不出点哪里能去配对。
+        """
+        if self.config.get("token"):
+            return f"{prefix} · 已配对（名称 {worker_id_for(self.config.get('name'))}）"
+        return f"{prefix} · 未配对——点「启动」开始配对"
+
+    def _sync_disconnect_button(self) -> None:
+        """有凭证就给出口：稳态叫「断开并重新配置…」，凭证失效时叫「重新配对」。"""
+        if not self.config.get("token"):
+            self.btn_disconnect.pack_forget()
+            return
+        self.btn_disconnect.configure(
+            text="重新配对" if self._auth_failed else "断开并重新配置…"
+        )
+        self.btn_disconnect.pack(side=tk.LEFT, padx=4)
+
+    def _disconnect(self) -> None:
+        """断开连接，并在服务端注销这枚凭证（与 Mac 转码器的「断开并重新配置」同义）。
+
+        只删本机令牌的话，服务端那枚凭证依然有效，「设置 → 设备」里会一直挂着一台
+        已经断开、却还能连上来的 Worker（Mac 端 DevicePairing 的注释专门讲过）。
+        """
+        # 稳态断开要确认（会丢掉配对）；凭证已经失效时没必要问——点它就是要重配
+        needs_confirm = bool(self.config.get("token")) and not self._auth_failed
+        if needs_confirm and not messagebox.askyesno(
+            APP_TITLE,
+            "断开并重新配置？\n\n"
+            "这会在服务端注销这台 Worker 的授权，需要重新配对才能继续转码。\n"
+            "服务器暂时连不上时只清本机，之后可以到网页「设置 → 设备」里注销它。\n"
+            "服务器地址、名称、并发这些本机配置会保留。",
+            default=messagebox.NO,
+            icon=messagebox.WARNING,
+        ):
+            return
+        self._restart_after_disconnect = self._auth_failed
+        self._auth_failed = False
+        self._disconnect_pending = True
+        self._set_conn("正在断开并注销这台 Worker…")
         if self.runtime is not None:
             self._stop()
         else:
-            self._finish_repair()
+            self._finish_disconnect()
 
-    def _finish_repair(self) -> None:
-        self._repair_pending = False
+    def _finish_disconnect(self) -> None:
+        """断开收尾：先尽力在服务端注销，再清本机令牌（顺序不能反——注销要用旧令牌）。"""
+        self._disconnect_pending = False
+        token = self.config.get("token")
+        server = (self.config.get("server") or "").strip().rstrip("/")
         self.config.pop("token", None)
         save_config(self.config)
-        self._log("已丢弃失效的凭证，重新配对")
-        self._start()
+        self._sync_disconnect_button()
+        if not token or not server:
+            self._on_event("disconnected", {"revoked": False})
+            return
+        self._set_conn("正在断开：在服务端注销这枚凭证…")
+        threading.Thread(
+            target=self._revoke_in_background, args=(server, token), daemon=True
+        ).start()
+
+    def _revoke_in_background(self, server: str, token: str) -> None:
+        # 网络调用不进 Tk 线程：注销最多等 5 秒，卡住界面比断开本身还难受
+        revoked = revoke_worker_credential(server, token)
+        self.ui_queue.put(("disconnected", {"revoked": revoked}))
 
     def _stop(self) -> None:
         if self.runtime is not None and not self.runtime.stop_event.is_set():
@@ -473,6 +557,7 @@ class WorkerGUI:
         if kind == "log":
             self._log(fields["line"])
         elif kind == "pairing":
+            self._auth_failed = False
             self._log(fields["line"])
             self._set_conn(
                 f"等待配对：配对码 {fields['user_code']}（{fields['expires_in']} 秒内有效），"
@@ -480,35 +565,45 @@ class WorkerGUI:
                 approve_url=fields["verify_url"],
             )
         elif kind == "connecting":
+            self._auth_failed = False
             self._set_conn(f"连接中 {fields['server']}…")
         elif kind == "online":
+            self._auth_failed = False
             self._set_conn(f"已连接 {fields['server']}")
         elif kind == "offline":
             retry = int(fields.get("retry_seconds") or 0)
             tail = f"，{retry} 秒后重试" if retry else "，正在重连"
             if fields.get("rejection") == "auth":
+                self._auth_failed = True
                 self._set_conn(
                     f"凭证已失效{tail}；在网页上注销过这台 Worker 的话，点「重新配对」"
-                    f"（{fields['reason']}）",
-                    repair=True,
+                    f"（{fields['reason']}）"
                 )
             else:
                 self._set_conn(f"连接断开：{fields['reason']}{tail}")
+        elif kind == "disconnected":
+            # 服务端注销的结果：两种都要说清，别让用户以为「点了没反应」
+            if fields.get("revoked"):
+                self._log("已在服务端注销这枚凭证（网页「设置 → 设备」里不再有它）")
+            else:
+                self._log("服务端没连上，只清了本机凭证；可到网页「设置 → 设备」里注销它")
+            self._set_conn(self._idle_text("已断开"))
+            if self._restart_after_disconnect:
+                # 凭证失效那条路：用户点的是「重新配对」，断完接着配，别让他再点一次
+                self._restart_after_disconnect = False
+                self._start()
         elif kind == "stopped":
-            self._set_conn("已停止")
+            self._set_conn(self._idle_text("已停止"))
         elif kind == "error":
             self._log(f"启动失败：{fields['reason']}")
             _append_log_file(fields["trace"])
             self._set_conn(f"启动失败：{fields['reason']}")
 
-    def _set_conn(self, text: str, approve_url: str | None = None, repair: bool = False) -> None:
+    def _set_conn(self, text: str, approve_url: str | None = None) -> None:
         self._conn_text = text
         self._approve_url = approve_url
         self.btn_approve.configure(state=tk.NORMAL if approve_url else tk.DISABLED)
-        if repair:
-            self.btn_repair.pack(side=tk.LEFT, padx=4)
-        else:
-            self.btn_repair.pack_forget()
+        self._sync_disconnect_button()
         self._refresh_status()
 
     def _refresh_status(self) -> None:
@@ -591,8 +686,8 @@ class WorkerGUI:
                 self.btn_start.configure(state=tk.NORMAL)
                 self.btn_stop.configure(state=tk.DISABLED)
                 self.lbl_slots.configure(text="任务：—")
-                if self._repair_pending and not self._exiting:
-                    self._finish_repair()
+                if self._disconnect_pending and not self._exiting:
+                    self._finish_disconnect()
         # 退出等待：收尾完成（或 30s 兜底）后真正关窗
         if self._exiting and (self.runtime is None or time.monotonic() - self._exit_at > 30):
             self.root.destroy()

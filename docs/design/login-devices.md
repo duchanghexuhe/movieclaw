@@ -130,7 +130,7 @@ Jellyfin 播放器的凭证受协议约束多（令牌格式、同设备覆盖�
 | `GET /auth/devices?all=` | 人在操作 | 我的设备（当前设备置顶）；`all=true` 仅超管，带主人 |
 | `GET /auth/devices/current` | 任何设备凭证 | 当前这台（`mclaw status` 用） |
 | `DELETE /auth/devices/current` | 任何设备凭证 | 注销自己（`mclaw logout`、App 退出、转码器断开配对） |
-| `PATCH /auth/devices/{id}` | 人在操作 | 改名（Jellyfin 播放器不可改名） |
+| `PATCH /auth/devices/{id}` | 人在操作 | 改名（名字由客户端自报的设备不可改：Jellyfin 播放器、配对转码器，回 400 并说明去哪儿改） |
 | `DELETE /auth/devices/{id}` | 人在操作 | 注销（自己的；超管可注销任何人的） |
 | `POST /auth/devices/cleanup` | 人在操作（`all` 仅超管） | 清理：`{inactive_days, all?, dry_run?}`，注销最近活跃（没有就按签发时间）早于 N 天的设备与 Jellyfin 播放器；本机、此刻连着的转码器不清。`dry_run` 只列名单给确认框用 |
 | `GET /auth/devices/requests/{code}` | 人在操作 | 按配对码查看一条待批准请求（含 `requires_admin`） |
@@ -144,6 +144,31 @@ Jellyfin 播放器的凭证受协议约束多（令牌格式、同设备覆盖�
 只在握手时验一次凭证、之后靠心跳在线，列表上的在线状态以它为准（其余设备没有长连接，
 按 `last_seen_at` 最近 5 分钟判断）；转码器的每条控制消息也会刷新 `last_seen_at`。删除了 `GET/DELETE /auth/tokens`、`GET /auth/devices/requests`
 （被上表取代）。
+
+### 设备名与机器标识
+
+转码器（`kind=worker`）的名字由它自己上报，**不是**网页上那个可改的设备名：
+
+| | 是什么 | 谁改 | 用在哪 |
+|---|---|---|---|
+| hello 的 `worker_id`（机器名） | 机器标识 **兼** 显示名 | 转码器本机（Mac 设置「这台 Mac → 名称」、Windows Worker 界面的「名称」/ `--name`） | 注册表键、同 ID 重连顶号（1012）、任务归属；握手时同步成设备名 |
+| `name`（设备名） | 设备列表那一行显示的名字 | **不可在网页改**；握手按上面的机器名同步 | 设备列表、「转码」页 Worker 行 |
+
+**这是作者定的口径**，Mac 设置页自己写着：「名称会显示在网页的设备列表和播放活动里。
+改名会重新连接一次。」（`SettingsPanes.swift`）。所以网页不给它改名入口：给了也存不住
+（下次握手就被机器名盖回去），那不叫功能，叫一个兑现不了的承诺。改名去转码器本机改。
+
+**做法照抄上游对 Jellyfin 播放器的处理**——同一类问题（名字由客户端自报），上游本来就是
+两件套：视图 `renamable=False` 不给入口，接口 `PATCH /auth/devices/{id}` 回 400 说明原因。
+转码器补上同两件套即可，一处改动网页与 Apple 各端同时生效（都读 `renamable`）。
+
+两条不能省的推论：
+
+- **设置「转码」页的 Worker 行显示的名字要与设备列表同源**。它原先把状态的 `worker_id`
+  当标签直接显示，而「未连接」那些行显示 `device_name`；两者在配对转码器上本来同源，
+  一旦不同源（刚同步过、或历史遗留行）同一台机器就在两个位置显示两个名字。
+- **「仅限转码」的手工令牌不在此列**：同步只认 `kind=worker`，手工令牌没有 Worker 在
+  握手，名字就是人在网页创建时起的那个，继续可改（`renamable=True`）。
 
 ## 7. 活动页
 

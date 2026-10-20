@@ -762,6 +762,42 @@ def test_ping_reports_a_locally_failed_session_so_the_client_steps_down(
     session.remote = False
 
 
+def test_ping_reports_worker_lost_when_the_executor_is_circuit_broken(client, tmp_path):
+    """在线但已被连续失败熔断的 Worker 同样算 worker_lost（2026-10-20 真机事故）。
+
+    Worker 连着、连心跳都正常，只是它本机的 ffmpeg 起不来（中转文件 Permission denied）。
+    旧判据只看「在不在线」，于是播放器把这条**执行者故障**记成「这一档放不了」，
+    连败后拉黑档 3——NAS 本地 vaapi/qsv 明明可用，省流本该落到它们身上，
+    结果退化成 4K HDR 原码率直通。熔断后这台 Worker 已不在候选里，同档重开必定
+    换执行者，所以取「可派单」而不是「在线」。
+    """
+    file_id = seed(client, tmp_path, container="mkv")
+    data = start_session(client, file_id)
+    session_id = data["session_id"]
+
+    session = get_session_manager().get(session_id)
+    session.remote = True
+    session.remote_worker_id = "win-a"
+    session.state = "failed"
+    session.error = "ffmpeg 退出码 4294967283：Permission denied"
+
+    registry = get_remote_worker_registry()
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(type(registry), "worker_usable", lambda self, worker_id: False)
+        pong = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+        assert pong["failed"] is False
+        assert pong["worker_lost"] is True
+        assert "Permission denied" in pong["error"]
+
+        monkey.setattr(type(registry), "worker_usable", lambda self, worker_id: True)
+        usable = client.post(f"{_PB}/sessions/{session_id}/ping").json()["data"]
+        assert usable["worker_lost"] is False
+    finally:
+        monkey.undo()
+        session.remote = False
+
+
 def test_full_decode_client_gets_the_original_file_without_a_session(client, tmp_path):
     """App 的自研引擎申报全解码（universal）：MKV 也直接给档 0 原文件地址，不建换封装会话、
     不拉起 ffmpeg——原来要先起一路 remux（冷启动还要采样关键帧）再被客户端丢掉。"""

@@ -61,6 +61,21 @@ _SUPPORTED_SEGMENT_TYPES = frozenset({"fmp4", "mpegts"})
 #: Mac 都能硬解它们，其余编码一律走软解（见 ffmpeg_args.WorkerVideoCaps）
 _DEFAULT_HW_DECODERS = ("h264", "hevc")
 
+#: 连续失败熔断：多长时间窗口内算「连续」。
+#:
+#: 与 Mac Worker 自己的 ``FaultTolerance``（5 分钟内 3 个任务都在 20 秒内失败就
+#: ``worker.draining``）同一个形状，但判据换成本机可观测的那一条——**任务没产出
+#: 任何分片就失败**。2026-10-20 真机事故：同一台 Windows Worker 的中转文件因
+#: 完整性标签写不进去，四次派单四次秒败，服务端一次都没熔断，播放器把档 3 拉黑
+#: 之后连省流转码都不再尝试（见 decide.py 的 ``_uplink_step_down_unworkable``）。
+REMOTE_FAILURE_WINDOW_S = 300.0
+#: 窗口内连续空跑几次暂停向它派**播放**任务。取 2：一次可能是片子/片源偶发，
+#: 两次同样的秒败基本就是这台机器装不起来（Mac 端用 3 是因为它自己会先排空）。
+REMOTE_FAILURE_LIMIT = 2
+#: 熔断多久后恢复派单。比 backend_health 的 10 分钟短：Worker 修好（换 ffmpeg、
+#: 改配置）后重连会立刻清零计数（见 ``register``），不需要等这一键过期。
+REMOTE_FAILURE_COOLDOWN_S = 300.0
+
 
 class RemoteWorkerUnavailable(RuntimeError):
     """没有可接单的远程 Worker。"""
@@ -158,6 +173,23 @@ class WorkerConnection:
     # 每台最多 32 种任务规格，重连即丢弃；不把不同片源的 speed 混成硬件跑分。
     speeds: dict[tuple[Any, ...], float] = field(default_factory=dict)
     speed_samples: dict[tuple[Any, ...], int] = field(default_factory=dict)
+    #: 窗口内的「空跑失败」时刻（起了 ffmpeg 却一个分片都没产出）。判据见
+    #: ``REMOTE_FAILURE_LIMIT``。跨任务累计、重连清零。
+    empty_failures: list[float] = field(default_factory=list)
+    #: 熔断到什么时候（monotonic）。期间不参与播放派单，仍可做预转码。
+    paused_until: float = 0.0
+    #: 熔断原因（诊断页与日志原样给出，不另写一套文案）
+    pause_reason: str = ""
+
+    def failure_window_count(self, now: float) -> int:
+        """窗口内还剩几次空跑记录（过期的顺手不算）。"""
+        self.empty_failures = [
+            seen for seen in self.empty_failures if now - seen <= REMOTE_FAILURE_WINDOW_S
+        ]
+        return len(self.empty_failures)
+
+    def paused(self, now: float) -> bool:
+        return now < self.paused_until
 
     async def send(self, payload: dict[str, Any]) -> None:
         """串行发送控制消息，防止并发 stop/start 交叉写 WebSocket。"""
@@ -184,6 +216,9 @@ class RemoteWorkerRegistry:
         self._job_profiles: dict[str, tuple[Any, ...]] = {}
         self._progress_samples: dict[str, tuple[float, int]] = {}
         self._job_speeds: dict[str, tuple[float, int, float]] = {}
+        #: 这一轮任务真出过帧的（out_time_ms > 0）。失败定性用：出过帧 = 这台机器
+        #: 装得起来，失败另有原因，不该算进「连续空跑」熔断（2026-10-20）。
+        self._job_output_seen: set[str] = set()
         self._paused_jobs: set[str] = set()
         #: 可被播放挤掉的任务（离线下载的转码导出）：播放视角下它们占的名额算空闲，
         #: 真要派播放任务时由会话层先停掉它（session.py ``_evict_export_for_remote``）
@@ -230,6 +265,11 @@ class RemoteWorkerRegistry:
             if previous is not None:
                 logger.warning("远程 Worker %s 重复连接，关闭旧连接", worker_id)
                 self._mark_jobs_lost(previous, "远程 Worker 连接已替换")
+                # 重连 = 用户可能刚改好了配置（换 ffmpeg、挪目录、修权限）。
+                # 熔断不许跨连接粘住：否则「改好了还得等 5 分钟」比不熔断更像故障。
+                connection.empty_failures = []
+                connection.paused_until = 0.0
+                connection.pause_reason = ""
             self._workers[worker_id] = connection
         if previous is not None:
             await self._close_quietly(previous.websocket, code=1012, reason="连接已替换")
@@ -383,6 +423,7 @@ class RemoteWorkerRegistry:
         """
         if not remote_worker_enabled():
             return False
+        now = time.monotonic()
         with self._lock:
             return any(
                 backend in connection.capabilities.backends
@@ -390,6 +431,9 @@ class RemoteWorkerRegistry:
                 # 离线导出占着的名额播放来了就让出来，不算「满」
                 and len(connection.jobs - self._preemptible_jobs) >= connection.max_jobs
                 and not connection.draining
+                # 熔断中的机器不是「忙」是「坏了」：说成忙会把用户支去等一个
+                # 注定等不来的名额，决策层该照常回落本地
+                and not connection.paused(now)
                 and self._is_fresh(connection)
                 for connection in self._workers.values()
             )
@@ -401,6 +445,23 @@ class RemoteWorkerRegistry:
         with self._lock:
             connection = self._workers.get(worker_id)
             return connection is not None and self._is_fresh(connection)
+
+    def worker_usable(self, worker_id: str | None) -> bool:
+        """这台 Worker 现在还能不能接播放任务：在线，且不在连续失败熔断里。
+
+        与 ``worker_online`` 分开：在线只说明连接活着，心跳与排空判断用它；
+        「能不能派单」还要看熔断——一台连着一个坏 ffmpeg 的机器，
+        连接再健康也不该继续接片（2026-10-20 真机：四次派单四次秒败）。
+        ``routes/playback.py`` 的心跳据此把会话判成 ``worker_lost``，
+        播放器走同档重开、换一台执行者。
+        """
+        if not worker_id:
+            return False
+        with self._lock:
+            connection = self._workers.get(worker_id)
+            if connection is None or not self._is_fresh(connection):
+                return False
+            return not connection.paused(time.monotonic())
 
     def video_caps(self, worker_id: str | None) -> WorkerVideoCaps | None:
         """某台在线 Worker 申报的视频能力（原盘清单按它给每段剪辑加取源选项）。"""
@@ -443,6 +504,10 @@ class RemoteWorkerRegistry:
                         for job_id in sorted(connection.jobs)
                     ],
                     "draining": connection.draining,
+                    # 连续失败熔断：诊断页要能回答「明明在线为什么不派单」
+                    "paused": connection.paused(time.monotonic()),
+                    "pause_reason": connection.pause_reason,
+                    "empty_failures": connection.failure_window_count(time.monotonic()),
                     "last_seen_seconds": max(0.0, time.monotonic() - connection.last_seen),
                     "online": self._is_fresh(connection),
                 }
@@ -562,7 +627,12 @@ class RemoteWorkerRegistry:
             return max(0, connection.max_jobs - len(connection.preload_jobs))
 
     def preload_workers(self) -> list[WorkerConnection]:
-        """带 preload 角色、不在排空、心跳新鲜的在线连接（按余量排序）。"""
+        """带 preload 角色、不在排空、心跳新鲜的在线连接（按余量排序）。
+
+        **不按连续失败熔断过滤**：熔断只挡播放派单（那张分片用户正在等），
+        批处理任务会落盘重试、断点续转，让这台机器继续干活无害——它多半只是
+        做不了实时，或者用户正在修配置。
+        """
         with self._lock:
             candidates = [
                 c
@@ -865,6 +935,12 @@ class RemoteWorkerRegistry:
                 logger.info("远程转码任务已转完：worker=%s job=%s", connection.worker_id, job_id)
             self.publish_job_event(job_id, message)
             if message_type in {"job.failed", "job.finished"}:
+                if message_type == "job.failed":
+                    self._note_job_failure(connection, job_id, message)
+                else:
+                    # 转完就是证据：这台 Worker 装得起来。窗口里的旧记录不再
+                    # 指向「它坏了」，别让下一条无关任务替上一次背锅。
+                    self._clear_failures(connection)
                 self._release_job(job_id)
             return None
         logger.debug(
@@ -875,6 +951,46 @@ class RemoteWorkerRegistry:
         return None
 
     # -- 内部 ------------------------------------------------------------
+
+    def _note_job_failure(
+        self, connection: WorkerConnection, job_id: str, message: dict[str, Any]
+    ) -> None:
+        """记一次任务失败；窗口内连续空跑过多就熔断这台 Worker 的播放派单。
+
+        **只认「空跑」**：起了 ffmpeg 却一个分片都没交出去（``out_time_ms`` 从未
+        出现过，且 Worker 报的是 ffmpeg 退出码而不是被叫停）。片源坏、seek 之后
+        源比台账短这类失败本来就会发生，它们同样空跑，但连续两次落在同一台机器上
+        才说明这台机器装不起来——一次偶发由播放器的重试兜住。
+
+        与 Mac Worker 自己的 ``FaultTolerance`` 互补而不是重复：那边判的是「20 秒
+        内连挂 3 个」并主动发 ``worker.draining``；这边判的是「任务压根没产出」，
+        连不上/不认消息的旧 Worker 也拦得住（2026-10-20 的四次秒败就是这种）。
+        """
+        now = time.monotonic()
+        with self._lock:
+            if job_id in self._job_output_seen:
+                # 出过帧、半路才失败：不是「装不起来」，不影响别的任务
+                return
+            connection.empty_failures.append(now)
+            count = connection.failure_window_count(now)
+            if count < REMOTE_FAILURE_LIMIT or connection.paused(now):
+                return
+            reason = describe_job_failure(message)[:200]
+            connection.paused_until = now + REMOTE_FAILURE_COOLDOWN_S
+            connection.pause_reason = reason
+        logger.warning(
+            "远程 Worker 连续 %d 次任务空跑，暂停向它派播放任务 %.0f 分钟：worker=%s：%s",
+            count,
+            REMOTE_FAILURE_COOLDOWN_S / 60,
+            connection.worker_id,
+            reason,
+        )
+
+    def _clear_failures(self, connection: WorkerConnection) -> None:
+        with self._lock:
+            connection.empty_failures.clear()
+            connection.paused_until = 0.0
+            connection.pause_reason = ""
 
     async def _requeue_preload(
         self, connection: WorkerConnection, task_id: int, *, reason: str
@@ -919,8 +1035,14 @@ class RemoteWorkerRegistry:
         source_id: int | None = None,
         yield_preemptible: bool = False,
     ) -> WorkerConnection | None:
-        """``yield_preemptible``：把离线导出占着的名额也算空闲（播放视角）。"""
+        """``yield_preemptible``：把离线导出占着的名额也算空闲（播放视角）。
+
+        连续失败熔断中的 Worker（``paused``）不参与播放派单；**预转码不走这里**
+        （派单见 ``preload_workers``，不按熔断过滤）——熔断针对的是「播放时一张
+        分片都要不出来」，批处理任务会落盘重试、用户不在等，让它继续干活无害。
+        """
         with self._lock:
+            now = time.monotonic()
             preemptible = self._preemptible_jobs if yield_preemptible else set()
             candidates = [
                 connection
@@ -933,6 +1055,7 @@ class RemoteWorkerRegistry:
                 and (not disc or connection.capabilities.disc_sources)
                 and len(connection.jobs - preemptible) < connection.max_jobs
                 and not connection.draining
+                and not connection.paused(now)
                 and self._is_fresh(connection)
             ]
             if not candidates:
@@ -1031,6 +1154,9 @@ class RemoteWorkerRegistry:
             if job_id in self._paused_jobs or type(output) is not int:
                 self._progress_samples.pop(job_id, None)
                 return
+            if output > 0:
+                # 真出过帧：这一轮即使最后失败，也不是「装不起来」那一类
+                self._job_output_seen.add(job_id)
             now = time.monotonic()
             previous = self._progress_samples.get(job_id)
             self._progress_samples[job_id] = (now, output)
@@ -1062,6 +1188,7 @@ class RemoteWorkerRegistry:
             self._job_profiles.pop(job_id, None)
             self._progress_samples.pop(job_id, None)
             self._job_speeds.pop(job_id, None)
+            self._job_output_seen.discard(job_id)
             self._paused_jobs.discard(job_id)
             self._preemptible_jobs.discard(job_id)
             if worker_id:
@@ -1093,6 +1220,7 @@ class RemoteWorkerRegistry:
                 self._job_profiles.pop(job_id, None)
                 self._progress_samples.pop(job_id, None)
                 self._job_speeds.pop(job_id, None)
+                self._job_output_seen.discard(job_id)
                 self._paused_jobs.discard(job_id)
                 self.publish_job_event(
                     job_id,
@@ -1195,6 +1323,7 @@ def reset_remote_worker_registry() -> None:
         _registry._job_profiles.clear()
         _registry._progress_samples.clear()
         _registry._job_speeds.clear()
+        _registry._job_output_seen.clear()
         _registry._paused_jobs.clear()
         _registry._preload_task_workers.clear()
 

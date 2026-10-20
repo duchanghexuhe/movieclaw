@@ -334,6 +334,9 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
         if principal.device is not None and principal.device.kind == "worker":
             # Mac 设置里的名称随 hello 更新；只同步已认证转码器自己的记录，
             # 不改手工令牌名称，也不赋予 Worker 修改其他设备的权限。
+            # 这是作者定的口径（Mac 设置页原话：「名称会显示在网页的设备列表和
+            # 播放活动里。改名会重新连接一次。」）：配对的转码器，名字以它自己
+            # 为准；「仅限转码」的手工令牌不在同步范围内，网页改的名长期有效。
             async with get_database().session() as session:
                 device = await login_devices.get_device(session, principal.device.id)
                 if device is not None and device.name != connection.worker_id:

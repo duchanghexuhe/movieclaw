@@ -13,7 +13,7 @@ import {
   SettingsSection,
 } from "@/components/settings-ui";
 import { type LoginDeviceView, listLoginDevices } from "@/lib/api/devices";
-import { relativeTime } from "@/lib/devices-display";
+import { relativeTime, workerDisplayName } from "@/lib/devices-display";
 import {
   type RemoteTranscodeConfigView,
   type RemoteTranscodeStatus,
@@ -206,6 +206,9 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
   const onlineWorkers = status?.workers.filter((w) => w.online) ?? [];
   // 按授权设备匹配，Worker 改名或使用不同名称的手工令牌都不会多出一条离线记录。
   const connectedDevices = new Set((status?.workers ?? []).map((w) => `ld-${w.device_id}`));
+  // 设备页改的名字要在这里立刻生效：worker_id 只是机器标识（注册表键、断线顶号
+  // 判据），人能改的是设备名（见 devices-display.workerDisplayName）。
+  const deviceNames = new Map(authorizedWorkers.map((d) => [d.id, d.name]));
   const offlineWorkers = authorizedWorkers.filter((d) => !connectedDevices.has(d.id));
   const hasAnyWorker = (status?.workers.length ?? 0) > 0 || offlineWorkers.length > 0;
   // 开关打开 ≠ Worker 连上了。这两件事分开说，用户才知道下一步该干什么：
@@ -329,7 +332,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                   key={worker.worker_id}
                   label={
                     <span className="flex items-center gap-2">
-                      <span className="truncate">{worker.worker_id}</span>
+                      <span className="truncate">{workerDisplayName(worker, deviceNames)}</span>
                       {/* 在线信号走色点不走彩字：与「当前状态」行同一形态，
                           避免 Netflix 主题下绿字与品牌红同屏撞色 */}
                       {worker.online && (

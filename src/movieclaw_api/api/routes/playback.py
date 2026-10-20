@@ -1637,21 +1637,28 @@ async def ping_playback_session(
     机器上放不了，客户端据此直接降档——分片 404 在播放器那边要层层重试十几分钟才会
     走到降档。
 
-    ``worker_lost``：远程会话判死且它的 Worker 已离线。分片 404 同样要等播放器把
-    分钟级重试烧完才会触发重开，这里直接告诉客户端「同档重开」——新会话的决策层
-    自动落到还活着的执行者（通常是 NAS 本地）。Worker 还在线时不报：远程 seek/
-    补片重启自己就能续上，重启换流反而白黑一屏。"""
+    ``worker_lost``：远程会话判死且它那台 Worker 已经不能再用（离线，或被连续失败
+    熔断暂停派单）。分片 404 同样要等播放器把分钟级重试烧完才会触发重开，这里直接
+    告诉客户端「同档重开」——新会话的决策层自动落到还活着的执行者（通常是 NAS 本地）。
+
+    **判死的不只是离线**：2026-10-20 真机事故是 Worker 一直在线、只有它本机的 ffmpeg
+    起不来（中转文件 Permission denied）。心跳当时按「Worker 在线 ⇒ 同档重开没意义」
+    不报，播放器于是把这条**执行者故障**记成了「这一档放不了」，连败两次后把档 3
+    拉黑——而 NAS 本地 vaapi/qsv 一直好好的，省流本该落到它们身上，结果退化成原码率
+    直通（4K HDR 18.7 Mbps 推给外网手机）。熔断后这台 Worker 已不在候选里，同档重开
+    必定换一台执行者，所以它也该报 worker_lost：**坏的是执行者，不是这一档**。"""
     member_id = principal.member_id if principal.member_id is not None else 0
     manager = get_session_manager()
     if not manager.ping(session_id, member_id=member_id):
         raise NotFoundException("会话不存在或已结束")
     session = manager.get(session_id, member_id=member_id)
     failed = session is not None and session.state == "failed" and not session.remote
+    registry = get_remote_worker_registry()
     worker_lost = (
         session is not None
         and session.state == "failed"
         and session.remote
-        and not get_remote_worker_registry().worker_online(session.remote_worker_id)
+        and not registry.worker_usable(session.remote_worker_id)
     )
     return ok(
         {
