@@ -1507,15 +1507,19 @@ class RealtimeClient:
             except OSError as exc:
                 self.last_problem = str(exc)
                 self.log(f"实时连接断开：{exc}")
+                fields: dict = {}
                 if isinstance(exc, ServerClosed) and exc.code == 1008:
-                    # 服务端明确拒绝：按理由定间隔，不走退避
-                    wait = _REJECT_RETRY_S[rejection_kind(exc.reason)]
+                    # 服务端明确拒绝：按理由定间隔，不走退避；分类随状态交出（凭证失效时
+                    # GUI 给「重新配对」）
+                    kind = rejection_kind(exc.reason)
+                    wait = _REJECT_RETRY_S[kind]
+                    fields["rejection"] = kind
                 elif time.time() - started < 30:
                     # 刚连上就断的按退避等，长连过的立即重连
                     wait, backoff = backoff, min(backoff * 2, 30.0)
                 else:
                     wait = 0.0
-                self.status("offline", reason=self.last_problem, retry_seconds=wait)
+                self.status("offline", reason=self.last_problem, retry_seconds=wait, **fields)
                 self.stop_event.wait(wait)
             else:
                 backoff = 2.0

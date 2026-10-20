@@ -262,6 +262,8 @@ class WorkerGUI:
         #: 连接状态行的文字（不含电池提示，电池条件每次刷新现算）；批准页地址只在配对时有
         self._conn_text = "未启动"
         self._approve_url: str | None = None
+        #: 点了「重新配对」、正等当前运行收尾：收尾后丢掉旧令牌重新启动
+        self._repair_pending = False
         self.ui_queue: queue.Queue[tuple] = queue.Queue()
         self.tray: TrayIcon | None = None
         self._build_ui()
@@ -326,6 +328,8 @@ class WorkerGUI:
             buttons, text="打开批准页", command=self._open_approve_page, state=tk.DISABLED
         )
         self.btn_approve.pack(side=tk.LEFT, padx=4)
+        # 只在服务端说凭证失效（这台 Worker 在网页上被注销等）时出现；平时不占位
+        self.btn_repair = ttk.Button(buttons, text="重新配对", command=self._repair)
 
         log_frame = ttk.LabelFrame(frame, text="日志")
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
@@ -411,6 +415,22 @@ class WorkerGUI:
         if self._approve_url:
             webbrowser.open(self._approve_url)
 
+    def _repair(self) -> None:
+        """凭证失效后重新配对：停掉当前运行，收尾后丢掉旧令牌、按原配置重新启动（直接进配对）。"""
+        self._repair_pending = True
+        self._set_conn("正在重新配对…")
+        if self.runtime is not None:
+            self._stop()
+        else:
+            self._finish_repair()
+
+    def _finish_repair(self) -> None:
+        self._repair_pending = False
+        self.config.pop("token", None)
+        save_config(self.config)
+        self._log("已丢弃失效的凭证，重新配对")
+        self._start()
+
     def _stop(self) -> None:
         if self.runtime is not None and not self.runtime.stop_event.is_set():
             self.runtime.stop_event.set()
@@ -466,7 +486,14 @@ class WorkerGUI:
         elif kind == "offline":
             retry = int(fields.get("retry_seconds") or 0)
             tail = f"，{retry} 秒后重试" if retry else "，正在重连"
-            self._set_conn(f"连接断开：{fields['reason']}{tail}")
+            if fields.get("rejection") == "auth":
+                self._set_conn(
+                    f"凭证已失效{tail}；在网页上注销过这台 Worker 的话，点「重新配对」"
+                    f"（{fields['reason']}）",
+                    repair=True,
+                )
+            else:
+                self._set_conn(f"连接断开：{fields['reason']}{tail}")
         elif kind == "stopped":
             self._set_conn("已停止")
         elif kind == "error":
@@ -474,10 +501,14 @@ class WorkerGUI:
             _append_log_file(fields["trace"])
             self._set_conn(f"启动失败：{fields['reason']}")
 
-    def _set_conn(self, text: str, approve_url: str | None = None) -> None:
+    def _set_conn(self, text: str, approve_url: str | None = None, repair: bool = False) -> None:
         self._conn_text = text
         self._approve_url = approve_url
         self.btn_approve.configure(state=tk.NORMAL if approve_url else tk.DISABLED)
+        if repair:
+            self.btn_repair.pack(side=tk.LEFT, padx=4)
+        else:
+            self.btn_repair.pack_forget()
         self._refresh_status()
 
     def _refresh_status(self) -> None:
@@ -560,6 +591,8 @@ class WorkerGUI:
                 self.btn_start.configure(state=tk.NORMAL)
                 self.btn_stop.configure(state=tk.DISABLED)
                 self.lbl_slots.configure(text="任务：—")
+                if self._repair_pending and not self._exiting:
+                    self._finish_repair()
         # 退出等待：收尾完成（或 30s 兜底）后真正关窗
         if self._exiting and (self.runtime is None or time.monotonic() - self._exit_at > 30):
             self.root.destroy()

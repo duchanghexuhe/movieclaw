@@ -419,14 +419,14 @@ def test_rejection_reason_classification(reason, kind):
 
 
 @pytest.mark.parametrize(
-    ("reason", "retry_seconds"),
+    ("reason", "retry_seconds", "rejection"),
     [
-        ("凭证无效或已被吊销，请在网页「设置 → 设备」重新配对", 300.0),
-        ("服务端尚未启用远程转码，请在网页设置「转码」页打开远程转码开关", 60.0),
+        ("凭证无效或已被吊销，请在网页「设置 → 设备」重新配对", 300.0, "auth"),
+        ("服务端尚未启用远程转码，请在网页设置「转码」页打开远程转码开关", 60.0, "remote_disabled"),
     ],
 )
-def test_run_forever_reports_rejection_and_waits_by_class(reason, retry_seconds):
-    """服务端 1008 拒绝：状态事件带真实理由，重试间隔按分类定（不走指数退避）。"""
+def test_run_forever_reports_rejection_and_waits_by_class(reason, retry_seconds, rejection):
+    """服务端 1008 拒绝：状态事件带真实理由与分类，重试间隔按分类定（不走指数退避）。"""
     from engine import RealtimeClient, ServerClosed
 
     client = RealtimeClient(
@@ -447,7 +447,11 @@ def test_run_forever_reports_rejection_and_waits_by_class(reason, retry_seconds)
     assert events == [
         (
             "offline",
-            {"reason": f"服务端关闭了连接（1008）：{reason}", "retry_seconds": retry_seconds},
+            {
+                "reason": f"服务端关闭了连接（1008）：{reason}",
+                "retry_seconds": retry_seconds,
+                "rejection": rejection,
+            },
         )
     ]
 
