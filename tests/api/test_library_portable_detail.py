@@ -221,7 +221,8 @@ def test_portable_detail_lists_the_source_subtitles_and_marks_what_playback_play
     portable, source = files[ids["portable"]], files[ids["source"]]
 
     # 便携版没有自己的外挂字幕：列表与源文件自己的一样（语言、标题都按源文件的文件名解析）
-    assert external_views(portable) == external_views(source)
+    # 唯一的差别是 borrowed：借来的为真
+    assert [{**s, "borrowed": False} for s in external_views(portable)] == external_views(source)
     assert [stream["file_name"] for stream in external_views(portable)] == [_CHS, _ENG]
     # 「默认」：原声英文、媒体库语言中文，开的是库语言的外挂字幕
     assert portable["playback_defaults"]["subtitle_track"] == f"external:{_CHS}"
@@ -232,6 +233,15 @@ def test_portable_detail_lists_the_source_subtitles_and_marks_what_playback_play
     assert data["decision"]["file_id"] == ids["portable"]
     assert sorted(playback_external_refs(data)) == [f"external:{_CHS}", f"external:{_ENG}"]
     assert playback_default(data) == portable["playback_defaults"]["subtitle_track"]
+
+
+def test_borrowed_external_subtitles_are_flagged_and_the_source_keeps_its_own(client, tmp_path):
+    ids = call(client, _seed, tmp_path)
+    files = detail_files(client, ids)
+
+    # 借来的外挂字幕归属源文件：标 borrowed，详情页据此不给删除入口（删除只认本行的文件名）
+    assert [s["borrowed"] for s in external_views(files[ids["portable"]])] == [True, True]
+    assert [s["borrowed"] for s in external_views(files[ids["source"]])] == [False, False]
 
 
 def test_portable_detail_borrows_nothing_while_its_source_is_not_in_place(client, tmp_path):

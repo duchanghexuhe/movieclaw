@@ -1417,6 +1417,8 @@ export interface SubtitleStream {
   external: boolean;
   /** 外挂字幕的文件名 */
   file_name: string | null;
+  /** 借自源文件的外挂字幕（便携版派生行）：归属源文件，不能从本条目删除 */
+  borrowed: boolean;
 }
 
 /** 字幕预览中的一条时间轴对白。 */

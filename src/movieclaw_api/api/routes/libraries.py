@@ -2853,6 +2853,7 @@ def _file_view(
                 default=parsed["default"],
                 external=True,
                 file_name=name,
+                borrowed=subtitle_owner is not None,
             )
         )
     return LibraryFileView(

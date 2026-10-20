@@ -375,7 +375,7 @@ interface TrackEntry {
   external: boolean | null;
   /** 组内排序：默认 → 内封 → 外挂 → AI 生成 */
   order: number;
-  /** 可删除的外挂字幕文件名；内封轨与音轨为 null（长在容器里，删不掉） */
+  /** 可删除的外挂字幕文件名；内封轨与音轨为 null（长在容器里，删不掉），借来的外挂也为 null（归属源文件） */
   deletable: string | null;
   /** 仅字幕有：点击后打开预览弹窗所需的一切 */
   preview: { stream: SubtitleStream; track: string; label: string } | null;
@@ -445,8 +445,8 @@ function subtitleEntries(
       external,
       order: isDefault ? 0 : isAiSubtitle(stream) ? 3 : external ? 2 : 1,
       // 外挂（含 AI 生成）是磁盘上的独立文件，可以单独删；内封轨要删得
-      // 重封装视频本体，不给入口
-      deletable: external ? (stream.file_name ?? null) : null,
+      // 重封装视频本体，不给入口；借来的外挂属于源文件，删除路由只认本视频的文件名，也不给
+      deletable: external && !stream.borrowed ? (stream.file_name ?? null) : null,
       preview: track ? { stream, track, label } : null,
     };
   });
