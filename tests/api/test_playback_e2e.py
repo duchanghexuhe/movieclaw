@@ -491,7 +491,7 @@ def test_wan_source_over_uplink_transcodes_before_stalling(client, tmp_path, mon
     resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
     assert resp.status_code == 200, resp.text
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address",
+        "movieclaw_api.api.routes.playback.network_side.request_side",
         _fake_client_address("1.2.3.4"),
     )
 
@@ -528,7 +528,7 @@ def test_wan_transcode_pins_audio_to_aac(client, tmp_path, monkeypatch):
     resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
     assert resp.status_code == 200, resp.text
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address",
+        "movieclaw_api.api.routes.playback.network_side.request_side",
         _fake_client_address("1.2.3.4"),
     )
 
@@ -547,7 +547,7 @@ def test_wan_transcode_pins_audio_to_aac(client, tmp_path, monkeypatch):
 def test_wan_source_fitting_uplink_still_direct_plays(client, tmp_path, monkeypatch):
     """外网但源片码率装得下：照常直通——不因为「在外网」就降档。"""
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address",
+        "movieclaw_api.api.routes.playback.network_side.request_side",
         _fake_client_address("1.2.3.4"),
     )
     resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 30})
@@ -564,7 +564,7 @@ def test_wan_source_fitting_uplink_still_direct_plays(client, tmp_path, monkeypa
 def test_lan_source_ignores_uplink_and_direct_plays(client, tmp_path, monkeypatch):
     """内网来源走的是局域网速度：配了上行带宽也永不降档。"""
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address",
+        "movieclaw_api.api.routes.playback.network_side.request_side",
         _fake_client_address("192.168.31.5"),
     )
     resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
@@ -585,7 +585,7 @@ def test_wan_step_down_without_transcoder_direct_plays(client, tmp_path, monkeyp
     原来会落成「这部片需要软件转码」的同意弹窗——NAS 没硬件、远程 Worker 离线时，
     外网每部高码率片都看不了（普通成员只能退出）。"""
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address",
+        "movieclaw_api.api.routes.playback.network_side.request_side",
         _fake_client_address("1.2.3.4"),
     )
     resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
@@ -606,7 +606,7 @@ def test_wan_step_down_without_transcoder_direct_plays(client, tmp_path, monkeyp
 def test_unset_uplink_keeps_current_behavior(client, tmp_path, monkeypatch):
     """没配置上行带宽：外网也按从前处理（直通，卡顿后由播放器提示兜底）。"""
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address",
+        "movieclaw_api.api.routes.playback.network_side.request_side",
         _fake_client_address("1.2.3.4"),
     )
 
@@ -632,7 +632,7 @@ def test_manual_quality_overrides_uplink_step_down(client, tmp_path, monkeypatch
     resp = client.put("/api/v1/app/config", json={"external_url": "", "uplink_mbps": 2})
     assert resp.status_code == 200, resp.text
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address",
+        "movieclaw_api.api.routes.playback.network_side.request_side",
         _fake_client_address("1.2.3.4"),
     )
 

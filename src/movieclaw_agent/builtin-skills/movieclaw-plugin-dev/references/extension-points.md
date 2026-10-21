@@ -42,6 +42,7 @@ tests 守着：契约有增删时本文必须同步）。都是实验级；清�
 | `library.file.trashed` / `restored` / `purged` | 文件进回收站 / 恢复 / 彻底清除 | 回收站联动 | |
 | `library.item.favorited` / `unfavorited` | 收藏 / 取消收藏（`level`：整部、一季、一集） | 收藏即准备好整部 | 敏感 |
 | `library.item.viewed` | 打开条目详情（网页详情页、播放器取条目） | 用户可能要看了，先准备 | 敏感、高频 |
+| `library.preload.cleaned` | 预转码产物被冷数据清理（定时自动或手动执行；载荷 `removed` 删了几个、`freed_bytes` 释放字节、`stale_days` 当时的阈值） | 清理后刷新自己的统计、通知用户腾了多少空间 | |
 | `playback.started` / `stopped` / `completed` | 开始播放 / 停止（`completed` 表示停时刚好看完）/ 看完 | 预取下一集、播放联动、记录 | 敏感 |
 | `playback.progress` | 播放进度（每集最多 30 秒一条） | 同步进度 | 敏感、高频 |
 | `playback.marked_played` / `marked_unplayed` | 标记已看 / 取消（整季标记是一个事件、带每一集） | 同步观看记录 | 敏感 |

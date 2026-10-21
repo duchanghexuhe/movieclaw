@@ -34,7 +34,7 @@ _PB = "/api/v1/playback"
 _ADMIN = {"username": "admin", "password": "Sup3rSecret!"}
 #: 全解码客户端：决策直接给档 0（原文件直出，不起 ffmpeg），字幕清单照常给
 _APP = {"universal": True}
-_EXTERNAL_HOST = "8.8.8.8"
+_EXTERNAL_SIDE = "outside"
 
 _SOURCE_NAME = "Show S01E01.mkv"
 _PORTABLE_NAME = "Show S01E01 - 省流 720p.mkv"
@@ -75,7 +75,7 @@ def client(tmp_path, monkeypatch):
 def _external(monkeypatch) -> None:
     """把会话判成外网：便携版只在外网参与择优（真实链路里是反代转发来的 X-Forwarded-For）。"""
     monkeypatch.setattr(
-        "movieclaw_api.api.routes.playback.client_address", lambda request: _EXTERNAL_HOST
+        "movieclaw_api.api.routes.playback.network_side.request_side", lambda request, **_kwargs: _EXTERNAL_SIDE
     )
 
 

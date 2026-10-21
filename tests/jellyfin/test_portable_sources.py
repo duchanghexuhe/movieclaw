@@ -105,7 +105,7 @@ def _playback_info(client: TestClient, token: str, guid: str) -> dict:
 
 def _external(monkeypatch) -> None:
     monkeypatch.setattr(
-        "movieclaw_jellyfin.routes.playback.client_address", lambda request: "8.8.8.8"
+        "movieclaw_jellyfin.routes.playback.network_side.request_side", lambda request, **_kwargs: "outside"
     )
 
 
