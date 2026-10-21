@@ -2429,6 +2429,14 @@ html:has(.player-root) {
   transform: rotate(90deg) translateY(-100%);
   transform-origin: top left;
 
+  /* 伪横屏里沿进度条拖、横划拖进度，物理上都是竖直方向——页面滚动 / 橡皮筋 /
+     下拉刷新要抢的恰好是这个方向。iOS 按触点所在图层的事件区域查 touch-action，
+     区域按绘制顺序拼，后画的 auto 元素会把某个元素自己写的 none 挖出一块洞；
+     写在整个容器上，里面每个元素的有效值都与它取交集成 none，不再取决于谁压着谁。
+     菜单与诊断面板自己是 overflow 滚动容器，有效值在那里重置，照常能滚。
+     进度条本身另有 touchstart / touchmove 上的 preventDefault 兜底（player-controls.tsx）。 */
+  touch-action: none;
+
   /* 安全区必须跟着一起转 90°。env() 给的永远是**物理**方向的值（设备还竖
      着拿），而容器顺时针转了 90°：物理顶边（灵动岛/状态栏）成了布局的左边，
      物理底边（Home 指示条）成了布局的右边。不重映射的话，时间药丸和操作

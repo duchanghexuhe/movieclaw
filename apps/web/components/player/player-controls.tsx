@@ -264,6 +264,11 @@ export interface PlayerControlsProps {
    */
   onScrubCancel: () => void;
   /**
+   * 拖动被系统收走（pointercancel）时报一条现场。iPhone 上没有可看的控制台，
+   * 「伪横屏里拖不动」这类问题只能让客户端自己把现场报到服务端日志，父组件负责落日志。
+   */
+  onScrubInterrupted: (detail: Record<string, unknown>) => void;
+  /**
    * 指针按在进度条上 / 离开进度条。父组件据此把控制条钉住：按住不动时没有
    * 移动事件去重排自动隐藏的倒计时，四秒一到控制条会在手指底下淡出
    * （lib/player/chrome.ts 的 scrubbing）。
@@ -325,6 +330,7 @@ export function PlayerControls(props: PlayerControlsProps) {
     onSeek,
     onScrub,
     onScrubCancel,
+    onScrubInterrupted,
     onScrubbingChange,
     subtitles,
     selectedSubtitle,
@@ -419,6 +425,8 @@ export function PlayerControls(props: PlayerControlsProps) {
    * 第二根手指落到条上时，它的 pointerup 也会派发到 input（裁决见 isScrubPointer）。
    */
   const activePointerIdRef = useRef<number | null>(null);
+  /** 这次拖动按下的时刻（performance.now），被系统收走时据此上报「按下多久后被收走」 */
+  const scrubDownAtRef = useRef(0);
   /**
    * 这次拖动里合帧最近一次刷到屏幕上的落点；按下时清空。
    *
@@ -469,6 +477,39 @@ export function PlayerControls(props: PlayerControlsProps) {
   );
 
   useEffect(() => cancelPointerFrame, [cancelPointerFrame]);
+
+  /**
+   * 进度条上的触摸归我们自己，系统手势不许收走：touchstart / touchmove 上 preventDefault。
+   *
+   * 只靠 `touch-action: none` 在 iOS 上不稳。Safari 按触点所在图层的事件区域查
+   * touch-action，区域按绘制顺序拼，后画的 auto 元素会把 none 挖出一块洞——贴在进度条
+   * 下面的操作行，内边距就压在 44px 命中带靠它那一侧的 12px 上。伪横屏里沿条拖是物理竖直方向，
+   * 页面滚动 / 橡皮筋 / 下拉刷新要抢的恰好是这个方向，被抢走就是 pointercancel，圆点
+   * 一动不动（Chromium 里把 touch-action 强改回 manipulation 即可复现：一次 pointermove
+   * 之后 pointercancel）。竖屏与真横屏沿条是横向，页面没有横向可滚，才碰巧没事。
+   *
+   * touchstart 上 preventDefault 把整次触摸判给页面（浏览器不再起滚动 / 缩放），touchmove
+   * 上再兜一道。顺带的好处：iOS 原生滑块会自己认领把手附近的触摸（SliderThumbElement），
+   * 之后它不再与指针路径并行，拖动只剩指针事件这一条。
+   *
+   * 必须是原生的非被动监听：React 把 touch 事件挂成被动的，合成事件里 preventDefault 无效。
+   */
+  const scrubRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const input = scrubRef.current;
+    if (!input) return;
+    const claimTouch = (event: TouchEvent) => {
+      // 滚动已经起步之后的 touchmove 不可取消，这时再 preventDefault 只会招一条警告
+      if (event.cancelable) event.preventDefault();
+    };
+    input.addEventListener("touchstart", claimTouch, { passive: false });
+    input.addEventListener("touchmove", claimTouch, { passive: false });
+    return () => {
+      input.removeEventListener("touchstart", claimTouch);
+      input.removeEventListener("touchmove", claimTouch);
+    };
+  }, []);
+
   /** 时间文字用的位置。取值规则与进度条自绘**同一个函数**，见 shownPositionMs */
   const shown = shownPositionMs({
     draggingMs: dragging,
@@ -793,6 +834,7 @@ export function PlayerControls(props: PlayerControlsProps) {
                 （hoverChapter），见 player-feel.md §2.C1 */}
           </div>
           <input
+            ref={scrubRef}
             type="range"
             min={0}
             max={durationMs ?? 0}
@@ -841,6 +883,7 @@ export function PlayerControls(props: PlayerControlsProps) {
               if (!durationMs || e.button !== 0 || !e.isPrimary) return;
               pointerDragRef.current = true;
               activePointerIdRef.current = e.pointerId;
+              scrubDownAtRef.current = performance.now();
               flushedPointerMsRef.current = null;
               onScrubbingChange(true);
               e.currentTarget.setPointerCapture(e.pointerId);
@@ -905,6 +948,14 @@ export function PlayerControls(props: PlayerControlsProps) {
               // 挪到一个用户没抬手确认过的位置上
               onScrubCancel();
               setDragging(null);
+              // 现场落服务端日志：多久被收走（几十毫秒 = 页面手势抢走，几秒 = 系统手势）、
+              // 是不是伪横屏、这一刻进度条上生效的 touch-action
+              onScrubInterrupted({
+                fake_landscape: fakeLandscape,
+                pointer_type: e.pointerType,
+                held_ms: Math.round(performance.now() - scrubDownAtRef.current),
+                touch_action: getComputedStyle(e.currentTarget).touchAction,
+              });
             }}
             // keyup / blur 这两条只属于**键盘拖动**（Home / End / PageUp 改 range
             // 的值走 onChange 进 dragging）。指针正按着时一律不理：鼠标按下

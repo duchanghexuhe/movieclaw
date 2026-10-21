@@ -1395,4 +1395,94 @@ input，拖动中按空格暂停、或随手一个 Shift，`keyup` 落在 range 
 iOS 那半边（AVPlayer 取消 seek → WebKit 提前发 `timeupdate`）仍是推断。矩阵跑在
 Chromium 的直出档上，转码会话（hls.js）与会话相对制那条路装置里没有——它要
 真 ffmpeg。修后真机再看：慢拖停住再松、快甩立刻松、拖到一半停几次再松、拖到
-片尾、按住不动几秒再松、**横屏里拖**。
+片尾、按住不动几秒再松、**横屏里拖**。（横屏里拖，真机的结论是没好，见 §20。）
+
+## 20. 第十六轮：iPhone 点了横屏，进度条还是拖不动（2026-10-21）
+
+反馈：**「iPhone Safari 播放，手动点击播放器右下角横屏按钮后，不能拖动进度条。」**
+
+iPhone 点横屏键走的是 CSS 伪横屏（§10）。§19.8 修过这条路，但那次的依据是 Chromium 里的
+pointercancel，§19.10 末尾也写着「横屏里拖」要真机再看。真机的结论：没好。
+
+### 20.1 能确认的，和只能推断的
+
+**能确认**（读 WebKit 源码 + 本机实测）：
+
+- 现在的构建在 Chromium 里伪横屏沿条拖是通的（CDP 真触摸，从圆点拖到 80%，画面落在
+  320 秒）；进度条的计算值 `touch-action` 是 `none`，Playwright 的 WebKit（Safari 26
+  引擎）里也是，旋转后进度条的几何和鼠标拖动的换算也都对。§19.8 的层级修复没丢，
+  问题不在 Chromium 测得到的那一层。
+- iOS 不直接看元素自己写的 `touch-action`：UI 进程在触点处**取最靠前那一层的事件区域**
+  （`touchActionsForPoint`），区域在 `EventRegion::unite` 里按绘制顺序拼——后画的 `auto`
+  元素会把先画的 `none` 减掉一块（`subtractAutoFromTouchActions`）。贴在进度条下面的
+  操作行，内边距压在 44px 命中带靠它那一侧的 12px 上（伪横屏里 x 64~76 的触点，
+  `elementFromPoint` 命中的是操作行，不是进度条）。所以写在进度条自己身上的 `none`，
+  并不能保证触点处的有效值是 none。
+- 伪横屏里「沿条拖」是物理竖直方向。竖屏、真横屏里沿条是横向，页面横向无物可滚，才一直
+  没事；页面滚动 / 橡皮筋 / 下拉刷新能抢的恰好是竖直方向，被抢走就是 pointercancel。
+
+**只能推断**：真机上抢走触摸的到底是不是这一条。没有 iPhone，也没有抓包。下面的改法是按
+机制堵，再用 Chromium 模拟「touch-action 没生效」来验；真机待验（§20.5），并且加了一条
+日志，下次再出事能看见现场（§20.3 第 3 条）。
+
+### 20.2 在 Chromium 里复现「touch-action 没生效」
+
+把进度条及所有祖先的 `touch-action` 强改回 `manipulation`（`!important`），伪横屏沿条拖：
+pointerdown，一次 pointermove，约 40 毫秒后 **pointercancel**，之后只剩没人听的 touchmove，
+画面停在 27 秒（目标 320 秒）。这就是 §19.8 的症状，也是 iOS 页面手势抢走触摸时该有的样子。
+
+### 20.3 改法
+
+1. **进度条上的触摸归页面**（player-controls.tsx 的 `scrubRef`）：原生非被动的 `touchstart`
+   / `touchmove`，里面 `preventDefault()`。touchstart 被页面认领后，iOS 结束手势延后并阻止
+   原生手势（WebKit 的 `_doneDeferringTouchStart:YES`），不再取决于 touch-action 区域怎么
+   拼；touchmove 上再兜一道。React 把 touch 事件挂成被动的，必须原生监听。
+   顺带的：iOS 原生滑块会自己认领把手附近的触摸（`SliderThumbElement::handleTouchStart`，
+   WebKit main 里把小把手的命中区放到至少 48pt——Safari 27 的更新说明写的是 iPadOS /
+   visionOS，iPhone 是否同样要真机确认；§19.1 表里「恰好压中那 1px」的估计偏小）。事件被
+   `preventDefault` 之后它的默认处理不再跑，拖动只剩指针事件这一条路径。
+2. **伪横屏容器 `touch-action: none`**（globals.css 的 `.player-fake-landscape`）：容器里所有
+   元素的有效值与它取交集成 none，不再取决于谁压着谁；菜单与诊断面板自己是 `overflow`
+   滚动容器，有效值在那里重置，照常能滚。顺带罩住画面上横划拖进度的手势——它在伪横屏里
+   同样是物理竖直方向，而它的 `preventDefault` 要位移过 12 像素才发。
+3. **被系统收走时留现场**：`onPointerCancel` 往服务端日志报 `scrub-interrupted`
+   （`fake_landscape` / `pointer_type` / `held_ms` 按下多久被收走 / `touch_action`），走既有的
+   `/playback/client-log`，不改接口。iPhone 没有控制台，这是看现场的唯一通道（§13.3）。
+   修完如果还有人拖不动，服务端日志里搜 `scrub-interrupted`：带着 `fake_landscape: true`、
+   几十毫秒就被收走 = 页面手势仍在抢；一行都没有 = 触摸根本没落到进度条上，去查命中与遮挡。
+
+### 20.4 验证
+
+`tests/e2e/test_player_fake_landscape_scrub_browser.py`：真 API + `pnpm dev` + Chrome + 现做
+mp4，页面按手机尺寸开、按掉元素级全屏，手指全程 CDP 真触摸。五条：
+
+| 条目 | 断言 | 修前 |
+|---|---|---|
+| 伪横屏从圆点拖到 80% | 画面落在 80%；无 pointercancel；进度条上的 touchstart / touchmove 都被 `preventDefault`；进度条与容器的计算值 `touch-action` 都是 none | 挂（触摸没被认领、容器不是 none） |
+| 同上，但 `touch-action` 强改回 manipulation | 拖到 80% 再往回拖到 20%，画面都跟到，无 pointercancel | 挂（pointercancel，画面不动） |
+| 拖到一半手指被系统收走 | 往日志报 `scrub-interrupted`；不再提交落点；圆点回到真实位置 | 挂（没有这条日志） |
+| 竖屏沿条拖、轻点条跳转 | 照常 | 过（回归防线） |
+| 伪横屏轻点画面 | 控制层照常开合（容器写了 none，click 仍要来） | 过（回归防线） |
+
+（修前一列是把三个源文件还原到改动前跑出来的，不是推测。）
+
+### 20.5 没做到的，真机待验
+
+- 全程**没有 iPhone**。改法是读 WebKit 源码加 Chromium 模拟的结果，不是真机验过的。真机请看：
+  点横屏后 ① 从圆点起手拖 ② 从条上别处起手拖 ③ 拖到两端 ④ 拖到一半手指滑出条外再松
+  ⑤ 横划画面拖进度。拖不动的话，看服务端日志里的 `scrub-interrupted`（§20.3 第 3 条）。
+- 进度条 44px 命中带靠操作行的那 12px 被操作行盖住（竖屏同样），没动：给进度条所在行加
+  z-index 会让菜单面板压到条下面。
+- 画面上横划拖进度（video 的 touchmove）在 iOS 伪横屏里的保护只有容器的 `touch-action: none`，
+  同样待验。
+
+### 20.6 §13.2 必答题
+
+1. **在途状态**：`scrubDownAtRef` 是按下时刻，每次按下覆盖，不需要清；新增的两个原生监听挂在
+   组件整个生命周期上，卸载时摘掉。
+2. **新的读法**：没有。
+3. **坐标与单位**：没碰；`held_ms` 是毫秒，由 `performance.now()` 的差算出。
+4. **鼠标与手指**：新增的监听只对触摸事件生效，鼠标路径不变；竖屏触屏拖 / 点条由 e2e 兜住。
+5. **计数与上报**：`scrub-interrupted` 只记日志，不进 QoE；分享访客的作用域 `telemetry`
+   为假，不上报。
+6. **断言**：见 §20.4，三条修前挂、两条回归防线。

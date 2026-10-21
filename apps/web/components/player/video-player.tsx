@@ -5092,6 +5092,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
             onSeek={commitSeek}
             onScrub={scrubTo}
             onScrubCancel={cancelScrubFollow}
+            onScrubInterrupted={(detail) =>
+              reportPlaybackClientLog("scrub-interrupted", detail, apiRef.current)
+            }
             onScrubbingChange={setScrubbing}
             subtitles={subtitles}
             selectedSubtitle={selectedSubtitle}
