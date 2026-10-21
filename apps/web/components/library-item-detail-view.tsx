@@ -36,7 +36,12 @@ import {
 import { useConfirm, useToast } from "@/components/feedback";
 import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
-import { markPlayIntent, playHref, rememberPlayerReturnPath } from "@/lib/player/play-links";
+import {
+  markPlayIntent,
+  pickedVersionFileId,
+  playHref,
+  rememberPlayerReturnPath,
+} from "@/lib/player/play-links";
 import { preloadHlsEngine } from "@/lib/player/engine";
 import { getCapabilitySnapshot } from "@/lib/player/capability";
 import { ReidentifyDialog } from "@/components/reidentify-dialog";
@@ -1130,8 +1135,12 @@ export function LibraryItemDetailView({
                         ? selectedSeriesEpisode.episode.episode_number
                         : undefined,
                     // 用户在版本选择器里明确选过：播放页锁定这个文件起播，
-                    // 不做多版本自动择优（否则 720p 测试直出会压过 4K 转码）
-                    fileId: selectedTrackFile?.id,
+                    // 不做多版本自动择优（否则 720p 测试直出会压过 4K 转码）。
+                    // 没碰过选择器（默认高亮的第一个）不锁：外网默认便携版靠服务端择优
+                    fileId: pickedVersionFileId(
+                      selectedTrackFileId,
+                      availableTrackFiles.map((file) => file.id),
+                    ),
                   }) as Route,
                 );
               }}

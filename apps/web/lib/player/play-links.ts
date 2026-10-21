@@ -27,7 +27,8 @@ export function playHref(
     season?: number;
     episode?: number;
     tSeconds?: number;
-    /** 用户在详情页明确选中的版本：播放页锁定该文件起播（跳过自动择优） */
+    /** 用户在详情页明确选中的版本：播放页锁定该文件起播（跳过自动择优）。
+     * 默认高亮的第一个版本不是选择，别传——见 pickedVersionFileId */
     fileId?: number;
   },
 ): string {
@@ -45,6 +46,24 @@ export function playHref(
   }
   if (query.length > 0) href += `?${query.join("&")}`;
   return href;
+}
+
+/**
+ * 详情页点播放要不要锁定文件（`playHref` 的 `fileId`）：只有用户**亲手**在版本选择器里选过、
+ * 且这个版本属于当前播放单元才锁，否则 undefined——让服务端按择优选版。
+ *
+ * 版本选择器没人碰过时默认高亮列表里的第一个版本，那不是用户的选择。把它也锁住会让服务端
+ * 跳过择优：外网默认放便携版就是靠择优选出来的，锁住原片后从详情页点播放永远选不到它
+ * （F1 有 480p 便携版，外网手机点播放却对 2160p 原片转了 1080p）。剧集切集后上一集选过的版本
+ * 不在当前集的文件里，同样不锁。
+ */
+export function pickedVersionFileId(
+  selectedFileId: number | null,
+  availableFileIds: readonly number[],
+): number | undefined {
+  return selectedFileId !== null && availableFileIds.includes(selectedFileId)
+    ? selectedFileId
+    : undefined;
 }
 
 const RETURN_KEY = "movieclaw.player.return-to";
