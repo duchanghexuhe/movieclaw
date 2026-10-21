@@ -4556,6 +4556,7 @@ nonisolated extension API {
         var specHash: String
         var version: String?
         var instanceId: String?
+        var proof: String?
 
         enum CodingKeys: String, CodingKey {
             case status
@@ -4564,6 +4565,7 @@ nonisolated extension API {
             case specHash = "spec_hash"
             case version
             case instanceId = "instance_id"
+            case proof
         }
     }
 
@@ -9815,6 +9817,8 @@ nonisolated extension API {
         var candidates: [API.ResolveCandidateView]
         /// 从豆瓣条目订阅、且豆瓣集数多于 TMDB 已录集数时给出（issue #640）；弹层据此提示「按豆瓣集数追」，确认后随创建请求带 episode_floors
         var doubanEpisodes: API.DoubanEpisodesView?
+        /// 智能选择摘要（docs/design/smart-subscription-memory.md）
+        var smart: API.SmartPlanView?
 
         enum CodingKeys: String, CodingKey {
             case status
@@ -9825,6 +9829,7 @@ nonisolated extension API {
             case suggestedSeasons = "suggested_seasons"
             case candidates
             case doubanEpisodes = "douban_episodes"
+            case smart
         }
     }
 
@@ -11589,6 +11594,63 @@ nonisolated extension API {
         }
     }
 
+    struct ServerAddressItem: Codable, Hashable, Sendable {
+        /// 协议 + 主机 + 端口，如 http://192.168.1.10:3300
+        var url: String
+        /// lan = 内网（在家用），wan = 外网（出门用）
+        var kind: String
+        /// learned = 有人用过自动记下的；configured = 外部访问地址等配置项；manual = 管理员手动加的
+        var source: String
+        /// 最近一次有人经它访问
+        var lastSeen: String?
+
+        enum CodingKeys: String, CodingKey {
+            case url
+            case kind
+            case source
+            case lastSeen = "last_seen"
+        }
+    }
+
+    struct ServerAddressPayload: Codable, Hashable, Sendable {
+        /// 要加的地址，http:// 或 https:// 开头
+        var url: String
+        /// 内网 / 外网；不填按地址自动判断
+        var kind: String?
+
+        enum CodingKeys: String, CodingKey {
+            case url
+            case kind
+        }
+    }
+
+    struct ServerAddressRemovePayload: Codable, Hashable, Sendable {
+        /// 要删的地址
+        var url: String
+
+        enum CodingKeys: String, CodingKey {
+            case url
+        }
+    }
+
+    struct ServerAddressesView: Codable, Hashable, Sendable {
+        /// 这台服务器的实例号（与 /health 的 instance_id 相同）
+        var instanceId: String
+        /// 主机公钥（base64url 的 32 字节 Ed25519 公钥）：验 /health?nonce= 的 proof
+        var hostKey: String
+        /// 内网在前，各自按最近使用排
+        var addresses: [API.ServerAddressItem]
+        /// 内网 IPv4 地址所在的 /24：客户端不发请求就能判断是否在这个网段
+        var lanSubnets: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case instanceId = "instance_id"
+            case hostKey = "host_key"
+            case addresses
+            case lanSubnets = "lan_subnets"
+        }
+    }
+
     /// 一个可勾选的服务：给管理页算「选了它会多几个工具」用。
     struct ServiceView: Codable, Hashable, Sendable {
         /// 服务域名，如 subscriptions
@@ -12393,6 +12455,218 @@ nonisolated extension API {
         }
     }
 
+    struct SmartDefaultsPayload: Codable, Hashable, Sendable {
+        var movieRevision: Int
+        var tvRevision: Int
+        var resolution: String
+        var source: String
+        var allowUpgrade: Bool?
+        var strictResolution: Bool?
+        var movieWaitSeconds: Int
+        var tvWaitSeconds: Int
+
+        enum CodingKeys: String, CodingKey {
+            case movieRevision = "movie_revision"
+            case tvRevision = "tv_revision"
+            case resolution
+            case source
+            case allowUpgrade = "allow_upgrade"
+            case strictResolution = "strict_resolution"
+            case movieWaitSeconds = "movie_wait_seconds"
+            case tvWaitSeconds = "tv_wait_seconds"
+        }
+    }
+
+    /// 智能设置只有一套：画质、洗版、最低要求共用，等待时间电影和剧集各一个。
+    struct SmartDefaultsView: Codable, Hashable, Sendable {
+        var configured: Bool
+        var movieRevision: Int
+        var tvRevision: Int
+        var resolution: String
+        var source: String
+        var allowUpgrade: Bool
+        var strictResolution: Bool
+        var movieWaitSeconds: Int
+        var tvWaitSeconds: Int
+
+        enum CodingKeys: String, CodingKey {
+            case configured
+            case movieRevision = "movie_revision"
+            case tvRevision = "tv_revision"
+            case resolution
+            case source
+            case allowUpgrade = "allow_upgrade"
+            case strictResolution = "strict_resolution"
+            case movieWaitSeconds = "movie_wait_seconds"
+            case tvWaitSeconds = "tv_wait_seconds"
+        }
+    }
+
+    struct SmartHabitView: Codable, Hashable, Sendable {
+        var key: String
+        /// 如「韩国的剧」
+        var label: String
+        /// 只写改过的项，如「1080p」「1080p 蓝光」
+        var qualityLabel: String
+        var sourceTitle: String?
+
+        enum CodingKeys: String, CodingKey {
+            case key
+            case label
+            case qualityLabel = "quality_label"
+            case sourceTitle = "source_title"
+        }
+    }
+
+    struct SmartLanguageOptionView: Codable, Hashable, Sendable {
+        var key: String
+        var label: String
+
+        enum CodingKeys: String, CodingKey {
+            case key
+            case label
+        }
+    }
+
+    struct SmartLanguageView: Codable, Hashable, Sendable {
+        var key: String
+        var label: String
+        var sourceTitle: String?
+        var removable: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case key
+            case label
+            case sourceTitle = "source_title"
+            case removable
+        }
+    }
+
+    /// 改记忆：设一种语言看不看得懂，或删一条画质习惯。
+    struct SmartMemoryPatch: Codable, Hashable, Sendable {
+        var revision: Int
+        var language: String?
+        var understood: Bool?
+        var removeHabit: String?
+
+        enum CodingKeys: String, CodingKey {
+            case revision
+            case language
+            case understood
+            case removeHabit = "remove_habit"
+        }
+    }
+
+    /// 智能设置页的「看得懂的语言」与「它记住的」。
+    struct SmartMemoryView: Codable, Hashable, Sendable {
+        var revision: Int
+        /// 看得懂的语言，中文在最前且不可移除
+        var languages: [API.SmartLanguageView]
+        var addableLanguages: [API.SmartLanguageOptionView]
+        var habits: [API.SmartHabitView]
+
+        enum CodingKeys: String, CodingKey {
+            case revision
+            case languages
+            case addableLanguages = "addable_languages"
+            case habits
+        }
+    }
+
+    /// 订阅弹层的智能选择摘要：按当前设置、记忆和作品信息解析出的结果与整句文案。
+    struct SmartPlanView: Codable, Hashable, Sendable {
+        /// 智能设置是否已保存；未保存时其余字段为空
+        var configured: Bool
+        var profileRevision: Int
+        var memoryRevision: Int
+        var resolution: String?
+        var source: String?
+        /// 如「优先 4K WEB-DL」
+        var qualityLabel: String?
+        /// 如「按「韩国的剧」的习惯」
+        var qualityNote: String?
+        /// 被更具体的习惯盖住的那条，如「「韩国的剧」是 1080p」
+        var qualityShadow: String?
+        /// 如「最多等 1 天 · 达标后停止洗版」
+        var waitLabel: String?
+        var subtitleLanguage: String?
+        var subtitleLanguageLabel: String?
+        /// 作品语言是否看得懂；未知语言为空
+        var subtitleUnderstood: Bool?
+        /// 如「英语 · 只下带中文字幕的」；中文或未知语言为空
+        var subtitleLine: String?
+        /// 仅管理员、且这种语言还没回答过时给出
+        var question: API.SmartQuestionView?
+        var scopeOptions: [API.SmartScopeOptionView]
+        /// 管理员可改字幕、画质并写入记忆
+        var canEdit: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case configured
+            case profileRevision = "profile_revision"
+            case memoryRevision = "memory_revision"
+            case resolution
+            case source
+            case qualityLabel = "quality_label"
+            case qualityNote = "quality_note"
+            case qualityShadow = "quality_shadow"
+            case waitLabel = "wait_label"
+            case subtitleLanguage = "subtitle_language"
+            case subtitleLanguageLabel = "subtitle_language_label"
+            case subtitleUnderstood = "subtitle_understood"
+            case subtitleLine = "subtitle_line"
+            case question
+            case scopeOptions = "scope_options"
+            case canEdit = "can_edit"
+        }
+    }
+
+    /// 第一次碰到某种语言时问的那一句；文案由服务端生成，各端原样显示。
+    struct SmartQuestionView: Codable, Hashable, Sendable {
+        /// 语言键，如 en / ja / yue
+        var language: String
+        /// 如「这是英语片，要中文字幕吗？」
+        var prompt: String
+        /// 默认选项，如「要，只下带中文字幕的」
+        var subtitlesLabel: String
+        /// 如「不用，我看得懂英语」
+        var understoodLabel: String
+
+        enum CodingKeys: String, CodingKey {
+            case language
+            case prompt
+            case subtitlesLabel = "subtitles_label"
+            case understoodLabel = "understood_label"
+        }
+    }
+
+    struct SmartScopeOptionView: Codable, Hashable, Sendable {
+        /// 回传给创建接口的 smart_scope；only = 只这部
+        var value: String
+        /// 如「只这部」「所有剧集」「韩国的剧」「tvN 的剧」
+        var label: String
+
+        enum CodingKeys: String, CodingKey {
+            case value
+            case label
+        }
+    }
+
+    /// 订阅详情：这部作品的字幕要求，「这次先下原版」之后追问看不看得懂要用。
+    struct SmartSubtitleView: Codable, Hashable, Sendable {
+        var language: String
+        var languageLabel: String
+        var line: String
+        var understood: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case language
+            case languageLabel = "language_label"
+            case line
+            case understood
+        }
+    }
+
     struct SourceCandidateView: Codable, Hashable, Sendable {
         var kind: String
         var key: String
@@ -12556,6 +12830,16 @@ nonisolated extension API {
         var libraryId: Int?
         var selectionMode: String?
         var smartProfileRevision: Int?
+        /// 管理员对字幕问题的回答，写入「看得懂的语言」
+        var smartLanguageAnswer: String?
+        /// 管理员在弹层里改过的分辨率
+        var smartResolution: String?
+        /// 管理员在弹层里改过的片源
+        var smartSource: String?
+        /// 改过的画质记在哪：only=只这部，或 title-preview 给出的范围选项
+        var smartScope: String?
+        /// 弹层读到的记忆版本；不一致返回 409
+        var smartMemoryRevision: Int?
         /// 每季集数下限 {季号: 集数}：TMDB 少录集数时按这个数追，超出部分先占位（如 {"1": 27}）；不超过 TMDB 已录集数的季忽略
         var episodeFloors: [String: Int]?
 
@@ -12568,6 +12852,11 @@ nonisolated extension API {
             case libraryId = "library_id"
             case selectionMode = "selection_mode"
             case smartProfileRevision = "smart_profile_revision"
+            case smartLanguageAnswer = "smart_language_answer"
+            case smartResolution = "smart_resolution"
+            case smartSource = "smart_source"
+            case smartScope = "smart_scope"
+            case smartMemoryRevision = "smart_memory_revision"
             case episodeFloors = "episode_floors"
         }
     }
@@ -12621,6 +12910,10 @@ nonisolated extension API {
         var canManage: Bool
         /// 资源发布时间预测正在后台刷新（订阅创建/调整/恢复后的几秒内）；为 true 时 wanted[].release_forecast 可能还是旧值或空值，稍后重取即可
         var forecastPending: Bool
+        /// 智能订阅的字幕要求；中文、语言未知或规则模式为 null
+        var smartSubtitle: API.SmartSubtitleView?
+        /// 智能订阅的画质按哪条习惯，如「按「韩国的剧」的习惯」
+        var smartQualityNote: String?
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -12642,6 +12935,8 @@ nonisolated extension API {
             case episodeHints = "episode_hints"
             case canManage = "can_manage"
             case forecastPending = "forecast_pending"
+            case smartSubtitle = "smart_subtitle"
+            case smartQualityNote = "smart_quality_note"
         }
     }
 

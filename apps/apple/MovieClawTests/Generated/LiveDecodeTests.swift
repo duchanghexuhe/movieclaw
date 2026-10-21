@@ -252,6 +252,9 @@ struct LiveDecodeTests {
     @Test func searchTorrents() async throws {
         try await LiveServer.check { try await $0.searchTorrents() }
     }
+    @Test func appAddressesList() async throws {
+        try await LiveServer.check { try await $0.appAddressesList() }
+    }
     @Test func sessionList() async throws {
         try await LiveServer.check { try await $0.sessionList() }
     }
@@ -284,6 +287,12 @@ struct LiveDecodeTests {
     }
     @Test func subscriptionsListRecentArrivals() async throws {
         try await LiveServer.check { try await $0.subscriptionsListRecentArrivals() }
+    }
+    @Test func subscriptionsGetSmartDefaults() async throws {
+        try await LiveServer.check { try await $0.subscriptionsGetSmartDefaults() }
+    }
+    @Test func subscriptionsGetSmartMemory() async throws {
+        try await LiveServer.check { try await $0.subscriptionsGetSmartMemory() }
     }
     @Test func subscriptionsListTodayArrivals() async throws {
         try await LiveServer.check { try await $0.subscriptionsListTodayArrivals() }

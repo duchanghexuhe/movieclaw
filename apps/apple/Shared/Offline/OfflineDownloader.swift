@@ -232,6 +232,22 @@ final class OfflineDownloader {
 
     // MARK: 视频下载任务
 
+    /// 续传数据是不是发往这个地址的（协议、主机、端口相同）。读不出地址时当作相同（照旧续传）
+    nonisolated static func resumeData(_ data: Data, matches url: URL) -> Bool {
+        let key = "NSURLSessionDownloadURL"
+        var recorded: String?
+        if let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] {
+            recorded = plist[key] as? String
+        }
+        if recorded == nil, let archived = try? NSKeyedUnarchiver.unarchivedObject(
+            ofClasses: [NSDictionary.self, NSString.self, NSNumber.self, NSData.self, NSURL.self], from: data
+        ) as? [String: Any] {
+            recorded = (archived[key] as? String) ?? (archived[key] as? URL)?.absoluteString
+        }
+        guard let recorded, let old = URL(string: recorded) else { return true }
+        return ServerRoutes.key(old) == ServerRoutes.key(url)
+    }
+
     private func contentURL(_ unit: OfflineUnit, origin: URL) -> URL? {
         if unit.profile == "original" {
             return origin.appending(path: "api/v1/offline/files/\(unit.fileId)/content")
@@ -242,16 +258,20 @@ final class OfflineDownloader {
 
     private func createTask(_ unit: OfflineUnit, owner: OfflineOwner) {
         let server = ServerAddress(origin: owner.origin)
+        // 发到这台服务器当前选中的地址（在家内网、出门外网）：每次（重新）建任务时定，续传断了重建也跟着换
         guard let token = TokenVault.token(server: server, username: owner.username),
-              let url = contentURL(unit, origin: owner.origin) else {
+              let url = contentURL(unit, origin: ServerRoutes.shared.origin(for: server)) else {
             fail(unit.fileId, Self.signedOutMessage, retryable: true)
             return
         }
         let resumeFile = OfflineDisk.resumeDataFile(owner.key, unit.mediaItemId, unit.fileId)
         let task: URLSessionDownloadTask
-        if let resume = try? Data(contentsOf: resumeFile) {
+        let resume = try? Data(contentsOf: resumeFile)
+        if let resume { OfflineDisk.queue.async { OfflineDisk.remove(resumeFile) } }
+        // 续传数据里写死了当初的地址：出门后（内网 → 外网）拿它续传会一直打到连不上的旧地址，每次失败又存一份
+        // 同样的续传数据。地址换了就丢掉它从当前地址重下——丢了已下的部分，但一定下得完
+        if let resume, Self.resumeData(resume, matches: url) {
             task = session.downloadTask(withResumeData: resume)
-            OfflineDisk.queue.async { OfflineDisk.remove(resumeFile) }
         } else {
             var request = URLRequest(url: url)
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

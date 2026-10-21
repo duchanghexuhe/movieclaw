@@ -30,12 +30,14 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import tarfile
 import threading
 import time
@@ -735,12 +737,43 @@ async def check_update() -> UpdateCheckView:
 
 
 def _atomic_symlink(target: Path, link: Path) -> None:
-    """原子地把 link 指向 target：先建临时链接再 rename 替换。"""
+    """原子地把 link 指向 target：先建临时链接再 rename 替换。
+
+    飞牛 NAS 等 ZFS 部署下，``os.replace()`` 替换符号链接会抛
+    ``OSError: [Errno 18] Invalid cross-device link``（ZFS 的 rename 对
+    symlink 走了跨设备路径）。data 卷挂在 ZFS 上时，应用内更新会在最后
+    「切换 current/previous 指针」这一步失败（回退与 NER 模型更新同理）。
+
+    这里在 EXDEV 时改用 coreutils 的 ``mv -T`` 兜底：它对 symlink 走
+    「先删后建」的路径，在 ZFS 上可以正确完成替换；遇到目标是普通目录时
+    会拒绝覆盖，不会误删目录内容。
+
+    不用 ``shutil.move()``：它在 rename 失败后会退化为 ``os.symlink()``，
+    目标已存在时不但没换掉旧链接，还会把目标本身改成指向新目录的链接
+    ——比直接失败更危险。
+    """
     tmp = link.with_name(link.name + ".tmp")
     if tmp.is_symlink() or tmp.exists():
         tmp.unlink()
     tmp.symlink_to(target)
-    os.replace(tmp, link)
+    try:
+        os.replace(tmp, link)
+        return
+    except OSError as exc:
+        # EXDEV(18)：ZFS 上 rename 符号链接的跨设备错误
+        if exc.errno != errno.EXDEV:
+            raise
+        logger.warning(
+            "检测到文件系统不支持原子替换符号链接（EXDEV），改用 mv 兜底：%s", link
+        )
+    result = subprocess.run(
+        ["mv", "-T", "--", str(tmp), str(link)], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"符号链接替换失败：{tmp} -> {link}（mv rc={result.returncode}）："
+            f"{result.stderr.strip()}"
+        )
 
 
 def _verify_sha256(path: Path, expected: str) -> None:

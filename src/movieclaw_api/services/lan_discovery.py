@@ -250,7 +250,28 @@ async def movieclaw_reply(client_ip: str, http_port: int) -> dict | None:
         "name": setting.server_name,
         "server_version": __version__,
         "addresses": addresses,
+        "endpoints": await _endpoints(addresses),
     }
+
+
+async def _endpoints(addresses: list[str]) -> list[dict[str, str]]:
+    """``addresses`` 加上访问地址簿，标上内网 / 外网（server-addresses.md §3.2）。"""
+    from movieclaw_api.services.server_addresses import address_book, normalize_url, url_kind
+
+    try:
+        book = await address_book.list()
+    except Exception:
+        logger.debug("自动发现：读访问地址失败", exc_info=True)
+        book = []
+    kinds = {view.url: view.kind for view in book}
+    result: dict[str, str] = {}
+    for raw in [*addresses, *(view.url for view in book)]:
+        try:
+            url = normalize_url(raw)
+        except ValueError:
+            continue
+        result.setdefault(url, kinds.get(url) or url_kind(url))
+    return [{"url": url, "kind": kind} for url, kind in result.items()]
 
 
 async def jellyfin_reply(client_ip: str, http_port: int) -> dict | None:
