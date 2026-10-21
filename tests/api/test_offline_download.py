@@ -868,6 +868,51 @@ def test_export_waits_when_the_transcoder_drops_before_it_starts(client, tmp_pat
     assert state["data"]["status"] == "queued", state
 
 
+def test_export_runs_on_a_windows_nvenc_transcoder(client, tmp_path, monkeypatch) -> None:
+    """NAS 没有显卡、软件转码没开，只连着一台 Windows（NVENC）转码器：导出交给它转，
+    不去等一台根本不存在的 Mac 转码器（以前远程只认 VideoToolbox，这里会一直排队）。
+    NVENC 没有 HEVC 导出链，出 H.264。"""
+    from movieclaw_api.services.playback import hwprobe
+    from movieclaw_api.services.playback import remote_worker as remote_worker_module
+
+    class _Socket:
+        async def send_json(self, _message: dict) -> None:
+            return None
+
+        async def close(self, **_: object) -> None:
+            return None
+
+    registry = remote_worker_module.RemoteWorkerRegistry()
+    monkeypatch.setattr(remote_worker_module, "_registry", registry)
+    monkeypatch.setattr(remote_worker_module, "remote_worker_enabled", lambda: True)
+    monkeypatch.setattr(hwprobe, "_cache", [])
+    _lib, _item, file_id = seed(client, tmp_path, real=False)
+
+    async def execution(session):
+        return await exports._execution(await session.get(LibraryFile, file_id), "480p", None)
+
+    assert _run(client, execution) is None, "没有任何转码器、软转没开：排队等"
+
+    async def connect():
+        return await registry.register(
+            _Socket(),
+            {
+                "worker_id": "win-pc",
+                "capabilities": {
+                    "backends": ["nvenc"],
+                    "encoders": ["h264_nvenc", "hevc_nvenc"],
+                    "filters": ["scale_cuda"],
+                },
+            },
+        )
+
+    client.portal.call(connect)  # type: ignore[attr-defined]
+    chosen = _run(client, execution)
+    assert chosen is not None
+    assert (chosen.hw_backend, chosen.remote) == ("nvenc", True)
+    assert chosen.plan.video.codec == "h264"
+
+
 def test_activity_shows_transcode_info_instead_of_export_hash(client, tmp_path) -> None:
     """活动页「正在下载」：转码导出那一行不显示导出号哈希，换成转码信息；边转边下时进度按
     已转比例推算的最终大小算（按码率上限估的大小会让进度条停在一半）。"""

@@ -964,6 +964,8 @@ class HwBackendStatusView(BaseModel):
     label: str
     available: bool
     detail: str
+    #: 远程 Worker 的能力（不是 NAS 本机探测的）；同名后端两边可以各有一条
+    remote: bool = False
 
 
 class HwProbeView(BaseModel):

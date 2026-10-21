@@ -64,7 +64,7 @@ from movieclaw_api.services.playback.limits import (
 from movieclaw_api.services.playback.plan import load_policy, select_execution_backend
 from movieclaw_api.services.playback.remote_worker import (
     effective_remote_transcode_config,
-    remote_worker_available,
+    remote_backends_available,
 )
 from movieclaw_api.services.playback.session import (
     DiskQuotaError,
@@ -400,8 +400,8 @@ async def _metadata_owner_for(f: LibraryFile) -> LibraryFile:
 async def _load_policy_for(segment_container: str) -> PlaybackPolicy:
     """转码策略，按播放器要的分片容器校正「有没有硬件」。
 
-    ``load_policy`` 把在线的远程 Worker 算作 VideoToolbox 硬件，但 TS 分片只能交给
-    声明了 ``mpegts`` 的 Worker：旧版 Mac Worker 的上传代理只放行 fMP4 产物，TS
+    ``load_policy`` 把在线的远程 Worker 算作硬件，但 TS 分片只能交给声明了
+    ``mpegts`` 的 Worker：旧版 Mac Worker 与 Windows Worker 的上传代理只放行 fMP4 产物，TS
     分片在它本机就被拒收，ffmpeg 却不看上传响应码、照样退出码 0 转完整部片，播放器
     等满 30 秒只拿到 404（issue #444）。硬件只剩这种 Worker 时本次按「无硬件」协商：
     软转开着就退软转，没开就按直连应答（硬边界 4），并在日志里点名要更新 Worker。
@@ -412,12 +412,12 @@ async def _load_policy_for(segment_container: str) -> PlaybackPolicy:
         return policy
     if await asyncio.to_thread(available_local_backends):
         return policy
-    if remote_worker_available("videotoolbox", segment_type="mpegts"):
+    if remote_backends_available("mpegts"):
         return policy
-    if remote_worker_available("videotoolbox"):
+    if remote_backends_available():
         logger.warning(
-            "在线的远程转码 Worker 版本过旧，传不回 Infuse 等播放器要的 TS 分片，本次按无硬件"
-            "处理。请把 Mac 上的 MovieClaw 转码器更新到与服务端相同的版本"
+            "在线的远程转码 Worker 传不回 Infuse 等播放器要的 TS 分片（Windows Worker 或旧版"
+            " Mac 转码器），本次按无硬件处理。Mac 上的 MovieClaw 转码器请更新到与服务端相同的版本"
         )
     return replace(policy, hardware_available=False)
 
@@ -1333,9 +1333,7 @@ async def _capped_transcode_spec(f: LibraryFile, params: TranscodeParams) -> _Se
             decision,
             available=backends,
             local_backends=local_backends,
-            remote_video_available=remote_worker_available(
-                "videotoolbox", segment_type=segment_type(decision)
-            ),
+            remote_video_available=bool(remote_backends_available(segment_type(decision))),
         )
         if hw_backend is None:
             if not policy.software_transcode_enabled:

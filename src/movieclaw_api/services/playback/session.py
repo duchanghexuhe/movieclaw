@@ -53,7 +53,6 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     SEGMENT_SECONDS,
     TranscodeCommand,
     build_hls_command,
-    effective_hw_backend,
     segment_pattern,
     segment_type,
 )
@@ -65,7 +64,8 @@ from movieclaw_api.services.playback.remote_worker import (
     WorkerConnection,
     effective_remote_transcode_config,
     get_remote_worker_registry,
-    remote_worker_available,
+    remote_backend_can_run,
+    remote_backends_available,
 )
 from movieclaw_db.models.base import utcnow
 from movieclaw_events import new_ulid
@@ -1352,10 +1352,8 @@ class TranscodeSessionManager:
         """
         assert not session.remote
         disc = session.concat_list is not None
-        for name in ("videotoolbox", "nvenc"):
-            if not remote_worker_available(name, segment_type(session.plan), disc=disc):
-                continue
-            if effective_hw_backend(session.plan, name) is None:
+        for name in remote_backends_available(segment_type(session.plan), disc=disc):
+            if not remote_backend_can_run(session.plan, name):
                 continue
             old_backend = session.hw_backend
             session.hw_backend = name

@@ -124,9 +124,23 @@ HTTPS 是公网和不可信网络的默认选择。可信内网可以在远程�
    Worker 上传代理与 NAS 产物端点的文件名白名单必须放行同一批名字，由 NAS 侧测试
    从 Swift 源码读出来核对。
 
-当前服务端主要使用 `videotoolbox`/`h264_videotoolbox` 能力，因此现有可用 Worker
-是 macOS Apple Silicon 实现。其他平台可以新增对应后端和编码器能力，不应仅凭平台名
+远程后端名单只在一处：`remote_worker.REMOTE_BACKENDS`（目前 `videotoolbox` 与 `nvenc`，
+按这个顺序优先）。播放决策、会话层的起步失败切远程、离线导出、Jellyfin 兼容层都从这里取，
+不再各写一份。其他平台新增后端 = 在这里加名字 + 那条命令链的真片矩阵，不应仅凭平台名
 推断硬件可用。
+
+**「在哪儿跑」与「用哪种硬件跑」分开**（2026-10-21）。同一个后端名可以本机、远程各有一份
+（NAS 插着 NVIDIA 卡、远程也是 Windows NVENC；以后 NAS 核显与低功耗主机都是 QSV），两边是
+两块硬件、两个 ffmpeg 构建，结论互不覆盖：
+
+- 本机自检（`hwprobe`）的结果只说 NAS：远程能力不写进本机探测缓存，也不写进 `ffmpeg_args`
+  的原生 tone-map / 编码器参数登记表。设置页的硬件检测把远程单列（`remote: true`）。
+- 远程任务的命令只看接单 Worker 的申报（`WorkerVideoCaps`）：原生 tone-map 按它的
+  `filters` 判（如 NVENC 要有 `tonemap_cuda`），不继承本机的 VAAPI 低功耗之类参数。
+- 决策层判「远程装不装得出这条链」时问注册表（`remote_backend_can_run`，按在线 Worker 各自
+  的申报），不拿本机结论代答。
+- 本机后端的起步熔断（`backend_health`）只管本机，远程同名 Worker 照常接单；远程自己的
+  熔断见 §3.2。
 
 Worker 每 5 秒发一次心跳，服务端超过 45 秒没收到任何消息就判定该 Worker 离线、不再
 派单。Worker 侧用同一个 45 秒窗口反向判定：超时没收到 NAS 的任何响应（含心跳 ack）
@@ -306,7 +320,7 @@ Worker 不自行决定转码质量参数，`ffmpeg_args` 由 NAS 的统一命令
 分片就失败**（`job.progress` 从未带来 `out_time_ms > 0`）。5 分钟内连续 2 次即熔断 5 分钟：
 
 - 熔断期间不参与**播放**派单（`_select_worker` 跳过），决策层随之看不到这个后端
-  （`hwprobe._with_remote_backend` 走 `remote_worker_available`），自动落回本机硬件；
+  （`hwprobe.available_backends` 走 `remote_backends_available`），自动落回本机硬件；
 - **预转码照派**（`preload_workers` 不过滤）：批处理会落盘重试、用户不在等，让它干活无害；
 - 转完一次、或 Worker 重连（用户改配置后的第一件事就是重启它）即清零，不跨连接粘住；
 - `worker_online`（连接活着）与 `worker_usable`（能派单）从此分开：心跳端点用后者判

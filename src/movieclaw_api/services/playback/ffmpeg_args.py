@@ -431,24 +431,33 @@ def register_native_tonemap(backend: str, filter_expr: str | None) -> None:
         _PROBED_TONEMAP.pop(backend, None)
 
 
-def tonemap_reads_dolby_vision(backend_name: str) -> bool:
+def tonemap_reads_dolby_vision(
+    backend_name: str, caps: WorkerVideoCaps | None = None
+) -> bool:
     """该后端的原生色调映射认不认杜比视界 RPU。VAAPI / QSV 不认：P5 的 IPT 基础层出来整片发紫。"""
     backend = HW_BACKENDS.get(backend_name)
-    expr = native_tonemap_filter(backend) if backend is not None else None
+    expr = native_tonemap_filter(backend, caps) if backend is not None else None
     return (expr or "").split("=", 1)[0] in _DOVI_AWARE_TONEMAPS
 
 
-def native_tonemap_filter(backend: HwBackend) -> str | None:
-    """该后端这次能用的原生 tone-map 滤镜；None=只能走软件 tone-map。"""
-    return _PROBED_TONEMAP.get(backend.name, backend.tonemap_filter)
+#: 要靠执行者的 ffmpeg 带着才有的原生 tone-map（不写死进 ``HW_BACKENDS`` 的那些）。
+#: 本机由自检确认后登记进 ``_PROBED_TONEMAP``；远程 Worker 看它申报的 ``filters``。
+_OPTIONAL_TONEMAP: dict[str, str] = {"nvenc": NVENC_TONEMAP}
 
 
-def registered_native_tonemap(backend: str) -> str | None:
-    """某个后端当前已注册的原生 tone-map 滤镜；None=没注册。
+def native_tonemap_filter(
+    backend: HwBackend, caps: WorkerVideoCaps | None = None
+) -> str | None:
+    """该后端这次能用的原生 tone-map 滤镜；None=只能走软件 tone-map。
 
-    给远程 Worker 的注册/撤销配对用：断开时只有当注册值仍是自己写入的那份
-    才撤销，避免盖掉本机探测的结论。"""
-    return _PROBED_TONEMAP.get(backend)
+    ``caps`` 非 None 即远程执行：只信接单 Worker 申报的滤镜，不看 NAS 本机的自检
+    结论——同名后端（本机 NVIDIA 与远程 Windows 显卡）的 ffmpeg 构建各不相同，
+    一边的结论套到另一边，装出来的链不是缺滤镜就是白白绕回 CPU。
+    """
+    if caps is None:
+        return _PROBED_TONEMAP.get(backend.name, backend.tonemap_filter)
+    expr = _OPTIONAL_TONEMAP.get(backend.name, backend.tonemap_filter)
+    return expr if expr and expr.split("=", 1)[0] in caps.filters else None
 
 
 #: VAAPI 的低功耗编码（Intel VDEnc 定长电路）。Intel 自 11/12 代起主推这条路；issue #763 的
@@ -470,13 +479,22 @@ def register_encoder_options(backend: str, options: tuple[str, ...]) -> None:
         _PROBED_ENCODER_OPTIONS.pop(backend, None)
 
 
-def encoder_options(backend: HwBackend) -> tuple[str, ...]:
-    """该后端这次编码要追加的参数。"""
+def encoder_options(
+    backend: HwBackend, caps: WorkerVideoCaps | None = None
+) -> tuple[str, ...]:
+    """该后端这次编码要追加的参数。远程执行（``caps`` 非 None）不加：本机自检的
+    结论（如 VAAPI 低功耗）说的是 NAS 这块核显，不是接单的那台机器。"""
+    if caps is not None:
+        return ()
     return _PROBED_ENCODER_OPTIONS.get(backend.name, ())
 
 
 def _needs_software_filters(
-    plan: PlaybackPlan, backend: HwBackend | None, *, burn: bool
+    plan: PlaybackPlan,
+    backend: HwBackend | None,
+    *,
+    burn: bool,
+    caps: WorkerVideoCaps | None = None,
 ) -> bool:
     """这条计划的滤镜链是不是必须落到软件侧（帧在系统内存里）。
 
@@ -493,12 +511,12 @@ def _needs_software_filters(
     （见 ``_filter_chain``），同样按软件滤镜处理。
 
     ``burn`` 由调用方给：装配层用的是解析后的轨道序号（解析不出来就不烧），
-    决策层只有计划字段，两者不能互相假定。
+    决策层只有计划字段，两者不能互相假定。``caps`` 见 ``native_tonemap_filter``。
     """
     if burn:
         return True
     if plan.video.tone_map and (
-        backend is None or native_tonemap_filter(backend) is None
+        backend is None or native_tonemap_filter(backend, caps) is None
     ):
         return True
     if _color_convert_filter(plan) is not None:
@@ -511,14 +529,17 @@ def _needs_software_filters(
     )
 
 
-def effective_hw_backend(plan: PlaybackPlan, hw_backend: str | None) -> str | None:
+def effective_hw_backend(
+    plan: PlaybackPlan, hw_backend: str | None, caps: WorkerVideoCaps | None = None
+) -> str | None:
     """这次会话**实际**用哪个硬件后端。
 
     滤镜链被拉回软件侧时（烧录、软件 tone-map、色彩空间转换），编码器吃不了
     软件帧的后端（VAAPI/QSV）退回软件编码。诊断面板的 ``hw_backend`` 必须走
     这里——报一个实际没用上的后端名，用户查「为什么转码这么卡」时会被带偏；
     路由层也据此判断硬件档还能不能执行（不能就走统一降档，而不是让 ffmpeg
-    带着一条装不起来的滤镜链去失败）。
+    带着一条装不起来的滤镜链去失败）。``caps``：远程执行时接单 Worker 的申报，
+    见 ``native_tonemap_filter``。
     """
     if plan.video.action != "transcode" or hw_backend is None:
         return None if plan.video.action != "transcode" else hw_backend
@@ -526,7 +547,7 @@ def effective_hw_backend(plan: PlaybackPlan, hw_backend: str | None) -> str | No
     if backend is None:
         return None
     if not backend.sw_frames_ok and _needs_software_filters(
-        plan, backend, burn=plan.video.burn_subtitle is not None
+        plan, backend, burn=plan.video.burn_subtitle is not None, caps=caps
     ):
         return None
     return hw_backend
@@ -576,7 +597,8 @@ def build_hls_command(
     只是索引近似，播放器按分片真实时间戳自我校正，Jellyfin 同款取舍）。
 
     ``worker_caps`` 是接单的远程 Worker 申报的视频能力（远程任务恒传，本机执行为
-    None），VideoToolbox 命令按它分流，见 ``_videotoolbox_mode``。
+    None）：VideoToolbox 命令按它分流（见 ``_videotoolbox_mode``），原生 tone-map 与
+    编码器参数也只看它、不看 NAS 本机的自检（见 ``native_tonemap_filter``）。
 
     ``seek_pad_s``：直通档 ``-ss`` 往起点后多给的秒数（见下面的注释）。VOD 重启由会话层按
     分片规划给（``SegmentPlan.seek_pad``），不能越过下一个关键帧。
@@ -596,7 +618,9 @@ def build_hls_command(
 
     transcoding_video = plan.video.action == "transcode"
     backend = (
-        HW_BACKENDS.get(effective_hw_backend(plan, hw_backend) or "") if transcoding_video else None
+        HW_BACKENDS.get(effective_hw_backend(plan, hw_backend, worker_caps) or "")
+        if transcoding_video
+        else None
     )
     burn_index = _burn_subtitle_index(plan) if transcoding_video else None
     vt_mode = _videotoolbox_mode(plan, backend, worker_caps, burn=burn_index is not None)
@@ -604,7 +628,9 @@ def build_hls_command(
         vt_mode == VT_SOFTWARE_DECODE
         or (
             vt_mode != VT_GPU
-            and _needs_software_filters(plan, backend, burn=burn_index is not None)
+            and _needs_software_filters(
+                plan, backend, burn=burn_index is not None, caps=worker_caps
+            )
         )
     )
 
@@ -679,7 +705,12 @@ def build_hls_command(
     argv += ["-sn", "-dn", "-map_metadata", "-1"]
 
     argv += _video_args(
-        plan, backend, software_filters, skip_filters=burn_index is not None, vt_mode=vt_mode
+        plan,
+        backend,
+        software_filters,
+        skip_filters=burn_index is not None,
+        vt_mode=vt_mode,
+        caps=worker_caps,
     )
     argv += _audio_args(
         plan, has_audio=audio_index is not None, absolute_ts=start_number is not None
@@ -824,6 +855,7 @@ def _video_args(
     *,
     skip_filters: bool = False,
     vt_mode: str | None = None,
+    caps: WorkerVideoCaps | None = None,
 ) -> list[str]:
     if plan.video.action == "copy":
         args = ["-c:v", "copy"]
@@ -847,7 +879,9 @@ def _video_args(
 
     # 烧录时滤镜已在 filter_complex 图里（-vf 与 filter_complex 互斥）
     filters = (
-        "" if skip_filters else _filter_chain(plan, backend, software_filters, vt_mode=vt_mode)
+        ""
+        if skip_filters
+        else _filter_chain(plan, backend, software_filters, vt_mode=vt_mode, caps=caps)
     )
     args = []
     if filters:
@@ -864,12 +898,13 @@ def _video_args(
     if backend is not None and hevc:
         # 离线导出的 HEVC：8-bit Main（输出恒为 SDR BT.709，iPhone 全系硬解），hvc1 标签
         # 理由同直通档。没有 H.264 那几条：hevc_videotoolbox 不认 -a53cc，High@4.1 是 H.264 的
-        args += ["-c:v", backend.hevc_encoder, *encoder_options(backend), "-profile:v", "main"]
+        args += ["-c:v", backend.hevc_encoder, *encoder_options(backend, caps)]
+        args += ["-profile:v", "main"]
         if vt_mode != VT_GPU:
             args += ["-pix_fmt", "yuv420p"]
         args += ["-tag:v", "hvc1", "-b:v", "0", "-maxrate", maxrate, "-bufsize", bufsize]
     elif backend is not None:
-        args += ["-c:v", backend.encoder, *encoder_options(backend)]
+        args += ["-c:v", backend.encoder, *encoder_options(backend, caps)]
         # iOS 原生 HLS 对 10-bit/High 10 的硬件编码结果兼容性很差，统一锁
         # 到 High profile + 8-bit yuv420p。level 4.1 与**实际编码尺寸**是硬校验
         #（H.264 level 4.1 上限 8192 宏块）：宽银幕缩到 1080p 高后宽出界——
@@ -1006,6 +1041,7 @@ def _filter_chain(
     software_filters: bool,
     *,
     vt_mode: str | None = None,
+    caps: WorkerVideoCaps | None = None,
 ) -> str:
     if vt_mode == VT_GPU:
         return _videotoolbox_gpu_chain(plan)
@@ -1013,7 +1049,7 @@ def _filter_chain(
     height = plan.video.height
     if plan.video.tone_map:
         native = (
-            native_tonemap_filter(backend)
+            native_tonemap_filter(backend, caps)
             if backend is not None and not software_filters
             else None
         )

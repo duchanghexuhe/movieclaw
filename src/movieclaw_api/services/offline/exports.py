@@ -9,7 +9,7 @@ App 选了 1080p / 720p / 480p 下载时，服务器把整片转成一个分片�
 分片多半还在转码缓存里，不必真重转）。
 
 **转码走播放的会话层**：导出就是一个「只下载、不看」的 VOD 会话，按顺序要分片、拿到就接到
-文件后面。挑执行者（本机硬件 → 在线的 Mac 转码器 → 软件）、远程派单、补片重启都与播放同一套，
+文件后面。挑执行者（本机硬件 → 在线的远程转码器 → 软件）、远程派单、补片重启都与播放同一套，
 NAS 没有显卡时整片交给转码器做。
 
 - **导出号** = 文件身份（id、大小、修改时间）+ 档位 + 音轨 + 导出格式版本的指纹：
@@ -59,6 +59,8 @@ from movieclaw_api.services.playback.limits import (
 )
 from movieclaw_api.services.playback.remote_config import effective_remote_transcode_config
 from movieclaw_api.services.playback.remote_worker import (
+    any_remote_worker_busy,
+    remote_backends_available,
     remote_worker_available,
     remote_worker_busy,
     remote_workers_have_encoder,
@@ -313,8 +315,8 @@ async def _execution(
             plan,
             available=backends,
             local_backends=local,
-            remote_video_available=remote_worker_available(
-                "videotoolbox", segment_type(plan), strict=True
+            remote_video_available=bool(
+                remote_backends_available(segment_type(plan), strict=True)
             ),
         )
         if backend is not None:
@@ -324,7 +326,7 @@ async def _execution(
                 plan = replace(plan, video=replace(plan.video, codec="hevc"))
             return _Execution(plan, backend, remote)
         if (
-            remote_worker_busy("videotoolbox")
+            any_remote_worker_busy()
             or plan.video.tone_map
             or not policy.software_transcode_enabled
         ):

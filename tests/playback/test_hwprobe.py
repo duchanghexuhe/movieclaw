@@ -307,10 +307,16 @@ def test_local_available_backends_excludes_remote_overlay(monkeypatch):
     """远程 Worker 的硬件能力不能变成本地 ffmpeg 参数。"""
     monkeypatch.setattr(hwprobe.shutil, "which", lambda _n: "/usr/bin/ffmpeg")
     monkeypatch.setattr(hwprobe, "_list_encoders", lambda: frozenset())
-    monkeypatch.setattr(hwprobe, "remote_worker_available", lambda _backend: True)
+    monkeypatch.setattr(hwprobe, "remote_backends_available", lambda: ("videotoolbox", "nvenc"))
 
-    assert hwprobe.available_backends() == ("nvenc", "videotoolbox")
+    assert hwprobe.available_backends() == ("videotoolbox", "nvenc")
     assert hwprobe.available_local_backends() == ()
+    # 设置页的本机探测结果里也没有它们：远程能力单列（remote_backend_statuses）
+    assert not any(s.available for s in hwprobe.probe_backends())
+    assert [(s.name, s.remote) for s in hwprobe.remote_backend_statuses()] == [
+        ("videotoolbox", True),
+        ("nvenc", True),
+    ]
 
 
 def test_every_backend_has_a_human_label():

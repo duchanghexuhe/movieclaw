@@ -819,13 +819,12 @@ def test_registry_reads_read_options_capability():
     assert parse(base).video_caps.read_options == frozenset()
 
 @pytest.mark.asyncio
-async def test_worker_disconnect_does_not_delete_foreign_registration():
-    """撤销只动自己写入的值：断开时注册表里已不是 hello 写入的那份（例如
-    本机探测刚重跑过），就原样保留。"""
+async def test_worker_hello_never_touches_local_probe_results():
+    """Worker 的申报只用于派给它的任务，不写进 NAS 本机的自检结论：本机也有 NVIDIA 卡时，
+    两边是两个 ffmpeg 构建，一边的结论套到另一边就会装出缺滤镜的链。上线、断开都不动它。"""
     from movieclaw_api.services.playback.ffmpeg_args import (
-        NVENC_TONEMAP,
-        register_native_tonemap,
-        registered_native_tonemap,
+        HW_BACKENDS,
+        native_tonemap_filter,
     )
 
     registry = RemoteWorkerRegistry()
@@ -840,11 +839,11 @@ async def test_worker_disconnect_does_not_delete_foreign_registration():
             },
         },
     )
-    assert registered_native_tonemap("nvenc") == NVENC_TONEMAP
-    # 本机「重新探测」写入了别的结论（比如探到不可用 → 清空）
-    register_native_tonemap("nvenc", None)
+    nvenc = HW_BACKENDS["nvenc"]
+    assert native_tonemap_filter(nvenc) is None, "本机没探到就是没有"
+    assert native_tonemap_filter(nvenc, connection.capabilities.video_caps) is not None
     await registry.unregister(connection)
-    assert registered_native_tonemap("nvenc") is None  # 探测的结论原样保留
+    assert native_tonemap_filter(nvenc) is None
 
 
 # ---------------------------------------------------------------------------

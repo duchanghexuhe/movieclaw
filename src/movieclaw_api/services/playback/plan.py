@@ -27,6 +27,9 @@ from movieclaw_api.services.playback.hwprobe import hardware_available
 from movieclaw_api.services.playback.iso_source import iso_disc_source
 from movieclaw_api.services.playback.limits import MAX_TRANSCODE_HEIGHT
 from movieclaw_api.services.playback.remote_worker import (
+    REMOTE_BACKENDS,
+    any_remote_worker_busy,
+    remote_backend_can_run,
     remote_worker_available,
     remote_worker_busy,
 )
@@ -250,10 +253,8 @@ async def load_policy() -> PlaybackPolicy:
     return PlaybackPolicy(
         software_transcode_enabled=stored.software_transcode_enabled,
         hardware_available=available,
-        # 本机无硬件但远程有（Mac 或 Windows GPU），提示「忙」而不是「没有」；
-        # 名单要覆盖 _with_remote_backend 叠加的每个远程后端
-        hardware_busy=not available
-        and any(remote_worker_busy(name) for name in ("videotoolbox", "nvenc")),
+        # 本机无硬件但远程有（Mac 或 Windows GPU），提示「忙」而不是「没有」
+        hardware_busy=not available and any_remote_worker_busy(),
         max_transcode_height=MAX_TRANSCODE_HEIGHT,
     )
 
@@ -305,16 +306,16 @@ def select_execution_backend(
 
     # 远程候选在进入顺序比较前先过两道闸：兼容性（滤镜链）与忙闲（名额
     # 全满的 Worker 选了也会在 reserve 时 503，而明明还有本机能放——忙者
-    # 跳过，让本地兜底接住）。谁在 ``available`` 里由 hwprobe._with_remote_backend
-    # 按在线状态叠加。``remote_online`` 是只过了兼容性这道闸的在线者，杜比视界
-    # 规则要用（见下）。
+    # 跳过，让本地兜底接住）。谁在 ``available`` 里由 hwprobe.available_backends
+    # 按在线状态叠加；兼容性按接单 Worker 自己申报的能力判（不是 NAS 本机的自检）。
+    # ``remote_online`` 是只过了兼容性这道闸的在线者，杜比视界规则要用（见下）。
     remote_online = tuple(
         backend
-        for backend in ("videotoolbox", "nvenc")
+        for backend in REMOTE_BACKENDS
         if (
             remote_video_available
             and backend in available
-            and effective_hw_backend(decision, backend) is not None
+            and remote_backend_can_run(decision, backend)
         )
     )
     remote_candidates = tuple(b for b in remote_online if not remote_worker_busy(b))
@@ -335,8 +336,7 @@ def select_execution_backend(
         if not usable:
             return (remote_candidates or remote_online)[0], True
 
-    # 本地执行不了才轮到远程 Worker。远程后端按优先级排：videotoolbox 在前
-    # （先接单的跑得久，速度画像更厚），nvenc（Windows GPU）兜底。
+    # 本地执行不了才轮到远程 Worker，远程后端按 REMOTE_BACKENDS 的优先级。
     # 熔过的本地后端先跳过（起步即死刚发生过，证据见 backend_health）；
     # 若全都被熔且远程也没有，末位兜底仍按原顺序试——熔断表达的是优先级
     # 降低，不是绝对禁用，没有替代者时把片子判死比再试一次坏后端更糟。
