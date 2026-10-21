@@ -75,8 +75,7 @@ import { usePluginApps } from "@/lib/plugin-apps-context";
 import { applyNavOrder, mergeNavOrder, sameNavOrder } from "@/lib/sidebar-nav";
 import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
 import { useActiveExtensionPoints } from "@/lib/use-extension-points";
-import { useTheme, useUiPrefs } from "@/lib/ui-prefs";
-import { useIsMobile } from "@/lib/use-media-query";
+import { useIsPhone, useTheme, useUiPrefs } from "@/lib/ui-prefs";
 import { useResolvedTheme } from "@/themes/registry";
 import { useTabParam } from "@/lib/use-tab-param";
 
@@ -810,7 +809,8 @@ function DisabledGlassGroup({ label, children }: { label: string; children: Reac
  *
  * **按当前设备语境设置**（2026-09-24 用户拍板：UI 不分「桌面端 / 移动端」两组）：
  * 在桌面端打开设置，改的就是桌面端主题（theme_desktop）；在移动端改的就是
- * 移动端主题（theme_mobile）。解析规则见 lib/ui-prefs.tsx 的 resolveThemeId；
+ * 移动端主题（theme_mobile）。「移动端」指手机设备类，含横过来拿的手机（判据见
+ * lib/themes.ts 的 PHONE_THEME_QUERY）。解析规则见 lib/ui-prefs.tsx 的 resolveThemeId；
  * 组内高亮的是当前端实际生效的主题——没单独设置过时跟随通用 theme 字段
  * （升级前老账号的唯一数据），点了卡才落当前端的覆盖字段。
  *
@@ -819,9 +819,9 @@ function DisabledGlassGroup({ label, children }: { label: string; children: Reac
  */
 function ThemeGroup() {
   const { savedPrefs, savePrefs, loading } = useUiPrefs();
-  const isMobile = useIsMobile();
-  // 在哪个版式上设置，就落哪个端的覆盖字段
-  const field = isMobile ? ("theme_mobile" as const) : ("theme_desktop" as const);
+  const phone = useIsPhone();
+  // 在哪个设备类上设置，就落哪个端的覆盖字段
+  const field = phone ? ("theme_mobile" as const) : ("theme_desktop" as const);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const current = normalizeThemeId(savedPrefs[field] ?? savedPrefs.theme);
@@ -845,7 +845,7 @@ function ThemeGroup() {
     <SettingsSection
       title="主题"
       footnote={`主题跟随账号保存，所有设备同步；切换立即生效。当前设置的是${
-        isMobile ? "移动端" : "桌面端"
+        phone ? "移动端" : "桌面端"
       }的主题，两端可分别设置。`}
     >
       <ThemeCards

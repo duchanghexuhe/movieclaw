@@ -111,6 +111,24 @@ export const THEMES: ThemeMeta[] = [
 
 export const DEFAULT_THEME_ID = "silver";
 
+/**
+ * 「手机」设备类的媒体查询：主题按设备类分开存（theme_mobile / theme_desktop）时，
+ * 用它决定取哪一份。
+ *
+ * 只看页面宽度不行：手机横过来（系统转屏）宽 844~956，越过 768 的断点，就被当成电脑、
+ * 取了电脑那份主题（2026-10-21 用户发现：手机上是银玻璃，转横屏变成电脑上存的 Netflix）。
+ * 所以再加一档「粗指针 + 视口高 ≤ 500」：手机横拿的高只有 320~440，平板与电脑都在 700 以上。
+ * 粗指针看的是主输入设备——带触屏的笔记本主输入是鼠标 / 触控板，不会被误判成手机。
+ *
+ * 只管「取哪份主题偏好」。外壳结构（侧栏 / 底栏）仍按宽度分叉（use-media-query.ts 的
+ * MOBILE_QUERY）：横屏手机拿到的是手机那份主题，版式照旧是宽屏版。
+ *
+ * 放在这个无组件依赖的纯数据模块里，是因为 layout.tsx 的防闪烁脚本（服务端组件）也要用
+ * 同一串——「use client」模块的非组件导出在服务端拿不到真值。改这里，三处同步变：
+ * 防闪烁脚本、UiPrefsProvider 的写入、设置页落哪份覆盖字段。
+ */
+export const PHONE_THEME_QUERY = "(max-width: 767px), (pointer: coarse) and (max-height: 500px)";
+
 const THEME_ID_SET = new Set(THEMES.map((theme) => theme.id));
 
 /**

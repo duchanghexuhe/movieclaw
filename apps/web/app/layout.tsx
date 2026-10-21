@@ -4,7 +4,7 @@ import localFont from "next/font/local";
 import { ViewportKeyboard } from "@/components/viewport-keyboard";
 import { appleStartupImages } from "@/lib/apple-splash";
 import { publicEnv } from "@/lib/env";
-import { DEFAULT_THEME_ID, THEMES } from "@/lib/themes";
+import { DEFAULT_THEME_ID, PHONE_THEME_QUERY, THEMES } from "@/lib/themes";
 
 // 先引入液态玻璃组件自带的样式，再引入本项目的全局深色主题（后者可覆盖前者）。
 import "@/vendor/liquid-glass/styles.css";
@@ -141,14 +141,14 @@ const THEME_CHROME_MAP = JSON.stringify(
 );
 /**
  * 首帧主题与外壳几何的落位（同一份脚本，避免两个脚本的先后歧义）：
- * - 主题按**版式**解析：移动端（<768px）优先取 theme_mobile 覆盖、桌面端优先
- *   theme_desktop，都没有（老账号 / 未单独设置）回落 theme——与
- *   lib/ui-prefs.tsx 的 resolveThemeId 同一份语义，改一处要看另一处；
+ * - 主题按**设备类**解析：手机（含横过来拿，判据 PHONE_THEME_QUERY）优先取
+ *   theme_mobile 覆盖、电脑优先 theme_desktop，都没有（老账号 / 未单独设置）回落
+ *   theme——与 lib/ui-prefs.tsx 的 resolveThemeId 同一份语义，改一处要看另一处；
  * - 几何按解析出的主题查 chrome 映射，未知 id（缓存被改坏）回落银玻璃；
  * - data-theme / theme-color 只在非默认主题写（默认 = 无属性，与 ui-prefs
  *   的写入口径一致）。
  */
-const RESTORE_THEME_SCRIPT = `try{var p=JSON.parse(localStorage.getItem("movieclaw.ui-prefs")||"null");var c=${THEME_COLOR_MAP};var k=${THEME_CHROME_MAP};var mobile=window.matchMedia&&matchMedia("(max-width:767px)").matches;var t=p?(mobile?(p.theme_mobile||p.theme):(p.theme_desktop||p.theme)):null;var ch=(t&&k[t])||k.silver;var d=document.documentElement;var s=d.style;s.setProperty("--mobile-topbar-h",ch.t+"px");s.setProperty("--mobile-tabbar-h",ch.b+"px");s.setProperty("--mobile-tabbar-offset",ch.o);if(ch.m==="docked")d.setAttribute("data-tabbar-mode","docked");else d.removeAttribute("data-tabbar-mode");if(t&&c[t]){d.setAttribute("data-theme",t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content",c[t])}}catch(e){}`;
+const RESTORE_THEME_SCRIPT = `try{var p=JSON.parse(localStorage.getItem("movieclaw.ui-prefs")||"null");var c=${THEME_COLOR_MAP};var k=${THEME_CHROME_MAP};var phone=window.matchMedia&&matchMedia(${JSON.stringify(PHONE_THEME_QUERY)}).matches;var t=p?(phone?(p.theme_mobile||p.theme):(p.theme_desktop||p.theme)):null;var ch=(t&&k[t])||k.silver;var d=document.documentElement;var s=d.style;s.setProperty("--mobile-topbar-h",ch.t+"px");s.setProperty("--mobile-tabbar-h",ch.b+"px");s.setProperty("--mobile-tabbar-offset",ch.o);if(ch.m==="docked")d.setAttribute("data-tabbar-mode","docked");else d.removeAttribute("data-tabbar-mode");if(t&&c[t]){d.setAttribute("data-theme",t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content",c[t])}}catch(e){}`;
 
 /**
  * iOS 主屏网页必须显式撑满根画布，不能依赖 height:100% 的初始包含块。

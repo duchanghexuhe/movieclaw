@@ -15,8 +15,14 @@ import {
   updateUiPreferences,
   type UiPreferences,
 } from "@/lib/api/ui";
-import { DEFAULT_THEME_ID, normalizeThemeId, themeMeta, type ThemeMeta } from "@/lib/themes";
-import { useIsMobile } from "@/lib/use-media-query";
+import {
+  DEFAULT_THEME_ID,
+  PHONE_THEME_QUERY,
+  normalizeThemeId,
+  themeMeta,
+  type ThemeMeta,
+} from "@/lib/themes";
+import { useMediaQuery } from "@/lib/use-media-query";
 import { readUiPrefsCache, writeUiPrefsCache } from "@/lib/ui-prefs-cache";
 
 /**
@@ -63,13 +69,22 @@ const THEME_BROWSER_CHROME: Record<string, string> = {
 };
 
 /**
- * 按版式解析生效主题（2026-09-24 起桌面 / 移动端可分别选主题）：
- * 当前版式有覆盖字段（theme_desktop / theme_mobile）就用它，没有（老账号、
+ * 当前是不是「手机」设备类（含横过来拿）：主题按设备类分开存时取哪一份。
+ * 判据见 lib/themes.ts 的 PHONE_THEME_QUERY——不能只看页面宽度，手机横屏会越过
+ * 768 被当成电脑。外壳结构的分叉仍用 useIsMobile()（只看宽度），两者不是一回事。
+ */
+export function useIsPhone(): boolean {
+  return useMediaQuery(PHONE_THEME_QUERY);
+}
+
+/**
+ * 按设备类解析生效主题（2026-09-24 起手机 / 电脑可分别选主题）：
+ * 当前设备类有覆盖字段（theme_mobile / theme_desktop）就用它，没有（老账号、
  * 未单独设置）回落通用 theme——老数据唯一来源，行为与升级前完全一致。
  * 覆盖值可能是老后端 / 坏缓存里的垃圾，最终由 normalizeThemeId 兜底。
  */
-function resolveThemeId(prefs: UiPreferences, isMobile: boolean): string {
-  const override = isMobile ? prefs.theme_mobile : prefs.theme_desktop;
+function resolveThemeId(prefs: UiPreferences, phone: boolean): string {
+  const override = phone ? prefs.theme_mobile : prefs.theme_desktop;
   return normalizeThemeId(override ?? prefs.theme);
 }
 
@@ -123,8 +138,8 @@ export function UiPrefsProvider({ children }: { children: React.ReactNode }) {
   // data-tabbar-mode）：首帧值由 layout.tsx 的防闪烁脚本按 localStorage 缓存
   // 写入，这里负责设置页切主题（含实时预览）后的即时跟随。两处是同一份逻辑
   // 的两个副本，改一处要看另一处。
-  const isMobile = useIsMobile();
-  const effectiveTheme = resolveThemeId(preview ?? prefs, isMobile);
+  const phone = useIsPhone();
+  const effectiveTheme = resolveThemeId(preview ?? prefs, phone);
   useEffect(() => {
     const root = document.documentElement;
     if (effectiveTheme === DEFAULT_THEME_ID) root.removeAttribute("data-theme");
@@ -201,10 +216,10 @@ export function useUiPrefs(): UiPrefsContextValue {
  */
 export function useTheme(): ThemeMeta {
   const ctx = useContext(UiPrefsContext);
-  // hooks 必须无条件调用：先取版式，再解析（桌面 / 移动端可分别选主题，
+  // hooks 必须无条件调用：先取设备类，再解析（手机 / 电脑可分别选主题，
   // 见 resolveThemeId）。Provider 外（登录页等）没有偏好可依，按默认主题渲染
-  const isMobile = useIsMobile();
-  return themeMeta(ctx ? resolveThemeId(ctx.prefs, isMobile) : DEFAULT_THEME_ID);
+  const phone = useIsPhone();
+  return themeMeta(ctx ? resolveThemeId(ctx.prefs, phone) : DEFAULT_THEME_ID);
 }
 
 /**
@@ -220,9 +235,9 @@ export function useTheme(): ThemeMeta {
  */
 export function useThemeState(): { theme: ThemeMeta; loading: boolean } {
   const ctx = useContext(UiPrefsContext);
-  const isMobile = useIsMobile();
+  const phone = useIsPhone();
   return {
-    theme: themeMeta(ctx ? resolveThemeId(ctx.prefs, isMobile) : DEFAULT_THEME_ID),
+    theme: themeMeta(ctx ? resolveThemeId(ctx.prefs, phone) : DEFAULT_THEME_ID),
     // Provider 外（登录页等）没有偏好可等，直接按「已落定」处理
     loading: ctx ? ctx.loading : false,
   };
