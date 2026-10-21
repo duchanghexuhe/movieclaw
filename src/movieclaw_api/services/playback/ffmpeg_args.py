@@ -412,10 +412,20 @@ def _tonemap_step(expr: str, plan: PlaybackPlan) -> str:
       先改正标签；写对了的片是空操作。要吃 RPU 的不动：那条走 RPU，不看矩阵。
     """
     name = expr.split("=", 1)[0]
-    if plan.video.dolby_vision == "ignore" and name in _DOVI_AWARE_TONEMAPS:
-        expr += ":apply_dovi=0"
+    expr = dovi_tonemap(expr, plan.video.dolby_vision)
     if name == "tonemap_videotoolbox" and plan.video.dolby_vision != "apply":
         expr = "setparams=colorspace=bt2020nc," + expr
+    return expr
+
+
+def dovi_tonemap(expr: str, dolby_vision: str | None) -> str:
+    """色调映射滤镜按杜比视界处理补 ``apply_dovi``（``VideoPlan.dolby_vision`` 的取值）。
+
+    ``ignore``（记录不可信、只认基础层）时认 RPU 的滤镜要关掉还原，见 ``_tonemap_step``。
+    实时转码与预转码共用这一处，两条链对同一部片的颜色判断不能有两套。
+    """
+    if dolby_vision == "ignore" and expr.split("=", 1)[0] in _DOVI_AWARE_TONEMAPS:
+        return expr + ":apply_dovi=0"
     return expr
 
 

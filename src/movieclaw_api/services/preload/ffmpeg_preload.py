@@ -29,12 +29,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from movieclaw_api.services.media_probe import dolby_vision_ignored
 from movieclaw_api.services.playback.ffmpeg_args import (
     _BT709_OUTPUT_TAGS,
     _COLOR_CONVERT_INPUT,
     _SOFTWARE_TONEMAP,
     HW_BACKENDS,
     HwBackend,
+    dovi_tonemap,
 )
 from movieclaw_playback.subtitles import parse_embedded_track
 from movieclaw_playback.track_policy import (
@@ -193,9 +195,11 @@ def _source_color_convert(color_space: str | None) -> str | None:
 
 
 def _dolby_vision_treatment(source: dict) -> str | None:
-    """这一单要不要靠杜比视界的动态元数据还原色彩（``dolby_vision="apply"``）。
+    """这一单的杜比视界元数据怎么处理（取值同 ``VideoPlan.dolby_vision``）。
 
-    与播放端 ``decide._transcode_dolby_vision`` 同一口径：基础层能直接解读（P7/P8 带 HDR10
+    与播放端 ``decide._transcode_dolby_vision`` 同一口径：记录不可信（探测判「记录与码流
+    矛盾」、``hdr`` 已定为别的 HDR 格式）的只认基础层——``ignore``，认 RPU 的滤镜要关掉还原，
+    否则拿 P5 的 IPT 还原去算 YCbCr 整片发绿；基础层能直接解读（P7/P8 带 HDR10
     基础层）吃不吃都行，交给滤镜默认；P5（以及 profile 未知）的基础层是 IPTPQc2，不按 RPU
     还原就是整片偏紫/发绿——这类必须 ``apply``，本机核显的硬件色调映射做不到。
 
@@ -203,6 +207,8 @@ def _dolby_vision_treatment(source: dict) -> str | None:
     不能直接解读（和播放端一致）。
     """
     hdr = source.get("hdr")
+    if dolby_vision_ignored(hdr, source.get("dv_profile")):
+        return "ignore"
     if hdr != "Dolby Vision" and source.get("dv_profile") is None:
         return None
     if source.get("dv_bl_compatible"):
@@ -249,6 +255,7 @@ def _gpu_filters(
     color_space: str | None,
     has_tonemapx: bool,
     has_tonemap_cuda: bool,
+    dolby_vision: str | None = None,
 ) -> list[str]:
     """NVENC 链的滤镜序列（帧全程或大部分留在 GPU 上）。
 
@@ -258,13 +265,16 @@ def _gpu_filters(
     """
     if needs_tone_map and has_tonemap_cuda:
         parts = [
-            "tonemap_cuda=tonemap=bt2390:desat=0:p=bt709:t=bt709:m=bt709:format=nv12"
+            dovi_tonemap(
+                "tonemap_cuda=tonemap=bt2390:desat=0:p=bt709:t=bt709:m=bt709:format=nv12",
+                dolby_vision,
+            )
         ]
         if needs_scale:
             parts.append(f"scale_cuda=-2:{height_cap}:format=nv12")
         return parts
     if needs_tone_map:
-        parts = [f"hwdownload,format=p010le,{_SOFTWARE_TONEMAP}"]
+        parts = [f"hwdownload,format=p010le,{dovi_tonemap(_SOFTWARE_TONEMAP, dolby_vision)}"]
         if needs_scale:
             parts.append(f"hwupload_cuda,scale_cuda=-2:{height_cap}:format=nv12")
         return parts
@@ -385,7 +395,7 @@ def _local_hw_video(
         # 整链留在 GPU：输出硬件帧（tone-map 与缩放都是 GPU 滤镜）
         hwaccel += ["-hwaccel_output_format", backend.hwaccel_output_format or backend.hwaccel]
         if needs_tone_map:
-            filters.append(local.native_tonemap or "")
+            filters.append(dovi_tonemap(local.native_tonemap or "", dolby_vision))
         if needs_scale or needs_tone_map:
             scale = f"{backend.scale_filter}=w=-2:h={height}:format=nv12" if needs_scale else ""
             if scale:
@@ -405,7 +415,7 @@ def _local_hw_video(
         if convert:
             filters.append(convert)
         if needs_tone_map:
-            filters.append(_SOFTWARE_TONEMAP)
+            filters.append(dovi_tonemap(_SOFTWARE_TONEMAP, dolby_vision))
         if needs_scale:
             filters.append(f"scale=-2:{height}")
         filters += ["format=nv12", upload]
@@ -477,6 +487,7 @@ def build_preload_command(
     )
     needs_scale = src_height is None or src_height > height_cap
     color_space = source.get("color_space")
+    dolby_vision = _dolby_vision_treatment(source)
 
     pre_input: list[str] = []
     input_args: list[str] = []
@@ -490,7 +501,7 @@ def build_preload_command(
         pre_input, input_args, video_args, unusable_reason, hw_frames = _local_hw_video(
             preset=preset, local=local, needs_tone_map=needs_tone_map,
             needs_scale=needs_scale, color_space=color_space,
-            dolby_vision=_dolby_vision_treatment(source),
+            dolby_vision=dolby_vision,
         )
         hw_backend_used = None if unusable_reason else local.backend
     else:
@@ -527,6 +538,7 @@ def build_preload_command(
                     color_space=color_space,
                     has_tonemapx=has_tonemapx,
                     has_tonemap_cuda=has_tonemap_cuda,
+                    dolby_vision=dolby_vision,
                 )
                 # 需要下载回内存做 CPU 滤镜（HDR 走软件 tonemapx）时，硬解也要能 hwdownload；
                 # tonemap_cuda 全 GPU 链不需要下载。BT.2020 色彩转换只在 SDR 源才轮得到
@@ -545,7 +557,7 @@ def build_preload_command(
             else:
                 filters = []
                 if needs_tone_map:
-                    filters.append(_SOFTWARE_TONEMAP)
+                    filters.append(dovi_tonemap(_SOFTWARE_TONEMAP, dolby_vision))
                 else:
                     convert = _source_color_convert(color_space)
                     if convert:

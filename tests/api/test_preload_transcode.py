@@ -2102,6 +2102,54 @@ def test_hdr_bt2020_source_keeps_full_gpu_chain(monkeypatch):  # type: ignore[no
     assert "colorspace=" in cpu_vf and "tonemapx" in cpu_vf
 
 
+def test_untrusted_dolby_vision_record_is_converted_from_the_base_layer():  # type: ignore[no-untyped-def]
+    """记录写着 P5、码流却是 HDR10（探测判「记录与码流矛盾」，hdr 定为 HDR10）：只认基础层。
+    与实时转码（decide 的 ``dolby_vision="ignore"``）、抓帧同一口径——认 RPU 的色调映射必须
+    ``apply_dovi=0``，否则拿 P5 的 IPT 还原去算 YCbCr，整片发绿（《驯龙高手》实测）；本机核显
+    也不该当成真 P5 拒做（它的基础层就是 HDR10，tonemap_vaapi 映射得对）。"""
+    from types import SimpleNamespace
+
+    from movieclaw_api.services.preload import service as _svc
+    from movieclaw_api.services.preload.ffmpeg_preload import LocalHw
+
+    task = SimpleNamespace(
+        id=1, preset_id="saver", video_format="h264", resume_parts=0, part_bytes=0
+    )
+    file = SimpleNamespace(
+        resolution="2160p", video_codec="hevc", hdr="HDR10", dv_profile=5,
+        dv_bl_compatible=False, color_space="BT.2020", bit_depth=10, duration_seconds=7200,
+        size_bytes=1, audio_streams=[{"codec": "eac3"}], subtitle_streams=[], chapters=[],
+        file_path="x.mkv",
+    )
+
+    def vf(command: dict) -> str:
+        assert command["unusable_reason"] is None, command["unusable_reason"]
+        return command["argv"][command["argv"].index("-vf") + 1]
+
+    native = LocalHw(
+        backend="vaapi", native_tonemap="tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709",
+        has_tonemapx=True,
+    )
+    assert vf(_svc.build_task_command(task, file, local=native)).startswith("tonemap_vaapi=")
+    cpu = vf(_svc.build_task_command(task, file, local=LocalHw(backend="vaapi", has_tonemapx=True)))
+    assert "tonemapx=" in cpu and "apply_dovi=0" in cpu
+    nvenc_caps = {
+        "encoders": ["h264_nvenc"],
+        "filters": ["scale_cuda", "tonemap_cuda", "tonemapx"],
+        "hw_decoders": ["hevc"],
+    }
+    gpu = vf(_svc.build_task_command(task, file, worker_caps=nvenc_caps))
+    assert "tonemap_cuda=" in gpu and "apply_dovi=0" in gpu
+    no_cuda_tonemap = {**nvenc_caps, "filters": ["scale_cuda", "tonemapx"]}
+    assert "apply_dovi=0" in vf(_svc.build_task_command(task, file, worker_caps=no_cuda_tonemap))
+    software = vf(_svc.build_task_command(task, file, worker_caps={"filters": ["tonemapx"]}))
+    assert "apply_dovi=0" in software
+
+    # 真杜比视界 P5 不受影响：照旧吃 RPU（不加 apply_dovi=0）
+    real_p5 = SimpleNamespace(**{**vars(file), "hdr": "Dolby Vision"})
+    assert "apply_dovi" not in vf(_svc.build_task_command(task, real_p5, worker_caps=nvenc_caps))
+
+
 def test_local_refuses_dolby_vision_profile5(monkeypatch):  # type: ignore[no-untyped-def]
     """杜比视界 P5（基础层是 IPTPQc2）：本机核显的 tonemap_vaapi 不认 RPU，硬转出来整片
     偏紫/发绿（2026-10-20 真机实测同帧 RGB 差一个数量级）。装配层直接判本机不可执行，
