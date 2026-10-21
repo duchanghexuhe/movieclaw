@@ -20,7 +20,6 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.api.client_address import client_address, is_lan_address
 from movieclaw_api.api.deps import require_admin, require_login
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import (
@@ -943,18 +942,16 @@ def _remember_session_capability(
 
 
 async def _uplink_bps_for(request: Request) -> int | None:
-    """外网会话的前置降档预算（bps）：内网 / 未配置 / 地址不可判 → None。
+    """外网会话的前置降档预算（bps）：在家 / 未配置 → None。
 
     「外网 + 家宽上行装不下源片码率」时把直通档在起播前换成低档转码——不等
     卡了再让用户手动换（用户拍板：不弹提示，直接降档；网页顶栏标「省流」、
-    一键切回原画）。判据是连接来源：
-    内网来源走的是局域网速度，永远直通；公网来源才按上行收。Docker 桥接把
-    来源 NAT 成网关时拿不到真实地址（``client_address`` 返回空），诚实按
-    「不降档」处理，退回既有的卡顿后提示兜底。用户手动选了画质上限时调用方
-    不传——他的选择优先于自动（与 adapt_to_downlink 同一口径）。
+    一键切回原画）。判据是 ``network_side.request_side``（docs/design/
+    server-addresses.md §5）：反代、隧道、Docker NAT 都会把对端 IP 抹成私网
+    地址，按 IP 判会把外网一律认成「在家」（#947）。用户手动选了画质上限时
+    调用方不传——他的选择优先于自动（与 adapt_to_downlink 同一口径）。
     """
-    host = client_address(request)
-    if not host or is_lan_address(host):
+    if network_side.request_side(request) == "home":
         return None
     setting = await get_setting_store().get(AppServerSetting)
     mbps = setting.uplink_mbps
@@ -964,14 +961,16 @@ async def _uplink_bps_for(request: Request) -> int | None:
 
 
 def _is_external_request(request: Request) -> bool:
-    """会话是否来自外网（按连接来源判定，不依赖 uplink_mbps 配置）。
+    """会话是否来自外网（不依赖 uplink_mbps 配置）。
 
     音轨省流量规则（转码会话固定 AAC 双声道）只看「是不是外网」：用户没填
-    上行数值也应该生效。Docker 桥接把来源 NAT 成网关时拿不到真实地址，与
-    ``_uplink_bps_for`` 同一口径按内网处理。
+    上行数值也应该生效。判定统一走 ``network_side.request_side``——按对端 IP
+    猜在反代 / 隧道 / Docker NAT 下会把外网认成「在家」（#947）。三态里只有
+    明确 ``home`` 才算内网：``unknown`` 按外面处理，与 ``uplink.note`` /
+    ``choose_direct`` 同一取舍——认不准时省流多压一次音轨的代价，小于把原
+    码率推给外网线路。
     """
-    host = client_address(request)
-    return bool(host) and not is_lan_address(host)
+    return network_side.request_side(request) != "home"
 
 
 async def _decide(

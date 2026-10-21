@@ -33,7 +33,6 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from sqlalchemy import select
 
-from movieclaw_api.api.client_address import client_address, is_lan_address
 from movieclaw_api.api.routes.playback import get_session_segment
 from movieclaw_api.exceptions import NotFoundException
 from movieclaw_api.services import network_side
@@ -380,9 +379,13 @@ async def playback_info(
 
 
 def _is_external(request: Request) -> bool:
-    """会话是否来自外网（按连接来源判定，与网页端同一口径：拿不到真实地址按内网处理）。"""
-    host = client_address(request)
-    return bool(host) and not is_lan_address(host)
+    """会话是否来自外网（与网页端同一口径：只有明确在「家」才算内网）。
+
+    判定统一走 ``network_side.request_side``——按对端 IP 猜在反代 / 隧道 /
+    Docker NAT 下会把外网认成「在家」（#947）。``unknown`` 按外面处理，与
+    ``uplink.note`` / ``choose_direct`` 同一取舍。
+    """
+    return network_side.request_side(request) != "home"
 
 
 def _owner_of(f: LibraryFile, contexts: dict[int, TrackContext]) -> LibraryFile | None:
