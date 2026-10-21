@@ -495,6 +495,43 @@ def test_connect_reports_connecting_then_online(monkeypatch):
     assert sent[0]["type"] == "worker.hello" and sent[0]["worker_id"] == "DESKTOP-1"
 
 
+def test_hello_declares_only_backends_the_ffmpeg_really_has(monkeypatch):
+    """hello 申报的后端随本机 ffmpeg 探测结果走：没有 NVENC 的机器（Intel 核显、纯 CPU）不再
+    冒报 nvenc；系统名按实际平台报（程序是纯标准库，Windows 之外也能跑）。"""
+    import engine as rw
+    from engine import RealtimeClient
+
+    def hello(caps: dict) -> dict:
+        sent: list[dict] = []
+
+        class FakeSocket:
+            def __init__(self, host, port, path, token, timeout=10.0):
+                self.inbox = [{"type": "worker.accepted", "max_jobs": 1}]
+
+            def send_json(self, payload):
+                sent.append(payload)
+
+            def recv_json(self, timeout):
+                return self.inbox.pop(0) if self.inbox else None
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(rw, "_WebSocket", FakeSocket)
+        client = RealtimeClient(
+            server="http://nas:3000", token="t", worker_id="box", ffmpeg="ffmpeg", caps=caps
+        )
+        client.status = lambda kind, **_: client.stop() if kind == "online" else None
+        client._connect_once()
+        return sent[0]["capabilities"]
+
+    assert hello({"encoders": ["h264_nvenc", "hevc_nvenc"]})["backends"] == ["nvenc"]
+    without_gpu = hello({"encoders": []})
+    assert without_gpu["backends"] == []
+    assert without_gpu["platform"] == rw.PLATFORM_NAME and without_gpu["platform"]
+    assert without_gpu["arch"]
+
+
 def test_job_work_dir_falls_back_when_ffmpeg_cannot_write(monkeypatch, tmp_path):
     """默认临时目录对 ffmpeg 不可写时改用下一候选（2026-10-20 真机事故）。
 

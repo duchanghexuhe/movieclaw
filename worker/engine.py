@@ -26,11 +26,13 @@ import base64
 import contextlib
 import json
 import os
+import platform
 import secrets
 import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -51,6 +53,9 @@ SERVER_SILENCE_SECONDS = 45.0
 # ffmpeg 子进程不弹控制台窗：pythonw 启动时子进程无可继承的控制台，
 # 不加这个每次起 ffmpeg 都会自建黑窗。常量仅 Windows 有，其它平台取 0
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+#: 配对与 hello 上报的系统名（只用于网页展示是哪台机器）。程序本身是纯标准库，
+#: Windows 之外也能跑，不能写死
+PLATFORM_NAME = {"win32": "windows", "darwin": "macos"}.get(sys.platform, sys.platform)
 #: ffmpeg 输出分片化 MP4 的片段时长（与服务端 PROGRESSIVE_FRAGMENT_US 一致）
 FRAGMENT_SECONDS = 0.5
 #: 取源代理的块大小与预取参数（对齐 Mac 的 SourceReadProxy）
@@ -1723,11 +1728,12 @@ class RealtimeClient:
                 "worker_id": self.worker_id,
                 "draining": False,
                 "capabilities": {
-                    "platform": "windows",
-                    "arch": os.environ.get("PROCESSOR_ARCHITECTURE", "x86_64").lower(),
+                    "platform": PLATFORM_NAME,
+                    "arch": platform.machine().lower() or "unknown",
                     "ffmpeg_version": self.caps.get("ffmpeg_version"),
                     "encoders": self.caps.get("encoders", []),
-                    "backends": ["nvenc"],
+                    # 只申报真探到编码器的后端：没有 NVENC 的机器申报了也会被服务端滤掉
+                    "backends": ["nvenc"] if "h264_nvenc" in self.caps.get("encoders", []) else [],
                     "max_jobs": self.max_jobs,
                     "roles": ["realtime", "preload"] if self.preload else ["realtime"],
                     "server_config": True,

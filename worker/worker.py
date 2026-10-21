@@ -173,6 +173,8 @@ class Api:
         取消——点了「停止」就不能干等到配对码过期。
         """
 
+        from engine import PLATFORM_NAME
+
         emit = status_cb or (lambda kind, **fields: print(fields.get("line") or f"（{kind}）"))
 
         status, view = self.request(
@@ -181,7 +183,7 @@ class Api:
             json_body={
                 "client_type": "worker",
                 "client_name": name,
-                "platform": "windows",
+                "platform": PLATFORM_NAME,
                 "client_version": "1.0.0",
             },
         )
