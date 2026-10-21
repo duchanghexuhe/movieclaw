@@ -51,6 +51,8 @@ apps/web/tmp/
 
 # 本地 UI 验收的临时产物（截图、隔离数据库、开发日志），只留本地不入仓库
 .tmp-uidev/
+# pytest 的临时根（隔离库、测试日志、SQLite 模板）：收在仓库内避免写满系统盘
+.tmp-pytest/
 
 # 运行期数据：SQLite 数据库文件及其 WAL/SHM 附属文件（部署时挂载为 volume）
 /data/

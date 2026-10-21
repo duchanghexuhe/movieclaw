@@ -7,6 +7,7 @@ git 历史。本地开发时复制 .env.example 为 .env 并填写即可，CI �
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
 import shutil
 import sqlite3
@@ -19,10 +20,52 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE = _PROJECT_ROOT / ".env"
 
+#: 测试临时产物（日志目录、SQLite 模板、pytest 的 tmp_path）的根目录。
+#:
+#: 默认落在仓库内的 ``.tmp-pytest/`` 而不是系统临时目录：一套 API 用例会建几十个
+#: 各 1.5 MB 的隔离库，pytest 的 ``tmp_path`` 还保留最近几轮；全放 ``%TEMP%`` 会把
+#: 系统盘慢慢吃掉（2026-10-21 盘点：C 盘 Temp 里累积了约 1 GB 测试残留）。
+#: 可用 ``MOVIECLAW_TEST_TMP`` 显式指定（CI 或想放别的盘时），显式值优先。
+def _test_tmp_root() -> Path:
+    configured = os.environ.get("MOVIECLAW_TEST_TMP")
+    root = Path(configured) if configured else _PROJECT_ROOT / ".tmp-pytest"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+_TEST_TMP_ROOT = _test_tmp_root()
+
+# 连同 TEMP/TMP 一起改：SQLite 建临时表（迁移里的 DROP TABLE 重建）和不少
+# 第三方库都直接读环境变量，只改 tempfile 的根管不到它们。Windows 上进程
+# 环境变量优先于注册表里的用户临时目录，改完 tempfile.gettempdir() 也一起变。
+os.environ["TEMP"] = str(_TEST_TMP_ROOT)
+os.environ["TMP"] = str(_TEST_TMP_ROOT)
+os.environ["TMPDIR"] = str(_TEST_TMP_ROOT)
+tempfile.tempdir = str(_TEST_TMP_ROOT)
+
+
+def _temp_dir(prefix: str) -> str:
+    """在测试临时根下开一个目录（每次 pytest 进程一个）。"""
+    return tempfile.mkdtemp(prefix=prefix, dir=str(_TEST_TMP_ROOT))
+
+
 # 测试期间产生的运行日志统一写进临时目录：create_app 会装配按天落盘的
 # 日志 Handler（见 core/logging.py），不隔离的话测试会在仓库 data/logs
 # 下留下日志文件。先于 .env 加载设置，测试环境始终生效。
-os.environ.setdefault("LOG_DIR", tempfile.mkdtemp(prefix="movieclaw-test-logs-"))
+_LOG_DIR = _temp_dir("logs-")
+os.environ.setdefault("LOG_DIR", _LOG_DIR)
+
+# 进程退出即清：日志目录只对这一次运行有意义，留着只会越积越多。
+# 必须先关掉日志 handler——Windows 上还开着的文件删不掉（rmtree 会静默失败），
+# 那正是旧方案在 %TEMP% 里留下几百个空壳目录的原因。
+def _cleanup_log_dir() -> None:
+    import logging
+
+    logging.shutdown()
+    shutil.rmtree(_LOG_DIR, ignore_errors=True)
+
+
+atexit.register(_cleanup_log_dir)
 
 
 def _resolve_ner_model_dir() -> None:
@@ -116,7 +159,9 @@ class _SQLiteMigrationTemplate:
     def __init__(self, migration_module) -> None:  # type: ignore[no-untyped-def]
         self._module = migration_module
         self.original = migration_module.run_migrations
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="movieclaw-test-db-template-")
+        self._temp_dir = tempfile.TemporaryDirectory(
+            prefix="db-template-", dir=str(_TEST_TMP_ROOT)
+        )
         self._template = Path(self._temp_dir.name) / "migrated.db"
         self._head_revision: str | None = None
         self._lock = threading.Lock()

@@ -127,6 +127,11 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
+# tmp_path 的根目录：conftest 把测试临时产物统一收进仓库内 .tmp-pytest/（已进
+# .gitignore），不再落系统盘——一套 API 用例会建几十个各 1.5 MB 的隔离库，
+# 2026-10-21 盘点时 C 盘 Temp 里已累积约 1 GB 测试残留。CI 想换位置可覆盖
+# MOVIECLAW_TEST_TMP。
+tmp_path_retention_policy = "failed"
 markers = [
   "integration: 依赖真实网络或 cookie 的集成测试，CI 中可用 -m 'not integration' 跳过",
   "real_password_hash: 使用生产 Argon2 参数的专项测试，不启用低成本测试 hasher",
