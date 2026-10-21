@@ -36,7 +36,20 @@ class PreloadSetting(SettingSchema):
         description="「N 天未播」冷数据阈值；手动清理与自动清理共用",
     )
     auto_cleanup: bool = Field(
-        default=False, description="自动清理：开启后定期删除超过 N 天未播的预转码产物"
+        default=True,
+        description=(
+            "自动清理：定期删除超过 N 天未播的预转码产物，并在配额不够时按"
+            "「播得多、越近播的留下」淘汰冷产物腾地方"
+        ),
+    )
+    disk_floor_percent: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description=(
+            "磁盘低水位：所在盘剩余空间低于这个百分比时立刻跑一次冷数据清理"
+            "（不等每小时的定时任务）。预转码与数据库同卷，盘满会让整个应用写不进去"
+        ),
     )
     video_format: Literal["h264", "hevc"] = Field(
         default="h264",

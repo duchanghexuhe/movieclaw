@@ -148,11 +148,19 @@ async def check_quota(session: AsyncSession, *, needed_bytes: int) -> None:
     """配额预检（§6）：现有产物 + 在途任务预估 + 本单预估 ≤ 配额，否则拒绝入队。
 
     在途任务必须计入：否则整季一批下单在产物登记前全都能过预检，合起来照样超配额。
+
+    超配额时先按「价值」淘汰冷产物腾地方（``evict_for_space``），腾出来的够用
+    就放行——用户下单不应该因为盘里躺着几部三个月没人看的旧片而被拒。淘汰仍
+    不够才抛 ``PreloadQuotaExceeded``，把那部分空间缺口如实报给用户。
     """
     setting = await get_setting_store().get(PreloadSetting)
     used = await preload_usage_bytes(session) + await preload_inflight_bytes(session)
-    if used + needed_bytes > setting.quota_bytes:
-        raise PreloadQuotaExceeded(needed_bytes, setting.quota_bytes - used)
+    if used + needed_bytes <= setting.quota_bytes:
+        return
+    shortfall = used + needed_bytes - setting.quota_bytes
+    freed = await evict_for_space(session, need_bytes=shortfall)
+    if freed < shortfall:
+        raise PreloadQuotaExceeded(needed_bytes, max(0, setting.quota_bytes - used + freed))
 
 
 def preload_root() -> Path:
@@ -1111,6 +1119,135 @@ async def fail_task(session: AsyncSession, task: PreloadTask, error: str) -> Pre
 # ---------------------------------------------------------------------------
 
 
+async def _play_stats(
+    session: AsyncSession, rows: list[LibraryFile]
+) -> dict[tuple[Any, Any, Any], tuple[Any, int]]:
+    """每个播放单元的（最近一次开始播放时间, 场次）。一把查齐，不逐行查。
+
+    键是 (media_item_id, 季, 集)——派生产物与源文件共用同一播放单元，用户看
+    的是「这一集」而不是「哪个文件」，按文件 id 统计会把命中源文件的播放漏掉。
+    """
+    from movieclaw_db.models import PlaybackLog
+
+    item_ids = {row.media_item_id for row in rows if row.media_item_id}
+    if not item_ids:
+        return {}
+    grouped = await session.execute(
+        select(
+            PlaybackLog.media_item_id,
+            PlaybackLog.season_number,
+            PlaybackLog.episode_number,
+            func.max(PlaybackLog.started_at),
+            func.count(PlaybackLog.id),
+        )
+        .where(PlaybackLog.media_item_id.in_(item_ids))  # type: ignore[arg-type]
+        .group_by(
+            PlaybackLog.media_item_id,
+            PlaybackLog.season_number,
+            PlaybackLog.episode_number,
+        )
+    )
+    return {
+        (int(media_item_id), season, episode): (last, int(count))
+        for media_item_id, season, episode, last, count in grouped.all()
+    }
+
+
+def _value_score(*, plays: int, days_since: float) -> float:
+    """越值得留越高：播得多、越近播的留下。
+
+    ``plays / (1 + 天数)``——一周前播过一次（1/8）排在一小时前播过五次
+    （5/1.04）之后、三个月没播的（1/91）之前。不引入任何权重旋钮：这类
+    「可解释」是 §6 拒绝 LRU/LFU 多开关策略的同一条理由。
+    """
+    return plays / (1.0 + days_since)
+
+
+async def evict_for_space(session: AsyncSession, *, need_bytes: int) -> int:
+    """腾空间：按价值从低到高删冷产物，直到腾出 ``need_bytes``，返回释放字节。
+
+    只在配额预检不够时才跑（``check_quota``），是「淘汰」而不是「清理」——
+    和按 N 天未播的冷数据清理共用同一套判据，但触发条件不同：那个看时间，
+    这个看空间。
+
+    两条硬规则，都来自上游播放侧的同一取舍：
+
+    1. **正在被播放的产物永不淘汰**——和 ``_evict_export_for_local`` 的
+       「播放优先」一致；删掉正在播的文件等于把用户踢出去。
+    2. **同一条目至少留一个产物**——一季几十集全删光，用户再点开又要从头
+       等转码，比多占几百 MB 更糟。
+    """
+    rows = list(
+        (
+            await session.execute(
+                select(LibraryFile).where(
+                    LibraryFile.derivation.is_not(None),  # type: ignore[union-attr]
+                )
+            )
+        ).scalars()
+    )
+    if not rows:
+        return 0
+    stats = await _play_stats(session, rows)
+    now = utcnow()
+    playing = await _files_in_playback(session)
+
+    # 先按条目分组，才能落实「同一条目至少留一个」
+    by_item: dict[Any, list[tuple[float, LibraryFile]]] = {}
+    for row in rows:
+        if row.id in playing:
+            continue
+        last, plays = stats.get(
+            (row.media_item_id, row.season_number, row.episode_number), (None, 0)
+        )
+        anchor = last or row.created_at
+        days = (now - anchor).total_seconds() / 86400 if anchor else 9999.0
+        by_item.setdefault(row.media_item_id, []).append(
+            (_value_score(plays=plays, days_since=max(0.0, days)), row)
+        )
+
+    candidates: list[tuple[float, LibraryFile]] = []
+    for group in by_item.values():
+        group.sort(key=lambda pair: pair[0])
+        candidates.extend(group[:-1] if len(group) > 1 else [])
+    candidates.sort(key=lambda pair: pair[0])
+
+    freed = 0
+    for _score, row in candidates:
+        if freed >= need_bytes:
+            break
+        path = Path(row.file_path)
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            logger.warning("配额淘汰删文件失败（跳过）：%s", path, exc_info=True)
+            continue
+        freed += row.size_bytes or 0
+        shutil.rmtree(path.parent, ignore_errors=True)
+        await _invalidate_tasks_of(session, row.id, PRODUCT_STALE_REASON)
+        await session.delete(row)
+    if freed:
+        await session.commit()
+        logger.info(
+            "预转码配额淘汰：删除产物释放 %.1f GB（本次下单需要 %d 字节）",
+            freed / 1024**3,
+            need_bytes,
+        )
+    return freed
+
+
+async def _files_in_playback(session: AsyncSession) -> set[int]:
+    """当下正在被转码会话读的派生文件 id 集合（网页会话 + Jellyfin + 离线导出）。"""
+    from movieclaw_api.services.playback.session import get_session_manager
+
+    try:
+        manager = get_session_manager()
+    except Exception:  # pragma: no cover - 未初始化（CLI / 测试）
+        return set()
+    return {int(fid) for fid in manager.files_in_use() if fid is not None}
+
+
 async def stale_preload_files(
     session: AsyncSession, *, days: int, library_ids: set[int] | None = None
 ) -> list[tuple[LibraryFile, int]]:
@@ -1125,34 +1262,11 @@ async def stale_preload_files(
     if library_ids is not None:
         stmt = stmt.where(LibraryFile.library_id.in_(library_ids))  # type: ignore[union-attr]
     rows = list((await session.execute(stmt)).scalars())
-    from movieclaw_db.models import PlaybackLog
-
-    # 最近一次播放一把查齐：按播放单元聚合，不逐行查（产物多时是 N+1）
-    last_played: dict[tuple[Any, Any, Any], Any] = {}
-    item_ids = {row.media_item_id for row in rows if row.media_item_id}
-    if item_ids:
-        grouped = await session.execute(
-            select(
-                PlaybackLog.media_item_id,
-                PlaybackLog.season_number,
-                PlaybackLog.episode_number,
-                func.max(PlaybackLog.started_at),
-            )
-            .where(PlaybackLog.media_item_id.in_(item_ids))  # type: ignore[arg-type]
-            .group_by(
-                PlaybackLog.media_item_id,
-                PlaybackLog.season_number,
-                PlaybackLog.episode_number,
-            )
-        )
-        last_played = {
-            (int(media_item_id), season, episode): last
-            for media_item_id, season, episode, last in grouped.all()
-        }
+    stats = await _play_stats(session, rows)
     out: list[tuple[LibraryFile, int]] = []
     for row in rows:
-        last = last_played.get(
-            (row.media_item_id, row.season_number, row.episode_number)
+        last, _plays = stats.get(
+            (row.media_item_id, row.season_number, row.episode_number), (None, 0)
         )
         anchor = last or row.created_at
         if anchor is None or anchor < horizon:
@@ -1387,35 +1501,76 @@ def register_task_safe():
 
 @register_task_safe()
 async def preload_maintenance() -> None:
-    """定时任务：租约回收 + 孤儿目录清理 + 自动冷数据清理（开启时）。"""
+    """定时任务：租约回收 + 孤儿目录清理 + 自动冷数据清理。
+
+    三道触发都走同一条清理规则（§6「不发明更多策略」）：
+
+    1. **每小时**（本任务）——清理超过 ``stale_days`` 未播的产物；
+    2. **磁盘低水位**——所在盘剩余低于 ``disk_floor_percent`` 时立刻清理，
+       不管距上次多久。预转码与数据库同卷，盘满会让 SQLite 写不进去；
+    3. **配额不够**——``check_quota`` 里按价值淘汰（``evict_for_space``）。
+
+    后两条与 ``auto_cleanup`` 开关无关：它们是「不清理就出事」的场景，
+    用户关掉定时清理不该连兜底一起关掉。
+    """
     db = get_database()
     async with db.session() as session:
         await reclaim_expired_leases(session)
         await invalidate_orphans(session)
         setting = await get_setting_store().get(PreloadSetting)
-        if setting.auto_cleanup:
-            result = await cleanup_stale(session, days=setting.stale_days)
-            if result["count"]:
-                freed = result.get("freed_bytes", 0)
-                logger.info(
-                    "预转码自动清理：%d 部共 %.1f GB",
-                    result["count"], freed / 1024**3,
+        urgent = _disk_below_floor(percent=setting.disk_floor_percent)
+        if not (setting.auto_cleanup or urgent):
+            return
+        # 磁盘告急时把阈值压到 0 天语义 = 「按价值腾地方」，交给自己腾出的空间够不够
+        if urgent:
+            freed_now = await evict_for_space(session, need_bytes=_urgent_free_bytes())
+            if freed_now:
+                logger.warning(
+                    "预转码：磁盘剩余低于 %d%%，按价值淘汰释放 %.1f GB",
+                    setting.disk_floor_percent, freed_now / 1024**3,
                 )
-                # 活动流记一笔（§6：自动化不该是盲盒）；publish 不抛错，
-                # 事件丢了清理本身不受影响
-                from movieclaw_api import events
-                from movieclaw_sdk.events.library import PRELOAD_CLEANED
+            return
+        result = await cleanup_stale(session, days=setting.stale_days)
+        if result["count"]:
+            freed = result.get("freed_bytes", 0)
+            logger.info(
+                "预转码自动清理：%d 部共 %.1f GB",
+                result["count"], freed / 1024**3,
+            )
+            # 活动流记一笔（§6：自动化不该是盲盒）；publish 不抛错，
+            # 事件丢了清理本身不受影响
+            from movieclaw_api import events
+            from movieclaw_sdk.events.library import PRELOAD_CLEANED
 
-                await events.publish(
-                    session,
-                    PRELOAD_CLEANED,
-                    lambda: {
-                        "removed": result["count"],
-                        "freed_bytes": freed,
-                        "stale_days": setting.stale_days,
-                    },
-                )
-                await session.commit()
+            await events.publish(
+                session,
+                PRELOAD_CLEANED,
+                lambda: {
+                    "removed": result["count"],
+                    "freed_bytes": freed,
+                    "stale_days": setting.stale_days,
+                },
+            )
+            await session.commit()
+
+
+def _disk_below_floor(*, percent: int) -> bool:
+    """产物根所在盘剩余空间是否低于 ``percent`` 的低水位。"""
+    try:
+        usage = shutil.disk_usage(preload_root())
+    except OSError:  # pragma: no cover - 盘不存在
+        return False
+    return usage.free * 100 < usage.total * percent
+
+
+def _urgent_free_bytes() -> int:
+    """磁盘告急时想腾出的量：把剩余拉回低水位的两倍，留一次任务周期的余量。"""
+    try:
+        usage = shutil.disk_usage(preload_root())
+    except OSError:  # pragma: no cover
+        return 0
+    target = int(usage.total * 0.2)
+    return max(0, target - usage.free)
 
 
 __all__ = [

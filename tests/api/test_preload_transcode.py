@@ -2190,3 +2190,123 @@ def test_local_refuses_dolby_vision_profile5(monkeypatch):  # type: ignore[no-un
     assert "tonemap_vaapi" in flat_p8
     assert "-hwaccel_output_format" in p8["argv"]  # 帧没落回内存
     assert "tonemapx" not in flat_p8
+
+# ---------------------------------------------------------------------------
+# 配额淘汰（§6 第 3 层）：不够就按价值腾地方，而不是一律拒绝下单
+# ---------------------------------------------------------------------------
+
+
+def test_quota_shortfall_evicts_the_least_valuable_artifact(
+    client, tmp_path, monkeypatch, no_local
+):
+    """配额不够时先淘汰最不值钱的旧产物，让这一单能下单成功。
+
+    一部没人看过的旧片 vs 一部刚看过几次的新的：删旧的那部。
+    """
+    from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    token = _pair_worker(client)
+    old_file = _seed_file(client, tmp_path, hdr="HDR10")
+    _, old_derived = _make_product(client, monkeypatch, token, old_file)
+    _age_row(client, old_derived, days=200)
+
+    new_file = _seed_file(client, tmp_path, hdr="HDR10")
+    _, new_derived = _make_product(client, monkeypatch, token, new_file)
+    _age_row(client, new_derived, days=1)
+
+    # 两件产物都在，配额压到「刚好装不下下一单」——多出的那部分只能靠淘汰补。
+    # 产物体积按真实落盘字节算，测试里那点字节不够腾，先把账做厚再验选择逻辑。
+    _set_row_size(client, old_derived, 4 * 1024**3)
+    _set_row_size(client, new_derived, 4 * 1024**3)
+    used = _usage_bytes(client)
+
+    async def _tight() -> None:
+        await get_setting_store().set(PreloadSetting(quota_bytes=used - 2 * 1024**3))
+
+    client.portal.call(partial(_tight))  # type: ignore[attr-defined]
+
+    third_file = _seed_file(client, tmp_path, hdr="HDR10")
+    resp = client.post(f"{_PRELOAD}/tasks", json={"file_id": third_file})
+    assert resp.status_code == 200, resp.text
+
+    # 没看过的那部被淘汰，刚看过的留下
+    assert not _row_exists(client, old_derived)
+    assert _row_exists(client, new_derived)
+
+
+def test_quota_eviction_never_drops_every_artifact_of_one_item(
+    client, tmp_path, monkeypatch, no_local
+):
+    """同一条目至少留一个产物：一部剧几十集全删光，用户点开又要从头等转码。"""
+    from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    token = _pair_worker(client)
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    _, derived = _make_product(client, monkeypatch, token, file_id)
+    _age_row(client, derived, days=300)
+
+    async def _zero() -> None:
+        await get_setting_store().set(PreloadSetting(quota_bytes=1))
+
+    client.portal.call(partial(_zero))  # type: ignore[attr-defined]
+
+    another = _seed_file(client, tmp_path, hdr="HDR10")
+    resp = client.post(f"{_PRELOAD}/tasks", json={"file_id": another})
+    # 唯一的产物不能删 → 腾不出空间 → 如实拒绝
+    assert resp.status_code == 409
+    assert _row_exists(client, derived)
+
+
+def test_quota_eviction_skips_artifact_in_playback(
+    client, tmp_path, monkeypatch, no_local
+):
+    """正在被播放的产物永不淘汰：删它等于把用户踢出去（与播放优先同一取舍）。"""
+    from movieclaw_api.services.preload import service as _svc
+    from movieclaw_api.settings import PreloadSetting
+    from movieclaw_api.settings.store import get_setting_store
+
+    token = _pair_worker(client)
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    _, derived = _make_product(client, monkeypatch, token, file_id)
+    _age_row(client, derived, days=300)
+
+    monkeypatch.setattr(_svc, "_files_in_playback", _async_return({derived}))
+
+    async def _zero() -> None:
+        await get_setting_store().set(PreloadSetting(quota_bytes=1))
+
+    client.portal.call(partial(_zero))  # type: ignore[attr-defined]
+
+    another = _seed_file(client, tmp_path, hdr="HDR10")
+    resp = client.post(f"{_PRELOAD}/tasks", json={"file_id": another})
+    assert resp.status_code == 409
+    assert _row_exists(client, derived)
+
+
+def _usage_bytes(client: TestClient) -> int:
+    from movieclaw_api.services.preload.service import preload_usage_bytes
+
+    async def _read() -> int:
+        async with get_database().session() as session:
+            return await preload_usage_bytes(session)
+
+    return client.portal.call(partial(_read))  # type: ignore[attr-defined]
+
+
+def _async_return(value):
+    async def _inner(*_args, **_kwargs):
+        return value
+
+    return _inner
+
+def _set_row_size(client: TestClient, row_id: int, size: int) -> None:
+    async def _set() -> None:
+        async with get_database().session() as session:
+            row = await session.get(LibraryFile, row_id)
+            row.size_bytes = size
+            session.add(row)
+            await session.commit()
+
+    client.portal.call(partial(_set))  # type: ignore[attr-defined]
