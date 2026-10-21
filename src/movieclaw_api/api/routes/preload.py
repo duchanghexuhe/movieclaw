@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends
@@ -51,6 +52,11 @@ class PreloadEstimatePayload(BaseModel):
     preset_id: str = PRESET_DEFAULT
 
 
+class PreloadPreviewPayload(BaseModel):
+    file_ids: list[int] = Field(default_factory=list, description="要预览的源文件 id（弹窗整屏一次）")
+    preset_id: str = Field(default=PRESET_DEFAULT, description="目标档位")
+
+
 class PreloadSettingsPayload(BaseModel):
     video_format: Literal["h264", "hevc"] = Field(description="预转码编码格式")
 
@@ -69,6 +75,7 @@ def _task_view(
     source_quality: str | None = None,
     library_id: int | None = None,
     executor: str | None = None,
+    artifact_name: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -93,6 +100,9 @@ def _task_view(
         "episode_number": episode_number,
         # 源文件的规格签名（「2160p WEB-DL DV」），帮人认出转的是哪个版本
         "source_quality": source_quality,
+        # 产物文件名：已完成的取实际落盘名，未完成的按下单规格预测——
+        # 任务列表直接显示它，用户看到的才是「会多出哪个版本」而不是「转了什么源」
+        "artifact_name": artifact_name,
         # 成员可见性过滤用（成员区列表按库筛；管理员不限）
         "library_id": library_id,
         # 执行者（活动页标明在哪转）：「NAS 本地」或 Worker 设备名；未领取为 None
@@ -103,7 +113,7 @@ def _task_view(
 async def enriched_task_views(
     session: AsyncSession, tasks: Sequence[PreloadTask]
 ) -> list[dict[str, Any]]:
-    """任务视图批量补片名与源规格：两查询取齐，列表页不做 N+1。"""
+    """任务视图批量补片名、源规格与产物名：三查询取齐，列表页不做 N+1。"""
     if not tasks:
         return []
     file_ids = {task.target_file_id for task in tasks}
@@ -120,6 +130,18 @@ async def enriched_task_views(
             await session.execute(select(MediaItem).where(MediaItem.id.in_(item_ids)))
         ).scalars()
     }
+    # 已完成任务的产物行：文件名取实际落盘的（重转改名、历史命名都在这里如实呈现）
+    result_ids = {task.result_file_id for task in tasks if task.result_file_id is not None}
+    products = (
+        {
+            row.id: row
+            for row in (
+                await session.execute(select(LibraryFile).where(LibraryFile.id.in_(result_ids)))
+            ).scalars()
+        }
+        if result_ids
+        else {}
+    )
     # 执行者名：Worker 按登录设备名显示，NAS 本地记为「NAS 本地」（活动页据此标明在哪转）
     device_ids = {task.worker_device_id for task in tasks if task.worker_device_id is not None}
     device_names = (
@@ -136,6 +158,7 @@ async def enriched_task_views(
     for task in tasks:
         file = files.get(task.target_file_id)
         item = items.get(file.media_item_id) if file and file.media_item_id else None
+        product = products.get(task.result_file_id) if task.result_file_id else None
         views.append(
             _task_view(
                 task,
@@ -145,9 +168,30 @@ async def enriched_task_views(
                 source_quality=quality_label_of(file) if file else None,
                 library_id=file.library_id if file else None,
                 executor=_executor_label(task, device_names),
+                artifact_name=(
+                    Path(product.file_path).name
+                    if product is not None
+                    else _predicted_artifact_name(task, file, item)
+                ),
             )
         )
     return views
+
+
+def _predicted_artifact_name(
+    task: PreloadTask, file: LibraryFile | None, item: MediaItem | None
+) -> str | None:
+    """还没产物的任务：按 complete 时的定名规则预测文件名（同一份 artifact_file_name）。"""
+    if file is None or item is None:
+        return None
+    return preload_service.artifact_file_name(
+        media_title=item.title,
+        year=item.year,
+        kind=item.kind,
+        season_number=file.season_number,
+        episode_number=file.episode_number,
+        preset=preload_service.preset_of_task(task),
+    )
 
 
 def _executor_label(task: PreloadTask, device_names: dict[int, str]) -> str | None:
@@ -250,6 +294,37 @@ async def estimate(
             "used_bytes": used,
             "free_bytes": max(setting.quota_bytes - used, 0),
         }
+    )
+
+
+@router.post(
+    "/preview",
+    summary="一批源文件的产物预览（文件名/预计体积/不能下单的原因）",
+    operation_id="preload.preview",
+)
+async def preview(
+    payload: PreloadPreviewPayload,
+    session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(require_login),
+    setting: Any = Depends(get_setting_store_dep),
+) -> ApiResponse[list[dict[str, Any]]]:
+    """下单弹窗逐行展示「转出来是哪个版本、多大」：省得点下去才知道。
+
+    与 ``/estimate`` 同一套预估口径，只是按整屏一次取；不可见的库按 404 拒绝。
+    """
+    if not preset_available(payload.preset_id, setting.video_format):
+        raise BadRequestException(f"未知档位：{payload.preset_id}")
+    files: list[LibraryFile] = []
+    for file_id in payload.file_ids:
+        file = await session.get(LibraryFile, file_id)
+        if file is None:
+            raise NotFoundException(f"源文件不存在：id={file_id}")
+        await assert_library_visible(session, principal, file.library_id)  # type: ignore[arg-type]
+        files.append(file)
+    return ok(
+        await preload_service.preview_artifacts(
+            session, files, preset=effective_preset(payload.preset_id, setting.video_format)
+        )
     )
 
 

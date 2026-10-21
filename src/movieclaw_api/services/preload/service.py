@@ -88,6 +88,11 @@ def _preset_of(task: PreloadTask) -> dict:
     return effective_preset(task.preset_id, task.video_format)
 
 
+def preset_of_task(task: PreloadTask) -> dict:
+    """任务档位定义的公开入口（路由层预测产物名用，与落盘定名同一份规格）。"""
+    return _preset_of(task)
+
+
 class PreloadQuotaExceeded(AppException):
     """配额预检未过（§6 三件套之一：防呆兜底）。"""
 
@@ -277,6 +282,82 @@ async def plan_for(session: AsyncSession, file: LibraryFile) -> TrackPlan:
     from movieclaw_api.services.playback.track_context import track_context
 
     return plan_tracks(file, await track_context(session, file))
+
+
+async def preview_artifacts(
+    session: AsyncSession, files: list[LibraryFile], *, preset: dict
+) -> list[dict[str, Any]]:
+    """一批源文件的产物预览（下单弹窗逐行展示）：预计文件名 / 预计体积 / 不能下单的原因。
+
+    批量取齐而不是逐文件往返：整季下单时弹窗里一次十几集。预估口径与
+    :func:`create_preload_task` 完全一致（同一份选轨结果算音轨数），所以弹窗里的
+    数字就是入队时预检用的数字。
+    """
+    if not files:
+        return []
+    from movieclaw_api.services.playback.track_context import track_contexts
+    from movieclaw_playback.track_policy import NO_CONTEXT
+
+    item_ids = {file.media_item_id for file in files if file.media_item_id}
+    items = (
+        {
+            item.id: item
+            for item in (
+                await session.execute(select(MediaItem).where(MediaItem.id.in_(item_ids)))
+            ).scalars()
+        }
+        if item_ids
+        else {}
+    )
+    contexts = await track_contexts(session, files)
+    out: list[dict[str, Any]] = []
+    for file in files:
+        plan = plan_tracks(file, contexts.get(file.id or 0, NO_CONTEXT))
+        item = items.get(file.media_item_id) if file.media_item_id else None
+        out.append(
+            {
+                "file_id": file.id,
+                "artifact_name": (
+                    artifact_file_name(
+                        media_title=item.title,
+                        year=item.year,
+                        kind=item.kind,
+                        season_number=file.season_number,
+                        episode_number=file.episode_number,
+                        preset=preset,
+                    )
+                    if item is not None
+                    else None
+                ),
+                "estimated_bytes": estimate_size_bytes(
+                    duration_seconds=file.duration_seconds,
+                    preset=preset,
+                    audio_tracks=len(plan.audio),
+                ),
+                "reason": _preview_block_reason(file, preset=preset, plan=plan),
+            }
+        )
+    return out
+
+
+def _preview_block_reason(file: LibraryFile, *, preset: dict, plan: TrackPlan) -> str | None:
+    """这一行现在不能下单的原因（与 :func:`create_preload_task` 的拒绝口径一致）。"""
+    if file.state == FileState.TRASHED:
+        return "源文件已进回收站"
+    if file.is_disc():
+        return "原盘目录暂不支持预转码"
+    if file.derivation is not None:
+        return "预转码产物不能再作为源"
+    command = build_preload_command(
+        source_path=file.file_path,
+        output_path="preview.mkv",
+        preset=preset,
+        source=_source_spec(file),
+        tracks=plan,
+    )
+    if command.video_copy:
+        return "源已是便携档，无需转码"
+    return None
 
 
 async def get_target_file(session: AsyncSession, file_id: int) -> LibraryFile:

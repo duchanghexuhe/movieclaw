@@ -48,6 +48,8 @@ export interface PreloadTaskView {
   episode_number: number | null;
   /** 源文件规格签名（「2160p WEB-DL DV」） */
   source_quality: string | null;
+  /** 产物文件名：已完成的取实际落盘名，未完成的按档位预测（null=源条目已删） */
+  artifact_name: string | null;
   /** 执行中的任务由谁转：「NAS 本地」或 Worker 设备名；排队中为 null */
   executor: string | null;
 }
@@ -77,6 +79,40 @@ export function preloadTaskTitle(task: PreloadTaskView): string {
 export function preloadTaskSubtitle(task: PreloadTaskView, presets: { id: string; short: string }[]): string {
   const preset = presets.find((p) => p.id === task.preset_id)?.short ?? task.preset_id;
   return [preset, task.source_quality].filter(Boolean).join(" · ");
+}
+
+export interface PreloadPreviewEntry {
+  /** 源文件 id */
+  file_id: number;
+  /** 预测产物文件名：与最终产物同名，下单前就看到成品名 */
+  artifact_name: string | null;
+  /** 预估产物体积（字节） */
+  estimated_bytes: number;
+  /** 不能下单的原因——弹窗里灰掉这一行并显示它；null=可以下单 */
+  reason: string | null;
+}
+
+/** 一批源文件的产物预览（下单弹窗整屏一次取；与 /estimate 同一套预估口径）。 */
+export function previewPreloadArtifacts(
+  fileIds: number[],
+  presetId?: string,
+): Promise<PreloadPreviewEntry[]> {
+  return unwrap(
+    request<ApiEnvelope<PreloadPreviewEntry[]>>("/preload/preview", {
+      method: "POST",
+      body: JSON.stringify({
+        file_ids: fileIds,
+        ...(presetId ? { preset_id: presetId } : {}),
+      }),
+    }),
+  );
+}
+
+/** 删除预转码产物版本。 */
+export function deletePreloadFile(fileId: number): Promise<null> {
+  return unwrap(
+    request<ApiEnvelope<null>>(`/preload/files/${fileId}`, { method: "DELETE" }),
+  );
 }
 
 export interface PreloadEstimate {
@@ -187,13 +223,6 @@ export function cancelPreloadTask(taskId: number): Promise<PreloadTaskView> {
 export function retryPreloadTask(taskId: number): Promise<PreloadTaskView> {
   return unwrap(
     request<ApiEnvelope<PreloadTaskView>>(`/preload/tasks/${taskId}/retry`, { method: "POST" }),
-  );
-}
-
-/** 删除预转码产物版本。 */
-export function deletePreloadFile(fileId: number): Promise<null> {
-  return unwrap(
-    request<ApiEnvelope<null>>(`/preload/files/${fileId}`, { method: "DELETE" }),
   );
 }
 

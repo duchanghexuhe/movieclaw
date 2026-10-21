@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Banner } from "@/components/cloud-push-ui";
 import { useConfirm, useToast } from "@/components/feedback";
 import {
   SETTINGS_BUTTON_CLASS,
+  SETTINGS_DANGER_BUTTON_CLASS,
   SETTINGS_INPUT_CLASS,
   SettingsEmpty,
   SettingsList,
@@ -22,6 +23,7 @@ import {
   type StaleCleanupResult,
   cancelPreloadTask,
   cleanupStalePreload,
+  deletePreloadFile,
   getPreloadOverview,
   getPreloadPresets,
   getPreloadSettings,
@@ -30,6 +32,7 @@ import {
   retryPreloadTask,
   savePreloadSettings,
 } from "@/lib/api/preload";
+import { TASK_PAGE_SIZE, canDeleteProduct, isActiveTask, orderTasks } from "@/lib/preload-task-list";
 
 const GB = 1024 ** 3;
 
@@ -134,6 +137,12 @@ export function TranscodeSection() {
   // 之间用户改输入框，删除集合必须还是预览过的那份
   const [previewDays, setPreviewDays] = useState<number | null>(null);
   const [cleaning, setCleaning] = useState(false);
+  // 任务列表默认收起成一行摘要（转码是长时间后台活，配置页第一眼该是配置）；
+  // 展开后先给最近一批，其余按「显示更多」一屏一屏放——台账上限 200 条，
+  // 一次性摊开会把下面的清理设置挤出视野
+  const [taskListOpen, setTaskListOpen] = useState(false);
+  const [taskLimit, setTaskLimit] = useState(TASK_PAGE_SIZE);
+  const [deletingTaskId, setDeletingTaskId] = useState<number | null>(null);
   const toast = useToast();
   const confirm = useConfirm();
 
@@ -221,6 +230,46 @@ export function TranscodeSection() {
     }
   }, [cleanupPreview, confirm, previewDays, toast]);
 
+  // 删除一单的产物（集中管理：不用跑去详情页再点一次）。只对已完成的单给按钮；
+  // 删完这一单在服务端转为「已失效（可重新转码）」，这里就地改状态而不是整页重拉——
+  // 重拉会让滚到中段的列表跳回顶部
+  const deleteProduct = useCallback(
+    async (task: PreloadTaskView) => {
+      const ok = await confirm({
+        title: `删除「${task.artifact_name ?? preloadTaskTitle(task)}」？`,
+        description: "预转码产物可随时重新转码，源文件不受影响。",
+        confirmLabel: "删除产物",
+        cancelLabel: "先不",
+        tone: "danger",
+      });
+      if (!ok) return;
+      setDeletingTaskId(task.id);
+      try {
+        await deletePreloadFile(task.result_file_id as number);
+        setTasks((current) =>
+          (current ?? []).map((row) =>
+            row.id === task.id
+              ? { ...row, status: "invalidated", result_file_id: null, actual_bytes: 0 }
+              : row,
+          ),
+        );
+        toast.success("产物已删除，可重新下单转码");
+        getPreloadOverview()
+          .then(setOverview)
+          .catch(() => {});
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "删除失败，请稍后重试");
+      } finally {
+        setDeletingTaskId(null);
+      }
+    },
+    [confirm, toast],
+  );
+
+  // 列表口径（活跃置顶、时间倒序）与分页粒度在纯函数模块里，见 preload-task-list.ts
+  const orderedTasks = useMemo(() => orderTasks(tasks ?? []), [tasks]);
+  const activeCount = orderedTasks.filter(isActiveTask).length;
+
   return (
       <SettingsSection
         title="预转码"
@@ -263,91 +312,148 @@ export function TranscodeSection() {
         <SettingsEmpty title="加载中…" />
       ) : (
         <div className="space-y-10">
-          <SettingsList>
-            {tasks.length === 0 ? (
-              <SettingsEmpty title="还没有预转码任务" description="在影片详情页顶部的「预转码」里下单。" />
-            ) : (
-              tasks.map((task) => (
-                <SettingsRow
-                  key={task.id}
-                  label={
-                    <>
-                      任务 #{task.id}
-                      <span className="ml-2 text-caption font-normal text-[var(--text-faint)]">
-                        {[
-                          presets.find((p) => p.id === task.preset_id)?.short ?? task.preset_id,
-                          // 这单转的是哪部片子——没有身份（未识别/源已删）才落回文件号
-                          preloadTaskTitle(task),
-                          task.source_quality,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                      </span>
-                    </>
-                  }
-                  description={
-                    <>
-                      {PRELOAD_STATUS_LABELS[task.status]} · 预估 {formatGB(task.estimated_bytes)}
-                      {task.actual_bytes > 0 && ` · 实际 ${formatGB(task.actual_bytes)}`}
-                      {task.error && <TaskErrorText error={task.error} />}
-                    </>
-                  }
+          <SettingsSection
+            title="转码任务"
+            description={
+              tasks.length === 0
+                ? "还没有任务。在影片详情页顶部的「预转码」里下单。"
+                : [
+                    activeCount > 0 ? `${activeCount} 个进行中` : null,
+                    `共 ${orderedTasks.length} 条记录`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
+            }
+            action={
+              tasks.length > 0 && (
+                <button
+                  type="button"
+                  aria-expanded={taskListOpen}
+                  className={SETTINGS_BUTTON_CLASS}
+                  onClick={() => setTaskListOpen((current) => !current)}
                 >
-                  {["queued", "claimed", "running"].includes(task.status) && (
-                    <button
-                      type="button"
-                      className={SETTINGS_BUTTON_CLASS}
-                      onClick={async () => {
-                        try {
-                          await cancelPreloadTask(task.id);
-                          toast.success("任务已取消");
-                          reload();
-                        } catch (e) {
-                          toast.error(e instanceof Error ? e.message : "取消失败");
+                  {taskListOpen ? "收起" : "展开"}
+                </button>
+              )
+            }
+          >
+            {tasks.length === 0 ? (
+              <SettingsEmpty
+                title="还没有预转码任务"
+                description="在影片详情页顶部的「预转码」里下单。"
+              />
+            ) : (
+              taskListOpen && (
+                <>
+                  <SettingsList>
+                    {orderedTasks.slice(0, taskLimit).map((task) => (
+                      <SettingsRow
+                        key={task.id}
+                        label={
+                          <span className="flex min-w-0 items-baseline gap-2">
+                            <span className="truncate">
+                              {task.artifact_name ?? preloadTaskTitle(task)}
+                            </span>
+                            <span className="shrink-0 text-caption font-normal text-[var(--text-faint)]">
+                              #{task.id}
+                            </span>
+                          </span>
                         }
-                      }}
-                    >
-                      取消
-                    </button>
-                  )}
-                  {task.status === "failed" && (
-                    <>
+                        description={
+                          <>
+                            {PRELOAD_STATUS_LABELS[task.status]}
+                            {" · "}
+                            {presets.find((p) => p.id === task.preset_id)?.short ??
+                              task.preset_id}
+                            {task.actual_bytes > 0
+                              ? ` · ${formatGB(task.actual_bytes)}`
+                              : ` · 预计 ${formatGB(task.estimated_bytes)}`}
+                            {task.executor && ` · ${task.executor} 转码`}
+                            {task.error && <TaskErrorText error={task.error} />}
+                          </>
+                        }
+                      >
+                        {["queued", "claimed", "running"].includes(task.status) && (
+                          <button
+                            type="button"
+                            className={SETTINGS_BUTTON_CLASS}
+                            onClick={async () => {
+                              try {
+                                await cancelPreloadTask(task.id);
+                                toast.success("任务已取消");
+                                reload();
+                              } catch (e) {
+                                toast.error(e instanceof Error ? e.message : "取消失败");
+                              }
+                            }}
+                          >
+                            取消
+                          </button>
+                        )}
+                        {task.status === "failed" && (
+                          <>
+                            <button
+                              type="button"
+                              className={SETTINGS_BUTTON_CLASS}
+                              onClick={async () => {
+                                try {
+                                  await retryPreloadTask(task.id);
+                                  toast.success("已重新排队");
+                                  reload();
+                                } catch (e) {
+                                  toast.error(e instanceof Error ? e.message : "重试失败");
+                                }
+                              }}
+                            >
+                              重试
+                            </button>
+                            <button
+                              type="button"
+                              className={SETTINGS_BUTTON_CLASS}
+                              onClick={async () => {
+                                try {
+                                  await cancelPreloadTask(task.id);
+                                  toast.success("任务已取消");
+                                  reload();
+                                } catch (e) {
+                                  toast.error(e instanceof Error ? e.message : "取消失败");
+                                }
+                              }}
+                            >
+                              取消
+                            </button>
+                          </>
+                        )}
+                        {/* 产物还在的单子就地可删：这一页是所有预转码产物的集中管理处，
+                            不用跑去详情页再点一次 */}
+                        {canDeleteProduct(task) && (
+                          <button
+                            type="button"
+                            className={SETTINGS_DANGER_BUTTON_CLASS}
+                            disabled={deletingTaskId === task.id}
+                            onClick={() => void deleteProduct(task)}
+                          >
+                            {deletingTaskId === task.id ? "删除中…" : "删除产物"}
+                          </button>
+                        )}
+                      </SettingsRow>
+                    ))}
+                  </SettingsList>
+                  {orderedTasks.length > taskLimit && (
+                    <div className="mt-3 flex justify-center">
                       <button
                         type="button"
                         className={SETTINGS_BUTTON_CLASS}
-                        onClick={async () => {
-                          try {
-                            await retryPreloadTask(task.id);
-                            toast.success("已重新排队");
-                            reload();
-                          } catch (e) {
-                            toast.error(e instanceof Error ? e.message : "重试失败");
-                          }
-                        }}
+                        onClick={() => setTaskLimit((current) => current + TASK_PAGE_SIZE)}
                       >
-                        重试
+                        显示更多（还有 {orderedTasks.length - taskLimit} 条）
                       </button>
-                      <button
-                        type="button"
-                        className={SETTINGS_BUTTON_CLASS}
-                        onClick={async () => {
-                          try {
-                            await cancelPreloadTask(task.id);
-                            toast.success("任务已取消");
-                            reload();
-                          } catch (e) {
-                            toast.error(e instanceof Error ? e.message : "取消失败");
-                          }
-                        }}
-                      >
-                        取消
-                      </button>
-                    </>
+                    </div>
                   )}
-                </SettingsRow>
-              ))
+                </>
+              )
             )}
-          </SettingsList>
+          </SettingsSection>
 
           <SettingsSection
             title="清理冷数据"

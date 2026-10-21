@@ -670,6 +670,7 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/preload/presets"),
     ("GET", "/api/v1/preload/overview"),
     ("POST", "/api/v1/preload/estimate"),
+    ("POST", "/api/v1/preload/preview"),
     ("POST", "/api/v1/preload/tasks"),
     ("GET", "/api/v1/preload/tasks"),
     ("GET", "/api/v1/preload/tasks/{task_id}"),

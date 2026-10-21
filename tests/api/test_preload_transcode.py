@@ -282,6 +282,61 @@ def test_estimate_and_create_task(client, tmp_path):
     assert again.json()["data"]["id"] == task["id"]
 
 
+def test_preview_lists_artifact_name_size_and_block_reason(client, tmp_path):
+    """下单弹窗的逐行预览：成品文件名、预计体积、不能下单的原因——与 /estimate 同口径。"""
+    normal = _seed_file(client, tmp_path, hdr="HDR10")
+    # 已是便携档的源（720p H.264 SDR）：省流档（480p）还能转，高清档（720p）不能
+    portable = _seed_file(client, tmp_path, codec="h264", resolution="720p")
+
+    resp = client.post(f"{_PRELOAD}/preview", json={"file_ids": [normal, portable]})
+    assert resp.status_code == 200, resp.text
+    rows = {row["file_id"]: row for row in resp.json()["data"]}
+    assert set(rows) == {normal, portable}
+
+    row = rows[normal]
+    assert row["reason"] is None
+    # 产物名与 complete 落盘同名（省流/H.264 → 480p）：下单前看到的就是成品
+    assert row["artifact_name"] == "示例 - 省流 480p H.264 1.5Mbps.mkv"
+
+    # 体积与 /estimate 完全一致（同一份选轨结果算音轨数）
+    est = client.post(f"{_PRELOAD}/estimate", json={"file_id": normal}).json()["data"]
+    assert row["estimated_bytes"] == est["estimated_bytes"]
+
+    # 高清档下 720p H.264 源已是便携档：预览直接给出原因，前端据此灰掉下单键
+    premium = client.post(
+        f"{_PRELOAD}/preview", json={"file_ids": [portable], "preset_id": "premium"}
+    )
+    assert premium.status_code == 200
+    assert premium.json()["data"][0]["reason"]
+
+    # 未知档位与不存在的源都明确拒绝
+    assert client.post(
+        f"{_PRELOAD}/preview", json={"file_ids": [normal], "preset_id": "nope"}
+    ).status_code == 400
+    assert client.post(
+        f"{_PRELOAD}/preview", json={"file_ids": [999999]}
+    ).status_code == 404
+
+
+def test_task_view_artifact_name_predicted_then_actual(client, tmp_path, monkeypatch):
+    """任务视图带产物文件名：未完成的按下单规格预测，完成的取实际落盘名。"""
+    file_id = _seed_file(client, tmp_path, hdr="HDR10")
+    task = client.post(
+        f"{_PRELOAD}/tasks", json={"file_id": file_id, "preset_id": "premium"}
+    ).json()["data"]
+    assert task["artifact_name"] == "示例 - 高清 720p H.264 3Mbps.mkv", task
+
+    token = _pair_worker(client)
+    _claim_and_upload(client, token, task["id"])
+    _fake_probe(monkeypatch)
+    done = client.post(
+        f"{_WORKER}/tasks/{task['id']}/complete", json={}, headers=_worker_headers(token)
+    )
+    assert done.status_code == 200, done.text
+    view = client.get(f"{_PRELOAD}/tasks/{task['id']}").json()["data"]
+    assert view["artifact_name"] == "示例 - 高清 720p H.264 3Mbps.mkv"
+
+
 def test_format_setting_drives_presets_estimate_and_snapshot(client, tmp_path):
     """格式是全局设置：默认 h264；切 hevc 后档位标题随格式变、高清档预估变
     大（4M vs 3M）；下单把格式快照到任务行——切回设置后，在途任务的命令

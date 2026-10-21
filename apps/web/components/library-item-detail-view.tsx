@@ -70,6 +70,7 @@ import {
 import {
   PRELOAD_STATUS_LABELS,
   type PreloadPreset,
+  type PreloadPreviewEntry,
   type PreloadTaskView,
   cancelPreloadTask,
   createPreloadTask,
@@ -77,6 +78,7 @@ import {
   estimatePreload,
   getPreloadPresets,
   listPreloadTasks,
+  previewPreloadArtifacts,
   retryPreloadTask,
 } from "@/lib/api/preload";
 import {
@@ -2600,6 +2602,8 @@ function PreloadDialog({
 }) {
   const [presets, setPresets] = useState<PreloadPreset[] | null>(null);
   const [presetId, setPresetId] = useState<string | undefined>(undefined);
+  // 每一行的产物预览（文件名 + 预计体积）：跟所选档位走，切档位重取
+  const [previews, setPreviews] = useState<Map<number, PreloadPreviewEntry>>(new Map());
 
   useEffect(() => {
     if (!open) return;
@@ -2617,6 +2621,28 @@ function PreloadDialog({
   }, [open]);
 
   const selectedPreset = presetId ?? presets?.[0]?.id;
+  // 预览仅在弹窗开着时拉：整季一次十几行，一次性批量取（不逐行往返）
+  const previewKey = files.map((f) => f.id).join(",");
+  useEffect(() => {
+    if (!open || !selectedPreset || !previewKey) {
+      setPreviews(new Map());
+      return;
+    }
+    let alive = true;
+    previewPreloadArtifacts(previewKey.split(",").map(Number), selectedPreset)
+      .then((rows) => {
+        if (!alive) return;
+        setPreviews(new Map(rows.map((row) => [row.file_id, row])));
+      })
+      .catch(() => {
+        // 取不到预览只是少一行提示：行本身照常可下单，不挡主流程
+        if (alive) setPreviews(new Map());
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open, selectedPreset, previewKey]);
+
   // 任务状态跟所选档位走：高清档已有任务不挡省流档下单（反之亦然）
   const taskFor = (file: LibraryItemFile) =>
     tasks.find(
@@ -2681,7 +2707,10 @@ function PreloadDialog({
         ) : hasSeasons ? (
           <div className="mt-4 overflow-hidden rounded-xl border border-white/[0.06]">
             {seasonGroups.map(([season, seasonFiles]) => {
-              const eligible = seasonFiles.filter((f) => canOrderPreload(taskFor(f)));
+              // 不能下单的（已是便携档/原盘/产物行）不进整季批量：服务端会逐单拒绝
+              const eligible = seasonFiles.filter(
+                (f) => canOrderPreload(taskFor(f)) && !previews.get(f.id)?.reason,
+              );
               return (
                 <div key={season} className="border-b border-white/[0.05] last:border-b-0">
                   <div className="flex items-center justify-between gap-3 bg-white/[0.03] px-4 py-2">
@@ -2711,6 +2740,7 @@ function PreloadDialog({
                         key={file.id}
                         file={file}
                         task={taskFor(file)}
+                        preview={previews.get(file.id)}
                         {...rowProps}
                       />
                     ))}
@@ -2722,7 +2752,13 @@ function PreloadDialog({
         ) : (
           <div className="mt-4 divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.06]">
             {files.map((file) => (
-              <PreloadFileRow key={file.id} file={file} task={taskFor(file)} {...rowProps} />
+              <PreloadFileRow
+                key={file.id}
+                file={file}
+                task={taskFor(file)}
+                preview={previews.get(file.id)}
+                {...rowProps}
+              />
             ))}
           </div>
         )}
@@ -2739,11 +2775,12 @@ function canOrderPreload(task: PreloadTaskView | null): boolean {
   return !task || task.status === "cancelled" || task.status === "invalidated";
 }
 
-/** 弹窗里的一行文件：规格摘要、任务状态徽章、取消/重试/下单。 */
+/** 弹窗里的一行文件：**产物**名与预计体积（下单前就看到成品长什么样）、任务状态、取消/重试/下单。 */
 function PreloadFileRow({
   file,
   task,
   presetId,
+  preview,
   onPreload,
   onPreloadCancel,
   onPreloadRetry,
@@ -2751,22 +2788,38 @@ function PreloadFileRow({
   file: LibraryItemFile;
   task: PreloadTaskView | null;
   presetId?: string;
+  /** 该源文件在当前档位下的产物预览；未取到（加载中/失败）为 undefined */
+  preview?: PreloadPreviewEntry;
   onPreload?: (file: LibraryItemFile, presetId?: string) => void;
   onPreloadCancel?: (task: PreloadTaskView) => void;
   onPreloadRetry?: (task: PreloadTaskView) => void;
 }) {
+  // 标题就是成品名：已有任务取任务的产物名，否则用预览预测名，都没有才退回源文件名
+  const title = task?.artifact_name ?? preview?.artifact_name ?? file.file_name;
+  const sourceSpec = [
+    file.resolution ? formatVideoResolution(file.resolution) : null,
+    file.hdr,
+    formatBytes(file.size_bytes),
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <div className="flex items-center gap-3 bg-white/[0.015] px-4 py-3">
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sub text-[var(--text)]">{file.file_name}</div>
-        <div className="mt-0.5 text-caption text-[var(--text-faint)]">
-          {[
-            file.resolution ? formatVideoResolution(file.resolution) : null,
-            file.hdr,
-            formatBytes(file.size_bytes),
-          ]
-            .filter(Boolean)
-            .join(" · ")}
+        <div className="truncate text-sub text-[var(--text)]">{title}</div>
+        <div className="mt-0.5 truncate text-caption text-[var(--text-faint)]">
+          {preview?.reason ? (
+            <span className="text-[var(--text-muted)]">{preview.reason}</span>
+          ) : (
+            <>
+              {preview
+                ? `预计 ${formatBytes(preview.estimated_bytes)}`
+                : task?.actual_bytes
+                  ? `实际 ${formatBytes(task.actual_bytes)}`
+                  : "计算中…"}
+              <span className="text-[var(--text-faint)]"> · 源 {sourceSpec}</span>
+            </>
+          )}
         </div>
       </div>
       {task && (
@@ -2798,7 +2851,7 @@ function PreloadFileRow({
           重试
         </button>
       )}
-      {canOrderPreload(task) && onPreload && (
+      {canOrderPreload(task) && preview?.reason == null && onPreload && (
         <button
           type="button"
           onClick={() => onPreload(file, presetId)}
