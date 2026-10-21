@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import socket
 import struct
 import subprocess
@@ -128,20 +129,16 @@ def _ffmpeg_can_write(ffmpeg: str, directory: Path) -> bool:
             probe.unlink()
 
 
-def _job_work_dir(job_id: str, ffmpeg: str) -> Path:
-    """给这一轮任务挑一个 ffmpeg 写得进去的中转目录（进程内只探一次）。
-
-    ``job_id`` 只参与子目录名（``mc-realtime-<末 8 位>``），与旧路径保持同名，
-    日志与 ``docs/design/remote-transcode.md`` 里的排障指引不用改。
+def _work_dir_root(ffmpeg: str) -> Path:
+    """本机实时中转目录的根（ffmpeg 写得进去的那个候选；进程内只探一次）。
 
     缓存按 ffmpeg 路径分键：换 ffmpeg（换了一台机器 / 换了一份二进制，标签可能
     不同）要重探；同一份 ffmpeg 的结论不变，不必每个任务都起一次探测进程。
     """
-    suffix = job_id[-8:]
     with _WORK_DIR_LOCK:
         cached = _WORK_DIR_CACHE.get(ffmpeg)
         if cached is not None:
-            return cached / f"mc-realtime-{suffix}"
+            return cached
         candidates = _work_dir_candidates()
         for root in candidates:
             try:
@@ -158,13 +155,59 @@ def _job_work_dir(job_id: str, ffmpeg: str) -> Path:
                         f"中转目录改用 {root}",
                         flush=True,
                     )
-                return root / f"mc-realtime-{suffix}"
+                return root
         # 一个都写不进去：仍按旧路径返回，让 ffmpeg 自己报 Permission denied，
         # 错误信息与升级前一致，不会被这层探测改写成另一套原因。
         fallback = Path(os.environ.get("TEMP", "."))
         _WORK_DIR_CACHE[ffmpeg] = fallback
-        return fallback / f"mc-realtime-{suffix}"
+        return fallback
 
+
+def _job_work_dir(job_id: str, ffmpeg: str) -> Path:
+    """给这一轮任务的中转目录（``mc-realtime-<job_id 末 8 位>``）。
+
+    子目录名与旧路径保持同名，日志与 ``docs/design/remote-transcode.md`` 里的
+    排障指引不用改。
+    """
+    return _work_dir_root(ffmpeg) / f"mc-realtime-{job_id[-8:]}"
+
+
+def sweep_stale_work_dirs(ffmpeg: str, *, active_job_ids: set[str] | None = None) -> int:
+    """删掉本进程没在用的中转目录（``mc-realtime-*``），返回删掉的个数。
+
+    为什么要它：每个实时任务在自己的 ``mc-realtime-<job_id 末 8 位>`` 里放
+    ``stream.frag.mp4`` 与调试日志，任务结束只删了那个 frag 文件，目录本身留着——
+    seek 换轮次、每次播放都新建一个，一天下来能积几百个（2026-10-21 盘点：
+    单机 Temp 里 117 个目录、614 MB）。任务线程退出时删自己的目录是最直接的，
+    但进程被杀（断电/任务管理器/更新重启）就走不到那里，所以启动时再扫一遍兜底。
+
+    只扫**本机选定的那个中转根**，不碰别的目录；``active_job_ids`` 里的任务
+    （重连后还在跑的）不删。同机只允许一个 Worker（命名互斥体），所以这里不会
+    误删另一个进程正在用的目录。
+    """
+    root = _work_dir_root(ffmpeg)
+    if not root.is_dir():
+        return 0
+    keep = {f"mc-realtime-{job_id[-8:]}" for job_id in (active_job_ids or set())}
+    removed = 0
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith("mc-realtime-") or entry.name in keep:
+            continue
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 0 if entry.exists() else 1
+            else:
+                entry.unlink()
+                removed += 1
+        except OSError:
+            # 目录被占用（任务线程还没退干净）：留着，下次启动再扫
+            continue
+    return removed
 
 
 def _allowed_artifact_name(name: str) -> bool:
@@ -1327,6 +1370,30 @@ class RealtimeJob:
             with self.client.jobs_lock:
                 if self.client.jobs.get(self.job_id) is self:
                     self.client.jobs.pop(self.job_id, None)
+            # 中转目录一并清掉：frag 文件与调试日志都在里面，任务结束后没有任何
+            # 复用价值。**只在没有新轮次接手时删**——seek 是「旧线程收尾 + 新线程
+            # 同 job_id 开跑」的并发形态，两边删同一个目录会把新一轮写着的文件删掉
+            self._cleanup_work_dir()
+
+    def _cleanup_work_dir(self) -> None:
+        """删掉本任务的中转目录（目录里只剩本轮的临时文件与调试日志）。
+
+        目录名只取 job_id 末 8 位，同 job 的新轮次会用同一个目录，所以必须
+        确认此刻没有别的 RealtimeJob 在用同一个目录才删。
+        """
+        try:
+            # 不能用 _work_dir()：它会 mkdir 把刚删掉的目录又建回来
+            directory = _job_work_dir(self.job_id, self.ffmpeg)
+        except OSError:
+            return
+        suffix = f"mc-realtime-{self.job_id[-8:]}"
+        with self.client.jobs_lock:
+            for other in self.client.jobs.values():
+                if other is self:
+                    continue
+                if f"mc-realtime-{other.job_id[-8:]}" == suffix:
+                    return  # 新一轮还在用这个目录
+        shutil.rmtree(directory, ignore_errors=True)
 
     def _run_inner(self, message: dict) -> None:
         arguments = list(message.get("ffmpeg_args") or [])

@@ -565,3 +565,95 @@ def test_job_work_dir_keeps_temp_path_when_nothing_writable(monkeypatch, tmp_pat
 
     picked = rw._job_work_dir("01JOBDDDDDDDDDDDDDDDDDDDD4", "ffmpeg")
     assert picked.parent == tmp_path / "temp-root"
+
+
+# ---------------------------------------------------------------------------
+# 中转目录的生命周期（2026-10-21：单机 Temp 里积了 117 个目录 / 614 MB）
+# ---------------------------------------------------------------------------
+
+
+def _use_root(monkeypatch, root: Path) -> None:
+    """把中转根固定到测试目录（不跑 ffmpeg 探测）。"""
+    import engine as rw
+
+    monkeypatch.setattr(rw, "_WORK_DIR_CACHE", {"ffmpeg": root})
+    monkeypatch.setattr(rw, "_work_dir_candidates", lambda: [root])
+    monkeypatch.setattr(rw, "_ffmpeg_can_write", lambda ffmpeg, directory: True)
+
+
+def test_job_removes_its_work_dir_when_it_ends(monkeypatch, tmp_path):
+    """任务线程退出即删自己的中转目录（frag + 调试日志都在里面）。
+
+    只删 frag 文件不删目录，等于每播一次留一个空壳：seek 换轮次、反复播放
+    会在 %TEMP% 里堆出几百个 mc-realtime-*（2026-10-21 盘点 117 个 / 614 MB）。
+    """
+    import engine as rw
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _use_root(monkeypatch, root)
+
+    job_id = "01JOBEEEEEEEEEEEEEEEEEEEE5"
+    job = RealtimeJob(job_id, {"ffmpeg_args": ["-c", "pass"]}, sys.executable, _StubClient())
+    work_dir = job._work_dir()
+    (work_dir / "stream.frag.mp4").write_bytes(b"x" * 1024)
+    assert work_dir.is_dir()
+
+    job._cleanup_work_dir()
+    assert not work_dir.exists()
+
+
+def test_job_keeps_work_dir_while_another_round_uses_it(monkeypatch, tmp_path):
+    """seek 换轮次是「旧线程收尾 + 新线程同 job_id 开跑」：旧轮次不能把新轮次的
+    目录删掉（两边目录名只取 job_id 末 8 位，是同一个）。"""
+    import engine as rw
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _use_root(monkeypatch, root)
+
+    job_id = "01JOBFFFFFFFFFFFFFFFFFFFF6"
+    client = _StubClient()
+    old = RealtimeJob(job_id, {"ffmpeg_args": ["-c", "pass"]}, sys.executable, client)
+    new = RealtimeJob(job_id, {"ffmpeg_args": ["-c", "pass"]}, sys.executable, client)
+    # 新一轮已经注册进 jobs（_start_job 的真实顺序），旧轮次随后收尾
+    with client.jobs_lock:
+        client.jobs[job_id] = new
+    work_dir = old._work_dir()
+    (work_dir / "stream.frag.mp4").write_bytes(b"y" * 1024)
+
+    old._cleanup_work_dir()
+    assert work_dir.is_dir(), "新一轮还在写这个目录，旧轮次不能删"
+
+
+def test_sweep_removes_only_stale_work_dirs(monkeypatch, tmp_path):
+    """启动清扫：删掉历史残留，保留正在跑的任务目录，不碰非 mc-realtime 的东西。"""
+    import engine as rw
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _use_root(monkeypatch, root)
+
+    active_job = "01JOBGGGGGGGGGGGGGGGGGGGG7"
+    stale = root / "mc-realtime-STALE000"
+    keep = root / f"mc-realtime-{active_job[-8:]}"
+    unrelated = root / "someone-elses-dir"
+    for directory in (stale, keep, unrelated):
+        directory.mkdir()
+        (directory / "stream.frag.mp4").write_bytes(b"z" * 512)
+
+    removed = rw.sweep_stale_work_dirs("ffmpeg", active_job_ids={active_job})
+
+    assert removed == 1
+    assert not stale.exists()
+    assert keep.is_dir() and (keep / "stream.frag.mp4").exists()
+    assert unrelated.is_dir()
+
+
+def test_sweep_is_noop_when_root_missing(monkeypatch, tmp_path):
+    """中转根还不存在（首次启动、还没跑过任务）：静默返回 0，不报错。"""
+    import engine as rw
+
+    _use_root(monkeypatch, tmp_path / "never-created")
+    assert rw.sweep_stale_work_dirs("ffmpeg") == 0
+

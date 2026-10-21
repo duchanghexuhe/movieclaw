@@ -981,6 +981,10 @@ class WorkerRuntime:
         client.preload_yield = self._yield_preload_slots
         self._realtime_client = client
 
+        # 启动时扫掉上次进程没来得及清的中转目录（进程被杀/断电时任务线程
+        # 走不到自己的清理）：此刻还没有任何任务在跑，整片 mc-realtime-* 都是残留
+        self._sweep_work_dirs(client)
+
         def watch() -> None:
             while not self.stop_event.is_set():
                 client.run_forever()
@@ -991,6 +995,20 @@ class WorkerRuntime:
         thread.start()
         self.log("统一调度已连接：预转码+实时播放任务均由服务端推送")
         return client
+
+    def _sweep_work_dirs(self, client) -> None:  # type: ignore[no-untyped-def]
+        """清掉本机中转目录里的历史残留，并汇报清了多少（只有真清了才说话）。"""
+        from engine import sweep_stale_work_dirs
+
+        try:
+            with client.jobs_lock:
+                active = set(client.jobs)
+            removed = sweep_stale_work_dirs(self.ffmpeg, active_job_ids=active)
+        except OSError as exc:  # 目录被占/权限：不影响启动
+            self.log(f"清理实时转码中转目录失败（忽略）：{exc}")
+            return
+        if removed:
+            self.log(f"已清理 {removed} 个上次遗留的实时转码中转目录")
 
     def _run_preload(self, message: dict) -> bool:
         """RealtimeClient 的 class=preload 执行器：跑 process_task。
