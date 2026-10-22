@@ -1,7 +1,10 @@
 "use client";
 
-import { ChevronLeftIcon } from "@/components/icons";
-import { PAGE_NAV_BUTTON_SIZE_CLASS } from "@/components/page-nav";
+import {
+  ChevronLeftIcon,
+  PAGE_NAV_BUTTON_SIZE_CLASS,
+} from "@movieclaw/theme-sdk";
+
 
 /**
  * Netflix 桌面详情页的返回键：裸的白色 chevron，fixed 悬浮在顶栏下方左上角。
@@ -11,7 +14,7 @@ import { PAGE_NAV_BUTTON_SIZE_CLASS } from "@/components/page-nav";
  *
  * Netflix 桌面返回语言一套：全出血(isHome)详情页用 NetflixBackButton；带
  * PageNav 工具条的页面用 PageNav 内返回键；两者同图标 / 同尺寸档 / 同 4vw
- * 基线 / 同 useBackNavigation 行为。isHome 全出血页（外壳不加 nf-nav-offset
+ * 基线 / 同 useBackNavigation 行为。isHome 全出血页（外壳不加 topnav-offset
  * 让位）不能渲染 PageNav——sticky z-30 会被 fixed z-40 的顶栏整个盖住，
  * 返回键看得见点不到；这是防遮挡硬约束（page-nav.tsx 渲染入口也按同源判定
  * 短路，见 lib/page-chrome.tsx 的 isHomeRoute），银玻璃与移动端仍用 PageNav。
@@ -38,15 +41,15 @@ export function NetflixBackButton({
       // pointer-coarse:size-11）：两颗键同在 4vw 基线上，键径不同就有 2px 级
       // 的图标中心错位（此前裸键 40px vs 工具条键 36px 差 2px，本档修复）。
       // 图标同取键径一半的 18px，与 PageNav 同一比例
-      className={`fixed left-[4vw] top-[calc(var(--nf-nav-h)_+_12px)] z-30 flex ${PAGE_NAV_BUTTON_SIZE_CLASS} items-center justify-center rounded-full border text-white/85 transition hover:text-white ${
+      className={`nf:fixed nf:left-[4vw] nf:top-[calc(var(--nf-nav-h)_+_12px)] nf:z-30 nf:flex ${PAGE_NAV_BUTTON_SIZE_CLASS} nf:items-center nf:justify-center nf:rounded-full nf:border nf:text-white/85 nf:transition nf:hover:text-white ${
         onPhoto
           ? // 亮底场景：page-nav-btn 钩子（netflix 下 bg rgb(0 0 0/0.45)，
             // border-color --line，关 blur）；字面量 bg 作无钩子主题的兜底
-            "page-nav-btn border-[var(--line)] bg-black/45 hover:bg-black/60"
-          : "hover:bg-white/10"
+            "page-nav-btn nf:border-[var(--line)] nf:bg-black/45 nf:hover:bg-black/60"
+          : "nf:hover:bg-white/10"
       }`}
     >
-      <ChevronLeftIcon className="size-[18px] drop-shadow-[0_1px_3px_rgba(0,0,0,0.8)]" />
+      <ChevronLeftIcon className="nf:size-[18px] nf:drop-shadow-[0_1px_3px_rgba(0,0,0,0.8)]" />
     </button>
   );
 }
@@ -58,7 +61,7 @@ export function NetflixBackButton({
  */
 export function NetflixPageActions({ children }: { children: React.ReactNode }) {
   return (
-    <div className="fixed right-[4vw] top-[calc(var(--nf-nav-h)_+_12px)] z-30 flex items-center gap-2">
+    <div className="nf:fixed nf:right-[4vw] nf:top-[calc(var(--nf-nav-h)_+_12px)] nf:z-30 nf:flex nf:items-center nf:gap-2">
       {children}
     </div>
   );

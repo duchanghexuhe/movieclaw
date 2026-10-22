@@ -62,6 +62,7 @@ def media_profile_from_file(
         bit_depth=file.bit_depth,
         bit_rate_bps=file.bit_rate,
         duration_ms=(file.duration_seconds * 1000) if file.duration_seconds else None,
+        frame_rate=file.frame_rate,
         audio_tracks=_audio_tracks(file, audio_choice),
         subtitle_tracks=_subtitle_tracks(file, subtitle_choice, context.metadata_owner or file),
         keyframe_interval_s=keyframe_interval_s,

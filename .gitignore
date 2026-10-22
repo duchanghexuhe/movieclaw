@@ -90,3 +90,6 @@ apps/web/s7.json
 # worker 运行期日志
 worker/*.err.log
 worker/*.log
+
+# 随带主题插件的构建产物（plugins/<id>/ 由 pnpm theme:build 编进来，docs/design/theme-plugins.md §8）
+src/movieclaw_plugins/netflix/

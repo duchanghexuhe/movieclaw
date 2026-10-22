@@ -3,21 +3,26 @@
 import type { Route } from "next";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-
-import { InfoIcon, PlayIcon, SparkIcon } from "@/components/icons";
-import { PosterImage } from "@/components/poster-image";
-import { type LibraryItem, listLibraries, listLibraryItems } from "@/lib/api/libraries";
-import { listUpNext, type UpNextItem } from "@/lib/api/playback";
 import {
+  formatRelativeTime,
   IMAGE_ASPECT,
   imageUrl,
+  InfoIcon,
+  type LibraryItem,
+  listLibraries,
+  listLibraryItems,
+  listUpNext,
+  PlayIcon,
+  PosterImage,
   responsiveImage,
+  SparkIcon,
   tmdbImageForWidth,
+  type UpNextItem,
+  useElementCoverWidth,
+  usePermissions,
   withImageWidth,
-} from "@/lib/image-proxy";
-import { useElementCoverWidth } from "@/lib/image-resolution";
-import { usePermissions } from "@/lib/permissions";
-import { formatRelativeTime } from "@/lib/time";
+} from "@movieclaw/theme-sdk";
+
 
 /**
  * Netflix 主题媒体库页（/library）顶部的全出血 Billboard——即原「内容首页」
@@ -97,11 +102,11 @@ export function NetflixLibraryHero() {
   // 空档消失会让「媒体库」页头顶进 68px 的透明顶栏底下被字标盖住——留一段
   // 小空档把内容压到顶栏下方，引导交给媒体库页自己的空态卡。
   return loading ? (
-    <div className="flex h-[40vh] min-h-[320px] items-center justify-center text-ui text-[var(--text-muted)] max-md:min-h-[300px] md:h-[clamp(480px,56.25vw,80vh)]">
-      <span className="size-5 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+    <div className="nf:flex nf:h-[40vh] nf:min-h-[320px] nf:items-center nf:justify-center nf:text-ui nf:text-[var(--text-muted)] nf:max-md:min-h-[300px] nf:md:h-[clamp(480px,56.25vw,80vh)]">
+      <span className="nf:size-5 nf:animate-spin nf:rounded-full nf:border-2 nf:border-white/20 nf:border-t-white/70" />
     </div>
   ) : (
-    <div aria-hidden="true" className="h-16 max-md:h-6" />
+    <div aria-hidden="true" className="nf:h-16 nf:max-md:h-6" />
   );
 }
 
@@ -195,10 +200,10 @@ function NetflixBillboard({
   }, [hdUrl, fallbackSrc]);
   const artSrc = artState === "ok" ? hdUrl : artState === "failed" ? fallbackSrc : "";
 
-  // 滚动退场（详情页 --nf-hero-recede 的 billboard 版）：billboard 跟随媒体库
+  // 滚动退场（详情页 --hero-recede 的 billboard 版）：billboard 跟随媒体库
   // 页的滚动容器滚走，下滚时画面渐暗 + 模糊。进度写在 section 元素上，只有
   // 本组件的子树消费它（.nf-billboard-art，见 globals.css），不挂
-  // html.nf-hero-live——那会牵连全站沉浸覆盖层的规则。
+  // html.hero-live——那会牵连全站沉浸覆盖层的规则。
   const sectionRef = useRef<HTMLElement | null>(null);
   // 同一个元素既给滚动退场用（ref），也要量尺寸算取图宽度（state，量到后重渲染）
   const attachSection = useCallback((el: HTMLElement | null) => {
@@ -228,7 +233,7 @@ function NetflixBillboard({
       // 缓出区间相应收短
       const range = Math.max(240, section.clientHeight * 0.8);
       const progress = Math.min(1, Math.max(0, scroller.scrollTop / range));
-      section.style.setProperty("--nf-hero-recede", progress.toFixed(3));
+      section.style.setProperty("--hero-recede", progress.toFixed(3));
     };
     const onScroll = () => {
       if (!frame) frame = window.requestAnimationFrame(sync);
@@ -245,15 +250,15 @@ function NetflixBillboard({
     <section
       ref={attachSection}
       aria-label={`正在展示《${title}》`}
-      className="relative h-[40vh] min-h-[320px] w-full max-md:min-h-[300px] md:h-[clamp(480px,56.25vw,80vh)]"
+      className="nf:relative nf:h-[40vh] nf:min-h-[320px] nf:w-full nf:max-md:min-h-[300px] nf:md:h-[clamp(480px,56.25vw,80vh)]"
     >
       {/* 画面：高清剧照直出（加载解码完成前保持黑场）；无剧照的条目用海报
           模糊铺底兜底。遮罩语言（左黑渐变 / 底部渐隐 / 滚动模糊）全部收口在
           .nf-billboard-art（globals.css，与详情页沉浸剧照同一套规则） */}
-      <div className="absolute inset-0 overflow-hidden bg-black">
+      <div className="nf:absolute nf:inset-0 nf:overflow-hidden nf:bg-black">
         {artSrc ? (
-          <div className="nf-billboard-art absolute inset-0">
-            <img src={artSrc} alt="" className="size-full object-cover" />
+          <div className="nf-billboard-art nf:absolute nf:inset-0">
+            <img src={artSrc} alt="" className="nf:size-full nf:object-cover" />
           </div>
         ) : artworkUrl ? null : libraryItem?.poster_url ? (
           <PosterFallbackFill url={libraryItem.poster_url} aspect={libraryItem.primary_aspect} />
@@ -261,31 +266,31 @@ function NetflixBillboard({
       </div>
 
       {/* 左下文案块：底距 16%（移动端 10%）让按钮/进度条下方留出一段仍在渐变的
-          余量——渐变 45%→100%（globals.css），压到 12% 时按钮正落在渐变终点上 */}
-      <div className="absolute inset-x-0 bottom-[16%] px-[4vw] max-md:bottom-[10%]">
-        <h1 className="max-w-[80%] text-[clamp(28px,4.6vw,56px)] font-bold leading-[1.12] tracking-[-0.02em] text-white text-on-image max-md:max-w-full">
+          余量——渐变 45%→100%（theme.css），压到 12% 时按钮正落在渐变终点上 */}
+      <div className="nf:absolute nf:inset-x-0 nf:bottom-[16%] nf:px-[4vw] nf:max-md:bottom-[10%]">
+        <h1 className="nf:max-w-[80%] nf:text-[clamp(28px,4.6vw,56px)] nf:font-bold nf:leading-[1.12] nf:tracking-[-0.02em] nf:text-white text-on-image nf:max-md:max-w-full">
           {title}
         </h1>
         {metaText && (
-          <p className="tnum text-on-image mt-2.5 flex flex-wrap items-center gap-x-2.5 text-[14px] font-medium text-[#e5e5e5] max-md:mt-2">
-            <span className="font-bold text-[var(--ok)]">在库</span>
+          <p className="tnum text-on-image nf:mt-2.5 nf:flex nf:flex-wrap nf:items-center nf:gap-x-2.5 nf:text-[14px] nf:font-medium nf:text-[#e5e5e5] nf:max-md:mt-2">
+            <span className="nf:font-bold nf:text-[var(--ok)]">在库</span>
             {metaText}
           </p>
         )}
         {addedLabel && (
-          <p className="text-on-image mt-1 text-caption text-[var(--text-muted)]">{addedLabel}</p>
+          <p className="text-on-image nf:mt-1 nf:text-caption nf:text-[var(--text-muted)]">{addedLabel}</p>
         )}
         {/* 按钮组：▶ 播放（品牌红）· ⓘ 详情（灰底）· ✦ 问 AI（ghost）。
             移动端可换行（320px 视口三颗排不下）且保持 44px 触控高度——
             billboard 按钮组是最高频的操作区，max-md:h-9 的 36px 偏小 */}
-        <div className="mt-4 flex items-center gap-2.5 max-md:mt-3.5 max-md:flex-wrap">
+        <div className="nf:mt-4 nf:flex nf:items-center nf:gap-2.5 nf:max-md:mt-3.5 nf:max-md:flex-wrap">
           {playHref && (
             <button
               type="button"
               onClick={() => router.push(playHref)}
-              className="media-cta flex h-10 items-center gap-2 rounded-[4px] bg-white px-5 text-[15px] font-bold text-black transition-colors hover:bg-white/75 max-md:h-11 max-md:px-4"
+              className="media-cta nf:flex nf:h-10 nf:items-center nf:gap-2 nf:rounded-[4px] nf:bg-white nf:px-5 nf:text-[15px] nf:font-bold nf:text-black nf:transition-colors nf:hover:bg-white/75 nf:max-md:h-11 nf:max-md:px-4"
             >
-              <PlayIcon className="size-5" fill="currentColor" />
+              <PlayIcon className="nf:size-5" fill="currentColor" />
               播放
             </button>
           )}
@@ -293,9 +298,9 @@ function NetflixBillboard({
             <button
               type="button"
               onClick={() => router.push(detailHref)}
-              className="flex h-10 items-center gap-2 rounded-[4px] bg-[rgba(109,109,110,0.7)] px-5 text-[15px] font-semibold text-white transition-colors hover:bg-[rgba(109,109,110,0.4)] max-md:h-11 max-md:px-4"
+              className="nf:flex nf:h-10 nf:items-center nf:gap-2 nf:rounded-[4px] nf:bg-[rgba(109,109,110,0.7)] nf:px-5 nf:text-[15px] nf:font-semibold nf:text-white nf:transition-colors nf:hover:bg-[rgba(109,109,110,0.4)] nf:max-md:h-11 nf:max-md:px-4"
             >
-              <InfoIcon className="size-5" />
+              <InfoIcon className="nf:size-5" />
               更多信息
             </button>
           )}
@@ -304,17 +309,17 @@ function NetflixBillboard({
             <button
               type="button"
               onClick={() => router.push("/new")}
-              className="text-on-image flex h-10 items-center gap-1.5 rounded-[4px] px-3 text-[15px] font-medium text-[var(--text-muted)] transition-colors hover:text-white max-md:h-11"
+              className="text-on-image nf:flex nf:h-10 nf:items-center nf:gap-1.5 nf:rounded-[4px] nf:px-3 nf:text-[15px] nf:font-medium nf:text-[var(--text-muted)] nf:transition-colors nf:hover:text-white nf:max-md:h-11"
             >
-              <SparkIcon className="size-4" />
+              <SparkIcon className="nf:size-4" />
               问 AI
             </button>
           )}
         </div>
         {/* 继续观看的进度：billboard 底部细红条（与播放器进度同语言） */}
         {progress != null && progress > 0 && (
-          <div className="mt-4 h-[3px] w-[min(320px,60%)] bg-white/25 max-md:mt-3">
-            <div className="h-full bg-[var(--accent)]" style={{ width: `${progress}%` }} />
+          <div className="nf:mt-4 nf:h-[3px] nf:w-[min(320px,60%)] nf:bg-white/25 nf:max-md:mt-3">
+            <div className="nf:h-full nf:bg-[var(--accent)]" style={{ width: `${progress}%` }} />
           </div>
         )}
       </div>
@@ -335,14 +340,14 @@ function PosterFallbackFill({ url, aspect }: { url: string; aspect: number }) {
       <img
         {...responsiveImage(src, POSTER_FILL_WIDTH)}
         alt=""
-        className="absolute inset-0 size-full scale-110 object-cover opacity-40 blur-2xl"
+        className="nf:absolute nf:inset-0 nf:size-full nf:scale-110 nf:object-cover nf:opacity-40 nf:blur-2xl"
       />
-      <div className="absolute inset-0 flex items-center justify-center">
+      <div className="nf:absolute nf:inset-0 nf:flex nf:items-center nf:justify-center">
         <div
           style={{ aspectRatio: aspect, height: "86%" }}
-          className="overflow-hidden rounded-[4px] shadow-[0_0_40px_rgba(0,0,0,0.6)]"
+          className="nf:overflow-hidden nf:rounded-[4px] nf:shadow-[0_0_40px_rgba(0,0,0,0.6)]"
         >
-          <PosterImage src={src} width={POSTER_FILL_WIDTH} alt="" className="size-full" />
+          <PosterImage src={src} width={POSTER_FILL_WIDTH} alt="" className="nf:size-full" />
         </div>
       </div>
     </>

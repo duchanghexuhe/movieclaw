@@ -62,12 +62,13 @@ _PROBE_FILTERS: dict[str, list[str]] = {
     "videotoolbox": ["-vf", "format=nv12"],
 }
 
-#: VAAPI 低功耗编码的探测参数：除了 ``-low_power 1``，把真实转码会带的 profile / level /
+#: VAAPI 低功耗编码的探测参数：除了 ``-low_power 1``，把真实转码会带的 profile /
 #: 码率控制也带上——VDEnc 支持的码率控制模式与普通编码不同，只探「能不能开」会探得通、
 #: 真用时再被码率参数拒掉。数值取 1080p 档的量级，探测源再小也照样走这套参数校验。
+#: level 与真实转码一样不钉，交给编码器选（issue #964）。
 _VAAPI_LOW_POWER_PROBE_ARGS: list[str] = [
     *VAAPI_LOW_POWER,
-    "-profile:v", "high", "-level:v", "4.1",
+    "-profile:v", "high",
     "-b:v", "0", "-maxrate", "8M", "-bufsize", "16M",
 ]  # fmt: skip
 
@@ -77,12 +78,14 @@ _VAAPI_LOW_POWER_PROBE_ARGS: list[str] = [
 #:
 #: 探测链与真实转码链**同构**——上传到显存 → tone-map → 硬件缩放 → 硬件编码，
 #: 否则会出现「探得通、真用炸」。输入要合成成 HDR10（PQ 曲线 + BT.2020 三件套）：
-#: tone-map 滤镜拒绝非 HDR 输入，拿 testsrc2 直接喂它必然失败。
+#: tone-map 滤镜拒绝非 HDR 输入，拿 testsrc2 直接喂它必然失败。``setparams`` 的
+#: 矩阵名取 ``AVColorSpace`` 枚举（``bt2020nc``），不是 ``colorspace`` 滤镜的
+#: ``bt2020ncl``——写错了整条链在上传显存前就解析失败，能用的卡被判成没有（#963）。
 _NATIVE_TONEMAP_PROBES: dict[str, tuple[str, str]] = {
     "nvenc": (
         NVENC_TONEMAP,
         "format=p010le,setparams=color_primaries=bt2020:color_trc=smpte2084"
-        ":colorspace=bt2020ncl,hwupload_cuda,{filter},scale_cuda=format=yuv420p:w=-2:h=240",
+        ":colorspace=bt2020nc,hwupload_cuda,{filter},scale_cuda=format=yuv420p:w=-2:h=240",
     ),
 }
 

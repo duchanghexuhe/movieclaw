@@ -233,6 +233,10 @@ _BT709_OUTPUT_TAGS = [
     "-color_range", "tv",
 ]
 
+#: 硬件帧链路末端给帧打的 BT.709 标签。ffmpeg 7.1 起 ``-colorspace`` 参与滤镜格式协商：帧上
+#: 标签与它不符时自动插软件 scale 去转换，而软件 scale 接不了硬件帧，整条命令失败（实测）。
+_BT709_FRAME_TAGS = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
+
 #: 多声道降混系数：提升中置声道权重。不带它，对白会明显偏小——
 #: 「音效很响但听不清台词」是用户投诉第一名（§7-⑤）。
 #: 不用 ``-af volume=2`` 那种 hack，那会削顶失真。
@@ -916,16 +920,12 @@ def _video_args(
     elif backend is not None:
         args += ["-c:v", backend.encoder, *encoder_options(backend, caps)]
         # iOS 原生 HLS 对 10-bit/High 10 的硬件编码结果兼容性很差，统一锁
-        # 到 High profile + 8-bit yuv420p。level 4.1 与**实际编码尺寸**是硬校验
-        #（H.264 level 4.1 上限 8192 宏块）：宽银幕缩到 1080p 高后宽出界——
-        # 坠落2 3828×2058 → 2010×1080 = 8568 宏块——VideoToolbox 以
-        # kVTParameterErr=-12902、NVENC 以 "Invalid Level" 在 InitializeEncoder
-        # 拒绝创建编码器，整部片起不了播（libx264 只是告警并自动抬高 level，
-        # Intel 驱动静默钳制，所以软编与 VAAPI/QSV 可以继续钉）。这两家交给
-        # 编码器按实际分辨率选合法 level（2160p 通常 5.1、宽银幕 1080p 4.2）。
+        # 到 High profile + 8-bit yuv420p。level 不钉，交给编码器按实际输出的
+        # 宽×高×帧率选合法值：输出只钉高度、宽度随源宽高比走，宽银幕 1080p
+        # （2000×1080、2588×1080）或 1080p60 都超出 4.1 的上限，NVENC 以
+        # 「Invalid Level」拒绝初始化、一段都不产出（issue #964）；VideoToolbox
+        # 在 4K 输出时同理以 kVTParameterErr=-12902 拒绝。
         args += ["-profile:v", "high"]
-        if backend.name not in ("videotoolbox", "nvenc"):
-            args += ["-level:v", "4.1"]
         if backend.name == "videotoolbox" and vt_mode != VT_GPU:
             # GPU 链路的帧是硬件帧、已是 8-bit NV12；再要 yuv420p 会逼 ffmpeg 插一个
             # 接不上硬件帧的软件格式转换
@@ -968,20 +968,7 @@ def _video_args(
     args += ["-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})"]
     # 输出侧的色彩标签放在最后、且不依赖滤镜链的属性传递：滤镜漏设（VAAPI 与
     # QSV 都漏过）或不同 ffmpeg 版本的协商差异，都会在这里被兜住。
-    #
-    # 例外：帧不落回软件的 VAAPI/QSV 链不能写 colorspace/primaries/trc——
-    # ffmpeg 7.1 在首帧到达、发现源色彩属性（BT.2020/PQ）与声明输出不符时会
-    # 重建滤镜图，重建插入的软件 auto_scale 接不上硬件帧，整链以
-    # 「Impossible to convert between the formats … / Function not implemented」
-    # 即刻崩掉（4K HDR10 + VAAPI 低功耗真机复现，2026-10-15，二分到这组标签）。
-    # 这两家的原生 tone-map 滤镜本来就在滤镜内声明了全套输出色彩
-    # （tonemap_vaapi 的 format/t/m/p、vpp_qsv 的 out_color_*），流标签不受影响。
-    hw_frames = (
-        backend is not None
-        and not software_filters
-        and backend.name in ("vaapi", "qsv")
-    )
-    if _outputs_bt709(plan) and not hw_frames:
+    if _outputs_bt709(plan):
         args += _BT709_OUTPUT_TAGS
     return args
 
@@ -1041,7 +1028,7 @@ def _videotoolbox_gpu_chain(plan: PlaybackPlan) -> str:
         return f"scale_vt={size}format=p010le,{_tonemap_step(VIDEOTOOLBOX_TONEMAP, plan)}"
     chain = f"scale_vt={size}format=nv12"
     if _outputs_bt709(plan):
-        chain += ",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
+        chain += f",{_BT709_FRAME_TAGS}"
     return chain
 
 
@@ -1098,6 +1085,17 @@ def _filter_chain(
             parts.append(f"scale=-2:{height}")
             if backend is not None and backend.name == "videotoolbox" and not software_filters:
                 parts.append("format=yuv420p")
+    if (
+        backend is not None
+        and backend.scale_filter
+        and not software_filters
+        and _outputs_bt709(plan)
+    ):
+        # 整条链留在显卡上（VAAPI / QSV / NVENC）时，帧标签同样要先打好（issue #958）：
+        # tonemap_vaapi、vpp_qsv、scale_* 在格式协商里把源的色彩空间原样往下传，HDR10 的
+        # bt2020nc（或无标签片的 unknown）撞上 -colorspace bt709，ffmpeg 就在硬件帧后面插一个
+        # 接不上的软件 scale，起步即退出。setparams 在协商里声明输出是 BT.709，链子才接得上
+        parts.append(_BT709_FRAME_TAGS)
     return ",".join(parts)
 
 

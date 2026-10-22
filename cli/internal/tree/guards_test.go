@@ -30,10 +30,16 @@ var knownNonGenerated = []string{
 	"skills.list",
 	// 插件网页（docs/design/plugin-web-pages.md）：侧边栏数据源与 iframe 加载的静态文件，
 	// 都是 Web 基础设施；命令行看插件网页走 app plugins pages list
+	// 网页主题（docs/design/theme-plugins.md）：前端加载器与设置页的数据源，CLI 场景无消费方
+	"ui.themes.list",
+	"ui.themes.stylesheet",
+	"ui.themes.file",
 	"ui.apps.list",
 	"ui.apps.root",
 	"ui.apps.file",
 	"ui.apps.errors.report",
+	// 插件市场的图标：网页 <img> 用的二进制，命令行看市场走 app plugins market list / show
+	"app.plugins.market.icon",
 	"auth.device.authorize",
 	"auth.device.token",
 	// 原生 App 的账号密码登录：客户端之间的协议端点，mclaw 走配对码
