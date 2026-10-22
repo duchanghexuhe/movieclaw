@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import logging
 import os
 import re
@@ -1850,6 +1851,7 @@ class _PartialSegmentResponse(StreamingResponse):
         *,
         final_path: PathLib,
         byte_sink: Callable[[int], None] | None = None,
+        on_disconnect: Callable[[], None] | None = None,
     ) -> None:
         # 借 StreamingResponse 的头部装配（不写 Content-Length）；发送循环在 __call__ 里自己管
         super().__init__(
@@ -1864,6 +1866,7 @@ class _PartialSegmentResponse(StreamingResponse):
         self._partial = partial
         self._final_path = final_path
         self._byte_sink = byte_sink
+        self._on_disconnect = on_disconnect
 
     async def __call__(self, scope, receive, send) -> None:
         partial = self._partial
@@ -1918,6 +1921,9 @@ class _PartialSegmentResponse(StreamingResponse):
                         partial.index,
                     )
                     return
+            # 收齐、作废、停滞都在循环里直接 return；能落到这里只有一种：分片没送完客户端就走了
+            if self._on_disconnect is not None:
+                self._on_disconnect()
         finally:
             watcher.cancel()
             handle.close()
@@ -1954,6 +1960,10 @@ async def get_session_segment(
     uplink.note(network_side.request_side(request, route=grant.route))
     session.touch()
     meter = await _session_activity_meter(session, grant, request)
+    byte_sink = meter.add if meter is not None else None
+    # 页签被直接关闭时 DELETE 发不出来，服务端唯一看得到的就是在途的分片响应被掐断：
+    # 按会话记下来，心跳巡检据此提前回收没人看的转码（SessionManager.note_stream_disconnect）
+    on_disconnect = functools.partial(manager.note_stream_disconnect, session_id)
     target = session.directory / name
     if session.segment_plan is not None and name.startswith("seg"):
         allow_partial = session.progressive and _consumes_partial_segments(request)
@@ -1970,7 +1980,7 @@ async def get_session_segment(
             raise NotFoundException("分片尚未就绪")
         if isinstance(ready, PartialSegment):
             return _PartialSegmentResponse(
-                ready, final_path=target, byte_sink=meter.add if meter is not None else None
+                ready, final_path=target, byte_sink=byte_sink, on_disconnect=on_disconnect
             )
         target = ready
     elif name == INIT_NAME:
@@ -2003,11 +2013,14 @@ async def get_session_segment(
     # 秒，回看必然重新走 HTTP）就变成本地命中，不再打服务端。
     headers = {"Cache-Control": "private, max-age=3600, immutable"}
     media_type = "video/mp2t" if name.endswith(".ts") else "video/mp4"
-    if meter is None:
-        return FileResponse(target, media_type=media_type, headers=headers)
-    # 逐块计量发出的字节（活动页的速率来源）；计量器随会话存活，这里不回收
+    # 逐块计量发出的字节（活动页的速率来源）；计量器随会话存活，这里不回收。
+    # 没有计量器的取流（旧令牌、未识别文件）也走这个响应类：断连登记不依赖计量
     return DisconnectAwareFileResponse(
-        target, media_type=media_type, headers=headers, byte_sink=meter.add
+        target,
+        media_type=media_type,
+        headers=headers,
+        byte_sink=byte_sink,
+        on_disconnect=on_disconnect,
     )
 
 
@@ -2146,14 +2159,8 @@ def _metered_file_response(
 
     ``windows`` 给了就只出文件里的这几截、首尾相接当一个文件（光盘镜像里的蓝光剪辑）。
     """
-    # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计。
-    # 旧令牌 / Jellyfin 兼容层没有播放编号，probe 为 None——断连回收记不上，
-    # 心跳巡检的既有档位照旧兜底
+    # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计
     probe = qoe.serve_probe(grant.attempt_id)
-    if probe is not None:
-        probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
-            grant.session_id
-        )
     stream = _register_play_stream(
         request,
         grant,
@@ -2208,12 +2215,7 @@ async def _cloud_stream_response(request: Request, grant, file: LibraryFile) -> 
 
 def _metered_relay_response(request: Request, grant, file: LibraryFile, link: StrmLink) -> Response:
     """转发网盘直链（``strm_needs_relay``），与磁盘直出同一套设备流与活动页登记。"""
-    # 与 _metered_file_response 同一口径：probe 为 None（无播放编号）只跳过断连回收
     probe = qoe.serve_probe(grant.attempt_id)
-    if probe is not None:
-        probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
-            grant.session_id
-        )
     stream = _register_play_stream(request, grant, file, name=PathLib(file.file_path).name)
     session_stopped, byte_sink, on_close = stream if stream is not None else (None, None, None)
     return RemoteRelayResponse(

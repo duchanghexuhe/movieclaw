@@ -49,6 +49,7 @@ from movieclaw_db.models import FileSource, FileState, LibraryFile, MediaItem
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_playback.decide import AudioPlan, PlaybackPlan, PlaybackTier, VideoPlan
 from movieclaw_playback.hls_vod import SegmentPlan
+from movieclaw_playback.streaming import DisconnectAwareFileResponse
 
 _PB = "/api/v1/playback"
 _ADMIN = {"username": "admin", "password": "Sup3rSecret!"}
@@ -2507,6 +2508,209 @@ async def test_partial_segment_response_aborts_without_final_chunk(tmp_path):
     await asyncio.wait_for(task, 2)
     bodies = [m for m in sent if m["type"] == "http.response.body"]
     assert bodies and all(m["more_body"] for m in bodies), "作废的分片不能正常收尾"
+
+
+def _partial_segment_response(tmp_path: Path, calls: list[str]):
+    path = tmp_path / ".seg00001.m4s.partial"
+    path.write_bytes(b"FRAG1")
+    segment = session_mod.PartialSegment(index=1, path=path, job="j", size=5, next_part=1)
+    response = routes_playback._PartialSegmentResponse(
+        segment,
+        final_path=tmp_path / "seg00001.m4s",
+        on_disconnect=lambda: calls.append("gone"),
+    )
+    return segment, response
+
+
+@pytest.mark.asyncio
+async def test_partial_segment_response_reports_a_client_that_leaves_early(tmp_path):
+    """跟着下发的分片还没收齐客户端就走了（页签直接关闭）：登记一次断开。"""
+    calls: list[str] = []
+    _, response = _partial_segment_response(tmp_path, calls)
+    gone = asyncio.Event()
+
+    async def receive() -> dict:
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            gone.set()
+            await asyncio.sleep(0.05)  # 让监听断开的后台任务跑一轮
+
+    await asyncio.wait_for(response({"type": "http"}, receive, send), 2)
+    assert calls == ["gone"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["complete", "abort"])
+async def test_partial_segment_response_does_not_report_a_normal_ending(tmp_path, ending):
+    """收齐、或作废（seek 重启）都不是客户端走了：不登记断开。"""
+    calls: list[str] = []
+    segment, response = _partial_segment_response(tmp_path, calls)
+    never = asyncio.Event()
+
+    async def receive() -> dict:
+        await never.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        return None
+
+    task = asyncio.ensure_future(response({"type": "http"}, receive, send))
+    await asyncio.sleep(0.05)
+    if ending == "complete":
+        segment.done = True
+    else:
+        segment.failed = True
+    segment.notify()
+    await asyncio.wait_for(task, 2)
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# 分片被掐断 → 登记到会话 → 心跳巡检提前回收（页签直接关闭、DELETE 发不出的场景）
+# ---------------------------------------------------------------------------
+
+
+async def _get_cut_after_first_chunk(app, path: str, query: str) -> list[dict]:
+    """走完整的应用（路由、中间件）取一个地址；收到第一块就像页签被关了那样断开。"""
+    sent: list[dict] = []
+    gone = asyncio.Event()
+    requested = False
+
+    async def receive() -> dict:
+        nonlocal requested
+        if not requested:
+            requested = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            gone.set()
+            await asyncio.sleep(0.05)  # 让监听断开的后台任务跑一轮，下一块读取前就看得到
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query.encode(),
+        "headers": [(b"host", b"testserver"), (b"user-agent", b"Mozilla/5.0 Chrome/140")],
+        "client": ("203.0.113.9", 50000),
+        "server": ("testserver", 80),
+        "root_path": "",
+    }
+    await app(scope, receive, send)
+    return sent
+
+
+def _segment_session(client: TestClient, tmp_path: Path, *, blocks: int = 3):
+    """一个带多块分片文件的会话 + 取流令牌；令牌没有播放编号（旧令牌 / 网页都是这样）。"""
+    file_id = seed(client, tmp_path, container="mkv")
+    grants = _install_remote_session(client, tmp_path, file_id)
+    session = get_session_manager().get(grants["session_id"])
+    assert session is not None
+    (session.directory / "seg00000.m4s").write_bytes(
+        b"x" * (DisconnectAwareFileResponse.chunk_size * blocks)
+    )
+    return file_id, session
+
+
+def _segment_url(client: TestClient, file_id: int, session, *, device_id=None) -> tuple[str, str]:
+    token = client.portal.call(
+        partial(
+            issue_stream_token,
+            member_id=0,
+            file_id=file_id,
+            session_id=session.id,
+            device_id=device_id,
+        )
+    )
+    return f"{_PB}/sessions/{session.id}/seg00000.m4s", f"token={token}"
+
+
+@pytest.mark.parametrize("device_id", [None, "browser-x"])
+def test_segment_cut_mid_response_is_registered_on_the_session(client, tmp_path, device_id):
+    """分片送到一半客户端没了：按会话记下来；送完的不记。
+
+    带设备标识的取流有活动页计量器，没有的（旧令牌、未识别文件）没有——两种都要登记。"""
+    from movieclaw_playback import activity
+
+    activity.reset()
+    file_id, session = _segment_session(client, tmp_path)
+    path, query = _segment_url(client, file_id, session, device_id=device_id)
+
+    full = client.get(f"{path}?{query}")
+    assert full.status_code == 200
+    assert session.last_stream_disconnect_at is None
+
+    sent = client.portal.call(partial(_get_cut_after_first_chunk, client.app, path, query))
+    assert sent[0]["status"] == 200
+    assert session.last_stream_disconnect_at is not None
+    activity.reset()
+
+
+@pytest.mark.parametrize(
+    ("then", "reaped"),
+    [("silence", 1), ("heartbeat", 0), ("next_segment", 0)],
+)
+def test_cut_segment_gets_the_session_reaped_early_only_if_nothing_follows(
+    client, tmp_path, monkeypatch, then, reaped
+):
+    """页签直接关闭：之后什么都没来 → 提前回收；心跳或新的分片请求来了（seek 掐掉在途请求
+    之后的常态）→ 照旧留着。"""
+    file_id, session = _segment_session(client, tmp_path)
+    path, query = _segment_url(client, file_id, session)
+    monkeypatch.setattr(session_mod, "STREAM_DISCONNECT_REAP_S", 0.2)
+
+    client.portal.call(partial(_get_cut_after_first_chunk, client.app, path, query))
+    assert session.last_stream_disconnect_at is not None
+    if then == "heartbeat":
+        assert client.post(f"{_PB}/sessions/{session.id}/ping").status_code == 200
+    elif then == "next_segment":
+        assert client.get(f"{path}?{query}").status_code == 200
+    time.sleep(0.3)
+
+    assert client.portal.call(get_session_manager().reap) == reaped
+    assert (get_session_manager().get(session.id) is None) == bool(reaped)
+
+
+def test_partial_segment_cut_mid_response_is_registered_on_the_session(
+    client, tmp_path, monkeypatch
+):
+    """边产出边送的分片（AVFoundation 客户端）走另一个响应类，同样要登记。"""
+    file_id, session = _segment_session(client, tmp_path)
+    session.progressive = True
+    session.segment_plan = SegmentPlan(
+        boundaries=tuple(float(i * 4) for i in range(10)), duration_s=40.0
+    )
+    partial_path = session.directory / ".seg00001.m4s.partial"
+    partial_path.write_bytes(b"FRAG1")
+    segment = session_mod.PartialSegment(index=1, path=partial_path, job="j", size=5, next_part=1)
+
+    async def ensure_segment(_session, index, *, allow_partial=False):
+        assert allow_partial, "只有渐进解码的客户端才该拿到半成品"
+        return segment
+
+    monkeypatch.setattr(get_session_manager(), "ensure_segment", ensure_segment)
+    _, query = _segment_url(client, file_id, session)
+
+    client.portal.call(
+        partial(
+            _get_cut_after_first_chunk,
+            client.app,
+            f"{_PB}/sessions/{session.id}/seg00001.m4s",
+            f"{query}&partial=1",
+        )
+    )
+    assert session.last_stream_disconnect_at is not None
 
 
 def test_whole_segment_upload_supersedes_a_half_written_partial(client, tmp_path):

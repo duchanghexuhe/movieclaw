@@ -415,9 +415,9 @@ async def test_idle_session_is_reaped(manager, monkeypatch):
 
 
 async def test_stream_disconnect_without_ping_reaps_early(manager, monkeypatch):
-    """页签直接关闭：DELETE 发不出，心跳与取流同时消失。
+    """页签直接关闭：DELETE 发不出，在途的分片响应被掐断，之后心跳与请求都没再来。
 
-    心跳空闲刚过 STREAM_DISCONNECT_REAP_S 且取流已断开过 → 提前回收，
+    断开后超过 STREAM_DISCONNECT_REAP_S 仍没有动静 → 提前回收，
     不让 ffmpeg 对着没人看的片转满整个空闲超时（GPU 空转数分钟）。"""
     install_fake(monkeypatch, WRITES_PLAYLIST_THEN_SLEEPS)
     monkeypatch.setattr(session_mod, "SESSION_IDLE_TIMEOUT_S", 0.2)
@@ -432,16 +432,21 @@ async def test_stream_disconnect_without_ping_reaps_early(manager, monkeypatch):
     assert manager.get(session.id) is None
 
 
-async def test_stream_disconnect_alone_does_not_reap_while_ping_flows(manager, monkeypatch):
-    """取流断开但心跳还在（暂停中、缓冲满）：不提前回收。"""
+async def test_activity_after_a_stream_disconnect_cancels_the_early_reap(manager, monkeypatch):
+    """分片响应被掐断后播放器又有动静：不提前回收。
+
+    seek 就会掐掉在途的分片请求，随后播放器照常发心跳、来取新分片。"""
     install_fake(monkeypatch, WRITES_PLAYLIST_THEN_SLEEPS)
     monkeypatch.setattr(session_mod, "STREAM_DISCONNECT_REAP_S", 0.1)
     session = await manager.start(make_plan(), source_path="/m/a.mkv", member_id=0)
-    manager.note_stream_disconnect(session.id)
-    await asyncio.sleep(0.05)
-    assert await manager.reap() == 0
-    assert manager.get(session.id) is not None
-    await manager.shutdown()
+    try:
+        manager.note_stream_disconnect(session.id)
+        assert manager.ping(session.id) is True
+        await asyncio.sleep(0.15)
+        assert await manager.reap() == 0
+        assert manager.get(session.id) is not None
+    finally:
+        await manager.shutdown()
 
 
 async def test_ping_keeps_session_alive(manager, monkeypatch):
