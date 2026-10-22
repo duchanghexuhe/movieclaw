@@ -51,7 +51,7 @@ class AppGraph(app: Application) {
 
     /**
      * 有网络连上了（系统回调；订阅时已经连着的也算一次）。开机直达 MovieClaw 时 Wi-Fi 常比 App 晚几秒连上：
-     * 首页一次都没加载成功时靠它立即重试，不等每分钟的定时刷新（docs/design/androidtv-home.md §7）
+     * 首页一次都没加载成功时靠它立即重试，不等每分钟的定时刷新
      */
     val networkAvailable: Flow<Unit> = callbackFlow {
         val manager = app.getSystemService(ConnectivityManager::class.java)
