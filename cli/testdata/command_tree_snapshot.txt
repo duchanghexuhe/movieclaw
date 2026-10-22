@@ -290,6 +290,7 @@ site catalog
 site delete
 site list
 site protection set
+site proxy request
 site ratio-boost pause
 site ratio-boost set
 site show
