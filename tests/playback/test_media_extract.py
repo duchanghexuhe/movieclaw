@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -454,21 +455,39 @@ async def test_whole_file_reads_are_serialized_across_files(tmp_path: Path, monk
     assert peak == 1, f"同时有 {peak} 个整文件通读在跑"
 
 
-def test_timeout_scales_with_file_size(tmp_path: Path) -> None:
-    """固定 120 秒读不完 60 GB 的 Remux；按保守吞吐放宽，封顶一小时。"""
-    small = tmp_path / "small.mkv"
-    small.write_bytes(b"x")
-    assert media_extract._extract_timeout(small) == media_extract.EXTRACT_TIMEOUT
+def test_timeout_scales_with_file_size() -> None:
+    """固定 120 秒读不完 60 GB 的 Remux；按保守吞吐放宽，封顶一小时。
 
-    remux = tmp_path / "remux.mkv"
-    with remux.open("wb") as fh:
-        fh.truncate(20 * 1024**3)  # 稀疏文件，不占真实磁盘
-    assert media_extract._extract_timeout(remux) == pytest.approx(1024.0)
+    体积走替身，**不真造文件**：这个用例原来 ``truncate`` 出 20 GB 与 200 GB 的
+    "稀疏文件"，而稀疏与否由文件系统决定——NTFS 等不支持稀疏文件的文件系统上会真写
+    出这么多零，把 pytest 临时目录所在的盘写满，之后的用例全部 ENOSPC（连 sqlite 都
+    开不了）。判定只读 ``stat().st_size``，喂它一个数就够了。
+    """
 
-    huge = tmp_path / "huge.mkv"
-    with huge.open("wb") as fh:
-        fh.truncate(200 * 1024**3)
-    assert media_extract._extract_timeout(huge) == media_extract._MAX_EXTRACT_TIMEOUT
+    class _SizedPath:
+        """只回答体积的假 Path：``_extract_timeout`` 只用 ``str()`` 与 ``stat().st_size``。"""
+
+        def __init__(self, name: str, size: int) -> None:
+            self._name = name
+            self._size = size
+
+        def __str__(self) -> str:
+            return self._name
+
+        def stat(self):  # noqa: ANN201 - 与 pathlib.Path.stat 同形的替身
+            return SimpleNamespace(st_size=self._size)
+
+    assert (
+        media_extract._extract_timeout(_SizedPath("small.mkv", 1))
+        == media_extract.EXTRACT_TIMEOUT
+    )
+    assert media_extract._extract_timeout(
+        _SizedPath("remux.mkv", 20 * 1024**3)
+    ) == pytest.approx(1024.0)
+    assert (
+        media_extract._extract_timeout(_SizedPath("huge.mkv", 200 * 1024**3))
+        == media_extract._MAX_EXTRACT_TIMEOUT
+    )
 
 
 @pytest.mark.asyncio
