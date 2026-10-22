@@ -37,7 +37,7 @@ export default async function PlayPage({
   searchParams,
 }: {
   params: Promise<{ mediaItemId: string; unit?: string[] }>;
-  searchParams: Promise<{ t?: string | string[] }>;
+  searchParams: Promise<{ t?: string | string[]; file?: string | string[] }>;
 }) {
   const { mediaItemId, unit } = await params;
   const query = await searchParams;
@@ -49,6 +49,7 @@ export default async function PlayPage({
       season={parsed?.season}
       episode={parsed?.episode}
       startMsOverride={startSeconds !== undefined ? startSeconds * 1000 : undefined}
+      lockedFileId={queryNumber(query.file)}
     />
   );
 }

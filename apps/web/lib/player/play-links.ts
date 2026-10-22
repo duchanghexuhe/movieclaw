@@ -23,15 +23,46 @@ export function parseUnitSegment(segment: string | undefined): {
 /** 生成播放页地址。季集号补零是媒体库的通用写法（s01e03），别自创。 */
 export function playHref(
   mediaItemId: number,
-  options?: { season?: number; episode?: number; tSeconds?: number },
+  options?: {
+    season?: number;
+    episode?: number;
+    tSeconds?: number;
+    /** 用户在详情页明确选中的版本：播放页锁定该文件起播（跳过自动择优）。
+     * 默认高亮的第一个版本不是选择，别传——见 pickedVersionFileId */
+    fileId?: number;
+  },
 ): string {
-  const { season, episode, tSeconds } = options ?? {};
+  const { season, episode, tSeconds, fileId } = options ?? {};
   let href = `/play/${mediaItemId}`;
   if (season !== undefined && episode !== undefined) {
     href += `/s${String(season).padStart(2, "0")}e${String(episode).padStart(2, "0")}`;
   }
-  if (tSeconds !== undefined && tSeconds > 0) href += `?t=${Math.floor(tSeconds)}`;
+  const query: string[] = [];
+  if (tSeconds !== undefined && tSeconds > 0) {
+    query.push(`t=${Math.floor(tSeconds)}`);
+  }
+  if (fileId !== undefined && fileId > 0) {
+    query.push(`file=${fileId}`);
+  }
+  if (query.length > 0) href += `?${query.join("&")}`;
   return href;
+}
+
+/**
+ * 详情页点播放要不要锁定文件（`playHref` 的 `fileId`）：只有用户**亲手**在版本选择器里选过、
+ * 且这个版本属于当前播放单元才锁，否则 undefined——让服务端按择优选版。
+ *
+ * 版本选择器没人碰过时默认高亮列表里的第一个版本，那不是用户的选择。把它也锁住会让服务端
+ * 跳过择优：服务端本来会按观看场景（内外网、播放器能力）挑最合适的版本，锁住第一个之后
+ * 从详情页点播放就永远用不上它。剧集切集后上一集选过的版本不在当前集的文件里，同样不锁。
+ */
+export function pickedVersionFileId(
+  selectedFileId: number | null,
+  availableFileIds: readonly number[],
+): number | undefined {
+  return selectedFileId !== null && availableFileIds.includes(selectedFileId)
+    ? selectedFileId
+    : undefined;
 }
 
 const RETURN_KEY = "movieclaw.player.return-to";

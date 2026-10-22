@@ -37,6 +37,8 @@ export interface PlayerPageProps {
   episode?: number;
   /** 分享链接的 `?t=` 起播覆盖（毫秒）；不给 = 服务端接各自的续播点 */
   startMsOverride?: number;
+  /** 详情页版本选择器带过来的 `?file=`：锁定该文件起播，跳过多版本自动择优 */
+  lockedFileId?: number;
   /** 播放接口作用域（影片分享页传 sharePlaybackScope(slug)）；缺省 = 登录态 */
   api?: PlaybackApiScope;
   /** 退出播放的固定落点（影片分享页回 /s/{slug}）；缺省按登录态的优先级算 */
@@ -53,6 +55,7 @@ export function PlayerPage({
   season,
   episode,
   startMsOverride,
+  lockedFileId,
   api = DEFAULT_PLAYBACK_SCOPE,
   exitHref,
 }: PlayerPageProps) {
@@ -213,6 +216,7 @@ export function PlayerPage({
       // 海报用作系统媒体控件封面（512×512）与起播前的 <video poster>，480 CSS px × 倍率足够
       posterUrl={info?.poster_url ? imageUrl(info.poster_url, { width: screenImageWidth(480) }) : null}
       startMsOverride={startMsOverride}
+      lockedFileId={lockedFileId}
       next={next}
       prev={prev}
       onPlayNext={playNext}

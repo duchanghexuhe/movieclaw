@@ -196,6 +196,11 @@ export interface VideoPlayerProps {
    */
   startMsOverride?: number;
   /**
+   * 详情页版本选择器带来的 `?file=`（锁定的源文件）。只对第一个单元生效：
+   * 切下一集回到「服务端多版本自动择优」。undefined = 没锁。
+   */
+  lockedFileId?: number;
+  /**
    * 下一集；没有（电影 / 本季最后一集）为 null。`label` 是一行的「S01E02 · 集名」（系统媒体控制用），
    * 「即将播放」卡片用分开的 `code`（第 2 集）/ `name` / `stillUrl`（剧照，没有为 null）
    */
@@ -409,6 +414,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     episodeLabel,
     posterUrl,
     startMsOverride,
+    lockedFileId,
     next,
     prev,
     onPlayNext,
@@ -1306,7 +1312,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     // 指纹必须覆盖**全部**会影响请求参数的依赖（quality 也在内）：漏一项的
     // 后果是该项单独变化时 effect 重跑却撞上相同指纹被去重跳过，而上一次
     // 在途请求已被 cancelled——响应回来没人认领，起播就永远停在转圈里。
-    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}`;
+    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}|${lockedFileId ?? ""}`;
     if (startedKeyRef.current === key) return;
     startedKeyRef.current = key;
 
@@ -1322,6 +1328,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
         const session = await startPlaybackSession(
           {
             ...unit,
+            // 详情页版本选择器带来的 `?file=`：锁定这个文件起播，服务端跳过
+            // 多版本自动择优（undefined = 没锁，照旧择优）
+            file_id: lockedFileId ?? undefined,
             capability: capabilityRef.current,
             failed_tiers: state.failedTiers,
             // null = 服务端接续播点；显式值（seek 重开 / 换轨 / ?t=）原样发
