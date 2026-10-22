@@ -95,7 +95,8 @@ logger = logging.getLogger("movieclaw_api.playback.session")
 #: 网页播放器另有兜底：心跳收到 404 会带着当前位置原地重开会话
 #: （components/player/video-player.tsx 的「掉线自愈」）。
 SESSION_IDLE_TIMEOUT_S = 180.0
-#: 心跳空闲超过这个秒数、且取流也断开过的会话提前回收（页签直接关闭的场景）。
+#: 分片响应被掐断后，心跳与请求都没再来超过这个秒数的会话提前回收（页签直接关闭的场景）。
+#: 心跳 15 秒一次，所以这里是「错过一拍还多等几秒」。
 STREAM_DISCONNECT_REAP_S = 20.0
 #: 回收巡检间隔。
 REAP_INTERVAL_S = 15.0
@@ -337,9 +338,10 @@ class TranscodeSession:
     process: asyncio.subprocess.Process | None = None
     state: str = "spawning"  # spawning | ready | failed | stopped
     last_ping: float = field(default_factory=time.monotonic)
-    #: 最近一次取流响应「中途断开」的时刻（页签直接关闭、播放器被杀）。
-    #: None = 没发生过；心跳巡检据此把「无心跳且取流也断」的会话提前回收——
-    #: 不然 ffmpeg 会对着没人看的片转满整个空闲超时（GPU 空转数分钟）。
+    #: 最近一次分片响应「中途断开」的时刻（页签直接关闭、播放器被杀）。
+    #: None = 没发生过，或断开之后又有动静（``touch()`` 会清掉）；心跳巡检据此把
+    #: 「断开后心跳和请求都没再来」的会话提前回收——不然 ffmpeg 会对着没人看的片
+    #: 转满整个空闲超时（GPU 空转数分钟）。
     last_stream_disconnect_at: float | None = None
     created_at: float = field(default_factory=time.monotonic)
     error: str | None = None
@@ -517,6 +519,8 @@ class TranscodeSession:
 
     def touch(self) -> None:
         self.last_ping = time.monotonic()
+        # 播放器还在（seek 也会掐掉在途的分片请求，随后照常来请求、发心跳）
+        self.last_stream_disconnect_at = None
 
     @property
     def paused(self) -> bool:
@@ -923,25 +927,18 @@ class TranscodeSessionManager:
         for sid, s in self._sessions.items():
             idle = now - s.last_ping
             if idle > SESSION_IDLE_TIMEOUT_S:
-                stale.append(
-                    (
-                        sid,
-                        f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）",
-                    )
-                )
+                reason = f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）"
+                stale.append((sid, reason))
             elif (
-                idle > STREAM_DISCONNECT_REAP_S
-                and s.last_stream_disconnect_at is not None
+                s.last_stream_disconnect_at is not None
                 and now - s.last_stream_disconnect_at > STREAM_DISCONNECT_REAP_S
             ):
-                # 页签被直接关闭时 DELETE 发不出来：心跳与取流同时消失。
-                # 心跳空闲刚过 20 秒且取流也断开过，就没有任何人在看了——
+                # 页签被直接关闭时 DELETE 发不出来：在途的分片响应被掐断，之后心跳与
+                # 请求都没再来（再来 touch() 就清掉了标记）。没有任何人在看了——
                 # 提前回收，别让 ffmpeg 对着空会话转满整个空闲超时。
+                quiet = now - s.last_stream_disconnect_at
                 stale.append(
-                    (
-                        sid,
-                        f"无心跳 {idle:.0f} 秒且取流已断开（播放器直接关闭），提前回收",
-                    )
+                    (sid, f"分片取流中断后 {quiet:.0f} 秒无心跳无请求（播放器直接关闭），提前回收")
                 )
         for sid, reason in stale:
             await self.stop(sid, reason=reason)

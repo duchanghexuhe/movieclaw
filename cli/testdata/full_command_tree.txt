@@ -409,6 +409,8 @@ site delete
 site list
 site protection
 site protection set
+site proxy
+site proxy request
 site ratio-boost
 site ratio-boost pause
 site ratio-boost set

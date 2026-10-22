@@ -127,6 +127,11 @@ fun HomeScreen() {
     // 接下来继续变了就同步到系统首页的「继续观看」
     val graph = io.movieclaw.androidtv.LocalGraph.current
     LaunchedEffect(store.upNext) { store.upNext?.let { graph.watchNext.publish(it, session.server, session.token) } }
+    // 开机直达 MovieClaw 时 Wi-Fi 常比 App 晚几秒连上：一次都没加载成功时，网络一连上就重试，不等下面每分钟的定时刷新；
+    // 加载成功后不再订阅。重试放在页面的作用域里跑：媒体库一到 failed 就变、这个 effect 随之重启，不能把还没回来的内容行请求一起取消
+    LaunchedEffect(store, store.failed) {
+        if (store.failed && store.libraries == null) graph.networkAvailable.collect { scope.launch { store.reload() } }
+    }
     // 定时刷新只在首页真被看着时做：播放器盖在上面、或压着二级页时不刷（故障注入实测：看片时首页照样每分钟
     // 把各行与背景图重取一遍，线路差时跟视频抢带宽）。回到首页由上面那条按可见性刷新补上
     val watching = pageVisible && router.player == null

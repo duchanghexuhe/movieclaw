@@ -64,6 +64,15 @@ def test_wildcards_never_cover_dangerous_operations(app_client) -> None:
     assert all(op.startswith("subscriptions.") for op in granted)
 
 
+def test_site_proxy_needs_an_explicit_grant(app_client) -> None:
+    """站点代请求能以用户的站点身份发任意 POST：``site.*`` 通配不覆盖，必须逐个列出。"""
+    app, _ = app_client
+    host = app.state.kernel.service(HOST_OPS)
+    assert "site.proxy.request" in host.index
+    assert "site.proxy.request" not in expand_grants(["site.*"], host.index)
+    assert "site.proxy.request" in expand_grants(["site.proxy.request"], host.index)
+
+
 def test_granted_operations_pass_and_everything_else_is_denied(app_client) -> None:
     app, client = app_client
     ops = mount_caller(app, client, "test.caller", ("app.plugins.list", "subscriptions.*"))

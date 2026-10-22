@@ -267,6 +267,58 @@ def test_proxy_request_api_base_uses_request_domain(client, monkeypatch) -> None
     assert sent.get("json") == {"_timestamp": 1, "_sgin": "sig"}
 
 
+def test_proxy_request_passes_timeout_seconds_through(client, monkeypatch) -> None:
+    # 字段不叫 timeout：它与 CLI 内置的 --timeout 重名，会让这条命令失去该标志
+    fake = _install_fake_access(monkeypatch, _html_response("ok"))
+    r = client.post(
+        "/api/v1/sites/hdsky/proxy",
+        json={"method": "GET", "path": "a.php", "timeout_seconds": 5},
+    )
+    assert r.status_code == 200, r.text
+    assert fake.calls[0]["timeout"] == 5.0
+
+
+def test_proxy_request_does_not_follow_redirects(client, monkeypatch) -> None:
+    """站点回 3xx 时不跟随，原样返回：认证头只发给校验过的那一个 URL。
+
+    站点客户端默认跟随跳转，x-api-key 又挂在客户端的默认头上；站点若有开放重定向，
+    跟到外站就会把 key 带出去（httpx 跨域跳转只剥 Authorization / Cookie）。
+    这里用真的站点客户端（只把传输层换成内存桩）验证，而不是只看传参。"""
+    from movieclaw_tracker.http import HttpClient
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "hdsky.me":
+            return httpx.Response(302, headers={"Location": "https://evil.example/collect"})
+        return httpx.Response(200, text="不该被请求到")
+
+    site_client = HttpClient(
+        headers={"x-api-key": "site-secret"}, transport=httpx.MockTransport(handler)
+    )
+    monkeypatch.setattr(
+        sites_routes, "get_site_access", lambda: _FakeAccess(_FakeSite(site_client))
+    )
+
+    r = client.post("/api/v1/sites/hdsky/proxy", json={"method": "GET", "path": "out.php?to=1"})
+
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["status_code"] == 302
+    headers = {k.lower(): v for k, v in data["headers"].items()}
+    assert headers["location"] == "https://evil.example/collect"
+    assert [req.url.host for req in seen] == ["hdsky.me"], "不能向跳转目标发出任何请求"
+    assert seen[0].headers["x-api-key"] == "site-secret"  # 宿主会话的认证头照常附加
+
+
+def test_proxy_request_is_marked_dangerous(client) -> None:
+    """能以用户的站点身份发任意 POST：CLI 要 --yes，插件要逐个声明（通配不覆盖）。"""
+    spec = client.app.openapi()
+    operation = spec["paths"]["/api/v1/sites/{site_id}/proxy"]["post"]
+    assert operation["x-cli-dangerous"] == "confirm"
+
+
 def test_proxy_request_rejects_bad_path_and_unknown_site(client) -> None:
     r1 = client.post(
         "/api/v1/sites/hdsky/proxy", json={"method": "GET", "path": "//evil.com/x"}

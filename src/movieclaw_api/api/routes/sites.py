@@ -366,6 +366,9 @@ async def reverify_site(
     response_model=ApiResponse[SiteProxyResponse],
     summary="借宿主已认证会话对站点发一个请求（凭据不出宿主）",
     operation_id="site.proxy.request",
+    # 能以用户的站点身份发任意 POST：插件要逐个声明并经用户批准（通配不覆盖），
+    # CLI 要 --yes（docs/design/plugin-extension-model.md §3.2）
+    openapi_extra={"x-cli-dangerous": "confirm"},
 )
 async def proxy_site_request(
     site_id: str,
@@ -376,10 +379,11 @@ async def proxy_site_request(
 
     安全边界：``path`` 只能是站内相对路径（完整 URL 由宿主按站点注册的域名拼接，
     防 SSRF）；``headers`` 里认证相关头（cookie / authorization / x-api-key）被剥除，
-    由宿主会话统一附加；响应剥掉 set-cookie 等凭据头、正文按上限截断。
+    由宿主会话统一附加；响应剥掉 set-cookie 等凭据头、正文按上限截断；站点回 3xx
+    时不跟随、原样返回（认证头不会跟着跳转带到别的主机）。
 
     行为：站点未配置 / 停用 / 未验证通过 → 409（可读中文原因）；认证失败 → 409
-    （凭据已失效）；网络错误 → 502。
+    （凭据已失效）；超时 / 连不上 → 503。
     """
     from movieclaw_tracker.exceptions import SiteNotFoundError
     from movieclaw_tracker.registry import get_site_config
@@ -414,10 +418,15 @@ async def proxy_site_request(
             headers=headers or None,
             json=json_body,
             content=content,
-            timeout=payload.timeout,
+            timeout=payload.timeout_seconds,
+            # 站点客户端默认跟随跳转，而 x-api-key 这类认证头挂在客户端的默认头上：
+            # 站点若有开放重定向，跟到外站就会把它带出去。校验只做了发请求前这一次
+            follow_redirects=False,
         )
     except httpx.TimeoutException as exc:
-        raise ServiceUnavailableException(f"站点响应超时（{payload.timeout:g}s）") from exc
+        raise ServiceUnavailableException(
+            f"站点响应超时（{payload.timeout_seconds:g}s）"
+        ) from exc
     except httpx.TransportError as exc:
         raise ServiceUnavailableException(f"无法连接站点：{exc}") from exc
 

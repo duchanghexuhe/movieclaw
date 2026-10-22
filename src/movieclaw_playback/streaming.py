@@ -226,11 +226,19 @@ class DisconnectAwareFileResponse(FileResponse):
         byte_sink: Callable[[int], None] | None = None,
         byte_patches: tuple[BytePatch, ...] = (),
         probe=None,
+        on_disconnect: Callable[[], None] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(path, **kwargs)
         self._session_stopped = session_stopped
         self._on_close = on_close
+        # 响应没发完就结束（客户端断开 / 播放器上报停止 / 读盘出错）时调一次；发完不调。
+        # 转码会话的分片响应借它告诉会话「取流断了」，见 SessionManager.note_stream_disconnect。
+        # 不能拿 ``_stopped_early`` 判：Starlette 新版的 FileResponse 自己盯着 receive，
+        # 客户端一走就直接取消发送，根本走不到 ``_should_stop_reading``
+        self._on_disconnect = on_disconnect
+        #: 最后一块（more_body=False）是否已交给服务器
+        self._completed = False
         # 每发出一块调用一次的字节计量回调（活动页「观看」视角的速率来源）；
         # 必须是同步且近零开销的，不能拖慢发送循环
         self._byte_sink = byte_sink
@@ -303,13 +311,21 @@ class DisconnectAwareFileResponse(FileResponse):
                     if key != "http.response.pathsend"
                 },
             }
+
+        async def tracked_send(message: Message) -> None:
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                self._completed = True
+
         watcher = asyncio.ensure_future(self._watch_disconnect(receive))
         try:
-            await super().__call__(scope, receive, send)
+            await super().__call__(scope, receive, tracked_send)
         finally:
             watcher.cancel()
             if self._probe is not None:
                 self._probe.finish(self._bytes_read, disconnected=self._stopped_early)
+            if not self._completed and self._on_disconnect is not None:
+                self._on_disconnect()
             if self._on_close is not None:
                 self._on_close()
 

@@ -459,9 +459,9 @@ def test_timeout_scales_with_file_size() -> None:
     """固定 120 秒读不完 60 GB 的 Remux；按保守吞吐放宽，封顶一小时。
 
     体积走替身，**不真造文件**：这个用例原来 ``truncate`` 出 20 GB 与 200 GB 的
-    "稀疏文件"，而稀疏与否由文件系统决定——2026-10-20 真机上那 200 GB 落成了真实
-    占用（G: 只剩 129 GB），pytest 的临时目录当场把整块盘写满，之后的用例全部
-    ENOSPC（连 sqlite 都开不了）。判定只读 ``stat().st_size``，喂它一个数就够了。
+    "稀疏文件"，而稀疏与否由文件系统决定——NTFS 等不支持稀疏文件的文件系统上会真写
+    出这么多零，把 pytest 临时目录所在的盘写满，之后的用例全部 ENOSPC（连 sqlite 都
+    开不了）。判定只读 ``stat().st_size``，喂它一个数就够了。
     """
 
     class _SizedPath:

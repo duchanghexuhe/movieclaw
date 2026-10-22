@@ -408,6 +408,9 @@ class SiteProxyRequest(BaseModel):
     ``base`` 在站点自己的请求域名与网页域名之间选择（API 类站点两者不同）。
     ``headers`` 里与认证相关的头（cookie / authorization / x-api-key 等）会被剥除：
     认证头由宿主会话自动附加，插件传不进也覆盖不了。
+    站点回 3xx 时**不跟随**，原样返回（目标在 ``headers.location``）：认证头只发给上面
+    校验过的那一个 URL，不会因为站点的开放重定向被带到别的主机；想跟的话插件自己
+    再发一次站内路径的请求。
     """
 
     method: Literal["GET", "POST"] = Field(description="HTTP 方法（保活场景只需要这两种）")
@@ -428,7 +431,7 @@ class SiteProxyRequest(BaseModel):
     body: dict[str, Any] | str | None = Field(
         default=None, description="POST 体：字典按 JSON 发送，字符串按原始内容发送"
     )
-    timeout: float = Field(default=30.0, ge=1.0, le=120.0, description="超时（秒）")
+    timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0, description="超时（秒）")
 
 
 class SiteProxyResponse(BaseModel):

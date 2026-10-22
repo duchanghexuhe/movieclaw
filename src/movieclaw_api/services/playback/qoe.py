@@ -27,11 +27,9 @@ App 没报结束的行（闪退、被系统杀掉、断网）不会丢：开始�
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -136,15 +134,12 @@ class ServeProbe:
     由 ``DisconnectAwareFileResponse`` 在发送循环里调用，必须同步、近零开销。
     """
 
-    __slots__ = ("_attempt_id", "_started", "_first_byte_ms", "on_disconnect")
+    __slots__ = ("_attempt_id", "_started", "_first_byte_ms")
 
     def __init__(self, attempt_id: str) -> None:
         self._attempt_id = attempt_id
         self._started = time.perf_counter()
         self._first_byte_ms: int | None = None
-        #: 取流响应中途断开时的一次性回调（会话层据此提前回收没人看的转码）；
-        #: 由路由在构造后接线，None = 不关心
-        self.on_disconnect: Callable[[], None] | None = None
 
     def first_chunk(self) -> None:
         if self._first_byte_ms is None:
@@ -157,9 +152,6 @@ class ServeProbe:
         tally.bytes += bytes_sent
         if disconnected:
             tally.disconnects += 1
-            if self.on_disconnect is not None:
-                with contextlib.suppress(Exception):
-                    self.on_disconnect()
         if self._first_byte_ms is not None:
             if len(tally.first_byte_ms) < _MAX_FIRST_BYTE_SAMPLES:
                 tally.first_byte_ms.append(self._first_byte_ms)
