@@ -2146,8 +2146,14 @@ def _metered_file_response(
 
     ``windows`` 给了就只出文件里的这几截、首尾相接当一个文件（光盘镜像里的蓝光剪辑）。
     """
-    # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计
+    # 播放体验打点的取流计时（playback-qoe.md §5.3）：令牌里带播放编号才计。
+    # 旧令牌 / Jellyfin 兼容层没有播放编号，probe 为 None——断连回收记不上，
+    # 心跳巡检的既有档位照旧兜底
     probe = qoe.serve_probe(grant.attempt_id)
+    if probe is not None:
+        probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
+            grant.session_id
+        )
     stream = _register_play_stream(
         request,
         grant,
@@ -2202,7 +2208,12 @@ async def _cloud_stream_response(request: Request, grant, file: LibraryFile) -> 
 
 def _metered_relay_response(request: Request, grant, file: LibraryFile, link: StrmLink) -> Response:
     """转发网盘直链（``strm_needs_relay``），与磁盘直出同一套设备流与活动页登记。"""
+    # 与 _metered_file_response 同一口径：probe 为 None（无播放编号）只跳过断连回收
     probe = qoe.serve_probe(grant.attempt_id)
+    if probe is not None:
+        probe.on_disconnect = lambda: get_session_manager().note_stream_disconnect(
+            grant.session_id
+        )
     stream = _register_play_stream(request, grant, file, name=PathLib(file.file_path).name)
     session_stopped, byte_sink, on_close = stream if stream is not None else (None, None, None)
     return RemoteRelayResponse(

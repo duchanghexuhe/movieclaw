@@ -92,6 +92,8 @@ logger = logging.getLogger("movieclaw_api.playback.session")
 #: 网页播放器另有兜底：心跳收到 404 会带着当前位置原地重开会话
 #: （components/player/video-player.tsx 的「掉线自愈」）。
 SESSION_IDLE_TIMEOUT_S = 180.0
+#: 心跳空闲超过这个秒数、且取流也断开过的会话提前回收（页签直接关闭的场景）。
+STREAM_DISCONNECT_REAP_S = 20.0
 #: 回收巡检间隔。
 REAP_INTERVAL_S = 15.0
 #: 等 playlist 出现的上限。playlist 先行——会话起来后 ffmpeg 立刻写出
@@ -332,6 +334,10 @@ class TranscodeSession:
     process: asyncio.subprocess.Process | None = None
     state: str = "spawning"  # spawning | ready | failed | stopped
     last_ping: float = field(default_factory=time.monotonic)
+    #: 最近一次取流响应「中途断开」的时刻（页签直接关闭、播放器被杀）。
+    #: None = 没发生过；心跳巡检据此把「无心跳且取流也断」的会话提前回收——
+    #: 不然 ffmpeg 会对着没人看的片转满整个空闲超时（GPU 空转数分钟）。
+    last_stream_disconnect_at: float | None = None
     created_at: float = field(default_factory=time.monotonic)
     error: str | None = None
     stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=_STDERR_KEEP_LINES))
@@ -896,6 +902,12 @@ class TranscodeSessionManager:
             return
         self._signal_group(session, signal.SIGCONT)
 
+    def note_stream_disconnect(self, session_id: str) -> None:
+        """取流响应中途断开（客户端没了）。只记账；回收判定在 reap。"""
+        session = self._sessions.get(session_id)
+        if session is not None:
+            session.last_stream_disconnect_at = time.monotonic()
+
     async def reap(self) -> int:
         """回收超时无心跳的会话，返回回收数量。顺带跑一遍磁盘水位哨兵，并把
         活跃会话的台账刷一遍（进程崩了也只丢最近十几秒的登记）。"""
@@ -904,16 +916,28 @@ class TranscodeSessionManager:
             if session.manifest is not None:
                 await asyncio.to_thread(self._save_manifest, session)
         now = time.monotonic()
-        stale = [
-            sid
-            for sid, s in self._sessions.items()
-            if now - s.last_ping > SESSION_IDLE_TIMEOUT_S
-        ]
-        for sid in stale:
-            await self.stop(
-                sid,
-                reason=f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）",
-            )
+        stale: list[tuple[str, str]] = []
+        for sid, s in self._sessions.items():
+            idle = now - s.last_ping
+            if idle > SESSION_IDLE_TIMEOUT_S:
+                reason = f"超过 {SESSION_IDLE_TIMEOUT_S:.0f} 秒无心跳回收（播放器已关闭或网络中断）"
+                stale.append((sid, reason))
+            elif (
+                idle > STREAM_DISCONNECT_REAP_S
+                and s.last_stream_disconnect_at is not None
+                and now - s.last_stream_disconnect_at > STREAM_DISCONNECT_REAP_S
+            ):
+                # 页签被直接关闭时 DELETE 发不出来：心跳与取流同时消失。
+                # 心跳空闲刚过 20 秒且取流也断开过，就没有任何人在看了——
+                # 提前回收，别让 ffmpeg 对着空会话转满整个空闲超时。
+                stale.append(
+                    (
+                        sid,
+                        f"无心跳 {idle:.0f} 秒且取流已断开（播放器直接关闭），提前回收",
+                    )
+                )
+        for sid, reason in stale:
+            await self.stop(sid, reason=reason)
         return len(stale)
 
     # -- 会话操作 ---------------------------------------------------------
@@ -2566,6 +2590,13 @@ class TranscodeSessionManager:
         first_signal = signal.SIGTERM if graceful else signal.SIGKILL
         try:
             os.killpg(os.getpgid(process.pid), first_signal)
+        except AttributeError:
+            # Windows 没有进程组：直接杀单个进程（本机开发/测试环境）
+            with contextlib.suppress(ProcessLookupError):
+                if graceful:
+                    process.terminate()
+                else:
+                    process.kill()
         except (ProcessLookupError, PermissionError):
             with contextlib.suppress(ProcessLookupError):
                 if graceful:
