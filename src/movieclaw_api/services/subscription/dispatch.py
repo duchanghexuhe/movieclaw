@@ -201,9 +201,17 @@ async def dispatch(
     else:
         target_text = "；未配置媒体库，下载完成后不会自动整理入库"
 
+    extended = None
     if not dry_run:
         try:
             submit_options = {}
+            if intent is None and subscription.episode_caps:
+                # 带订阅上限的规则订阅：整包可能是上千集，选择性下载不确定时也不回落
+                # 全量（智能订阅本来就是严格路径）
+                submit_options = {
+                    "selection_owner": f"movieclaw-cap-{subscription.id}",
+                    "strict_selection": True,
+                }
             if intent is not None:
                 from movieclaw_api.services.subscription.smart_submission import prepare_remote
 
@@ -237,16 +245,38 @@ async def dispatch(
                     )
 
                     await ensure_can_submit(session, intent)
-                submit_result, downloader_row = await _submit_real(
-                    session,
-                    candidate,
-                    save_path=dispatch_dir,
-                    subtitle=candidate.subtitle if entry_level else None,
-                    select_units=selective_units,
-                    known_seasons=subscription.selected_seasons or None,
-                    media_kind=item.kind,
-                    **submit_options,
-                )
+                if (
+                    selective_units
+                    and subscription.kind == "tv"
+                    and not is_trial
+                    and not upgrade_rows
+                ):
+                    # 候选若是本订阅自己投递、还在下载器里的整包（调大订阅上限后的
+                    # 下一批），把新单元并进它的文件选中集合，而不是当作重复投递
+                    from movieclaw_api.services.subscription.pack_extension import (
+                        extend_owned_pack,
+                    )
+
+                    extended = await extend_owned_pack(
+                        session,
+                        subscription=subscription,
+                        candidate=candidate,
+                        targets=set(selective_units),
+                        before_resume=submit_options.get("before_resume"),
+                    )
+                if extended is not None:
+                    submit_result, downloader_row = extended
+                else:
+                    submit_result, downloader_row = await _submit_real(
+                        session,
+                        candidate,
+                        save_path=dispatch_dir,
+                        subtitle=candidate.subtitle if entry_level else None,
+                        select_units=selective_units,
+                        known_seasons=subscription.selected_seasons or None,
+                        media_kind=item.kind,
+                        **submit_options,
+                    )
             skipped_files = submit_result.skipped_file_count
         except Exception as exc:  # noqa: BLE001 -- 投递失败退回调度通道重试
             reason = f"{type(exc).__name__}: {exc}"
@@ -512,6 +542,9 @@ async def dispatch(
                 for key, value in values.items():
                     setattr(existing_attempt, key, value)
                 session.add(existing_attempt)
+            if extended is not None and intent is not None:
+                # 并进了既有的整包：本次的意图没有对应的远端任务，台账已合并进原尝试
+                await session.delete(intent)
             await session.commit()
 
     if intent is not None and dry_run:
@@ -913,6 +946,7 @@ async def _submit_real(
     selection_owner: str | None = None,
     before_resume=None,
     media_kind: str | None = None,
+    strict_selection: bool = False,
 ):
     """真实投递：委托公共编排（站点取种 → 默认下载器提交，幂等判重）。
 
@@ -938,6 +972,7 @@ async def _submit_real(
         downloader_id=downloader_id,
         selection_owner=selection_owner,
         before_resume=before_resume,
+        strict_selection=strict_selection,
         route_hint=hooks.DownloaderQuery(
             site_id=candidate.site_id,
             title=candidate.title,

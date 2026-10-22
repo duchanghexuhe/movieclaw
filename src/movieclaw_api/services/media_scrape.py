@@ -307,6 +307,7 @@ async def _scrape(
         recompute_subscription_status,
         refresh_release_forecasts,
     )
+    from movieclaw_api.services.subscription.episode_cap import caps_of
     from movieclaw_api.services.subscription.episode_floor import (
         floors_of,
         refresh_douban_evidence,
@@ -394,6 +395,7 @@ async def _scrape(
                 list(subscription.selected_seasons),
                 subscription.follow_future,
                 floors_of(subscription),
+                caps_of(subscription),
             )
             await _grow_and_sync(session, subscription, item, expected, known_keys)
             # 豆瓣集数随刷新复查（详情走持久缓存，不额外打豆瓣）：TMDB 少录的

@@ -173,6 +173,18 @@ class Subscription(TimestampMixin, table=True):
         description="集数证据（站点集号/豆瓣集数/已忽略值），只用于提示",
     )
 
+    # -- 订阅上限（docs/design/subscription-episode-cap.md）-------------------
+    # 一季上千集时用户只想先订阅前 N 集。上限是 E 定义的一部分：E 里这一季
+    # 超过上限的集（含追新与占位集）一律不在其中，所以被截断的季不会判
+    # 「已收齐」，订阅留在订阅中等用户决定要不要继续。与 episode_floors
+    # 方向相反：下限纠正「这季其实有几集」（事实），上限是「我先订阅到第几集」
+    # （节奏）。只存确实截断了本季的上限。
+    episode_caps: dict | None = Field(
+        default=None,
+        sa_column=Column(JSON(none_as_null=True), nullable=True),
+        description="用户选择订阅到第几集的上限 {季号: 集号}；NULL=整季",
+    )
+
     # -- 归属（docs/design/member-management.md §3.5）-----------------------
     # NULL = 超管发起。成员被删除时外键 SET NULL——订阅自动转为超管发起，
     # 绝不连带删除订阅与下载任务（资源是全家的）。

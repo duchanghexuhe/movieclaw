@@ -357,6 +357,13 @@ class SubscriptionCreatePayload(BaseModel):
             '（如 {"1": 27}）；不超过 TMDB 已录集数的季忽略'
         ),
     )
+    episode_caps: dict[int, int] | None = Field(
+        default=None,
+        description=(
+            "每季订阅到第几集的上限 {季号: 集号}：一季上千集时先订阅前面一部分"
+            '（如 {"1": 20}），之后可随时调大；不低于本季总集数的季忽略'
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_selection_mode(self):
@@ -398,6 +405,13 @@ class SubscriptionUpdatePayload(BaseModel):
         description=(
             '整体替换每季集数下限 {季号: 集数}，如 {"1": 27}；传 {} 清除、'
             "改回以 TMDB 为准；不传=不变"
+        ),
+    )
+    episode_caps: dict[int, int] | None = Field(
+        default=None,
+        description=(
+            '整体替换每季订阅到第几集的上限 {季号: 集号}，如 {"1": 40}；传 {} 清除、'
+            "改回订阅整季；不传=不变。调大会补上新增的集，调小只让超出的集退出追踪"
         ),
     )
 
@@ -551,6 +565,14 @@ class SmartSubtitleView(BaseModel):
     understood: bool
 
 
+class EpisodeWindowView(BaseModel):
+    """被订阅上限截断的一季：订阅到第 cap 集，本季共 total 集。"""
+
+    season_number: int
+    cap: int = Field(description="订阅到第几集（含）")
+    total: int = Field(description="本季总集数（TMDB 已录最大集号与集数下限取大）")
+
+
 class SubscriptionView(BaseModel):
     id: int
     media: MediaBrief
@@ -569,6 +591,13 @@ class SubscriptionView(BaseModel):
         default_factory=list,
         description="剧集按季收录统计；电影或无需展示时为空",
     )
+    episode_windows: list[EpisodeWindowView] | None = Field(
+        default=None,
+        description=(
+            "被订阅上限截断的季（订阅到第几集 / 本季共几集）；有内容时订阅不会判"
+            "「已收齐」，用户可以继续订阅；没有上限或电影为 null"
+        ),
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -581,7 +610,13 @@ class SubscriptionView(BaseModel):
         selected = {s for s in self.selected_seasons if s > 0}
         if not selected and seasons:
             selected = {max(s.season_number for s in seasons)}
-        missing = any(s.aired_count > s.owned_count for s in seasons if s.season_number in selected)
+        # 被订阅上限截断的季只算订阅范围内的集：后面的集用户还没订阅，不是缺集
+        caps = {w.season_number: w.cap for w in self.episode_windows or []}
+        missing = any(
+            min(s.aired_count, caps.get(s.season_number, s.aired_count)) > s.owned_count
+            for s in seasons
+            if s.season_number in selected
+        )
         progress = self.progress
         if missing or progress.wanted + progress.grabbed + progress.downloaded > 0:
             return 0
@@ -909,6 +944,7 @@ class EpisodeSeasonView(BaseModel):
     season_number: int
     tmdb_count: int = Field(description="TMDB 已录到的最大集号")
     floor: int | None = Field(default=None, description="已设的集数下限；null=以 TMDB 为准")
+    cap: int | None = Field(default=None, description="已设的订阅上限；null=订阅整季")
 
 
 class EpisodeHintView(BaseModel):

@@ -45,6 +45,7 @@ import {
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { SubscriptionAdjustDialog } from "@/components/subscription-adjust-dialog";
 import { SubscriptionCancelDialog } from "@/components/subscription-cancel-dialog";
+import { EpisodeWindowBanner } from "@/components/subscription-episode-cap";
 import { EpisodeFloorDialog, EpisodeHintBanner } from "@/components/subscription-episode-floor";
 import { UpgradeRunDialog } from "@/components/upgrade-run-dialog";
 import {
@@ -73,6 +74,7 @@ import { imageUrl } from "@/lib/image-proxy";
 import { seasonsWithIndeterminate } from "@/lib/media-source-annotation";
 import { shouldShowResourceTiming } from "@/lib/resource-timing";
 import { buildSearchPath, titleSearchAlso } from "@/lib/search-url";
+import { rangeLabel } from "@/lib/subscription-episode-cap";
 import { subscriptionStatusMeta } from "@/lib/subscription-ui";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
@@ -508,7 +510,9 @@ export function SubscriptionInspectorView({
                   isMovie
                     ? "正片"
                     : detail.selected_seasons.length > 0
-                      ? `第 ${detail.selected_seasons.join("、")} 季`
+                      ? detail.episode_windows?.length
+                        ? rangeLabel(detail.selected_seasons, detail.episode_windows)
+                        : `第 ${detail.selected_seasons.join("、")} 季`
                       : "未勾选季"
                 }
               />
@@ -604,6 +608,14 @@ export function SubscriptionInspectorView({
 
       {/* —— 2. 单视图主体：搜索轮次摘要 → 按季分组的集履历 → 排查记录 —— */}
       <div className="mt-7 space-y-4">
+        <EpisodeWindowBanner
+          detail={detail}
+          canTune={canTune}
+          onChanged={() => {
+            reload();
+            refreshSubscriptions();
+          }}
+        />
         <EpisodeHintBanner
           detail={detail}
           canTune={canTune}

@@ -815,7 +815,10 @@ export function subscriptionStanding(
     return active(3 + group.daysAhead / 100, { text: `${when}更新`, tone: "calm" });
   }
   if (isTV) {
-    return missing > 0 ? active(5, { text: `缺 ${missing} 集`, tone: "warn" }) : active(6, null);
+    if (missing > 0) return active(5, { text: `缺 ${missing} 集`, tone: "warn" });
+    // 订阅上限截断了本季，这一批已就绪：等用户决定要不要继续订阅
+    if (sub.episode_windows?.length) return active(6, { text: "可继续订阅", tone: "calm" });
+    return active(6, null);
   }
   return released(sub)
     ? active(5, { text: "找资源中", tone: "warn" })
@@ -837,7 +840,12 @@ export function missingAired(sub: Subscription): number {
     );
     scoped = latest ? [latest] : [];
   }
-  return scoped.reduce((sum, season) => sum + Math.max(0, season.aired_count - season.owned_count), 0);
+  // 被订阅上限截断的季只算订阅范围内的集：后面的集用户还没订阅，不是缺集
+  const cap = new Map((sub.episode_windows ?? []).map((win) => [win.season_number, win.cap]));
+  return scoped.reduce((sum, season) => {
+    const aired = Math.min(season.aired_count, cap.get(season.season_number) ?? season.aired_count);
+    return sum + Math.max(0, aired - season.owned_count);
+  }, 0);
 }
 
 /** 海报下第二行 */

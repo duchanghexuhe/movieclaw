@@ -200,6 +200,7 @@ async def submit_torrent(
     selection_owner: str | None = None,
     route_hint: hooks.DownloaderQuery | None = None,
     before_resume=None,
+    strict_selection: bool = False,
 ) -> tuple[SubmitResult, DownloaderClient]:
     """从站点取回种子并提交到下载器，返回（提交结果, 所用下载器记录）。
 
@@ -216,7 +217,12 @@ async def submit_torrent(
     select_units 非空时启用**选择性下载**：种子以暂停态提交，按文件清单
     只保留覆盖这些 (季, 集) 单元的文件，其余标记不下载后恢复——整季包
     只补缺口集用。known_seasons 是条目真实存在的季号，借给规划器做季号
-    守卫。规划或写入失败一律回退全量下载，绝不影响投递本身。
+    守卫。规划或写入失败默认回退全量下载，绝不影响投递本身。
+
+    ``strict_selection``（需同时给 ``selection_owner`` 作任务标签）：带订阅上限的
+    订阅用，整包可能是上千集，"多下几个 GB 只是浪费"的前提不再成立。全新任务的
+    文件取舍走严格路径：规划不出结论、写入失败都**不回落全量**，抛错让投递退回
+    队列重试，刚加进来的暂停任务一并移除。已存在的任务照旧不碰。
     """
     if not download_url:
         raise BadRequestException("该种子没有可用的下载入口（download_url 缺失）")
@@ -299,7 +305,7 @@ async def submit_torrent(
         # 的目标目录（否则文件留在刷流目录，入库监听永远看不见），台账转出。
         # 迁移失败不连累提交——留给刷流的认领转出兜底，订阅按"非自有任务"
         # 的既有路径处理
-        if selection_owner and select_units and submit_result.info_hash:
+        if selection_owner and select_units and submit_result.info_hash and not strict_selection:
             submit_result = await apply_strict_file_selection(
                 downloader,
                 submit_result,
@@ -307,6 +313,20 @@ async def submit_torrent(
                 known_seasons=known_seasons,
                 owner=selection_owner,
                 before_resume=before_resume,
+            )
+        elif (
+            strict_selection
+            and selection_owner
+            and select_units
+            and submit_result.info_hash
+            and not submit_result.already_exists
+        ):
+            submit_result = await _apply_strict_to_new_task(
+                downloader,
+                submit_result,
+                select_units,
+                known_seasons=known_seasons,
+                owner=selection_owner,
             )
         elif submit_result.already_exists and category != "movieclaw-boost":
             submit_result = await _reclaim_boost_task(
@@ -419,6 +439,36 @@ async def apply_strict_file_selection(
     return submit_result.model_copy(
         update={"already_exists": False, "skipped_file_count": len(plan.skip_indices)}
     )
+
+
+async def _apply_strict_to_new_task(
+    downloader,  # noqa: ANN001 -- BaseDownloader，避免顶层引入适配器依赖
+    submit_result: SubmitResult,
+    select_units: set[tuple[int, int]],
+    *,
+    known_seasons: Collection[int] | None,
+    owner: str,
+) -> SubmitResult:
+    """严格版文件取舍（``strict_selection``）：任何一步失败都不恢复下载，并移除刚加的任务。
+
+    移除是安全的：任务由本次提交刚创建、一直停在暂停态；``delete_files=False`` 连
+    落点上可能预先存在的文件也不碰。不移除的话，下一轮重试会把它当成「已存在的
+    任务」直接认领，工单就挂在一个什么都没选的任务上。
+    """
+    try:
+        return await apply_strict_file_selection(
+            downloader,
+            submit_result,
+            select_units,
+            known_seasons=known_seasons,
+            owner=owner,
+        )
+    except Exception:
+        try:
+            await downloader.delete_torrent(submit_result.info_hash, delete_files=False)
+        except Exception:  # noqa: BLE001 -- 清理失败只记录，原始错误才是要抛的
+            logger.warning("严格取舍失败后移除新任务失败：hash=%s", submit_result.info_hash)
+        raise
 
 
 async def _apply_file_selection(

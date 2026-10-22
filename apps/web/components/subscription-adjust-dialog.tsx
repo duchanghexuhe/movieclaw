@@ -16,7 +16,7 @@
  * 判定复制一份到前端，那是第二份真相源。先保存，再拿真实的 reconcile 结果追问。
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 
 import { useToast } from "@/components/feedback";
 import { Modal } from "@/components/modal";
@@ -30,6 +30,7 @@ import {
   useSheetForm,
 } from "@/components/sheet-scaffold";
 import { SeasonChoiceRow, SeasonRow } from "@/components/subscribe-dialog";
+import { SeasonCapLine } from "@/components/subscription-episode-cap";
 import { listLibraries, type MediaLibrary } from "@/lib/api/libraries";
 import {
   cleanupSubscriptionSeasons,
@@ -44,6 +45,15 @@ import {
   type SubscriptionRemovalPreview,
 } from "@/lib/api/subscriptions";
 import { usePermissions } from "@/lib/permissions";
+import {
+  capsPayload,
+  currentCaps,
+  draftFromSeasons,
+  effectiveCap,
+  isLongSeason,
+  sameCaps,
+  type CapDraft,
+} from "@/lib/subscription-episode-cap";
 
 export function SubscriptionAdjustDialog({
   detail,
@@ -65,6 +75,8 @@ export function SubscriptionAdjustDialog({
   const [selectedSeasons, setSelectedSeasons] = useState<Set<number>>(
     () => new Set(detail.selected_seasons),
   );
+  // 超长的一季先订阅一部分：起点是订阅现在的状态，存量订阅不会被默认值悄悄改成先订阅一批
+  const [capDraft, setCapDraft] = useState<CapDraft>(() => draftFromSeasons(detail.episode_seasons));
   const [libraryId, setLibraryId] = useState<number | null>(detail.library_id);
   const [preview, setPreview] = useState<DispatchPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -137,6 +149,14 @@ export function SubscriptionAdjustDialog({
     return detail.selected_seasons.filter((s) => !kept.has(s) && progressed.has(s));
   }, [detail, isMovie, selectedSeasons]);
 
+  // 提交的是整份上限（后端整体替换）；勾上的超长季才有一行「先订阅前 N 集」
+  const nextCaps = useMemo(
+    () => capsPayload(seasons ?? [], selectedSeasons, capDraft),
+    [seasons, selectedSeasons, capDraft],
+  );
+  const setCap = (seasonNumber: number, next: number | null) =>
+    setCapDraft((prev) => ({ ...prev, [seasonNumber]: next }));
+
   const changed = useMemo(() => {
     const seasonsChanged =
       !isMovie &&
@@ -145,9 +165,11 @@ export function SubscriptionAdjustDialog({
     return {
       seasons: seasonsChanged,
       library: canManageSubscriptions && libraryId !== detail.library_id,
+      caps:
+        !isMovie && seasons !== null && !sameCaps(nextCaps, currentCaps(detail.episode_seasons)),
     };
-  }, [canManageSubscriptions, detail, isMovie, libraryId, selectedSeasons]);
-  const dirty = changed.seasons || changed.library;
+  }, [canManageSubscriptions, detail, isMovie, libraryId, nextCaps, seasons, selectedSeasons]);
+  const dirty = changed.seasons || changed.library || changed.caps;
 
   const save = async () => {
     setBusy(true);
@@ -163,6 +185,7 @@ export function SubscriptionAdjustDialog({
           : {}),
         // 显式带上 null 即「清除指定库、改回默认库路由」（后端区分未传与 null）
         ...(canManageSubscriptions && changed.library ? { library_id: libraryId } : {}),
+        ...(changed.caps ? { episode_caps: nextCaps } : {}),
       });
       toast.success("订阅已调整");
       if (dropped.length > 0 && canManageSubscriptions) {
@@ -249,7 +272,7 @@ export function SubscriptionAdjustDialog({
         title="调整订阅"
         subtitle={
           <>
-            《{detail.media.title}》——加季会恢复或补建追踪；减季会让整季退出追踪范围，
+            《{detail.media.title}》——加季会恢复或补建追踪；减季、调小订阅的集数会让这部分退出追踪范围，
             但不会删除下载器任务、已下载文件或入库内容。
           </>
         }
@@ -267,12 +290,22 @@ export function SubscriptionAdjustDialog({
               <SheetRow label={<span className="text-[var(--text-muted)]">正在加载季集信息…</span>} />
             ) : (
               seasons.map((s) => (
-                <SeasonChoiceRow
-                  key={s.season_number}
-                  season={s}
-                  checked={selectedSeasons.has(s.season_number)}
-                  onToggle={() => toggleSeason(s.season_number)}
-                />
+                <Fragment key={s.season_number}>
+                  <SeasonChoiceRow
+                    season={s}
+                    checked={selectedSeasons.has(s.season_number)}
+                    onToggle={() => toggleSeason(s.season_number)}
+                  />
+                  {selectedSeasons.has(s.season_number) && isLongSeason(s) && (
+                    <SeasonCapLine
+                      season={s}
+                      cap={effectiveCap(s, capDraft)}
+                      showName={false}
+                      onChange={(next) => setCap(s.season_number, next)}
+                      className="min-h-11 px-4 py-2.5"
+                    />
+                  )}
+                </Fragment>
               ))
             )}
           </SheetSection>
@@ -305,7 +338,7 @@ export function SubscriptionAdjustDialog({
       <div className="border-b border-white/[0.07] px-6 pb-4 pt-6 max-md:px-5">
         <h2 className="text-title font-bold text-white">调整订阅</h2>
         <p className="mt-1 text-sub leading-6 text-[var(--text-muted)]">
-          《{detail.media.title}》——加季会恢复或补建追踪；减季会让整季退出追踪范围，
+          《{detail.media.title}》——加季会恢复或补建追踪；减季、调小订阅的集数会让这部分退出追踪范围，
           但不会删除下载器任务、已下载文件或入库内容。
         </p>
       </div>
@@ -333,12 +366,22 @@ export function SubscriptionAdjustDialog({
               ) : (
                 <div className="space-y-1.5">
                   {seasons.map((s) => (
-                    <SeasonRow
-                      key={s.season_number}
-                      season={s}
-                      checked={selectedSeasons.has(s.season_number)}
-                      onToggle={() => toggleSeason(s.season_number)}
-                    />
+                    <div key={s.season_number}>
+                      <SeasonRow
+                        season={s}
+                        checked={selectedSeasons.has(s.season_number)}
+                        onToggle={() => toggleSeason(s.season_number)}
+                      />
+                      {selectedSeasons.has(s.season_number) && isLongSeason(s) && (
+                        <SeasonCapLine
+                          season={s}
+                          cap={effectiveCap(s, capDraft)}
+                          showName={false}
+                          onChange={(next) => setCap(s.season_number, next)}
+                          className="px-4 pb-1 pt-2"
+                        />
+                      )}
+                    </div>
                   ))}
                 </div>
               )}
