@@ -2503,6 +2503,23 @@ html:has(.player-root) {
     rgb(0 0 0 / 0.5) 62%,
     transparent
   );
+  /* 左右各 ~12px 横向淡出：scrim 与轨道同宽（inset-inline: 0），两端的
+     垂直边缘在亮画面（雪景/天空）上是一道硬切线。mask 让它从两端向中间
+     渐显，硬边消失。 */
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent,
+    black 12px,
+    black calc(100% - 12px),
+    transparent
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    black 12px,
+    black calc(100% - 12px),
+    transparent
+  );
 }
 
 
