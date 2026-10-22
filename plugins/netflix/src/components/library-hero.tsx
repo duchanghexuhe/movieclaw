@@ -265,8 +265,9 @@ function NetflixBillboard({
         ) : null}
       </div>
 
-      {/* 左下文案块 */}
-      <div className="nf:absolute nf:inset-x-0 nf:bottom-[12%] nf:px-[4vw] nf:max-md:bottom-[10%]">
+      {/* 左下文案块：底距 16%（移动端 10%）让按钮/进度条下方留出一段仍在渐变的
+          余量——渐变 45%→100%（theme.css），压到 12% 时按钮正落在渐变终点上 */}
+      <div className="nf:absolute nf:inset-x-0 nf:bottom-[16%] nf:px-[4vw] nf:max-md:bottom-[10%]">
         <h1 className="nf:max-w-[80%] nf:text-[clamp(28px,4.6vw,56px)] nf:font-bold nf:leading-[1.12] nf:tracking-[-0.02em] nf:text-white text-on-image nf:max-md:max-w-full">
           {title}
         </h1>
