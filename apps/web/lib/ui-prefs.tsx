@@ -36,13 +36,14 @@ import {
 } from "@/lib/theme-runtime";
 import {
   DEFAULT_THEME_ID,
+  PHONE_THEME_QUERY,
   isKnownTheme,
   normalizeThemeId,
   themeMeta,
   type ThemeLayout,
   type ThemeMeta,
 } from "@/lib/themes";
-import { useIsMobile } from "@/lib/use-media-query";
+import { useMediaQuery } from "@/lib/use-media-query";
 import { readUiPrefsCache, writeUiPrefsCache } from "@/lib/ui-prefs-cache";
 
 /**
@@ -86,13 +87,22 @@ interface UiPrefsContextValue {
 const UiPrefsContext = createContext<UiPrefsContextValue | null>(null);
 
 /**
- * 按版式解析生效主题（2026-09-24 起桌面 / 移动端可分别选主题）：
- * 当前版式有覆盖字段（theme_desktop / theme_mobile）就用它，没有（老账号、
+ * 当前是不是「手机」设备类（含横过来拿）：主题按设备类分开存时取哪一份。
+ * 判据见 lib/themes.ts 的 PHONE_THEME_QUERY——不能只看页面宽度，手机横屏会越过
+ * 768 被当成电脑。外壳结构的分叉仍用 useIsMobile()（只看宽度），两者不是一回事。
+ */
+export function useIsPhone(): boolean {
+  return useMediaQuery(PHONE_THEME_QUERY);
+}
+
+/**
+ * 按设备类解析生效主题（2026-09-24 起手机 / 电脑可分别选主题）：
+ * 当前设备类有覆盖字段（theme_mobile / theme_desktop）就用它，没有（老账号、
  * 未单独设置）回落通用 theme——老数据唯一来源，行为与升级前完全一致。
  * 覆盖值可能是老后端 / 坏缓存里的垃圾，最终由 normalizeThemeId 兜底。
  */
-function resolveThemeId(prefs: UiPreferences, isMobile: boolean): string {
-  const override = isMobile ? prefs.theme_mobile : prefs.theme_desktop;
+function resolveThemeId(prefs: UiPreferences, phone: boolean): string {
+  const override = phone ? prefs.theme_mobile : prefs.theme_desktop;
   return normalizeThemeId(override ?? prefs.theme);
 }
 
@@ -183,8 +193,8 @@ export function UiPrefsProvider({ children }: { children: React.ReactNode }) {
   // 默认主题移除属性而不是写 data-theme="silver"，与防闪烁脚本（只认非默认
   // 主题）的落点保持一致，SSR 首屏也无需任何属性。外壳几何由主题 CSS 在
   // data-theme 作用域里声明，属性一改就跟着换，这里不必另写。
-  const isMobile = useIsMobile();
-  const requestedTheme = resolveThemeId(preview ?? prefs, isMobile);
+  const phone = useIsPhone();
+  const requestedTheme = resolveThemeId(preview ?? prefs, phone);
   // catalogVersion / runtimeVersion 只为在目录、加载状态变化时重算这两个值
   void catalogVersion;
   void runtimeVersion;
