@@ -19,7 +19,7 @@ from sqlmodel import select
 
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.plugins.local import PACKAGE
-from movieclaw_api.services import durable_events
+from movieclaw_api.services import durable_events, plugin_runtime
 from movieclaw_db.engine import get_database
 from movieclaw_db.models.plugin_data import PluginData
 
@@ -97,6 +97,10 @@ def client(request, tmp_path, monkeypatch):
     reset_secret_box()
     reset_auth_state()
     durable_events.reset_state()
+    # 进程外插件的代码位置是进程级全局、卸载时不清：上一个用例（process 参数）留下的
+    # 条目会让这一个（inline）误走子进程校验，去读上个用例已被清掉的目录
+    for entry_id in ("acme-sync", "acme-rules"):
+        plugin_runtime.process_specs.pop(entry_id, None)
     (tmp_path / "plugins").mkdir()
     (tmp_path / "plugins" / "acme_sync.py").write_text(PLUGIN, encoding="utf-8")
     (tmp_path / "plugins" / "acme_rules.py").write_text(NESTED, encoding="utf-8")

@@ -190,7 +190,8 @@ def test_walk_videos_lists_each_dir_exactly_once(tmp_path, monkeypatch) -> None:
     listed: list[str] = []
 
     def counting_scandir(path, *args, **kwargs):
-        listed.append(os.fspath(path))
+        if not isinstance(path, int):  # rmtree 清 tmp_path 时按 fd 列目录，放过
+            listed.append(os.fspath(path))
         return real_scandir(path, *args, **kwargs)
 
     monkeypatch.setattr(scan_mod.os, "scandir", counting_scandir)
@@ -231,7 +232,7 @@ def test_walk_videos_collects_unreadable_dirs(tmp_path, monkeypatch) -> None:
     real_scandir = os.scandir
 
     def flaky_scandir(path, *args, **kwargs):
-        if os.fspath(path) == bad:
+        if not isinstance(path, int) and os.fspath(path) == bad:  # int 是 rmtree 的 fd
             raise PermissionError(13, "mock: 网络挂载抖动")
         return real_scandir(path, *args, **kwargs)
 
