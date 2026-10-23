@@ -189,9 +189,20 @@ struct SmartDefaultsEditor: View {
                 } footer: {
                     Text(defaults?.configured == true ? "新订阅和还在等待的订阅都会按新设置来，已经下载的不受影响。" : "只需设置一次，电影和剧集都按它来。")
                 }
-                Section("最低要求") {
+                Section {
                     Toggle("只接受 \(draft.wrappedValue.resolution == "2160p" ? "4K" : "1080p")", isOn: Binding(mcGet: { draft.wrappedValue.strictResolution ?? false }, set: { draft.wrappedValue.strictResolution = $0 }))
                         .toggleStyle(SystemSwitchStyle()).accessibilityIdentifier("smart-strict-resolution")
+                    // 旧服务器没有这个字段（defaults.avoidDvP5 == nil）：不显示，保存时也不带它，服务器上的值不受影响
+                    if defaults?.avoidDvP5 != nil {
+                        Toggle("不要杜比视界 Profile 5", isOn: Binding(mcGet: { draft.wrappedValue.avoidDvP5 ?? false }, set: { draft.wrappedValue.avoidDvP5 = $0 }))
+                            .toggleStyle(SystemSwitchStyle()).accessibilityIdentifier("smart-avoid-dv-p5")
+                    }
+                } header: {
+                    Text("最低要求")
+                } footer: {
+                    if defaults?.avoidDvP5 != nil {
+                        Text("杜比视界 Profile 5 没有 HDR10 兼容层，服务器转码会偏绿偏紫；Apple TV、iPhone 等能直接播放的设备可以不开。")
+                    }
                 }
             } else if error == nil {
                 Section { HStack { ProgressView(); Text("正在读取智能设置…") } }
@@ -289,6 +300,7 @@ struct SmartDefaultsEditor: View {
                 movieRevision: value.movieRevision, tvRevision: value.tvRevision,
                 resolution: value.resolution, source: value.source,
                 allowUpgrade: value.allowUpgrade, strictResolution: value.strictResolution,
+                avoidDvP5: value.avoidDvP5,
                 movieWaitSeconds: value.movieWaitSeconds, tvWaitSeconds: value.tvWaitSeconds
             )
         } catch { self.error = error.localizedDescription }

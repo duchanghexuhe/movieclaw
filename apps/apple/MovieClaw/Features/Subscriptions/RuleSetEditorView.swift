@@ -260,11 +260,16 @@ struct RuleSetEditorSheet: View {
                         Text("另有自定义值：\(extras.map(RuleSetVocabulary.platformLabel).joined(separator: "、"))（保留）").font(.caption).foregroundStyle(Theme.textFaint)
                     }
                 }
-                field("HDR", hint: "点一下 = 只要，再点 = 排除，第三下取消。\"SDR\" 指资源没标注任何 HDR 格式；都不选 = 不限") {
+                field("HDR", hint: "点一下 = 只要，再点 = 排除，第三下取消。\"SDR\" 指资源没标注任何 HDR 格式；\"DV P5\" 是只标了 DV、没有 HDR10 兼容层的杜比视界（转码会偏色），只能排除，点一下即排除；都不选 = 不限") {
                     chips {
                         ForEach(RuleSetVocabulary.hdrOptions, id: \.self) { value in
                             SubsTriChip(label: value, state: triState(value, allow: hdrLevels, block: hdrBlock)) {
                                 cycle(value, allow: &hdrLevels, block: &hdrBlock)
+                            }
+                        }
+                        ForEach(RuleSetVocabulary.hdrBlockOnly, id: \.self) { value in
+                            SubsTriChip(label: value, state: hdrBlock.contains(value) ? .exclude : .off) {
+                                toggle(&hdrBlock, value)
                             }
                         }
                     }

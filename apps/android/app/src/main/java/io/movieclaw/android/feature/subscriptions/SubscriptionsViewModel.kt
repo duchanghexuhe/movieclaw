@@ -268,6 +268,7 @@ class SubscribeViewModel @Inject constructor(
                                 movieRevision = d.movieRevision, tvRevision = d.tvRevision,
                                 resolution = d.resolution, source = d.source,
                                 allowUpgrade = d.allowUpgrade, strictResolution = d.strictResolution,
+                                avoidDvP5 = d.avoidDvP5,
                                 movieWaitSeconds = d.movieWaitSeconds, tvWaitSeconds = d.tvWaitSeconds,
                             ),
                         )

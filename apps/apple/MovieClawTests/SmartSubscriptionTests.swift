@@ -94,4 +94,30 @@ struct SmartSubscriptionTests {
         #expect(extend["extend_seconds"] as? Int == 7200)
         #expect(extend["candidate_key"] == nil)
     }
+
+    /// 「不要杜比视界 Profile 5」开关：旧服务器没有这个字段也读得出设置，保存时没动它就不带这个键
+    /// （服务器上的值不受影响——旧客户端同样如此），动了才写。
+    @Test func avoidDvP5IsOptionalOnTheWire() throws {
+        let base: [String: Any] = [
+            "configured": true, "movie_revision": 1, "tv_revision": 1, "resolution": "2160p", "source": "web-dl",
+            "allow_upgrade": true, "strict_resolution": false, "movie_wait_seconds": 86400, "tv_wait_seconds": 10800,
+        ]
+        let oldServer = try JSONDecoder().decode(API.SmartDefaultsView.self, from: JSONSerialization.data(withJSONObject: base))
+        #expect(oldServer.avoidDvP5 == nil)
+        let newServer = try JSONDecoder().decode(
+            API.SmartDefaultsView.self,
+            from: JSONSerialization.data(withJSONObject: base.merging(["avoid_dv_p5": true]) { $1 })
+        )
+        #expect(newServer.avoidDvP5 == true)
+
+        var payload = API.SmartDefaultsPayload(
+            movieRevision: 1, tvRevision: 1, resolution: "2160p", source: "web-dl",
+            movieWaitSeconds: 86400, tvWaitSeconds: 10800
+        )
+        var wire = try JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as! [String: Any]
+        #expect(wire["avoid_dv_p5"] == nil)
+        payload.avoidDvP5 = true
+        wire = try JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as! [String: Any]
+        #expect(wire["avoid_dv_p5"] as? Bool == true)
+    }
 }
