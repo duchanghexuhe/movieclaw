@@ -363,6 +363,13 @@ HDR」认定为基础层格式（`hdr="HDR10"`，记录原样留在 `dv_profile`
 改给换封装（封装打 hvc1，记录不进流）；App 新版自研引擎申报 `dolby_vision_record_audit`，
 照常拿原文件，自己核对后放基础层（引擎补丁 P62）。
 
+**全范围（`color_range=pc`）源与 VAAPI**。P5 的基础层全是全范围；少数 HDR10 / SDR 压制也是。VPP 色调映射
+和缩放**保持输入的范围**（合成黑白场实测：全范围源黑 0 / 白 255），而输出侧声明 `-color_range tv`，帧标签
+（pc）与声明不符，ffmpeg 7.1 在硬件帧后面插接不上的软件 scale，起步即崩。修法是两步都做：硬件 scale 带
+`out_range=tv`（GPU 上真转换，黑 0→16、白 255→235；它**只转数据、不改帧标签**），帧标签再如实写
+`range=tv`。只贴标签不转换，全范围的黑白会被当成 limited 剪掉；两步缺一不可。只有 VAAPI 实测过
+（`HwBackend.scale_range`），QSV / NVENC 不写。
+
 **多候选择优**。同一条目常有 1080p / 2160p 两个版本
 （[disc-version-layout.md](disc-version-layout.md)）。决策接口的形状必须是
 **候选集合 → 最优计划**，而不是单文件判档：优先选能落在低档位的版本

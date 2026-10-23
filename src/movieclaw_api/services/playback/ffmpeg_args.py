@@ -333,6 +333,12 @@ class HwBackend:
     #: 8-bit，实测直接报错退出（滤镜自动协商不会在硬件帧之间插格式转换）。
     #: 软件档的 ``-pix_fmt yuv420p`` 就是同一个坑的对应兜底。
     scale_format: str | None = None
+    #: 硬件 scale 的 ``out_range``，让输出数据的范围与我们声明的一致（见 ``_filter_chain``）。
+    #: 全范围源（``color_range=pc``：杜比视界 P5 全是，另有少数 HDR10 / SDR 压制）经 VPP 色调映射
+    #: 后**仍是全范围数据**，输出侧却声明 limited（``-color_range tv``）：帧标签与声明不符，
+    #: ffmpeg 7.1 在硬件帧后面插一个接不上的软件 scale，起步即崩（NAS 真机实测，合成黑白场：
+    #: 全范围源黑 0 / 白 255，加 ``out_range=tv`` 后 16 / 235）。只有 VAAPI 实测过，其它后端不写
+    scale_range: str | None = None
     device: str | None = None
     #: 编码器能否直接吃系统内存帧。烧录（overlay 是软件滤镜）会把整条滤镜链
     #: 拉回软件侧：NVENC / VideoToolbox 的编码器接软件帧没问题；VAAPI / QSV
@@ -356,6 +362,7 @@ HW_BACKENDS: dict[str, HwBackend] = {
         # 最高 90，观感是整体偏红发品（issue #331）。
         tonemap_filter="tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709",
         scale_format="nv12",
+        scale_range="tv",
         device="/dev/dri/renderD128",
         sw_frames_ok=False,
     ),
@@ -1044,6 +1051,8 @@ def _filter_chain(
         return _videotoolbox_gpu_chain(plan)
     parts: list[str] = []
     height = plan.video.height
+    # 硬件 scale 已把数据转成的范围（见 ``HwBackend.scale_range``）；帧标签据此如实声明
+    frame_range: str | None = None
     if plan.video.tone_map:
         native = (
             native_tonemap_filter(backend, caps)
@@ -1073,6 +1082,10 @@ def _filter_chain(
             )
             if backend.scale_format:
                 opts = f"format={backend.scale_format}:{opts}"
+            if backend.scale_range and _outputs_bt709(plan):
+                # 输出侧要声明 limited 时，数据也得是 limited：全范围源在这里由 GPU 转换
+                opts += f":out_range={backend.scale_range}"
+                frame_range = backend.scale_range
             parts.append(f"{backend.scale_filter}={opts}")
         else:
             # -2 保持宽高比并对齐到偶数（编码器要求）
@@ -1094,8 +1107,9 @@ def _filter_chain(
         # 整条链留在显卡上（VAAPI / QSV / NVENC）时，帧标签同样要先打好（issue #958）：
         # tonemap_vaapi、vpp_qsv、scale_* 在格式协商里把源的色彩空间原样往下传，HDR10 的
         # bt2020nc（或无标签片的 unknown）撞上 -colorspace bt709，ffmpeg 就在硬件帧后面插一个
-        # 接不上的软件 scale，起步即退出。setparams 在协商里声明输出是 BT.709，链子才接得上
-        parts.append(_BT709_FRAME_TAGS)
+        # 接不上的软件 scale，起步即退出。setparams 在协商里声明输出是 BT.709，链子才接得上。
+        # scale 的 ``out_range`` 只转数据、不改帧标签：全范围源的帧还标着 pc，也要在这里改成 tv
+        parts.append(_BT709_FRAME_TAGS + (f":range={frame_range}" if frame_range else ""))
     return ",".join(parts)
 
 

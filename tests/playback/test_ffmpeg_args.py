@@ -566,8 +566,46 @@ def test_hardware_frame_chain_labels_bt709_before_the_encoder_asks_for_it(
     argv = argv_of(plan(PlaybackTier.HARDWARE_TRANSCODE, video=video), hw_backend=backend)
     assert pair(argv, "-hwaccel_output_format")  # 全程硬件帧
     vf = pair(argv, "-vf") or ""
-    assert vf.endswith(",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709")
+    # VAAPI 的硬件 scale 还把数据转成 limited，帧标签跟着如实写 range=tv（见下一条）
+    tail = ":range=tv" if backend == "vaapi" else ""
+    assert vf.endswith(
+        f",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709{tail}"
+    )
     assert pair(argv, "-colorspace") == "bt709"
+
+
+@pytest.mark.parametrize(
+    "video",
+    [
+        VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True),
+        VideoPlan(action="transcode", codec="h264", height=720, source_color="BT.709"),
+    ],
+    ids=["hdr10", "sdr"],
+)
+def test_vaapi_converts_full_range_sources_to_limited_before_declaring_limited(video):
+    """全范围源（color_range=pc：杜比视界 P5 全是）经 VPP 仍是全范围数据，输出侧又声明
+    ``-color_range tv``：帧标签与声明不符，ffmpeg 7.1 在硬件帧后面插接不上的软件 scale，起步即崩
+    （NAS 真机：《空枪》P5 + VAAPI，报「Impossible to convert ... 'Parsed_setparams_N' and
+    'auto_scale_0'」）。要让数据真的是 limited：硬件 scale 带 out_range=tv（GPU 上转换，黑 0→16、
+    白 255→235），帧标签再如实写 range=tv——只写标签不转换，全范围的黑白就被当成 limited 剪掉。"""
+    argv = argv_of(plan(PlaybackTier.HARDWARE_TRANSCODE, video=video), hw_backend="vaapi")
+    vf = pair(argv, "-vf") or ""
+    # 硬件 scale 紧挨着帧标签：转换在前、声明在后
+    assert ":out_range=tv,setparams=colorspace=bt709:" in vf
+    assert vf.endswith(":color_trc=bt709:range=tv")
+    assert pair(argv, "-color_range") == "tv"
+
+
+@pytest.mark.parametrize("backend", ["qsv", "nvenc"])
+def test_full_range_conversion_is_only_written_for_the_backend_that_was_verified(
+    backend, probed_nvenc_tonemap
+):
+    """out_range 只在 VAAPI 真机上验证过；QSV / NVENC 的缩放滤镜认不认、行为如何都没验过，
+    不能顺手带过去。"""
+    video = VideoPlan(action="transcode", codec="h264", height=1080, tone_map=True)
+    argv = argv_of(plan(PlaybackTier.HARDWARE_TRANSCODE, video=video), hw_backend=backend)
+    vf = pair(argv, "-vf")
+    assert vf and "out_range" not in vf and ":range=" not in vf
 
 
 def test_hardware_frame_chain_leaves_uncertain_colors_unlabelled():
@@ -582,8 +620,8 @@ def test_hardware_frame_chain_leaves_uncertain_colors_unlabelled():
     # 宽度走 min(4096,…) 表达式（NVENC 宽上限，见上面 test_hardware_scale_* 的同款断言）
     vf = pair(argv, "-vf") or ""
     assert vf.startswith("scale_vaapi=format=nv12:w=min(4096")
-    assert "setparams" not in vf
-    assert "-colorspace" not in argv
+    assert "setparams" not in vf and "out_range" not in vf  # 没声明输出范围，也就不转换
+    assert "-colorspace" not in argv and "-color_range" not in argv
 
 
 @pytest.mark.parametrize("backend", ["vaapi", "qsv", "nvenc", "videotoolbox"])
