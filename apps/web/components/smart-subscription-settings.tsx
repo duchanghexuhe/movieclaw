@@ -25,6 +25,9 @@ export function waitText(seconds: number) {
   return seconds % 86400 === 0 ? `最多等 ${seconds / 86400} 天` : `最多等 ${seconds / 3600} 小时`;
 }
 
+/** 只标 DV、没有 HDR10 兼容层的杜比视界：转码链路读不了它的 RPU，画面偏绿偏紫；Apple TV、iPhone 等能原样播放的设备上它反而是最好的版本，所以默认不拦。 */
+const AVOID_DV_P5_LABEL = "不要杜比视界 Profile 5（没有 HDR10 兼容层，服务器转码会偏色；Apple TV 等能直接播放的设备不必勾选）";
+
 const selectClass = "mt-1.5 w-full rounded-xl border border-[var(--line)] bg-[var(--surface-inset)] p-2.5";
 
 /** 等待上限：预设三档、自定义 1–7 天，旧版本存下的整小时值原样保留为一档。 */
@@ -97,6 +100,7 @@ export function SmartDefaultsFields({ draft, setDraft, disabled = false }: {
           <p>已有资源的发布时间会计入等待。等待上限指选择下载版本的时间，不是可观看时间。</p>
         </div>
         <label className="mt-3 flex items-start gap-2"><input className="mt-1" type="checkbox" checked={draft.strict_resolution} onChange={(e) => setDraft({ ...draft, strict_resolution: e.target.checked })} />{strictLabel}</label>
+        <label className="mt-3 flex items-start gap-2"><input className="mt-1" type="checkbox" checked={draft.avoid_dv_p5} onChange={(e) => setDraft({ ...draft, avoid_dv_p5: e.target.checked })} />{AVOID_DV_P5_LABEL}</label>
       </details>
     </fieldset>
   );
@@ -105,7 +109,7 @@ export function SmartDefaultsFields({ draft, setDraft, disabled = false }: {
 function inputOf(d: SmartDefaults): SmartDefaultsInput {
   return {
     movie_revision: d.movie_revision, tv_revision: d.tv_revision, resolution: d.resolution, source: d.source,
-    allow_upgrade: d.allow_upgrade, strict_resolution: d.strict_resolution,
+    allow_upgrade: d.allow_upgrade, strict_resolution: d.strict_resolution, avoid_dv_p5: d.avoid_dv_p5,
     movie_wait_seconds: d.movie_wait_seconds, tv_wait_seconds: d.tv_wait_seconds,
   };
 }
@@ -159,6 +163,7 @@ export function SmartDefaultsCard({ compact = false, startEditing = false, onSav
     <p className="text-title font-semibold">优先 {smartSummary(defaults)}</p>
     <p className="text-sub text-[var(--text-muted)]">电影{waitText(defaults.movie_wait_seconds)} · 剧集每集{waitText(defaults.tv_wait_seconds)} · {defaults.allow_upgrade ? "达标后停止洗版" : "入库后不洗版"}</p>
     {defaults.strict_resolution && <p className="text-sub text-[var(--text-muted)]">只接受 {defaults.resolution === "2160p" ? "4K" : "1080p"}</p>}
+    {defaults.avoid_dv_p5 && <p className="text-sub text-[var(--text-muted)]">不要杜比视界 Profile 5</p>}
   </div>;
 
   return <section className={compact ? "text-[var(--text)]" : "rounded-2xl border border-[var(--line)] bg-[var(--surface-inset)] p-4 text-[var(--text)]"} aria-label="智能设置">
