@@ -9,7 +9,15 @@ from movieclaw_matcher import (
     covered_by_existing,
     provably_at_cutoff,
 )
-from movieclaw_matcher.smart import SmartPolicy, decide, is_upgrade, target_met
+from movieclaw_matcher.smart import (
+    SmartPolicy,
+    SmartPreferences,
+    decide,
+    eligible,
+    format_blocked,
+    is_upgrade,
+    target_met,
+)
 
 NOW = datetime(2026, 10, 7, 12)
 POLICY = SmartPolicy(kind="tv", profile_revision=1, source="blu-ray")
@@ -330,3 +338,68 @@ def test_current_budget_caps_waiting_deadline_without_extending_it():
     )
     kept = decide(no_wait, [candidate()], now=later, state=extended)
     assert kept.action == "wait" and kept.state.deadline == NOW + timedelta(hours=9)
+
+
+# ---------------------------------------------------------------------------
+# 不要杜比视界 Profile 5（docs/design/avoid-dv-p5.md）
+# ---------------------------------------------------------------------------
+
+
+def hdr_candidate(name, hdr, *, seeders=10):
+    return TorrentCandidate(
+        site_id="test",
+        torrent_id=name,
+        title=name,
+        subtitle="",
+        attrs=TorrentAttrs(
+            resolution="2160p", media_source="WEB-DL", release_group=name, hdr=hdr
+        ),
+        seeders=seeders,
+    )
+
+
+def test_avoid_dv_p5_skips_it_even_with_the_most_seeders():
+    p5 = hdr_candidate("p5", ["DV"], seeders=500)
+    p8 = hdr_candidate("p8", ["DV", "HDR10"], seeders=3)
+    avoiding = SmartPolicy(kind="movie", profile_revision=1, wait_seconds=0, avoid_dv_p5=True)
+    decision = decide(avoiding, [p5, p8], now=NOW)
+    assert (decision.action, decision.candidate_key) == ("download", "test/p8")
+    # 关着（默认）时行为与以前逐字相同：做种最多的 P5 赢
+    default = SmartPolicy(kind="movie", profile_revision=1, wait_seconds=0)
+    assert decide(default, [p5, p8], now=NOW).candidate_key == "test/p5"
+
+
+def test_format_blocked_only_when_quality_was_fine_and_the_format_is_the_reason():
+    avoiding = SmartPolicy(kind="movie", profile_revision=1, avoid_dv_p5=True)
+    assert format_blocked(hdr_candidate("p5", ["DV"]), avoiding)
+    assert not format_blocked(hdr_candidate("p8", ["DV", "HDR10"]), avoiding)
+    # 品质本来就不合格（比如 720p）：拒绝原因该写品质，不是格式
+    low = TorrentCandidate(
+        site_id="test",
+        torrent_id="low",
+        title="low",
+        subtitle="",
+        attrs=TorrentAttrs(resolution="480p", media_source="WEB-DL", hdr=["DV"]),
+        seeders=10,
+    )
+    assert not eligible(low, avoiding) and not format_blocked(low, avoiding)
+
+
+def test_avoid_dv_p5_with_only_p5_available_downloads_nothing_and_keeps_manual_pick_open():
+    p5 = hdr_candidate("p5", ["DV"])
+    avoiding = SmartPolicy(kind="movie", profile_revision=1, wait_seconds=0, avoid_dv_p5=True)
+    assert decide(avoiding, [p5], now=NOW).action == "no_candidate"
+    assert not eligible(p5, avoiding)
+    # 手动选种走 eligible：关着的策略不拦
+    assert eligible(p5, SmartPolicy(kind="movie", profile_revision=1))
+
+
+def test_avoid_dv_p5_switch_is_only_written_when_on():
+    """关着不写这个键：旧版本（禁止多余字段）读到的策略逐字不变，存量订阅也不会被判成「策略变了」。"""
+    assert "avoid_dv_p5" not in SmartPreferences().model_dump()
+    policy = SmartPolicy(kind="tv", profile_revision=1)
+    assert "avoid_dv_p5" not in policy.model_dump(mode="json")
+    on = SmartPolicy(kind="tv", profile_revision=1, avoid_dv_p5=True)
+    assert on.model_dump(mode="json")["avoid_dv_p5"] is True
+    assert SmartPolicy.model_validate(on.model_dump(mode="json")).avoid_dv_p5 is True
+    assert SmartPolicy.model_validate(policy.model_dump(mode="json")).avoid_dv_p5 is False

@@ -149,7 +149,7 @@ def _to_observation(
         hit_and_run=item.hit_and_run,
         # 扩充属性在入库前算好（本地正则 + NER 推理）。exclude_defaults 只存
         # 真提取到的字段——没提取到任何字段时是 {}，与"从未扩充"（NULL）可区分
-        attrs=enrich(item.title, item.subtitle, category_value).model_dump(
+        attrs=enrich(item.title, item.subtitle, category_value, item.labels).model_dump(
             mode="json", exclude_defaults=True
         ),
         enrich_version=ENRICH_VERSION,

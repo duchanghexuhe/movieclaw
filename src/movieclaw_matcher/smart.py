@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
+from movieclaw_matcher.formats import is_dv_p5
 from movieclaw_matcher.models import QualitySnapshot, TorrentCandidate, UpgradeSource
 
 ALGORITHM_VERSION = 1
@@ -35,6 +36,22 @@ class SmartPreferences(BaseModel):
     wait_seconds: int = Field(default=7200, ge=0, le=604800)
     allow_upgrade: bool = True
     strict_resolution: bool = False
+    # 不要杜比视界 Profile 5（判定见 formats.py）。默认关：能原样播放 P5 的设备
+    # （Apple TV / iPhone 等）上它反而是最好的版本，不能替用户拦。
+    avoid_dv_p5: bool = False
+
+    @model_serializer(mode="wrap")
+    def _omit_default_avoid(self, handler):
+        """关着的时候不写这个键。
+
+        两个理由：① 本模型禁止多余字段，回退到不认识它的旧版本时，没开过开关的人读到的
+        设置与升级前逐字相同，不会因此整批读不出来；② 订阅冻结的策略按「内容变了才重写」
+        比较，多出一个恒为 false 的键会让所有存量订阅都被判成「策略变了」并各刷一条活动。
+        """
+        data = handler(self)
+        if not self.avoid_dv_p5:
+            data.pop("avoid_dv_p5", None)
+        return data
 
 
 class SmartPolicy(SmartPreferences):
@@ -94,7 +111,7 @@ def is_upgrade(incoming: object, current: object, policy: SmartPolicy) -> bool:
     return all(a >= b for a, b in zip(new, old, strict=True)) and new != old
 
 
-def eligible(candidate: TorrentCandidate, policy: SmartPolicy) -> bool:
+def _quality_eligible(candidate: TorrentCandidate, policy: SmartPolicy) -> bool:
     resolution, source = quality_vector(candidate.attrs)
     # 首版只接受已识别的高清正片，未知不是“无限制”。不自动追逐 8K。
     if resolution is None or source is None or resolution < 3 or source < 2:
@@ -104,6 +121,20 @@ def eligible(candidate: TorrentCandidate, policy: SmartPolicy) -> bool:
     if policy.strict_resolution and candidate.attrs.resolution != policy.resolution:
         return False
     return candidate.seeders is None or candidate.seeders > 0
+
+
+def format_allowed(candidate: TorrentCandidate, policy: SmartPolicy) -> bool:
+    """资源不是用户不要的格式（目前只有杜比视界 Profile 5）。判不准的一律当作可以要。"""
+    return not (policy.avoid_dv_p5 and is_dv_p5(candidate.attrs))
+
+
+def eligible(candidate: TorrentCandidate, policy: SmartPolicy) -> bool:
+    return _quality_eligible(candidate, policy) and format_allowed(candidate, policy)
+
+
+def format_blocked(candidate: TorrentCandidate, policy: SmartPolicy) -> bool:
+    """品质本来合格，只因是用户不要的格式被挡下——拒绝原因要如实写成这一条。"""
+    return _quality_eligible(candidate, policy) and not format_allowed(candidate, policy)
 
 
 def watchable(candidate: TorrentCandidate, policy: SmartPolicy) -> bool:

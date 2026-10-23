@@ -102,6 +102,7 @@ from movieclaw_api.services.tmdb_images import local_media_files
 from movieclaw_db.engine import get_session
 from movieclaw_db.models import MediaItem, SmartProfile, Subscription, WantedItem
 from movieclaw_db.repositories import LibraryFileRepository, MediaItemRepository
+from movieclaw_matcher.formats import DV_P5, FORMAT_LABELS
 from movieclaw_matcher.smart import SmartPreferences
 from movieclaw_media import DoubanError, TmdbError
 from movieclaw_media.library import ResolveStatus
@@ -140,7 +141,13 @@ async def put_smart_profile(
     payload: SmartProfilePayload,
     session: AsyncSession = Depends(get_session),
 ):
-    row = await save_profile(session, kind, payload.preferences, payload.revision)
+    preferences = payload.preferences
+    if "avoid_dv_p5" not in preferences.model_fields_set:
+        # 按类型的旧接口不认识这个开关：没带就沿用现在的值，别把统一设置页里开着的关掉
+        current = await session.get(SmartProfile, kind)
+        if current is not None and current.preferences.get("avoid_dv_p5"):
+            preferences = preferences.model_copy(update={"avoid_dv_p5": True})
+    row = await save_profile(session, kind, preferences, payload.revision)
     return ok({"kind": kind, "revision": row.revision, "preferences": row.preferences})
 
 
@@ -170,6 +177,7 @@ async def _smart_plan_view(
         if prefs.strict_resolution
         else ""
     )
+    avoid = f" · 不要{FORMAT_LABELS[DV_P5]}" if prefs.avoid_dv_p5 else ""
     return SmartPlanView(
         configured=True,
         profile_revision=plan.profile.revision,
@@ -180,7 +188,7 @@ async def _smart_plan_view(
         quality_note=resolved.quality_note,
         quality_shadow=resolved.quality_shadow,
         wait_label=f"{_wait_label(prefs.wait_seconds)} · "
-        f"{'达标后停止洗版' if prefs.allow_upgrade else '入库后不洗版'}{strict}",
+        f"{'达标后停止洗版' if prefs.allow_upgrade else '入库后不洗版'}{strict}{avoid}",
         subtitle_language=language,
         subtitle_language_label=language_label(language) if language else None,
         subtitle_understood=None if language is None else not resolved.watchable_languages,
@@ -214,6 +222,7 @@ async def get_smart_defaults(session: AsyncSession = Depends(get_session)):
             source=shared.source,
             allow_upgrade=shared.allow_upgrade,
             strict_resolution=shared.strict_resolution,
+            avoid_dv_p5=shared.avoid_dv_p5,
             movie_wait_seconds=movie.preferences["wait_seconds"] if movie else 86400,
             tv_wait_seconds=tv.preferences["wait_seconds"] if tv else 10800,
         )
@@ -231,11 +240,16 @@ async def put_smart_defaults(
 ):
     from movieclaw_api.services.subscription.smart_profiles import save_defaults
 
+    avoid_dv_p5 = payload.avoid_dv_p5
+    if avoid_dv_p5 is None:  # 旧客户端没传：沿用现在的值
+        current = await session.get(SmartProfile, "movie") or await session.get(SmartProfile, "tv")
+        avoid_dv_p5 = bool(current and current.preferences.get("avoid_dv_p5"))
     shared = SmartPreferences(
         resolution=payload.resolution,
         source=payload.source,
         allow_upgrade=payload.allow_upgrade,
         strict_resolution=payload.strict_resolution,
+        avoid_dv_p5=avoid_dv_p5,
         wait_seconds=payload.movie_wait_seconds,
     )
     await save_defaults(

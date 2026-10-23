@@ -99,6 +99,7 @@ def _build_hits(site_id: str, name: str, items: list[TorrentListItem]) -> list[T
                 item.title,
                 item.subtitle,
                 item.category.value if item.category else None,
+                item.labels,
             ),
             **item.model_dump(),
         )

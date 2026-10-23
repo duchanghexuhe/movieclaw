@@ -1305,6 +1305,9 @@ class SmartDefaultsView(BaseModel):
     source: str = "web-dl"
     allow_upgrade: bool = True
     strict_resolution: bool = False
+    # 声明成可选只为客户端兼容：新客户端连没有这个字段的旧服务器，设置页也要读得出来；
+    # 本服务器永远输出 true / false，不会输出 null
+    avoid_dv_p5: bool | None = False
     movie_wait_seconds: int = 86400
     tv_wait_seconds: int = 10800
 
@@ -1316,6 +1319,12 @@ class SmartDefaultsPayload(BaseModel):
     source: Literal["web-dl", "blu-ray", "remux"]
     allow_upgrade: bool = True
     strict_resolution: bool = False
+    # 不传 = 保持现状：旧客户端不认识这个字段，保存别的设置时不能顺手把它改回关
+    avoid_dv_p5: bool | None = Field(
+        default=None,
+        description="不要杜比视界 Profile 5（只标 DV、没有 HDR10 兼容层的 DV，转码会偏色）；"
+        "不传=不变",
+    )
     movie_wait_seconds: int = Field(ge=0, le=604800)
     tv_wait_seconds: int = Field(ge=0, le=604800)
 
