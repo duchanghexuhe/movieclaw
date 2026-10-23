@@ -461,6 +461,17 @@ def tonemap_reads_dolby_vision(
     return (expr or "").split("=", 1)[0] in _DOVI_AWARE_TONEMAPS
 
 
+def tonemap_ignores_dolby_vision(
+    backend_name: str, caps: WorkerVideoCaps | None = None
+) -> bool:
+    """该后端这次装出来的色调映射，是不是一个**不认** RPU 的原生滤镜（VAAPI 的 tonemap_vaapi、QSV 的
+    vpp_qsv）。与 ``tonemap_reads_dolby_vision`` 不同：没有原生滤镜的后端（NVENC 没自检到
+    tonemap_cuda）退回软件 tonemapx，那条认 RPU，不算。"""
+    backend = HW_BACKENDS.get(backend_name)
+    expr = native_tonemap_filter(backend, caps) if backend is not None else None
+    return expr is not None and expr.split("=", 1)[0] not in _DOVI_AWARE_TONEMAPS
+
+
 #: 要靠执行者的 ffmpeg 带着才有的原生 tone-map（不写死进 ``HW_BACKENDS`` 的那些）。
 #: 本机由自检确认后登记进 ``_PROBED_TONEMAP``；远程 Worker 看它申报的 ``filters``。
 _OPTIONAL_TONEMAP: dict[str, str] = {"nvenc": NVENC_TONEMAP}

@@ -21,9 +21,10 @@ from movieclaw_api.services.playback import backend_health
 from movieclaw_api.services.playback.disc_source import disc_source_for_file
 from movieclaw_api.services.playback.ffmpeg_args import (
     effective_hw_backend,
+    tonemap_ignores_dolby_vision,
     tonemap_reads_dolby_vision,
 )
-from movieclaw_api.services.playback.hwprobe import hardware_available
+from movieclaw_api.services.playback.hwprobe import BACKEND_LABELS, hardware_available
 from movieclaw_api.services.playback.iso_source import iso_disc_source
 from movieclaw_api.services.playback.limits import MAX_TRANSCODE_HEIGHT
 from movieclaw_api.services.playback.remote_worker import (
@@ -349,6 +350,32 @@ def select_execution_backend(
     for backend in usable:
         return backend, False
     return None, False
+
+
+def dolby_vision_caveat(
+    decision: PlaybackDecision, hw_used: str | None, *, use_remote: bool
+) -> str | None:
+    """杜比视界 P5 落到读不了 RPU 的本机后端时，给播放诊断「判定理由」补的一句话；否则 None。
+
+    ``select_execution_backend`` 只在没有转码器可用时才把 P5 交给 VAAPI / QSV：片能放，但 IPT
+    基础层被当成 YCbCr 色调映射，整片偏绿或偏紫，色彩没法在本机修。用户看到偏色时，面板里要能
+    找到原因和出路，否则只会当成画质 bug 反复报。``hw_used`` 是**实际执行**的硬件后端
+    （``effective_hw_backend``）：烧录等原因让链路落到软件 tonemapx 的会话是 None，色彩是对的，
+    不提示。
+    """
+    if (
+        not isinstance(decision, PlaybackPlan)
+        or decision.video.dolby_vision != "apply"
+        or use_remote
+        or hw_used is None
+        or not tonemap_ignores_dolby_vision(hw_used)
+    ):
+        return None
+    return (
+        "杜比视界 P5 的色彩要按动态元数据还原，"
+        f"但本机的 {BACKEND_LABELS.get(hw_used, hw_used)}色调映射做不到，画面会偏绿或偏紫；"
+        "连接转码器可正确转码"
+    )
 
 
 def _best(
