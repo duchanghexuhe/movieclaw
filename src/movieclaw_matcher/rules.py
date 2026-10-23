@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from movieclaw_enrich.vocab import codec_family
 from movieclaw_matcher.decision import MEDIA_SOURCE_TIER_LABEL, media_source_rank
+from movieclaw_matcher.formats import DV_P5, FORMAT_LABELS, FORMAT_REASONS, matched_formats
 from movieclaw_matcher.models import (
     HrUnknownPolicy,
     RuleSetSpec,
@@ -50,9 +51,14 @@ def evaluate_rules(
     ``pack_episode_count``：整季包的体积按每集均摊评估，避免 40 集合集
     被"单集体积上限"误杀。
     """
-    from movieclaw_matcher.smart import SmartPolicy, eligible
+    from movieclaw_matcher.smart import SmartPolicy, eligible, format_blocked
 
     if isinstance(spec, SmartPolicy):
+        if format_blocked(candidate, spec):
+            return _reject(
+                "smart_format_blocked",
+                f"已按「不要{FORMAT_LABELS[DV_P5]}」跳过：该资源是{FORMAT_REASONS[DV_P5]}",
+            )
         accepted = eligible(candidate, spec)
         return RuleVerdict(
             accepted=accepted,
@@ -135,6 +141,12 @@ def evaluate_rules(
         return _reject(
             "hdr_blocked",
             f"规则排除 {'/'.join(spec.hdr_block)}，该资源标注了 {'/'.join(attrs.hdr)}",
+        )
+    # 「DV P5」不是标题里的标记而是判定结果（formats.py），所以不走上面的集合交集
+    if spec.hdr_block and (hit := matched_formats(attrs, spec.hdr_block)):
+        return _reject(
+            "hdr_blocked",
+            f"规则排除 {'/'.join(spec.hdr_block)}，该资源是{FORMAT_REASONS[hit[0]]}",
         )
     if spec.hdr_levels and not declared & set(spec.hdr_levels):
         text = "/".join(attrs.hdr) or "未标注 HDR（按 SDR 处理）"

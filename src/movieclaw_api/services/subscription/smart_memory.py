@@ -31,6 +31,7 @@ from movieclaw_db.models import (
 )
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.media_metadata import MediaMetadata
+from movieclaw_matcher.formats import DV_P5, FORMAT_LABELS
 from movieclaw_matcher.smart import SmartPolicy, SmartPreferences
 from movieclaw_matcher.smart_memory import (
     DEFAULT_UNDERSTOOD,
@@ -327,13 +328,15 @@ async def apply_to_subscriptions(
             continue
         target = f"{policy.resolution} {policy.source}"
         subtitles = "，只下看得懂的字幕版本" if policy.watchable_languages else ""
+        formats = f"，不要{FORMAT_LABELS[DV_P5]}" if policy.avoid_dv_p5 else ""
         session.add(
             SubscriptionActivity(
                 subscription_id=sub.id,
                 type=ActivityType.ADJUSTED,
                 message=(
                     f"已跟随当前智能设置与记忆：{_wait_text(policy.wait_seconds)}，目标 {target}"
-                    f"{subtitles}{'，达标后停止洗版' if policy.allow_upgrade else '，不洗版'}"
+                    f"{subtitles}{formats}"
+                    f"{'，达标后停止洗版' if policy.allow_upgrade else '，不洗版'}"
                 ),
                 payload={"smart_policy": payload},
             )
