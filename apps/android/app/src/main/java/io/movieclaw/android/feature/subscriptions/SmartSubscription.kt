@@ -348,6 +348,10 @@ fun SmartSettingsSheet(
             WaitChoice("剧集每集最多等", draft.tvWaitSeconds, "smart-tv-wait") { onDraft(draft.copy(tvWaitSeconds = it)) }
             SwitchRow("允许后续洗版", draft.allowUpgrade, "smart-upgrade") { onDraft(draft.copy(allowUpgrade = it)) }
             SwitchRow("只接受 ${if (draft.resolution == "2160p") "4K" else "1080p"}，到期也不降低分辨率", draft.strictResolution, "smart-strict-resolution") { onDraft(draft.copy(strictResolution = it)) }
+            // 旧服务端没有这个设置（avoidDvP5 == null）：不显示，保存时也不带，服务端的值不受影响
+            if (draft.avoidDvP5 != null) {
+                SwitchRow("不要杜比视界 Profile 5（没有 HDR10 兼容层，服务器转码会偏色；Apple TV 等能直接播放的设备不必开）", draft.avoidDvP5 == true, "smart-avoid-dv-p5") { onDraft(draft.copy(avoidDvP5 = it)) }
+            }
             if (configured && memory != null) {
                 Spacer(Modifier.height(18.dp))
                 Text("看得懂的语言", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)

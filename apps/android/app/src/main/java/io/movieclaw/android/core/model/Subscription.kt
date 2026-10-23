@@ -91,6 +91,8 @@ data class SmartDefaultsView(
     val source: String = "web-dl",
     val allowUpgrade: Boolean = true,
     val strictResolution: Boolean = false,
+    /** 不要杜比视界 Profile 5；null = 服务端还没有这个设置（旧版本），界面不显示、保存时不带 */
+    val avoidDvP5: Boolean? = null,
     val movieWaitSeconds: Int = 86400,
     val tvWaitSeconds: Int = 10800,
 )
@@ -103,6 +105,8 @@ data class SmartDefaultsPayload(
     val source: String,
     val allowUpgrade: Boolean,
     val strictResolution: Boolean,
+    /** null = 不动服务端现有的值（旧服务端没有这个设置；explicitNulls=false，不会出现在请求里） */
+    val avoidDvP5: Boolean? = null,
     val movieWaitSeconds: Int,
     val tvWaitSeconds: Int,
 )

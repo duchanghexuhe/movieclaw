@@ -31,6 +31,11 @@ enum RuleSetVocabulary {
     /// HDR 值域；"SDR" 是哨兵 = 资源未标注任何 HDR 格式
     static let hdrOptions = ["DV", "HDR10+", "HDR10", "HLG", "SDR"]
 
+    /// 只能「排除」的 HDR 项：「DV P5」= 只标了 DV、没有 HDR10 兼容层的杜比视界（Profile 5），
+    /// 服务器转码会偏绿偏紫。它是后端按命名约定与站点标记得出的判定，不是标题里的记号，
+    /// 「只要 P5」没有意义，所以不进三态循环，只在「不限 ↔ 排除」之间切。
+    static let hdrBlockOnly = ["DV P5"]
+
     static let subtitleLanguages: [(value: String, label: String)] = [
         ("zh", "中文（不限简繁）"), ("zh-Hans", "简体中文"), ("zh-Hant", "繁体中文"), ("en", "英文"),
     ]
