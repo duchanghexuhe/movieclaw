@@ -65,6 +65,22 @@ export function pickedVersionFileId(
     : undefined;
 }
 
+/**
+ * 播放页 `?file=` 的锁定只对**进入播放页的那一集**生效，别的集回到自动择优。
+ *
+ * 自动连播 / 点「下一集」只是换 unit、不重新导航，`lockedFileId` 这个 prop 在整个播放页
+ * 生命周期里一直都在；而服务端 `file_id` 的优先级高于 `media_item_id + 季集`，不按集收口就会
+ * 拿第 1 集的文件去请求第 2 集（界面与进度按第 2 集走，实际又播了一遍第 1 集）。
+ * 同一集里 seek / 换轨 / 降档重开会话照旧锁定；切回进入时的那一集也照旧锁定。
+ */
+export function lockedFileForUnit(
+  unitKey: string,
+  entryUnitKey: string,
+  lockedFileId: number | undefined,
+): number | undefined {
+  return unitKey === entryUnitKey ? lockedFileId : undefined;
+}
+
 const RETURN_KEY = "movieclaw.player.return-to";
 
 /** 进播放页前记下「从哪来」。只收站内路径——防开放跳转。 */

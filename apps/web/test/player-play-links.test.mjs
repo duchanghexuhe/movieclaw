@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseUnitSegment, pickedVersionFileId, playHref } from "../lib/player/play-links.ts";
+import {
+  lockedFileForUnit,
+  parseUnitSegment,
+  pickedVersionFileId,
+  playHref,
+} from "../lib/player/play-links.ts";
 
 test("电影地址只有条目 id", () => {
   assert.equal(playHref(127), "/play/127");
@@ -52,4 +57,18 @@ test("详情页点播放：用户亲手选过的版本才锁（含选的恰好�
 test("详情页点播放：选过的版本不属于当前播放单元（剧集切集后）不锁", () => {
   assert.equal(pickedVersionFileId(1795, [1796]), undefined);
   assert.equal(pickedVersionFileId(1795, []), undefined);
+});
+
+test("播放页锁定文件只对进入播放页的那一集生效：连播 / 点下一集换了 unit，回到自动择优", () => {
+  // 进入时是第 1 集，锁定 4260
+  assert.equal(lockedFileForUnit("288/1/1", "288/1/1", 4260), 4260);
+  // 自动连播到第 2 集：不能再带第 1 集的文件，否则服务端 file_id 优先，又播了一遍第 1 集
+  assert.equal(lockedFileForUnit("288/1/2", "288/1/1", 4260), undefined);
+  // 点上一集切回进入时的那一集：照旧锁定
+  assert.equal(lockedFileForUnit("288/1/1", "288/1/1", 4260), 4260);
+});
+
+test("播放页锁定文件：没锁（?file= 没带）在任何一集都是 undefined", () => {
+  assert.equal(lockedFileForUnit("288/0/0", "288/0/0", undefined), undefined);
+  assert.equal(lockedFileForUnit("288/1/2", "288/1/1", undefined), undefined);
 });

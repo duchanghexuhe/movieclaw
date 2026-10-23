@@ -110,7 +110,7 @@ import {
 import { createSessionReleaser } from "@/lib/player/session-release";
 import { reportedTracks } from "@/lib/player/track-memory";
 import { type QoeEvent, initialQoe, liveStats, reduceQoe, summarize } from "@/lib/player/qoe";
-import { consumePlayIntent } from "@/lib/player/play-links";
+import { consumePlayIntent, lockedFileForUnit } from "@/lib/player/play-links";
 import { StartupTrace } from "@/lib/player/startup-trace";
 import { type TrickplayIndex, tileAt } from "@/lib/player/trickplay";
 import { FALLBACK_FRAME_RATE, isEditableTarget, resolveShortcut } from "@/lib/player/shortcuts";
@@ -196,8 +196,8 @@ export interface VideoPlayerProps {
    */
   startMsOverride?: number;
   /**
-   * 详情页版本选择器带来的 `?file=`（锁定的源文件）。只对第一个单元生效：
-   * 切下一集回到「服务端多版本自动择优」。undefined = 没锁。
+   * 详情页版本选择器带来的 `?file=`（锁定的源文件）。只对进入播放页的那一集生效：
+   * 切到别的集回到「服务端多版本自动择优」。undefined = 没锁。
    */
   lockedFileId?: number;
   /**
@@ -423,6 +423,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
     api = DEFAULT_PLAYBACK_SCOPE,
   } = props;
   const unitKey = unitKeyOf(unit);
+  // `?file=` 的锁定只对进入播放页的那一集生效（切集只是换 unit、不重新导航，见 lockedFileForUnit）
+  const entryUnitKeyRef = useRef(unitKey);
+  const lockFile = lockedFileForUnit(unitKey, entryUnitKeyRef.current, lockedFileId);
   // 接口作用域放 ref：各回调 / effect 的依赖数组一律不变，作用域在组件生命周期内是常量
   const apiRef = useRef(api);
   apiRef.current = api;
@@ -1312,7 +1315,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
     // 指纹必须覆盖**全部**会影响请求参数的依赖（quality 也在内）：漏一项的
     // 后果是该项单独变化时 effect 重跑却撞上相同指纹被去重跳过，而上一次
     // 在途请求已被 cancelled——响应回来没人认领，起播就永远停在转圈里。
-    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}|${lockedFileId ?? ""}`;
+    const key = `${unitKey}|${phase}|${state.startMs}|${failedKey}|${state.failureCount}|${state.attempt}|${requestedAudio ?? ""}|${requestedSubtitle ?? ""}|${quality ?? ""}|${lockFile ?? ""}`;
     if (startedKeyRef.current === key) return;
     startedKeyRef.current = key;
 
@@ -1329,8 +1332,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
           {
             ...unit,
             // 详情页版本选择器带来的 `?file=`：锁定这个文件起播，服务端跳过
-            // 多版本自动择优（undefined = 没锁，照旧择优）
-            file_id: lockedFileId ?? undefined,
+            // 多版本自动择优（undefined = 没锁 / 已切到别的集，照旧择优）
+            file_id: lockFile,
             capability: capabilityRef.current,
             failed_tiers: state.failedTiers,
             // null = 服务端接续播点；显式值（seek 重开 / 换轨 / ?t=）原样发
