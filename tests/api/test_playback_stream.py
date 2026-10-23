@@ -141,6 +141,8 @@ async def _seed(
     hdr: str | None = None,
     resolution: str = "1080p",
     strm_url: str = "https://pan.example.com/a.mkv",
+    dv_profile: int | None = None,
+    dv_bl_compatible: bool | None = None,
 ) -> int:
     """建库 + 建条目 + 落一个真实存在的文件，返回 library_file.id。
 
@@ -173,6 +175,8 @@ async def _seed(
             video_codec=codec,
             resolution=resolution,
             hdr=hdr,
+            dv_profile=dv_profile,
+            dv_bl_compatible=dv_bl_compatible,
             duration_seconds=duration_seconds,
             audio_streams=[{"codec": "aac", "channels": 2, "default": True}],
         )
@@ -345,6 +349,75 @@ def test_profile_5_transcode_prefers_a_transcoder_whose_tonemap_reads_the_rpu():
     assert select(p5("apply"), **both, remote_video_available=True) == ("videotoolbox", True)
     assert select(p5("apply"), **both, remote_video_available=False) == ("vaapi", False)
     assert select(p5(None), **both, remote_video_available=True) == ("vaapi", False)
+
+
+def test_profile_5_caveat_only_when_a_rpu_blind_local_gpu_does_the_tone_map():
+    """P5 落到 VAAPI / QSV：片能放但整片偏绿，诊断的判定理由要说清原因与出路。认得 RPU 的
+    （Mac 转码器、自检到 tonemap_cuda 的 NVENC）、退回软件 tonemapx 的、远程执行的，都不该提示。"""
+    from movieclaw_api.services.playback.ffmpeg_args import NVENC_TONEMAP, register_native_tonemap
+
+    def plan_for(dolby_vision):
+        return PlaybackPlan(
+            tier=PlaybackTier.HARDWARE_TRANSCODE,
+            file_id=1,
+            container="hls-fmp4",
+            video=VideoPlan(
+                action="transcode", codec="h264", height=1080, tone_map=True,
+                source_codec="hevc", source_bit_depth=10, dolby_vision=dolby_vision,
+            ),
+            audio=AudioPlan(action="copy"),
+        )
+
+    caveat = routes_playback.playback_plan.dolby_vision_caveat
+    for blind in ("vaapi", "qsv"):
+        text = caveat(plan_for("apply"), blind, use_remote=False)
+        assert text and "杜比视界 P5" in text and "转码器" in text
+    assert "VAAPI" in caveat(plan_for("apply"), "vaapi", use_remote=False)
+
+    # 不是要吃 RPU 的片 / 没用硬件 / 远程执行
+    assert caveat(plan_for(None), "vaapi", use_remote=False) is None
+    assert caveat(plan_for("ignore"), "vaapi", use_remote=False) is None
+    assert caveat(plan_for("apply"), None, use_remote=False) is None
+    assert caveat(plan_for("apply"), "vaapi", use_remote=True) is None
+    # 本机没有原生色调映射的后端走软件 tonemapx（认 RPU）
+    assert caveat(plan_for("apply"), "videotoolbox", use_remote=False) is None
+    assert caveat(plan_for("apply"), "nvenc", use_remote=False) is None
+    register_native_tonemap("nvenc", NVENC_TONEMAP)  # 自检确认了的 tonemap_cuda 也认 RPU
+    try:
+        assert caveat(plan_for("apply"), "nvenc", use_remote=False) is None
+    finally:
+        register_native_tonemap("nvenc", None)
+
+
+def test_profile_5_session_on_a_local_gpu_tells_the_user_why_the_colors_are_off(
+    client, tmp_path, monkeypatch
+):
+    """《空枪》（杜比视界 P5）在只有 VAAPI 的 NAS 上：能放，判定理由里写明为什么偏绿、怎么修；
+    同样走 VAAPI 的普通 HDR10 不该有这句。"""
+    from movieclaw_api.services.playback import hwprobe
+    from movieclaw_api.services.playback import plan as plan_mod
+
+    backends = lambda: ("vaapi",)  # noqa: E731
+    monkeypatch.setattr(hwprobe, "available_backends", backends)
+    monkeypatch.setattr(routes_playback, "available_backends", backends)
+    monkeypatch.setattr(routes_playback, "available_local_backends", backends)
+    monkeypatch.setattr(routes_playback, "remote_worker_available", lambda *_a, **_k: False)
+    monkeypatch.setattr(plan_mod, "hardware_available", lambda: True)
+    p5 = seed(
+        client, tmp_path, container="mkv", codec="hevc", hdr="Dolby Vision",
+        resolution="2160p", dv_profile=5, dv_bl_compatible=False,
+    )
+    hdr10 = seed(client, tmp_path, container="mkv", codec="hevc", hdr="HDR10", resolution="2160p")
+
+    data = start_session(client, p5)
+    assert data["decision"]["tier"] == int(PlaybackTier.HARDWARE_TRANSCODE), data["decision"]
+    assert data["hw_backend"] == "vaapi"
+    assert "杜比视界 P5" in data["decision"]["reason"]
+    assert "转码器" in data["decision"]["reason"]
+
+    plain = start_session(client, hdr10)
+    assert plain["hw_backend"] == "vaapi"
+    assert "杜比视界" not in plain["decision"]["reason"]
 
 
 # ---------------------------------------------------------------------------

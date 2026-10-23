@@ -1397,6 +1397,16 @@ async def start_playback_session(
         if execution_backend and view.video and view.video.action == "transcode"
         else None
     )
+    # 杜比视界 P5 只能落到读不了 RPU 的本机显卡（没有转码器可用）：能放但整片偏绿 / 偏紫。
+    # NAS 日志留一条、诊断面板的判定理由补一句，用户才找得到原因与出路
+    caveat = playback_plan.dolby_vision_caveat(decision, hw_used, use_remote=use_remote)
+    if caveat:
+        logger.warning(
+            "杜比视界 P5 落到本机 %s（色调映射不认 RPU，画面会偏色，连接转码器可修复）：file_id=%s",
+            hw_used,
+            file.id,
+        )
+        view = view.model_copy(update={"reason": "；".join(p for p in (view.reason, caveat) if p)})
     # 仅把「硬件转码」任务交给远程硬件 Worker；直通/音频单转继续走 NAS，
     # 软件转码也保留本地回路。
     #

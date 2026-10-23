@@ -363,6 +363,25 @@ HDR」认定为基础层格式（`hdr="HDR10"`，记录原样留在 `dv_profile`
 改给换封装（封装打 hvc1，记录不进流）；App 新版自研引擎申报 `dolby_vision_record_audit`，
 照常拿原文件，自己核对后放基础层（引擎补丁 P62）。
 
+**P5 在 NAS 本机核显上**（2026-10-23，J4125 / UHD 600 + jellyfin-ffmpeg 7.1.4 实测）。VAAPI /
+QSV 的原生色调映射不认 RPU，P5 的 IPT 基础层被当 YCbCr 映射，整片偏绿或偏紫（《空枪》）。要吃 RPU
+的执行者只有 Mac（`tonemap_videotoolbox`）、NVENC（`tonemap_cuda`）和软件 `tonemapx`，所以
+`select_execution_backend` 优先把 P5 交给在线的转码器；没有转码器时仍落本机——能放但颜色一定不对，
+这时判定理由里会补一句原因与出路（`plan.dolby_vision_caveat`，网页 / App 诊断面板的底部）。
+本机补救路径逐条实测过，**没有可交付的**，别再重走：
+
+- CPU（GPU 解码 + `hwdownload` + `tonemapx` + 硬编）：这块核显回读只有约 40 MB/s（1080p P010 3.6 帧/秒），
+  纯软件 4K 解码约 3 帧/秒；`tonemapx` 本身 1080p 约 28 帧/秒，瓶颈在回读，不在算力。
+- Vulkan / `libplacebo`（杜比视界实现最正统）：镜像里 ANV 驱动在，但 Mesa 25.0 的 ANV 导入不了带 DRM
+  modifier 的多平面帧，`libplacebo` 建图失败（NV12、P010 都一样；`hwmap` 到 Vulkan 后 `hwdownload` 倒是通）。
+- OpenCL `tonemap_opencl`（带 `apply_dovi`）：镜像没有 OpenCL ICD（要装 `intel-opencl-icd` 及其依赖的
+  LLVM / IGC，数百 MB）。装上后 4K→1080p 约 2 倍实时，**输出正常的那几次**颜色是对的（与 CPU 参照
+  的亮度均值差 <0.5），但杜比视界内核的输出**不确定**：同一输入重复运行，约一半几乎全黑（Debian 的 NEO
+  22.43 与 Intel 的 legacy 24.35 + IGC 1.0.17537 都复现；`tradeoff=0/1` 都不改善，`tonemap_mode=rgb|lum`
+  只是离群变少，12 次里仍有 1 次不同；`apply_dovi=0` 与纯 HDR10 合成源则 8/8 确定）。帧要先打 HDR10
+  标签（`setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc`）并显式 `peak=100`，
+  缺一就偏暗。不可靠，没做。
+
 **全范围（`color_range=pc`）源与 VAAPI**。P5 的基础层全是全范围；少数 HDR10 / SDR 压制也是。VPP 色调映射
 和缩放**保持输入的范围**（合成黑白场实测：全范围源黑 0 / 白 255），而输出侧声明 `-color_range tv`，帧标签
 （pc）与声明不符，ffmpeg 7.1 在硬件帧后面插接不上的软件 scale，起步即崩。修法是两步都做：硬件 scale 带
@@ -1642,7 +1661,7 @@ Mac mini 验证。做成发版前的人工清单，列进 `.claude/skills/releas
 | §4.5 | 并发超限「排队并明确告知」 | **立即拒绝**并报当前占用（如「2/2」） | HTTP 请求里排队 = 用户对着转圈等一个不知道多久的位置 |
 | §3.5 | 关键帧索引落 `library_file` | **不落库**，采样现算 + 内存缓存 | 存量库无论如何要懒加载补齐，落库的增量收益只是「重启后不用重算」，不值一次迁移 |
 | §7-④ | 按 `dv_profile` 区分 P5/P8 | **DV 一律转码** | 探测层只落 `hdr="Dolby Vision"` 不落 profile；判错的代价是绿紫画面，保守 |
-| §7-④ | P5 转码 + tone-map 即可 | **仍未真正解决 P5** | P5 是 IPT-PQ-c2，不是 YCbCr/BT.2020；`tonemapx` 按 BT.2020 处理它依然出绿紫。要治得走 jellyfin-ffmpeg 的 `-dolbyvision` 解码开关，缺真片验证，未动 |
+| §7-④ | P5 转码 + tone-map 即可 | **要认 RPU 的执行者才还原得对** | P5 是 IPT-PQ-c2，不是 YCbCr/BT.2020；当年的 `zscale+tonemap` 出绿紫。现在由 jellyfin-ffmpeg 的 `tonemapx` / `tonemap_cuda` / `tonemap_videotoolbox` 的 `apply_dovi` 按 RPU 还原；VAAPI / QSV 的原生映射不认，见 §3.5 |
 | §7-④e | BT.601 源也转到 709 | **不转，也不打标签** | 探测层把 601 的 525/625 两制式并成一个标签，补不回来是哪一个；两者矩阵相同只差原色，猜错的收益小于风险 |
 
 ### 12.5 尚未做

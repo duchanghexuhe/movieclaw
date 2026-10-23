@@ -449,6 +449,15 @@ def tonemap_reads_dolby_vision(backend_name: str) -> bool:
     return (expr or "").split("=", 1)[0] in _DOVI_AWARE_TONEMAPS
 
 
+def tonemap_ignores_dolby_vision(backend_name: str) -> bool:
+    """该后端这次装出来的色调映射，是不是一个**不认** RPU 的原生滤镜（VAAPI 的 tonemap_vaapi、QSV 的
+    vpp_qsv）。与 ``tonemap_reads_dolby_vision`` 不同：没有原生滤镜的后端（NVENC 没自检到
+    tonemap_cuda）退回软件 tonemapx，那条认 RPU，不算。"""
+    backend = HW_BACKENDS.get(backend_name)
+    expr = native_tonemap_filter(backend) if backend is not None else None
+    return expr is not None and expr.split("=", 1)[0] not in _DOVI_AWARE_TONEMAPS
+
+
 def native_tonemap_filter(backend: HwBackend) -> str | None:
     """该后端这次能用的原生 tone-map 滤镜；None=只能走软件 tone-map。"""
     return _PROBED_TONEMAP.get(backend.name, backend.tonemap_filter)
