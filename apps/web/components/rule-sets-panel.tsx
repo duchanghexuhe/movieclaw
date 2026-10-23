@@ -413,6 +413,14 @@ const mediaSourceLabel = (value: string): string =>
 const HDR_OPTIONS = ["DV", "HDR10+", "HDR10", "HLG", "SDR"];
 
 /**
+ * 只能「排除」的 HDR 项：它不是标题里的记号，而是后端按命名约定与站点标记得出的判定
+ * （movieclaw_matcher.formats）。「DV P5」= 只标了 DV、没有 HDR10 兼容层的杜比视界
+ * （Profile 5），服务器转码会偏绿偏紫；与「DV」（整类）不同，带 HDR10 兼容层的 P8/P7 不受影响。
+ * 「只要 P5」没有意义，所以它不进三态循环，只在「不限 ↔ 排除」之间切。
+ */
+const HDR_BLOCK_ONLY = ["DV P5"];
+
+/**
  * 旧三态字段 → (白名单, 黑名单)。与后端 models._hdr_from_legacy 同一张表，
  * 属兼容层：存量规则组保存过一次后就带上新键了，旧键退休时这段一起删。
  */
@@ -665,6 +673,9 @@ export function RuleSetEditorDialog({
       setHdrBlock((prev) => prev.filter((v) => v !== value));
     }
   };
+
+  const toggleHdrBlock = (value: string) =>
+    setHdrBlock((prev) => (prev.includes(value) ? prev.filter((v) => v !== value) : [...prev, value]));
 
   /** 阶梯维度：交互与分辨率偏好完全一致——点击依次入列，序号即位次。
    *  最后一维不允许移除：空阶梯没有任何一位可比，后端会回落到缺省二元组，
@@ -1061,11 +1072,20 @@ export function RuleSetEditorDialog({
 
           <Field
             label="HDR"
-            hint='点一下 = 只要，再点 = 排除，第三下取消。"SDR" 指资源没标注任何 HDR 格式；都不选 = 不限'
+            hint='点一下 = 只要，再点 = 排除，第三下取消。"SDR" 指资源没标注任何 HDR 格式；"DV P5" 是只标了 DV、没有 HDR10 兼容层的杜比视界（转码会偏色），只能排除，点一下即排除；都不选 = 不限'
           >
             <div className="flex flex-wrap gap-1.5">
               {HDR_OPTIONS.map((value) => (
                 <TriChip key={value} state={hdrState(value)} onClick={() => cycleHdr(value)}>
+                  {value}
+                </TriChip>
+              ))}
+              {HDR_BLOCK_ONLY.map((value) => (
+                <TriChip
+                  key={value}
+                  state={hdrBlock.includes(value) ? "exclude" : "off"}
+                  onClick={() => toggleHdrBlock(value)}
+                >
                   {value}
                 </TriChip>
               ))}
