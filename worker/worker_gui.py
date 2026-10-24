@@ -467,7 +467,7 @@ class WorkerGUI:
             name=self.config.get("name"),
             concurrency=config["concurrency"],
             ac_only=config["ac_only"],
-            on_token=lambda token: save_config({**self.config, "token": token}),
+            on_token=self._remember_token,
             status_cb=self._on_runtime_event,
         )
         self.runtime = runtime
@@ -478,6 +478,15 @@ class WorkerGUI:
             target=self._run_runtime, args=(runtime,), daemon=True
         )
         self._start_thread.start()
+
+    def _remember_token(self, token: str) -> None:
+        """配对成功拿到令牌：写进配置文件，也同步进界面用的 self.config。
+
+        状态行的「已配对」、按钮是「断开并重新配置…」还是「重新配对」都看 self.config；
+        只写文件的话，本次运行里配对完按钮永远不出现，直到重启 GUI。
+        """
+        self.config["token"] = token
+        save_config(self.config)
 
     def _refuse_start(self, reason: str) -> None:
         """启动前校验不过：不启动，给出原因（窗口可能正收在托盘里，先唤出来）。"""

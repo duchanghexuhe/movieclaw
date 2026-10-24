@@ -170,6 +170,62 @@ def test_repair_drops_token_and_restarts_into_pairing(gui, monkeypatch):
     assert "token" not in json.loads(config_file.read_text())
 
 
+def test_pairing_token_counts_in_the_same_session(gui, monkeypatch):
+    """配对成功的令牌要当场生效：界面用的 self.config 也得拿到它。
+
+    否则本次运行里配对完「断开并重新配置…」按钮、「已配对」状态都不出现，
+    凭证被注销时「重新配对」也看不见，直到重启 GUI（2026-10-24 端到端实测）。
+    """
+    import worker_gui
+
+    app, config_file = gui
+    app.config = {"server": "http://nas:3000", "ffmpeg": "ffmpeg"}
+    app._sync_disconnect_button()
+    assert not _disconnect_shown(app), "没凭证就没有可断开的东西"
+
+    class PairingRuntime:
+        """配对成功：与 WorkerRuntime.ensure_token 一样，在 runtime 线程里回调 on_token。"""
+
+        def __init__(self, **kwargs):
+            self.on_token = kwargs["on_token"]
+            self.stop_event = threading.Event()
+            self.ac_only = False
+
+        def start(self):
+            self.on_token("fresh-token")
+            self.stop_event.wait(10)
+
+        def progress_view(self):
+            return []
+
+    monkeypatch.setattr(worker_gui, "WorkerRuntime", PairingRuntime)
+    monkeypatch.setattr(worker_gui, "check_ffmpeg", lambda path: None)
+
+    def saved_token() -> str | None:
+        try:
+            return json.loads(config_file.read_text()).get("token")
+        except (OSError, ValueError):
+            return None  # 正好在写：下一拍再读
+
+    app._start()
+    deadline = time.monotonic() + 5
+    while saved_token() != "fresh-token" and time.monotonic() < deadline:
+        app.root.update()
+        time.sleep(0.05)
+    assert saved_token() == "fresh-token"
+    assert app.config.get("token") == "fresh-token"
+
+    app._on_event("online", {"server": "http://nas:3000"})
+    app.root.update()
+    assert _disconnect_shown(app), "配对成功后这一次运行里就该看得见「断开并重新配置…」"
+    assert "已配对" in app._idle_text("已停止")
+
+    app._on_event("offline", dict(_AUTH_REJECTION))
+    app.root.update()
+    assert _disconnect_shown(app)
+    assert app.btn_disconnect.cget("text") == "重新配对"
+
+
 def test_manual_disconnect_revokes_and_stays_unpaired(gui, monkeypatch):
     """稳态「断开并重新配置…」：注销服务端凭证、清本机令牌，停在未配对不再自动重配。
 
