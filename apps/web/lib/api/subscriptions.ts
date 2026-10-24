@@ -1044,8 +1044,6 @@ export interface SmartPreferences {
   wait_seconds: number;
   allow_upgrade: boolean;
   strict_resolution: boolean;
-  /** 不要杜比视界 Profile 5：关着时服务端不写这个键，读到 undefined 就是关 */
-  avoid_dv_p5?: boolean;
 }
 export interface SmartProfile {
   kind: "movie" | "tv";
@@ -1081,8 +1079,6 @@ export interface SmartDefaults {
   source: SmartPreferences["source"];
   allow_upgrade: boolean;
   strict_resolution: boolean;
-  /** 不要杜比视界 Profile 5（只标 DV、没有 HDR10 兼容层，转码会偏色）；默认关 */
-  avoid_dv_p5: boolean;
   movie_wait_seconds: number;
   tv_wait_seconds: number;
 }

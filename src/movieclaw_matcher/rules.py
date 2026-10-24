@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from movieclaw_enrich.vocab import codec_family
 from movieclaw_matcher.decision import MEDIA_SOURCE_TIER_LABEL, media_source_rank
-from movieclaw_matcher.formats import DV_P5, FORMAT_LABELS, FORMAT_REASONS, matched_formats
+from movieclaw_matcher.formats import FORMAT_REASONS, matched_formats
 from movieclaw_matcher.models import (
     HrUnknownPolicy,
     RuleSetSpec,
@@ -51,14 +51,9 @@ def evaluate_rules(
     ``pack_episode_count``：整季包的体积按每集均摊评估，避免 40 集合集
     被"单集体积上限"误杀。
     """
-    from movieclaw_matcher.smart import SmartPolicy, eligible, format_blocked
+    from movieclaw_matcher.smart import SmartPolicy, eligible
 
     if isinstance(spec, SmartPolicy):
-        if format_blocked(candidate, spec):
-            return _reject(
-                "smart_format_blocked",
-                f"已按「不要{FORMAT_LABELS[DV_P5]}」跳过：该资源是{FORMAT_REASONS[DV_P5]}",
-            )
         accepted = eligible(candidate, spec)
         return RuleVerdict(
             accepted=accepted,

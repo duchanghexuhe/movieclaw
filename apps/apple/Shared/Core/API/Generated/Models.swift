@@ -12467,8 +12467,6 @@ nonisolated extension API {
         var source: String
         var allowUpgrade: Bool?
         var strictResolution: Bool?
-        /// 不要杜比视界 Profile 5（只标 DV、没有 HDR10 兼容层的 DV，转码会偏色）；不传=不变
-        var avoidDvP5: Bool?
         var movieWaitSeconds: Int
         var tvWaitSeconds: Int
 
@@ -12479,7 +12477,6 @@ nonisolated extension API {
             case source
             case allowUpgrade = "allow_upgrade"
             case strictResolution = "strict_resolution"
-            case avoidDvP5 = "avoid_dv_p5"
             case movieWaitSeconds = "movie_wait_seconds"
             case tvWaitSeconds = "tv_wait_seconds"
         }
@@ -12494,7 +12491,6 @@ nonisolated extension API {
         var source: String
         var allowUpgrade: Bool
         var strictResolution: Bool
-        var avoidDvP5: Bool?
         var movieWaitSeconds: Int
         var tvWaitSeconds: Int
 
@@ -12506,7 +12502,6 @@ nonisolated extension API {
             case source
             case allowUpgrade = "allow_upgrade"
             case strictResolution = "strict_resolution"
-            case avoidDvP5 = "avoid_dv_p5"
             case movieWaitSeconds = "movie_wait_seconds"
             case tvWaitSeconds = "tv_wait_seconds"
         }

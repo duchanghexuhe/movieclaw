@@ -1,12 +1,10 @@
-"""「不要杜比视界 Profile 5」的浏览器验收：真实页面 → 接口 → 临时数据库 → 真实匹配 → 详情。
+"""规则组「DV P5」芯片的浏览器验收：真实页面 → 接口 → 临时数据库 → 真实匹配 → 详情。
 
 按用户真实的使用顺序走一遍（docs/design/avoid-dv-p5.md）：
-1. 设置页「智能选择」：默认关；在「选择说明与最低要求」里勾上，保存后卡片写明
-   「不要杜比视界 Profile 5」；
-2. 设置页「自定义规则」：规则组的 HDR 一行多一个「DV P5」芯片，点一下排除、再点取消，
-   保存后落进规则；
-3. 订阅一部片：弹层的结论行写明「不要杜比视界 Profile 5」；站点先后出现 P5（只标 DV）和 P8
-   （DV + HDR10）：P5 被跳过且活动里说明原因，P8 被下载。
+1. 设置页「自定义规则」：规则组的 HDR 一行多一个「DV P5」芯片，点一下排除、再点取消，
+   保存后落进规则，重新打开仍是排除态；
+2. 用这个规则组订阅一部片；站点先后出现 P5（只标 DV）和 P8（DV + HDR10）：P5 被跳过且
+   订阅详情的「排查记录」写明原因，P8 被下载。
 
 外部元数据与下载器隔离（tests/e2e/_smart_memory_api_launcher.py），其余都是真实服务。
 """
@@ -27,7 +25,7 @@ pytestmark = pytest.mark.integration
 
 ADMIN = {"username": "p5-admin", "password": "isolated-test-only"}
 SHOTS = Path(os.environ.get("MC_SHOT_DIR", str(REPO / ".tmp-pytest" / "avoid-dv-p5-shots")))
-P5_NOTE = "已按「不要杜比视界 Profile 5」跳过"
+P5_NOTE = "规则排除 DV P5"
 
 
 def _stop(proc: subprocess.Popen) -> None:
@@ -94,7 +92,7 @@ def shot(page, name):
     page.screenshot(path=str(SHOTS / f"{name}.png"))
 
 
-def test_avoid_dv_p5_from_settings_to_skipped_release(stack, browser):
+def test_dv_p5_chip_from_rule_group_to_skipped_release(stack, browser):
     base, api = stack
     context = browser.new_context(viewport={"width": 1280, "height": 1000})
     assert context.request.post(f"{base}/api/v1/auth/bootstrap", data=ADMIN).status == 200
@@ -102,25 +100,8 @@ def test_avoid_dv_p5_from_settings_to_skipped_release(stack, browser):
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
 
-    def defaults():
-        return context.request.get(f"{base}/api/v1/subscriptions/smart-defaults").json()["data"]
-
-    # ---- 1 智能选择：默认关，勾上后保存 ------------------------------------
+    # ---- 1 自定义规则：HDR 一行的「DV P5」芯片，只在 不限 ↔ 排除 之间切 ----------
     page.goto(f"{base}/settings/subscription")
-    smart = page.get_by_role("tabpanel", name="智能选择", exact=True)
-    settings = smart.get_by_role("region", name="智能设置", exact=True)
-    settings.get_by_text("只需设置一次，电影和剧集都按它来。").wait_for()
-    settings.get_by_text("选择说明与最低要求").click()
-    switch = settings.get_by_label(re.compile("^不要杜比视界 Profile 5"))
-    assert not switch.is_checked(), "默认关：Apple TV 等能原样播 P5 的设备不该被替着拦"
-    shot(page, "01-switch-off-by-default")
-    switch.check()
-    settings.get_by_role("button", name="保存设置").click()
-    settings.get_by_text("不要杜比视界 Profile 5", exact=True).wait_for()
-    assert defaults()["avoid_dv_p5"] is True
-    shot(page, "02-switch-on-summary")
-
-    # ---- 2 自定义规则：HDR 一行的「DV P5」芯片，只在 不限 ↔ 排除 之间切 ----------
     page.get_by_role("tab", name="自定义规则", exact=True).click()
     rules = page.get_by_role("tabpanel", name="自定义规则", exact=True)
     rules.get_by_role("button", name="新建规则组", exact=True).click()
@@ -131,7 +112,7 @@ def test_avoid_dv_p5_from_settings_to_skipped_release(stack, browser):
     assert "✕" not in chip.inner_text()
     chip.click()
     assert "✕" in chip.inner_text(), "点一下就是排除（没有「只要 P5」这一档）"
-    shot(page, "03-rule-chip-excluded")
+    shot(page, "01-rule-chip-excluded")
     chip.click()
     assert "✕" not in chip.inner_text(), "再点取消"
     chip.click()
@@ -146,22 +127,16 @@ def test_avoid_dv_p5_from_settings_to_skipped_release(stack, browser):
     editor = page.get_by_role("dialog", name="编辑规则组「不要 DV P5」", exact=True)
     editor.get_by_role("button", name=re.compile("^画质")).click()
     assert "✕" in editor.get_by_role("button", name=re.compile(r"DV P5$")).inner_text()
+    shot(page, "02-rule-chip-reopened")
     editor.get_by_role("button", name="取消", exact=True).click()
 
-    # ---- 3 订阅一部片：结论行写明；P5 被跳过、P8 被下载 -----------------------
-    page.goto(f"{base}/media/movie/701")
-    page.get_by_role("button", name="订阅追踪").first.click()
-    card = page.get_by_role("region", name="智能选择")
-    card.get_by_text(re.compile("不要杜比视界 Profile 5")).wait_for()
-    shot(page, "04-subscribe-dialog-conclusion")
-    # 英语片要字幕：弹层按默认答案「要」走，下面的资源都声明了简中字幕
-    page.get_by_role("button", name="确认订阅", exact=True).last.click()
-    card.wait_for(state="detached")
-    rows = context.request.get(f"{base}/api/v1/subscriptions").json()["data"]
-    items = rows["items"] if isinstance(rows, dict) else rows
-    sub_id = next(s["id"] for s in items if s["media"]["tmdb_id"] == 701)
-    detail = context.request.get(f"{base}/api/v1/subscriptions/{sub_id}").json()["data"]
-    assert detail["smart_policy"]["avoid_dv_p5"] is True
+    # ---- 2 用这个规则组订阅；P5 被跳过、P8 被下载 ------------------------------
+    created = context.request.post(
+        f"{base}/api/v1/subscriptions",
+        data={"title_ref": "tmdb:movie:701", "rule_set_id": saved["id"]},
+    )
+    assert created.status == 200, created.text()
+    sub_id = created.json()["data"]["subscription"]["id"]
 
     p5 = context.request.post(
         f"{api}/__lab/release/movie/701?name=FLUXP5&subs=zh-Hans&hdr=DV&labels=中字,4k,DoVi"
@@ -177,5 +152,5 @@ def test_avoid_dv_p5_from_settings_to_skipped_release(stack, browser):
     # 拒绝原因记在「排查记录」里（默认折叠）：用户想知道「为什么没下它」时展开就能看到
     page.get_by_role("button", name=re.compile("^排查记录")).click()
     page.get_by_text(re.compile(P5_NOTE)).first.wait_for()
-    shot(page, "05-activity-says-why")
+    shot(page, "03-activity-says-why")
     assert not errors, errors

@@ -197,6 +197,9 @@ private val RESOLUTIONS = listOf("2160p", "1080p", "720p")
 private val SOURCES = listOf("remux" to "Remux", "blu-ray" to "蓝光", "web-dl" to "WEB-DL", "rip" to "Rip 类", "tv" to "电视录制类")
 private val CODECS = listOf("H.265" to listOf("x265", "H.265", "HEVC"), "H.264" to listOf("x264", "H.264", "AVC"), "AV1" to listOf("AV1"))
 private val HDRS = listOf("DV", "HDR10+", "HDR10", "HLG", "SDR")
+// 只能「排除」的 HDR 项：「DV P5」= 只标 DV、没有 HDR10 兼容层的杜比视界（Profile 5），转码会偏色。
+// 后端按命名约定与站点标记判定，「只要 P5」没有意义，所以不进三态循环。
+private val HDR_BLOCK_ONLY = listOf("DV P5")
 private val PLATFORMS = listOf(
     "netflix" to "Netflix", "disney_plus" to "Disney+", "amazon" to "Prime Video", "hbo_max" to "HBO Max",
     "apple_tv_plus" to "Apple TV+", "hulu" to "Hulu", "paramount_plus" to "Paramount+", "peacock" to "Peacock",
@@ -974,7 +977,11 @@ private fun RuleSetEditor(
             }
 
             SectionLabel("HDR（点一下「要」，再点「排除」，第三下取消；都不选 = 不限）")
-            TriChips(HDRS.map { it to it }, d.hdrAllow, d.hdrBlock) { v, state ->
+            Text(
+                "「DV P5」是只标了 DV、没有 HDR10 兼容层的杜比视界，转码会偏色；只能排除，点一下即排除。",
+                style = McType.caption, color = TextFaint, lineHeight = 16.sp,
+            )
+            TriChips((HDRS + HDR_BLOCK_ONLY).map { it to it }, d.hdrAllow, d.hdrBlock, blockOnly = HDR_BLOCK_ONLY) { v, state ->
                 d = when (state) {
                     1 -> d.copy(hdrAllow = d.hdrAllow + v, hdrBlock = d.hdrBlock - v)
                     2 -> d.copy(hdrAllow = d.hdrAllow - v, hdrBlock = d.hdrBlock + v)
@@ -1129,6 +1136,7 @@ private fun TriChips(
     options: List<Pair<String, String>>,
     allow: List<String>,
     block: List<String>,
+    blockOnly: List<String> = emptyList(),
     onChange: (String, Int) -> Unit,
 ) {
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1153,7 +1161,8 @@ private fun TriChips(
                             else -> Color.White.copy(alpha = 0.05f)
                         }
                     )
-                    .clickable { onChange(v, (state + 1) % 3) }
+                    // 只能排除的项在「不限 ↔ 排除」之间切，不经过「要」
+                    .clickable { onChange(v, if (v in blockOnly) (if (state == 2) 0 else 2) else (state + 1) % 3) }
                     .padding(horizontal = 9.dp, vertical = 4.dp),
             )
         }

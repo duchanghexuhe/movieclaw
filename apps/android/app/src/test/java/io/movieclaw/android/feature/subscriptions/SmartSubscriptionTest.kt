@@ -2,8 +2,6 @@ package io.movieclaw.android.feature.subscriptions
 
 import io.movieclaw.android.core.model.MediaBrief
 import io.movieclaw.android.core.model.PrepareView
-import io.movieclaw.android.core.model.SmartDefaultsPayload
-import io.movieclaw.android.core.model.SmartDefaultsView
 import io.movieclaw.android.core.model.SmartPlanView
 import io.movieclaw.android.core.model.SmartQuestionView
 import io.movieclaw.android.core.model.SmartScopeOptionView
@@ -101,19 +99,5 @@ class SmartSubscriptionTest {
         val shanghai = java.time.ZoneId.of("Asia/Shanghai")
         assertEquals("10-22 07:37", localTimeText("2026-10-21T23:37:00", shanghai))
         assertEquals("10-22 07:37", localTimeText("2026-10-21T23:37:00+00:00", shanghai))
-    }
-
-    @Test
-    fun avoidDvP5IsOptionalOnTheWire() {
-        // 与应用里 NetworkModule.json() 同一套配置
-        val json = Json { ignoreUnknownKeys = true; explicitNulls = false; coerceInputValues = true; namingStrategy = JsonNamingStrategy.SnakeCase; encodeDefaults = true }
-        val base = """{"configured":true,"movie_revision":1,"tv_revision":1,"resolution":"2160p","source":"web-dl","allow_upgrade":true,"strict_resolution":false,"movie_wait_seconds":86400,"tv_wait_seconds":10800"""
-        // 旧服务端没有这个字段：读得出来，界面据此不显示开关
-        assertNull(json.decodeFromString(SmartDefaultsView.serializer(), "$base}").avoidDvP5)
-        assertEquals(true, json.decodeFromString(SmartDefaultsView.serializer(), "$base,\"avoid_dv_p5\":true}").avoidDvP5)
-        val untouched = SmartDefaultsPayload(1, 1, "2160p", "web-dl", true, false, avoidDvP5 = null, movieWaitSeconds = 86400, tvWaitSeconds = 10800)
-        assertFalse(json.encodeToString(SmartDefaultsPayload.serializer(), untouched).contains("avoid_dv_p5"))
-        val on = json.encodeToString(SmartDefaultsPayload.serializer(), untouched.copy(avoidDvP5 = true))
-        assertTrue(on, on.contains("\"avoid_dv_p5\":true"))
     }
 }

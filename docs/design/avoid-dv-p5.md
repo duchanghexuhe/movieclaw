@@ -1,6 +1,7 @@
 # 不要杜比视界 Profile 5
 
-状态：**已实现**（2026-10-23）。判定在 `movieclaw_matcher/formats.py`，两个入口见 §3。
+状态：**已实现**（2026-10-23；2026-10-24 按评审收窄为只有规则组一个入口）。判定在
+`movieclaw_matcher/formats.py`，入口见 §3。
 
 ## 0. 问题与结论
 
@@ -8,20 +9,21 @@
 （本机核显、网页端）会把画面转得偏绿偏紫，只能交给能处理杜比视界的转码器。P8 / P7 自带
 HDR10 基础层，不支持杜比视界的屏幕放基础层就行，没有这个问题。
 
-现状的两个缺口：
+现状的缺口：规则组的 HDR 黑名单能拦 `DV`，但是整类——P8 / P7 一起被拦。
 
-- 规则组的 HDR 黑名单能拦 `DV`，但是整类——P8 / P7 一起被拦；
-- 智能选择完全不看 HDR（`eligible` 只看分辨率与片源），做种最多的 P5 就会被选中。
-
-**结论：把 P5 单列成「不要的格式」，一套判定、两个入口。**
+**结论：把 P5 单列成规则组 HDR 黑名单里的一个值。**
 
 | 入口 | 位置 | 默认 |
 |---|---|---|
 | 规则组 | HDR 一行多一个「DV P5」芯片，只能排除（点一下排除、再点取消） | 不选 = 不限 |
-| 智能选择 | 智能设置「选择说明与最低要求」里一个开关「不要杜比视界 Profile 5」 | 关 |
 
-默认都关：Apple TV、iPhone 等能原样播放 P5 的设备上，它反而是最好的版本，不能替用户拦。
-一个订阅要么走智能、要么走规则组（数据库约束 `ck_subscription_selection_mode`），所以两处都要有。
+默认不选：Apple TV、iPhone 等能原样播放 P5 的设备上，它反而是最好的版本，不能替用户拦。
+规则组本来就是给懂行用户的高级能力，加一个只能排除的芯片不增加任何必经的选项。
+
+**智能选择不加开关**（评审意见）：智能订阅的用户不该为了做决定先弄懂 Profile 5 与转码，智能订阅
+保持干净、「把复杂留给产品」。后续方向是由产品自动判断——看有没有能处理杜比视界的转码器、常用
+播放设备能不能直放 P5，自动降低 P5 的优先级（不是硬拦），用户无需设置；`is_dv_p5` 与
+`attrs.site_labels` 就是为那一步留的底子，本 PR 不做。
 
 ## 1. 站点能给什么（2026-10-23 实测）
 
@@ -62,27 +64,23 @@ HDR10 基础层，不支持杜比视界的屏幕放基础层就行，没有这�
 
 ## 3. 入口
 
-- **规则组**：`hdr_block` 认 `DV P5`（也认 `DV-P5` / `DV_P5`）；写进白名单 `hdr_levels` 会被当未知值丢掉
-  并留一条日志。命中时拒绝原因是 `hdr_blocked` +「规则排除 …，该资源是只标了 DV、没有 HDR10 兼容层的杜比视界
-  （Profile 5），转码会偏色」。与「只要 DV」叠加 = 只要带 HDR10 兼容层的杜比视界。
-- **智能选择**：`SmartPreferences.avoid_dv_p5`，和 `strict_resolution` 一样属于「最低要求」，电影和剧集共用。
-  命中时拒绝原因是 `smart_format_blocked`「已按「不要杜比视界 Profile 5」跳过：…」，记在订阅的「排查记录」里；
-  订阅弹层的结论行（`wait_label`）写明「不要杜比视界 Profile 5」；设置变更时在等的订阅立刻跟随并写一条活动。
+**规则组**：`hdr_block` 认 `DV P5`（也认 `DV-P5` / `DV_P5`）；写进白名单 `hdr_levels` 会被当未知值丢掉
+并留一条日志。命中时拒绝原因是 `hdr_blocked` +「规则排除 …，该资源是只标了 DV、没有 HDR10 兼容层的杜比视界
+（Profile 5），转码会偏色」，记在订阅详情的「排查记录」里。与「只要 DV」叠加 = 只要带 HDR10 兼容层的杜比视界。
+芯片在 Web / iOS / Android / 鸿蒙 / 桌面的规则组编辑器里（Android 的编辑器是 `RuleSetsScreen.kt`）。
 
 ## 4. 兼容
 
-- **旧客户端不能把它改回关**：`PUT /subscriptions/smart-defaults` 的 `avoid_dv_p5` 不传 = 不变；
-  按类型的旧接口 `PUT /smart-profiles/{kind}` 没带这个键时沿用现值。
-- **新客户端连旧服务器**：`SmartDefaultsView.avoid_dv_p5` 声明为可选，旧服务器没有这个字段也读得出设置，
-  界面据此不显示开关、保存时不带。
-- **回退旧版本**：`SmartPreferences` 禁止多余字段，所以开关关着时**不写这个键**（自定义序列化器），
-  没开过开关的人读到的设置与升级前逐字相同；存量订阅的冻结策略也不会因多出一个恒为 false 的键被判成
-  「策略变了」而各刷一条活动。规则组的 `hdr_block` 读取对未知值宽容，旧版本直接忽略 `DV P5`。
+- 规则组 spec 里多一个 `hdr_block` 取值：读取对未知值宽容，回退到旧版本时旧版直接忽略 `DV P5`
+  （旧三态读到的是「不限」），没有迁移。
 - `attrs.site_labels` 是新增的可选键，旧版本读 attrs 时忽略；`TorrentListItem.labels` 标了 `exclude`，
-  搜索结果等接口的输出契约不变。
+  搜索结果的条目输出字段不变（只多 `attrs.site_labels`）。
+- 站点标记不是提取逻辑，没有 bump `ENRICH_VERSION`，部署后不会触发整库重算；存量重算
+  （`enrich_backfill`）会从旧 attrs 把站点标记带回去，不会抹掉。
 
 ## 5. 没做的
 
+- **智能选择里的开关 / 自动降优先级**：见 §0，由产品后续自动判断。
 - **入库后 ffprobe 兜底**：标题与站点标记都漏掉的 P5 下完才知道，现在只在媒体库里看得到 `dv_profile`，
   不会自动换版本（换版本涉及下载器清理与做种保护，单独设计）。
 - **MediaInfo 确认**：见 §1，M-Team 不需要；没有站点标记的 NexusPHP 系将来再说。
@@ -95,11 +93,8 @@ HDR10 基础层，不支持杜比视界的屏幕放基础层就行，没有这�
 | 场景 | 位置 |
 |---|---|
 | 判定：15 个真实样本 × 三种证据（只看标题 / 标题 + 站点标记 / 只看站点标记）+ 边界表 | `tests/matcher/test_formats.py` |
-| 规则组：拦 P5、放 P8、与 DV 白名单叠加、写法归一、旧版回退 | `tests/matcher/test_rules.py` |
-| 智能：做种最多的 P5 也被跳过、关着时逐字不变、序列化只在开着时带键 | `tests/matcher/test_smart.py` |
+| 规则组：拦 P5、放 P8、与 DV 白名单叠加、写法归一、旧版回退、站点标记纠正与补缺 | `tests/matcher/test_rules.py` |
 | M-Team 列表解析 `labelsNew` | `tests/tracker/unit/test_mteam_labels.py` |
-| 存量重算带回站点标记 | `tests/enrich/test_backfill.py` |
-| 真实匹配链路：智能 / 规则组 / 站点标记纠正与补缺 / 同步管线落库 | `tests/api/test_avoid_dv_p5.py` |
-| 接口：旧客户端不改回关、按类型旧接口、冻结与跟随 | `tests/api/test_avoid_dv_p5_routes.py` |
-| 浏览器：设置页开关、规则组芯片、订阅弹层结论行、被跳过的原因 | `tests/e2e/test_avoid_dv_p5_browser.py` |
-| iOS 线上契约（字段可选） / Android JSON 往返 | `SmartSubscriptionTests.swift` / `SmartSubscriptionTest.kt` |
+| 存量重算带回站点标记；搜索结果带 `attrs.site_labels` | `tests/enrich/test_backfill.py`、`tests/api/test_search.py` |
+| 真实匹配链路：规则组跳过 P5 下 P8、对照组、只有 P5 时等待、站点标记纠正与补缺、同步管线落库 | `tests/api/test_avoid_dv_p5.py` |
+| 浏览器：规则组芯片点选与回显、被跳过的原因出现在「排查记录」 | `tests/e2e/test_avoid_dv_p5_browser.py` |

@@ -1,4 +1,4 @@
-"""「不要杜比视界 Profile 5」在真实匹配链路里的行为：被动匹配 → 规则/智能判定 → 投递。
+"""规则组「DV P5」在真实匹配链路里的行为：被动匹配 → 规则判定 → 投递。
 
 发布名与站点标记取自真实 M-Team 种子（docs/design/avoid-dv-p5.md）：WEB 源只标 DV 的是
 Profile 5，DV + HDR 的是 Profile 8。链路是真的（真库、真迁移、真匹配与选优），只有下载器
@@ -24,11 +24,9 @@ from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
 from movieclaw_api.services.subscription import SubscriptionService
 from movieclaw_api.services.subscription.matching import evaluate_and_dispatch
-from movieclaw_api.services.subscription.smart_profiles import save_defaults
 from movieclaw_api.services.torrent_sync import _to_observation
 from movieclaw_db.models import SiteTorrent, WantedStatus
 from movieclaw_db.models.base import utcnow
-from movieclaw_matcher.smart import SmartPreferences
 from movieclaw_media.models import MediaKind
 from movieclaw_tracker.models import TorrentListItem
 
@@ -37,19 +35,13 @@ def _service(session) -> SubscriptionService:
     return SubscriptionService(session, MediaLibraryService(session, _fake_tmdb(ROUTES)))
 
 
-async def _smart_movie(session, *, avoid: bool):
-    """智能订阅一部英语片（701）；等待上限设为 0，匹配到合格候选就下，省掉观察期。"""
-    await save_defaults(
-        session,
-        SmartPreferences(avoid_dv_p5=avoid),
-        movie_wait_seconds=0,
-        tv_wait_seconds=0,
-        movie_revision=0,
-        tv_revision=0,
+async def _movie_with_rule(session, *, hdr_block: list[str]):
+    """用一个 2160p 规则组订阅一部英语片（701）；``hdr_block`` 是 HDR 黑名单。"""
+    rule = await RuleSetService(session).create(
+        "不要 DV P5" if hdr_block else "只要 2160p",
+        {"resolutions": ["2160p"], "hdr_block": hdr_block},
     )
-    return await _service(session).create(
-        MediaKind.MOVIE, 701, selection_mode="smart", smart_profile_revision=1
-    )
+    return await _service(session).create(MediaKind.MOVIE, 701, rule_set_id=rule.id)
 
 
 async def _release(session, group, tags, *, seeders, labels=()):
@@ -72,89 +64,66 @@ async def _release(session, group, tags, *, seeders, labels=()):
     )
 
 
-async def test_smart_skips_p5_even_with_the_most_seeders_and_takes_the_p8(db):
+async def test_rule_group_skips_p5_even_with_the_most_seeders_and_takes_the_p8(db):
     async with db.session() as session:
-        sub = await _smart_movie(session, avoid=True)
-        assert sub.smart_policy["avoid_dv_p5"] is True
+        sub = await _movie_with_rule(session, hdr_block=["DV P5"])
         p5 = await _release(session, "FLUXP5", ["DV"], seeders=500)
         p8 = await _release(session, "BYNDRP8", ["DV", "HDR10"], seeders=5)
-        result = await evaluate_and_dispatch(session, [p5, p8], source="test")
+        result = await evaluate_and_dispatch(session, [p5, p8], source="被动匹配")
         assert result.dispatched_units == 1
         assert [t for t in result.dispatched_torrents if "BYNDRP8" in t]
         assert not [t for t in result.dispatched_torrents if "FLUXP5" in t]
         # 为什么没下 P5：活动流水里有一条说得明白的拒绝（每个候选只记一次）
         rejected = [a for a in await _activities(session, sub.id) if a.type == "match_rejected"]
         assert len(rejected) == 1
-        assert rejected[0].payload["reason_code"] == "smart_format_blocked"
-        assert "已按「不要杜比视界 Profile 5」跳过" in rejected[0].message
+        assert rejected[0].payload["reason_code"] == "hdr_blocked"
+        assert "DV P5" in rejected[0].message and "Profile 5" in rejected[0].message
 
 
-async def test_smart_default_off_still_takes_the_p5_when_it_has_the_most_seeders(db):
-    """对照组：开关默认关，行为与以前完全一样——Apple TV 这类能原样播 P5 的人不受影响。"""
+async def test_rule_group_without_the_chip_still_takes_the_p5_when_it_has_the_most_seeders(db):
+    """对照组：黑名单里没有「DV P5」，行为与以前完全一样——能原样播 P5 的人不受影响。"""
     async with db.session() as session:
-        sub = await _smart_movie(session, avoid=False)
-        assert "avoid_dv_p5" not in sub.smart_policy
+        await _movie_with_rule(session, hdr_block=[])
         p5 = await _release(session, "FLUXP5", ["DV"], seeders=500)
         p8 = await _release(session, "BYNDRP8", ["DV", "HDR10"], seeders=5)
-        result = await evaluate_and_dispatch(session, [p5, p8], source="test")
+        result = await evaluate_and_dispatch(session, [p5, p8], source="被动匹配")
         assert [t for t in result.dispatched_torrents if "FLUXP5" in t]
 
 
-async def test_smart_with_only_p5_waits_and_a_p8_arriving_later_is_taken(db):
+async def test_rule_group_with_only_p5_waits_and_a_p8_arriving_later_is_taken(db):
     async with db.session() as session:
-        sub = await _smart_movie(session, avoid=True)
+        sub = await _movie_with_rule(session, hdr_block=["DV P5"])
         p5 = await _release(session, "FLUXP5", ["DV"], seeders=500)
-        result = await evaluate_and_dispatch(session, [p5], source="test")
+        result = await evaluate_and_dispatch(session, [p5], source="被动匹配")
         assert result.dispatched_units == 0
         wanted = (await _wanted_map(session, sub.id))[(0, 0)]
         assert wanted.status == WantedStatus.WANTED
         rejected = [a for a in await _activities(session, sub.id) if a.type == "match_rejected"]
-        assert [a.payload["reason_code"] for a in rejected] == ["smart_format_blocked"]
+        assert [a.payload["reason_code"] for a in rejected] == ["hdr_blocked"]
         p8 = await _release(session, "BYNDRP8", ["DV", "HDR10"], seeders=5)
-        later = await evaluate_and_dispatch(session, [p8], source="test")
+        later = await evaluate_and_dispatch(session, [p8], source="被动匹配")
         assert [t for t in later.dispatched_torrents if "BYNDRP8" in t]
 
 
 async def test_site_labels_decide_when_the_title_alone_would_mislead(db):
     async with db.session() as session:
-        await _smart_movie(session, avoid=True)
+        await _movie_with_rule(session, hdr_block=["DV P5"])
         # 标题只写 DV，站点却标了 hdr10：其实带 HDR10 兼容层，不该被拦
         looks_like_p5 = await _release(
             session, "MISLABELED", ["DV"], seeders=50, labels=["中字", "4k", "hdr10", "DoVi"]
         )
-        result = await evaluate_and_dispatch(session, [looks_like_p5], source="test")
+        result = await evaluate_and_dispatch(session, [looks_like_p5], source="被动匹配")
         assert [t for t in result.dispatched_torrents if "MISLABELED" in t]
 
 
 async def test_site_labels_catch_a_p5_the_title_never_mentions(db):
     async with db.session() as session:
-        sub = await _smart_movie(session, avoid=True)
+        await _movie_with_rule(session, hdr_block=["DV P5"])
         silent = await _release(session, "SILENT", [], seeders=50, labels=["中字", "4k", "DoVi"])
         plain = await _release(session, "PLAIN", [], seeders=1)
-        result = await evaluate_and_dispatch(session, [silent, plain], source="test")
+        result = await evaluate_and_dispatch(session, [silent, plain], source="被动匹配")
         assert [t for t in result.dispatched_torrents if "PLAIN" in t]
         assert not [t for t in result.dispatched_torrents if "SILENT" in t]
-        assert sub.id is not None
-
-
-async def test_rule_group_with_dv_p5_chip_rejects_p5_with_a_readable_reason(db):
-    async with db.session() as session:
-        rule = await RuleSetService(session).create(
-            "不要 DV P5", {"resolutions": ["2160p"], "hdr_block": ["DV P5"]}
-        )
-        assert rule.spec["hdr_block"] == ["DV P5"]
-        sub = await _service(session).create(MediaKind.MOVIE, 701, rule_set_id=rule.id)
-        p5 = await _release(session, "FLUXP5", ["DV"], seeders=500)
-        result = await evaluate_and_dispatch(session, [p5], source="被动匹配")
-        assert result.dispatched_units == 0
-        rejected = [a for a in await _activities(session, sub.id) if a.type == "match_rejected"]
-        assert len(rejected) == 1
-        assert rejected[0].payload["reason_code"] == "hdr_blocked"
-        assert "Profile 5" in rejected[0].message
-
-        p8 = await _release(session, "BYNDRP8", ["DV", "HDR10"], seeders=5)
-        later = await evaluate_and_dispatch(session, [p8], source="被动匹配")
-        assert [t for t in later.dispatched_torrents if "BYNDRP8" in t]
 
 
 async def test_site_labels_survive_the_sync_pipeline_into_the_index(db):

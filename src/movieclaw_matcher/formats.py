@@ -31,7 +31,7 @@ from collections.abc import Collection
 
 from movieclaw_enrich.models import TorrentAttrs
 
-# 规则组 HDR 黑名单里的取值（也是智能设置开关在日志/文案里的名字）
+# 规则组 HDR 黑名单里的取值
 DV_P5 = "DV P5"
 
 # 「有 HDR10 兼容层」的标记：标题里出现任何一个，或站点标记里出现任何一个，都说明这份 DV 不是单层
@@ -40,8 +40,7 @@ _FALLBACK_LABELS = frozenset({"hdr10", "hdr10+", "hdr", "hlg", "hdrvi"})
 # 只有流媒体源才有 P5
 _WEB_SOURCES = frozenset({"web-dl", "webrip"})
 
-#: 展示名与拒绝原因：整句进活动流水，用户一眼看懂「为什么没下这一份」
-FORMAT_LABELS: dict[str, str] = {DV_P5: "杜比视界 Profile 5"}
+#: 拒绝原因：整句进活动流水，用户一眼看懂「为什么没下这一份」
 FORMAT_REASONS: dict[str, str] = {
     DV_P5: "只标了 DV、没有 HDR10 兼容层的杜比视界（Profile 5），转码会偏色",
 }
