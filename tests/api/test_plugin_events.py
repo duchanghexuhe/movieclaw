@@ -185,10 +185,11 @@ def test_package_events_and_notifications_from_install_to_uninstall(data_dir) ->
             "会发通知：站点配额超限",
             "发给事件里的那个成员；收不收在「账号 → 通知」里开",
         ) in adds
-        # 每条事件 / 通知行都带自己的去处，前端逐行给「查看」（webhook 订它 / 通知设置收不收）
+        # 每条事件 / 通知行都带自己的去处，前端逐行给「查看」（webhook 订它 / 通知设置收不收）；
+        # 通知行还带 ?event=<事件名>，「账号 → 通知」据此直达这条开关
         assert [
             a["href"] for a in detail.json()["data"]["adds"] if a["kind"] == "notification"
-        ] == ["/settings/notifications"]
+        ] == ["/settings/notifications?event=acme-pkg.quota.exceeded"]
         assert [a["href"] for a in detail.json()["data"]["adds"] if a["kind"] == "event"] == [
             "/settings/webhook"
         ]
