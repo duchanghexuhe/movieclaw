@@ -1384,6 +1384,17 @@ class JobDispatcher:
             job = await self._load_owned(session, job_id, lease_token)
             if job is None:
                 return
+            if job.cancel_requested_at is not None:
+                # 取消优先：取消请求可能落在「已领取、处理器还没走到安全点」的窗口里
+                # （handler 解析、定义版本检查、刚起步）。这里若照常写 BLOCKED / FAILED，
+                # 用户点过的取消就丢了，任务还会一直占着去重键与资源锁。
+                await self._set_cancelled(session, job)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                await self._release_locks(session, job_id)
+                await session.commit()
+                await notify_job_change()
+                return
             now = utcnow()
             job.status = status
             job.error = exc.as_error()
@@ -1407,6 +1418,15 @@ class JobDispatcher:
         async with db.session() as session:
             job = await self._load_owned(session, job_id, lease_token)
             if job is None:
+                return
+            if job.cancel_requested_at is not None:
+                # 取消优先（同 _finish_controlled）：已请求取消的任务不该再排一次重试
+                await self._set_cancelled(session, job)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                await self._release_locks(session, job_id)
+                await session.commit()
+                await notify_job_change()
                 return
             if job.attempt >= job.max_attempts:
                 terminal = JobFailed(
@@ -1443,6 +1463,15 @@ class JobDispatcher:
         async with db.session() as session:
             job = await self._load_owned(session, job_id, lease_token)
             if job is None:
+                return
+            if job.cancel_requested_at is not None:
+                # 取消优先（同 _finish_controlled）
+                await self._set_cancelled(session, job)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                await self._release_locks(session, job_id)
+                await session.commit()
+                await notify_job_change()
                 return
             if job.attempt < job.max_attempts:
                 job.status = JobStatus.RETRY_WAIT

@@ -60,6 +60,8 @@ from movieclaw_api.services.playback.limits import (
 )
 from movieclaw_api.services.playback.remote_config import effective_remote_transcode_config
 from movieclaw_api.services.playback.remote_worker import (
+    any_remote_worker_busy,
+    remote_backends_available,
     remote_worker_available,
     remote_worker_busy,
     remote_workers_have_encoder,
@@ -317,8 +319,8 @@ async def _execution(
             plan,
             available=backends,
             local_backends=local,
-            remote_video_available=remote_worker_available(
-                "videotoolbox", segment_type(plan), strict=True
+            remote_video_available=bool(
+                remote_backends_available(segment_type(plan), strict=True)
             ),
         )
         if backend is not None:
@@ -328,7 +330,7 @@ async def _execution(
                 plan = replace(plan, video=replace(plan.video, codec="hevc"))
             return _Execution(plan, backend, remote)
         if (
-            remote_worker_busy("videotoolbox")
+            any_remote_worker_busy()
             or plan.video.tone_map
             or not policy.software_transcode_enabled
         ):

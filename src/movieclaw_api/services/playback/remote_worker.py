@@ -25,7 +25,11 @@ from typing import Any
 
 from starlette.websockets import WebSocket
 
-from movieclaw_api.services.playback.ffmpeg_args import WorkerVideoCaps
+from movieclaw_api.services.playback.ffmpeg_args import (
+    HW_BACKENDS,
+    WorkerVideoCaps,
+    effective_hw_backend,
+)
 from movieclaw_api.services.playback.remote_config import (
     RemoteTranscodeRuntimeConfig,
     remote_transcode_issues,
@@ -42,7 +46,12 @@ WORKER_IDLE_TIMEOUT_S = 45.0
 JOB_ACCEPT_TIMEOUT_S = 8.0
 LOAD_TIMEOUT_S = 15.0
 _WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-_SUPPORTED_BACKENDS = frozenset({"videotoolbox"})
+#: 远程 Worker 允许申报的硬件后端，按派单优先级排：videotoolbox（Mac）在前，nvenc
+#: （Windows 的 CUDA 链）其次。hello 里申报其他名字一律丢弃。**远程后端名单只在这里**：
+#: 播放决策、会话层的起步失败切远程、离线导出、Jellyfin 兼容层都从这里取。再加一种
+#: 后端 = 在这里加名字，并给那条命令链做真片矩阵（docs/design/remote-transcode.md §7）。
+REMOTE_BACKENDS: tuple[str, ...] = ("videotoolbox", "nvenc")
+_SUPPORTED_BACKENDS = frozenset(REMOTE_BACKENDS)
 #: HLS 分片类型，取值同 ffmpeg ``-hls_segment_type``（见 ffmpeg_args.segment_type）。
 _SUPPORTED_SEGMENT_TYPES = frozenset({"fmp4", "mpegts"})
 #: 没申报 ``hw_decoders`` 的旧版 Worker 只按这两种算能硬解：所有支持的 Apple 芯片
@@ -342,6 +351,19 @@ class RemoteWorkerRegistry:
                 return None
             return next(iter(sorted(connection.jobs & self._preemptible_jobs)), None)
 
+    def any_worker_can_run(self, plan: PlaybackPlan, backend: str) -> bool:
+        """在线 Worker 里有没有一台按**它自己申报的能力**装得出这条计划的硬件链。
+
+        不能拿 NAS 本机的自检结论代答：同名后端在两边是两块硬件、两个 ffmpeg 构建
+        （NAS 插着 NVIDIA 卡、远程也是 Windows NVENC）。"""
+        with self._lock:
+            caps = [
+                connection.capabilities.video_caps
+                for connection in self._workers.values()
+                if backend in connection.capabilities.backends and self._is_fresh(connection)
+            ]
+        return any(effective_hw_backend(plan, backend, item) is not None for item in caps)
+
     def has_busy_worker(self, backend: str = "videotoolbox") -> bool:
         """有能执行这个后端的 Worker 在线，只是任务名额都占满了（正在排空的不算）。
 
@@ -484,15 +506,15 @@ class RemoteWorkerRegistry:
             if connection is None:
                 if disc and self._select_worker(backend, segment_type) is not None:
                     raise RemoteWorkerUnavailable(
-                        "在线的 Worker 版本过旧，不支持原盘，"
-                        "请把 MovieClaw 转码器更新到与服务端相同的版本"
+                        "在线的 Worker 版本过旧或不支持原盘（Windows 转码器不读原盘；"
+                        "Mac 转码器请更新到与服务端相同的版本）"
                     )
                 if segment_type != "fmp4" and self._select_worker(backend) is not None:
                     raise RemoteWorkerUnavailable(
-                        f"在线的 Worker 版本过旧，不支持 {segment_type} 分片，"
-                        "请把 MovieClaw 转码器更新到与服务端相同的版本"
+                        f"在线的 Worker 版本过旧或不支持 {segment_type} 分片（Windows 转码器不接"
+                        " TS 分片；Mac 转码器请更新到与服务端相同的版本）"
                     )
-                raise RemoteWorkerUnavailable("没有在线且空闲的 Apple VideoToolbox Worker")
+                raise RemoteWorkerUnavailable(f"没有在线且空闲的远程转码 Worker（{backend}）")
             self._job_workers[job_id] = connection.worker_id
             self._job_attempts[job_id] = (
                 attempt_id if isinstance(attempt_id, str) and attempt_id else job_id
@@ -905,8 +927,8 @@ class RemoteWorkerRegistry:
         encoders = tuple(
             item for item in raw.get("encoders", []) if isinstance(item, str)
         )
-        if "videotoolbox" in backends and "h264_videotoolbox" not in encoders:
-            backends = tuple(item for item in backends if item != "videotoolbox")
+        # 申报了后端却没有它的 H.264 编码器：这条链装不起来，当没申报
+        backends = tuple(item for item in backends if HW_BACKENDS[item].encoder in encoders)
         try:
             max_jobs = max(1, min(4, int(raw.get("max_jobs", 1))))
         except (TypeError, ValueError):
@@ -923,6 +945,7 @@ class RemoteWorkerRegistry:
                 return None
             return tuple(item for item in value if isinstance(item, str) and item)
 
+        declared_decoders = names("hw_decoders")
         return WorkerCapabilities(
             backends=backends,
             encoders=encoders,
@@ -935,7 +958,8 @@ class RemoteWorkerRegistry:
             # 没声明（旧版 Worker）按只会 fMP4 处理，见字段注释
             segment_types=segment_types or ("fmp4",),
             disc_sources=raw.get("disc_sources") is True,
-            hw_decoders=names("hw_decoders") or _DEFAULT_HW_DECODERS,
+            # 声明了空列表 = 这块显卡什么都硬解不了（NAS 整段软解）；没声明才是旧版 Worker
+            hw_decoders=_DEFAULT_HW_DECODERS if declared_decoders is None else declared_decoders,
             filters=names("filters") or (),
             progressive_segments=raw.get("progressive_segments") is True,
             read_options=names("read_options") or (),
@@ -1003,6 +1027,28 @@ def remote_worker_available(
 
     离线导出占着的槽位对播放算空闲（播放来了它让路）；``strict`` 只认真正空着的。"""
     return _registry.has_capable_worker(backend, segment_type, disc=disc, strict=strict)
+
+
+def remote_backends_available(
+    segment_type: str = "fmp4", *, disc: bool = False, strict: bool = False
+) -> tuple[str, ...]:
+    """有在线且有空闲名额的 Worker 的远程后端，按 ``REMOTE_BACKENDS`` 的优先级。参数同
+    ``remote_worker_available``。"""
+    return tuple(
+        backend
+        for backend in REMOTE_BACKENDS
+        if remote_worker_available(backend, segment_type, disc=disc, strict=strict)
+    )
+
+
+def remote_backend_can_run(plan: PlaybackPlan, backend: str) -> bool:
+    """有在线 Worker 按它申报的能力装得出这条计划的硬件链（见 ``any_worker_can_run``）。"""
+    return _registry.any_worker_can_run(plan, backend)
+
+
+def any_remote_worker_busy() -> bool:
+    """任一远程后端在线但名额全满（见 ``RemoteWorkerRegistry.has_busy_worker``）。"""
+    return any(remote_worker_busy(backend) for backend in REMOTE_BACKENDS)
 
 
 def remote_workers_have_encoder(encoder: str, backend: str = "videotoolbox") -> bool:

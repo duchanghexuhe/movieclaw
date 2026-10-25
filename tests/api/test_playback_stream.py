@@ -309,7 +309,18 @@ def test_decide_route_forwards_all_playback_preferences(client, tmp_path, monkey
     assert unit_call["max_height"] == 480
 
 
-def test_execution_backend_uses_remote_when_local_backend_is_incompatible():
+@pytest.fixture
+def remote_workers_run_any_plan(monkeypatch):
+    """决策层单测不连真 Worker：在线的远程后端都当作装得出这条链。远程能不能装由接单
+    Worker 自己的申报决定（``remote_backend_can_run``，见 test_executor_isolation.py）。"""
+    monkeypatch.setattr(
+        routes_playback.playback_plan, "remote_backend_can_run", lambda _plan, _backend: True
+    )
+
+
+def test_execution_backend_uses_remote_when_local_backend_is_incompatible(
+    remote_workers_run_any_plan,
+):
     """PGS 烧录不能因 VAAPI 排在首位而错过可用的远程 VideoToolbox。"""
     decision = PlaybackPlan(
         tier=PlaybackTier.HARDWARE_TRANSCODE,
@@ -383,7 +394,9 @@ def test_prefer_hevc_output_needs_every_condition(monkeypatch):
     assert codec(prefer(_hw_plan(), hevc_client, "videotoolbox", remote=True)) == "h264"
 
 
-def test_profile_5_transcode_prefers_a_transcoder_whose_tonemap_reads_the_rpu():
+def test_profile_5_transcode_prefers_a_transcoder_whose_tonemap_reads_the_rpu(
+    remote_workers_run_any_plan,
+):
     """P5 的 IPT 基础层要吃 RPU：VAAPI 的映射不认、出来整片发紫，Mac 转码器在线就交给它；
     不在线时照旧用本机（与原来相同）。不是 P5 的不受影响"""
     def p5(dolby_vision):
@@ -455,7 +468,7 @@ def test_profile_5_session_on_a_local_gpu_tells_the_user_why_the_colors_are_off(
     monkeypatch.setattr(hwprobe, "available_backends", backends)
     monkeypatch.setattr(routes_playback, "available_backends", backends)
     monkeypatch.setattr(routes_playback, "available_local_backends", backends)
-    monkeypatch.setattr(routes_playback, "remote_worker_available", lambda *_a, **_k: False)
+    monkeypatch.setattr(routes_playback, "remote_backends_available", lambda *_a, **_k: ())
     monkeypatch.setattr(plan_mod, "hardware_available", lambda: True)
     p5 = seed(
         client, tmp_path, container="mkv", codec="hevc", hdr="Dolby Vision",
@@ -937,7 +950,7 @@ def test_remote_only_backend_is_never_sent_to_local_ffmpeg(client, tmp_path, mon
     monkeypatch.setattr(hwprobe, "available_backends", lambda: ("videotoolbox",))
     monkeypatch.setattr(routes_playback, "available_backends", lambda: ("videotoolbox",))
     monkeypatch.setattr(routes_playback, "available_local_backends", lambda: ())
-    monkeypatch.setattr(routes_playback, "remote_worker_available", lambda *_, **__: False)
+    monkeypatch.setattr(routes_playback, "remote_backends_available", lambda *_, **__: ())
 
     file_id = seed(client, tmp_path, container="mkv", codec="hevc")
     response = client.post(
@@ -958,8 +971,8 @@ def test_quality_switch_releases_remote_worker_before_final_decision(
 
     availability = {"value": False}
 
-    def remote_available(_backend: str, **_kwargs: object) -> bool:
-        return availability["value"]
+    def remote_available(*_args: object, **_kwargs: object) -> tuple[str, ...]:
+        return ("videotoolbox",) if availability["value"] else ()
 
     monkeypatch.setattr(
         hwprobe,
@@ -972,7 +985,10 @@ def test_quality_switch_releases_remote_worker_before_final_decision(
         lambda: ("videotoolbox",) if availability["value"] else (),
     )
     monkeypatch.setattr(routes_playback, "available_local_backends", lambda: ())
-    monkeypatch.setattr(routes_playback, "remote_worker_available", remote_available)
+    monkeypatch.setattr(routes_playback, "remote_backends_available", remote_available)
+    monkeypatch.setattr(
+        routes_playback.playback_plan, "remote_backend_can_run", lambda _plan, _backend: True
+    )
     monkeypatch.setattr(
         routes_playback,
         "effective_remote_transcode_config",
@@ -1051,10 +1067,13 @@ def test_reopening_a_tone_mapped_title_frees_its_own_worker_slot_first(
     monkeypatch.setattr(routes_playback, "available_backends", backends)
     monkeypatch.setattr(routes_playback, "available_local_backends", lambda: ())
     monkeypatch.setattr(
-        routes_playback, "remote_worker_available", lambda *_a, **_k: availability["value"]
+        routes_playback,
+        "remote_backends_available",
+        lambda *_a, **_k: ("videotoolbox",) if availability["value"] else (),
     )
     monkeypatch.setattr(plan_mod, "hardware_available", lambda: availability["value"])
-    monkeypatch.setattr(plan_mod, "remote_worker_busy", lambda _b: not availability["value"])
+    monkeypatch.setattr(plan_mod, "any_remote_worker_busy", lambda: not availability["value"])
+    monkeypatch.setattr(plan_mod, "remote_backend_can_run", lambda _plan, _backend: True)
     monkeypatch.setattr(
         routes_playback,
         "effective_remote_transcode_config",
@@ -2892,10 +2911,14 @@ def test_diagnostic_encoder_marks_vaapi_low_power():
     session = SimpleNamespace(
         plan=SimpleNamespace(video=VideoPlan(action="transcode", codec="h264")),
         hw_backend="vaapi",
+        remote=False,
     )
     assert routes_playback._diagnostic_encoder(session) == "h264_vaapi"
     register_encoder_options("vaapi", VAAPI_LOW_POWER)
     try:
         assert routes_playback._diagnostic_encoder(session) == "h264_vaapi（低功耗）"
+        # 远程会话不看本机自检：那是 NAS 这块核显的结论，不是接单的那台机器
+        remote = SimpleNamespace(**{**vars(session), "remote": True})
+        assert routes_playback._diagnostic_encoder(remote) == "h264_vaapi"
     finally:
         register_encoder_options("vaapi", ())

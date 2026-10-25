@@ -51,7 +51,7 @@ export interface RemoteTranscodeSectionProps {
  * 在这里启用远程转码，并调整每台设备的并发上限。开关、并发上限改完即存；
  * 覆盖地址是单个文本值，失焦或回车提交。
  *
- * Worker 用哪个地址连过来，是在 Mac 那侧填的；服务端下发任务时用的取源地址和
+ * Worker 用哪个地址连过来，是在转码器那侧填的；服务端下发任务时用的取源地址和
  * 产物回传地址，默认直接取用那条控制连接自报的地址（remote_worker.py 的
  * observed_base_url）。所以地址在这一页降级成「高级」里的覆盖项，只服务于
  * 反向代理改写 Host 的少数部署，也不再和系统外部访问地址有任何关系。
@@ -269,7 +269,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
     <>
       <SettingsSection
         title="远程转码"
-        description="只把需要远程硬件能力的转码任务交给兼容 Worker。NAS 仍负责鉴权、播放会话和 HLS 缓存；修改后立即生效，不需要重启应用。当前可用的 Worker 实现为 macOS Apple Silicon 版本。"
+        description="只把需要远程硬件能力的转码任务交给兼容 Worker。NAS 仍负责鉴权、播放会话和 HLS 缓存；修改后立即生效，不需要重启应用。当前可用的 Worker 实现为 macOS（Apple Silicon）与 Windows（NVIDIA 显卡）版本。"
       >
         <div className="space-y-3">
           {error && <ErrorBanner>{error}</ErrorBanner>}
@@ -406,7 +406,7 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
                     </span>
                   }
                   description={`已授权 · 最近活跃 ${relativeTime(device.last_seen_at)}${
-                    config.ready ? " · Mac 没开机或没联网时属正常" : ""
+                    config.ready ? " · 电脑没开机或没联网时属正常" : ""
                   }`}
                 >
                   {limitControl(device.name, Number(device.id.replace("ld-", "")), status.device_limits[device.id] ?? 1)}
@@ -418,10 +418,11 @@ export function RemoteTranscodeSection({ onOpenDevices }: RemoteTranscodeSection
               title="还没有 Worker 接入"
               description={
                 <>
-                  在 Mac 上打开 MovieClaw 转码器，选择它在局域网里找到的 movieclaw（或直接填地址），
-                  点「连接并配对」；它会显示一段配对码并打开网页上的批准页，核对后批准即可。
-                  批准页没打开的话，到「设置 → 设备」输入它显示的配对码。全程不需要在任何一边输入
-                  令牌——Worker 的凭证是批准时签发的，直接回到那台 Mac，不经过屏幕。
+                  在装了 MovieClaw 转码器的电脑上配对：打开转码器，选它在局域网里找到的
+                  movieclaw（或直接填地址），点「连接并配对」。它会显示一段配对码并打开网页上的
+                  批准页，核对后批准即可。批准页没打开的话，到「设置 → 设备」输入它显示的配对码。
+                  全程不需要在任何一边输入令牌——Worker 的凭证是批准时签发的，直接回到那台电脑，
+                  不经过屏幕。
                 </>
               }
               action={

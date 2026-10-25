@@ -37,7 +37,7 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     register_hevc_encoder,
     register_native_tonemap,
 )
-from movieclaw_api.services.playback.remote_worker import remote_worker_available
+from movieclaw_api.services.playback.remote_worker import remote_backends_available
 
 logger = logging.getLogger("movieclaw_api.playback.hwprobe")
 
@@ -114,6 +114,8 @@ class HwBackendStatus:
     label: str
     available: bool
     detail: str
+    #: 远程 Worker 的能力（不是 NAS 本机探测的）。同名后端两边可以并存，各是各的
+    remote: bool = False
 
 
 _cache: list[HwBackendStatus] | None = None
@@ -128,7 +130,7 @@ def probe_backends(*, force: bool = False) -> list[HwBackendStatus]:
     """
     global _cache
     if _cache is not None and not force:
-        return _with_remote_backend(_cache)
+        return _cache
 
     if shutil.which("ffmpeg") is None:
         _cache = [
@@ -140,7 +142,7 @@ def probe_backends(*, force: bool = False) -> list[HwBackendStatus]:
             )
             for name in HW_BACKENDS
         ]
-        return _with_remote_backend(_cache)
+        return _cache
 
     encoders = _list_encoders()
     _cache = [_probe_hevc(_probe_one(name, encoders), encoders) for name in HW_BACKENDS]
@@ -155,22 +157,44 @@ def probe_backends(*, force: bool = False) -> list[HwBackendStatus]:
             "（默认关闭，播放此类影片时会弹窗征求开启）。逐后端原因如下：%s",
             "；".join(f"{s.label}：{s.detail}" for s in _cache if not s.available),
         )
-    return _with_remote_backend(_cache)
+    return _cache
+
+
+def remote_backend_statuses() -> list[HwBackendStatus]:
+    """在线远程 Worker 的能力，按后端各一条（设置页与本机探测结果并列展示）。
+
+    远程 Worker 不参与 NAS 容器内的一秒探测；它在连接 hello 中已经完成了 ffmpeg 能力
+    探测。每次现取而不是写进本机缓存：Worker 断线后，下一次决策立即回到真实的本机
+    结果；同名后端（NAS 也插着 NVIDIA 卡）也不会互相覆盖。
+    """
+    return [
+        HwBackendStatus(
+            name=name,
+            label=f"远程转码器 · {BACKEND_LABELS.get(name, name)}",
+            available=True,
+            detail="已连接远程 Worker，按它在握手中申报的能力执行。",
+            remote=True,
+        )
+        for name in remote_backends_available()
+    ]
 
 
 def available_backends() -> tuple[str, ...]:
-    """可用后端名，按优先级。决策引擎的 ``PlaybackPolicy`` 输入之一。"""
-    return tuple(s.name for s in probe_backends() if s.available)
+    """可用后端名（本机在前、远程独有的在后）。决策引擎的 ``PlaybackPolicy`` 输入之一。
+
+    只回答「这种硬件链有没有人能跑」，不回答「由谁跑」：生成 NAS 进程的 ffmpeg 参数
+    必须用 ``available_local_backends``，远程执行由会话路由单独选择。
+    """
+    local = available_local_backends()
+    return (*local, *(name for name in remote_backends_available() if name not in local))
 
 
 def available_local_backends() -> tuple[str, ...]:
     """只返回 NAS 当前进程实际探测通过的后端。
 
-    ``available_backends()`` 会叠加外置 Worker 的 VideoToolbox 能力，供播放
-    决策判断「是否存在硬件转码能力」。但这个合并结果不能直接拿来生成 NAS
-    进程的 ffmpeg 参数，否则 Worker 短暂断线的竞态会把
-    ``h264_videotoolbox`` 错交给 Linux ffmpeg。执行层必须使用这份本地快照，
-    远程执行则由会话路由单独选择。
+    远程 Worker 的能力不在这里：拿合并结果生成 NAS 进程的 ffmpeg 参数，Worker 短暂
+    断线的竞态会把 ``h264_videotoolbox`` 错交给 Linux ffmpeg。执行层必须使用这份
+    本地快照，远程执行则由会话路由单独选择。
     """
     if _cache is None:
         probe_backends()
@@ -194,31 +218,6 @@ def reset_probe_cache() -> None:
 
 async def probe_backends_async(*, force: bool = False) -> list[HwBackendStatus]:
     return await asyncio.to_thread(probe_backends, force=force)
-
-
-def _with_remote_backend(statuses: list[HwBackendStatus]) -> list[HwBackendStatus]:
-    """把在线远程 Worker 映射为决策层可识别的 VideoToolbox 后端。
-
-    远程 Worker 不参与 NAS 容器内的一秒探测；它在连接 hello 中已经完成了
-    ffmpeg 能力探测。动态追加而不是写入本地缓存，保证 Worker 断线后下一次
-    决策立即回到真实的本机结果。
-    """
-    if not remote_worker_available("videotoolbox"):
-        return statuses
-    remote_status = HwBackendStatus(
-        name="videotoolbox",
-        label=BACKEND_LABELS["videotoolbox"],
-        available=True,
-        detail="已连接远程 Worker，并通过其 VideoToolbox 能力声明。",
-    )
-    # Linux 探测矩阵也会包含 videotoolbox=False；在线 Worker 应覆盖这个
-    # “本机没有该后端”的诊断，而不是重复返回两个同名后端。
-    if any(status.name == "videotoolbox" for status in statuses):
-        return [
-            remote_status if status.name == "videotoolbox" else status
-            for status in statuses
-        ]
-    return [*statuses, remote_status]
 
 
 def _probe_one(name: str, encoders: frozenset[str]) -> HwBackendStatus:

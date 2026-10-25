@@ -30,7 +30,9 @@ from movieclaw_api.services.playback.hwprobe import BACKEND_LABELS, hardware_ava
 from movieclaw_api.services.playback.iso_source import iso_disc_source
 from movieclaw_api.services.playback.limits import MAX_TRANSCODE_HEIGHT
 from movieclaw_api.services.playback.remote_worker import (
-    remote_worker_busy,
+    REMOTE_BACKENDS,
+    any_remote_worker_busy,
+    remote_backend_can_run,
     remote_workers_have_encoder,
 )
 from movieclaw_api.services.playback.strm_probe import ensure_strm_spec
@@ -207,7 +209,8 @@ async def load_policy() -> PlaybackPolicy:
     return PlaybackPolicy(
         software_transcode_enabled=stored.software_transcode_enabled,
         hardware_available=available,
-        hardware_busy=not available and remote_worker_busy("videotoolbox"),
+        # 本机无硬件但远程有（Mac 或 Windows GPU），提示「忙」而不是「没有」
+        hardware_busy=not available and any_remote_worker_busy(),
         max_transcode_height=MAX_TRANSCODE_HEIGHT,
     )
 
@@ -224,8 +227,8 @@ def select_execution_backend(
     ``available`` 是给决策层用的合并能力快照，``local_backends`` 则只包含
     NAS 本机实际探测通过的后端。两者不能按列表首项直接使用：列表顺序是
     全局优先级，不代表该计划（尤其是 PGS 烧录）的滤镜链兼容性。先选能在
-    NAS 执行当前计划的后端；只有本地都不兼容时，才把在线 VideoToolbox
-    Worker 作为候选。返回值的第二项明确标出是否需要远程会话。
+    NAS 执行当前计划的后端；只有本地都不兼容时，才把在线的远程 Worker
+    （``REMOTE_BACKENDS``）作为候选。返回值的第二项明确标出是否需要远程会话。
 
     网页播放器与 Jellyfin 兼容层的转码入口共用这一个函数——两条链路起的是
     同一种会话，执行后端的选法不能有两套。
@@ -233,20 +236,23 @@ def select_execution_backend(
     if decision.tier is not Tier.HARDWARE_TRANSCODE or decision.video.action != "transcode":
         return None, False
 
-    remote_ok = (
-        remote_video_available
-        and "videotoolbox" in available
-        and effective_hw_backend(decision, "videotoolbox") is not None
+    # 兼容性按接单 Worker 自己申报的能力判（不是 NAS 本机的自检）
+    remote_online = tuple(
+        backend
+        for backend in REMOTE_BACKENDS
+        if remote_video_available
+        and backend in available
+        and remote_backend_can_run(decision, backend)
     )
     usable = [b for b in local_backends if effective_hw_backend(decision, b) is not None]
-    if decision.video.dolby_vision == "apply" and remote_ok:
+    if decision.video.dolby_vision == "apply" and remote_online:
         # P5 的 IPT 基础层只有吃 RPU 才出得了对的颜色。本机只有 VAAPI / QSV（硬件色调映射
-        # 不认 RPU，整片发紫）而 Mac 转码器在线时，交给它
+        # 不认 RPU，整片发紫）而远程转码器在线时，交给它
         usable = [b for b in usable if tonemap_reads_dolby_vision(b)]
     if usable:
         return usable[0], False
-    if remote_ok:
-        return "videotoolbox", True
+    if remote_online:
+        return remote_online[0], True
     return None, False
 
 

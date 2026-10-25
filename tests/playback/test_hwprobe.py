@@ -447,13 +447,47 @@ def test_result_is_cached_until_forced(monkeypatch):
 
 
 def test_local_available_backends_excludes_remote_overlay(monkeypatch):
-    """远程 Worker 的 VideoToolbox 能力不能变成本地 ffmpeg 参数。"""
+    """远程 Worker 的硬件能力不能变成本地 ffmpeg 参数。"""
     monkeypatch.setattr(hwprobe.shutil, "which", lambda _n: "/usr/bin/ffmpeg")
     monkeypatch.setattr(hwprobe, "_list_encoders", lambda: frozenset())
-    monkeypatch.setattr(hwprobe, "remote_worker_available", lambda _backend: True)
+    monkeypatch.setattr(
+        hwprobe, "remote_backends_available", lambda *a, **k: ("videotoolbox", "nvenc")
+    )
 
-    assert hwprobe.available_backends() == ("videotoolbox",)
+    assert hwprobe.available_backends() == ("videotoolbox", "nvenc")
     assert hwprobe.available_local_backends() == ()
+
+
+def test_remote_backend_does_not_overwrite_the_local_status_of_the_same_name(monkeypatch):
+    """NAS 本机没有 NVIDIA 卡、远程 Windows Worker 却是 NVENC：两条各说各的。
+
+    远程能力不写进本机探测结果，同名时不能把「本机为什么不行」顶掉——用户据这行文案
+    判断要不要给 NAS 配显卡；远程那条单列，由设置页并排展示。"""
+    monkeypatch.setattr(hwprobe.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(hwprobe, "remote_backends_available", lambda *a, **k: ("nvenc",))
+
+    local = {s.name: s for s in hwprobe.probe_backends()}
+    assert local["nvenc"].available is False
+    assert "未找到 ffmpeg" in local["nvenc"].detail
+    assert not any(s.remote for s in local.values())
+
+    remote = hwprobe.remote_backend_statuses()
+    assert [(s.name, s.available, s.remote) for s in remote] == [("nvenc", True, True)]
+    # 决策层看到的是并集：本机没有、远程有，也算「有这种硬件链」
+    assert hwprobe.available_backends() == ("nvenc",)
+    assert hwprobe.available_local_backends() == ()
+
+
+def test_remote_workers_go_offline_and_the_overlay_disappears(monkeypatch):
+    """Worker 断线后下一次决策立即回到真实的本机结果：叠加不缓存。"""
+    monkeypatch.setattr(hwprobe.shutil, "which", lambda _n: None)
+    online = ["nvenc"]
+    monkeypatch.setattr(hwprobe, "remote_backends_available", lambda *a, **k: tuple(online))
+
+    assert hwprobe.available_backends() == ("nvenc",)
+    online.clear()
+    assert hwprobe.available_backends() == ()
+    assert hwprobe.remote_backend_statuses() == []
 
 
 def test_every_backend_has_a_human_label():

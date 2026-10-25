@@ -1259,9 +1259,11 @@ class TranscodeSessionManager:
         await self._evict_export_for_remote(session)
         # 先占位再拼 URL：得先知道是谁接单，才能用它连上来的地址拼。
         try:
+            if not session.hw_backend:
+                raise SessionStartError("远程会话缺少执行后端（决策层未给出）")
             connection = registry.reserve(
                 job_id,
-                backend=session.hw_backend or "videotoolbox",
+                backend=session.hw_backend,
                 segment_type=segment_type(session.plan),
                 attempt_id=job_id,
                 disc=session.concat_list is not None,
@@ -1323,7 +1325,7 @@ class TranscodeSessionManager:
                 "远程转码会话已接单：session=%s worker=%s backend=%s",
                 session.id,
                 worker_id,
-                session.hw_backend or "videotoolbox",
+                session.hw_backend,
             )
         except RemoteWorkerUnavailable as exc:
             session.error = str(exc)
@@ -1381,8 +1383,10 @@ class TranscodeSessionManager:
             s.export_id is not None and s.remote for s in self._sessions.values()
         ):
             return
+        if not session.hw_backend:
+            return
         job_id = get_remote_worker_registry().preemptible_job_for(
-            session.hw_backend or "videotoolbox",
+            session.hw_backend,
             segment_type(session.plan),
             disc=session.concat_list is not None,
         )
@@ -2211,9 +2215,11 @@ class TranscodeSessionManager:
                 # ``_spawn_remote``）。不能沿用上一轮的地址——seek 完全可能被
                 # 另一台从不同入口连进来的 Worker 接走。
                 await self._evict_export_for_remote(session)
+                if not session.hw_backend:
+                    raise SessionStartError("远程会话缺少执行后端（决策层未给出）")
                 connection = registry.reserve(
                     job_id,
-                    backend=session.hw_backend or "videotoolbox",
+                    backend=session.hw_backend,
                     segment_type=segment_type(session.plan),
                     attempt_id=job_id,
                     disc=session.concat_list is not None,
