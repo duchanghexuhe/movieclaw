@@ -166,7 +166,10 @@ def test_row_links_land_on_the_row_itself(app_env) -> None:
     with start() as client:
         data = detail(client, "acme-detail")
         by_kind = {a["kind"]: a for a in data["adds"]}
-        assert by_kind["notification"]["href"] == "/settings/notifications?event=acme-detail.grab.failed"
+        assert (
+            by_kind["notification"]["href"]
+            == "/settings/notifications?event=acme-detail.grab.failed"
+        )
         assert by_kind["event"]["href"] == "/settings/webhook"
         # 定位键是任务 key，不是带「插件id:」前缀的贡献 id
         assert by_kind["task"]["href"] == "/settings/app?tab=tasks&task=acme_detail_patrol"
