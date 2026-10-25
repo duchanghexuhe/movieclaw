@@ -34,9 +34,19 @@ export function subscriptionProgressNote(sub: Subscription): string {
       return imported > 0 ? "已入库" : inPipeline > 0 ? "下载安排中" : "已收齐";
     }
     if (inPipeline > 0) return `${inPipeline} 集下载中 · 已入库 ${imported}`;
-    // 订阅上限截断了本季：等的是用户，不是片源
+    // 订阅窗口截断了本季：等的是用户，不是片源。完结季「可继续」，在播季「可往前补」
     const win = sub.episode_windows?.[0];
-    if (sub.status === "active" && win) return `已订阅到第 ${win.cap} 集 · 可继续`;
+    if (sub.status === "active" && win) {
+      // 「最新 N 集」锚定已播集数（宣称的集数可能还没播到），拿不到退回窗口总集数。
+      // 千分位与 lib/subscription-episode-cap 的 formatEpisodes 同口径；不直接导入它
+      // ——运行时导入会让 node --test 解析不了 @/ 别名
+      const aired =
+        sub.season_collection.find((s) => s.season_number === win.season_number)?.aired_count ??
+        win.total;
+      return win.end === null
+        ? `已订阅最新 ${Math.max(1, aired - win.start + 1).toLocaleString("en-US")} 集 · 可以往前补`
+        : `已订阅到第 ${win.end.toLocaleString("en-US")} 集 · 可继续`;
+    }
     if (sub.status === "active") return "等待新集播出";
     return imported > 0 ? `全部 ${total} 集已入库` : `全部 ${total} 集已安排`;
   }

@@ -1,10 +1,12 @@
 import type { EpisodeSeason, EpisodeWindow, SeasonOverview } from "@/lib/api/subscriptions";
 
 /**
- * 订阅上限：一季上千集时先订阅前面一部分（docs/design/subscription-episode-cap.md）。
+ * 订阅窗口：一季上千集时先订阅一部分（docs/design/subscription-episode-cap.md）。
  *
- * 判定都在服务端（episode_windows / episode_seasons），这里只放两样东西：
- * 什么时候给用户看这个选项，以及订阅弹层里用户改动的草稿怎么变成提交内容。
+ * 判定都在服务端（episode_windows / episode_seasons），这里放三样东西：
+ * 什么时候给用户看这个选项；订阅弹层里用户改动的草稿怎么变成提交内容；
+ * 以及「这一季在不在播」——完结的超长季从第 1 集订起，在播的超长季订
+ * 最新的 N 集且之后播出的照常进来，弹层文案随之不同。
  */
 
 /**
@@ -14,7 +16,7 @@ import type { EpisodeSeason, EpisodeWindow, SeasonOverview } from "@/lib/api/sub
  */
 export const EPISODE_CAP_THRESHOLD = 100;
 
-/** 超长的一季默认先订阅的集数；「继续订阅」每次再加这么多。 */
+/** 超长的一季默认先订阅的集数；「继续订阅」「往前再订」每次都是这么多。 */
 export const EPISODE_CAP_BATCH = 20;
 
 type SeasonCounts = Pick<SeasonOverview, "season_number" | "episode_count" | "aired_count">;
@@ -35,89 +37,159 @@ export function isLongSeason(season: SeasonCounts): boolean {
 }
 
 /**
- * 弹层里用户对上限的改动：键缺失 = 没动过（超长的季按默认先订阅一批），
- * null = 用户选了「全部」，数字 = 用户设的集号。
+ * 这一季是不是「在播」：剧还在播（TMDB status 为 Returning Series），而且它是
+ * 最近一个开播的季。完结的超长季从第 1 集订起；在播的订最新一批——追这类剧的
+ * 用户最想要的就是最新的几集。已在播的新一季还没有已播集时按完结季处理
+ * （从第 1 集订起，反正也没有更早的集可补）。
  */
-export type CapDraft = Record<number, number | null>;
-
-/** 这一季当前生效的上限；null = 订阅整季（不长、选了全部、或上限不低于总集数）。 */
-export function effectiveCap(season: SeasonCounts, draft: CapDraft): number | null {
-  if (!isLongSeason(season)) return null;
-  const value = draft[season.season_number];
-  const cap = value === undefined ? EPISODE_CAP_BATCH : value;
-  return cap !== null && cap >= 1 && cap < seasonTotal(season) ? cap : null;
+export function isAiringSeason(
+  mediaStatus: string | null | undefined,
+  seasons: readonly SeasonCounts[],
+  seasonNumber: number,
+): boolean {
+  if (mediaStatus !== "Returning Series") return false;
+  const started = seasons.filter((s) => s.season_number > 0 && s.aired_count > 0);
+  return started.length > 0 && Math.max(...started.map((s) => s.season_number)) === seasonNumber;
 }
 
-/** 提交给服务端的上限：只含被勾选、且确实截断了本季的季。 */
+/** 一季的订阅窗口：从第 start 集起（含），到第 end 集（含）；end=null 不设上界。 */
+export interface CapWindow {
+  start: number;
+  end: number | null;
+}
+
+/**
+ * 弹层里用户对窗口的改动：键缺失 = 没动过（超长的季按默认先订阅一批），
+ * null = 用户选了「全部」，有值 = 用户改动后的窗口。存窗口本身而不是集数，
+ * 在播季的「最新 N 集」随新集播出自动生长，保存时不悄悄滑动。
+ */
+export type CapDraft = Record<number, CapWindow | null>;
+
+/** 窗口盖住整季（start=1 且不设上界，或 end 不低于总集数）就等于没设。 */
+function normalizeWindow(window: CapWindow, total: number): CapWindow | null {
+  const start = Math.max(1, Math.floor(window.start));
+  const end = window.end === null ? null : Math.max(start, window.end);
+  if (start === 1 && (end === null || end >= total)) return null;
+  // 两头都收的混合窗口不是弹层能表达的：有 start 就按「从第 X 集起」处理
+  return start > 1 ? { start, end: null } : { start: 1, end };
+}
+
+/** 没动过时这一季的默认窗口：完结季从第 1 集订一批；在播季订最新一批（end 不设上界）。 */
+export function defaultWindow(season: SeasonCounts, airing: boolean): CapWindow | null {
+  return airing
+    ? { start: Math.max(1, season.aired_count - EPISODE_CAP_BATCH + 1), end: null }
+    : { start: 1, end: EPISODE_CAP_BATCH };
+}
+
+/** 这一季当前生效的窗口；null = 订阅整季（不长、选了全部、或窗口盖住整季）。 */
+export function effectiveWindow(
+  season: SeasonCounts,
+  draft: CapDraft,
+  airing: boolean,
+): CapWindow | null {
+  if (!isLongSeason(season)) return null;
+  const value = draft[season.season_number];
+  if (value !== undefined) {
+    return value === null ? null : normalizeWindow(value, seasonTotal(season));
+  }
+  return defaultWindow(season, airing);
+}
+
+/** 提交给服务端的窗口：只含被勾选、且确实截断了本季的季。 */
 export function capsPayload(
   seasons: readonly SeasonCounts[],
   selected: ReadonlySet<number>,
   draft: CapDraft,
-): Record<number, number> {
-  const caps: Record<number, number> = {};
+  mediaStatus: string | null | undefined,
+): Record<number, CapWindow> {
+  const caps: Record<number, CapWindow> = {};
   for (const season of seasons) {
     if (!selected.has(season.season_number)) continue;
-    const cap = effectiveCap(season, draft);
-    if (cap !== null) caps[season.season_number] = cap;
+    const win = effectiveWindow(
+      season,
+      draft,
+      isAiringSeason(mediaStatus, seasons, season.season_number),
+    );
+    if (win !== null) caps[season.season_number] = win;
   }
   return caps;
 }
 
 /**
- * 已有订阅的草稿起点：订阅范围内每一季都记下它现在的状态（没有上限就是明确的
+ * 已有订阅的草稿起点：订阅范围内每一季都记下它现在的窗口（没有窗口就是明确的
  * 「全部」），免得存量订阅一打开调整弹层就被默认值悄悄改成「先订阅一批」。
  * 弹层里新勾上的超长季没有记录，仍按默认先订阅一批。
  */
 export function draftFromSeasons(seasons: readonly EpisodeSeason[] | null | undefined): CapDraft {
   const draft: CapDraft = {};
-  for (const season of seasons ?? []) draft[season.season_number] = season.cap ?? null;
+  for (const season of seasons ?? []) {
+    draft[season.season_number] = season.window ? { ...season.window } : null;
+  }
   return draft;
 }
 
-/** 详情页已设的上限 {季号: 集号}（整体替换提交时，未改的季原样带回）。 */
-export function currentCaps(seasons: readonly EpisodeSeason[] | null | undefined) {
-  const caps: Record<number, number> = {};
+/** 详情页已设的窗口 {季号: 窗口}（整体替换提交时，未改的季原样带回）。 */
+export function currentWindows(seasons: readonly EpisodeSeason[] | null | undefined) {
+  const windows: Record<number, CapWindow> = {};
   for (const season of seasons ?? []) {
-    if (season.cap) caps[season.season_number] = season.cap;
+    if (season.window) windows[season.season_number] = { ...season.window };
   }
-  return caps;
+  return windows;
 }
 
-/** 两份上限是否相同（与键顺序无关）。 */
-export function sameCaps(a: Record<number, number>, b: Record<number, number>): boolean {
+/** 两份窗口是否相同（与键顺序无关）。 */
+export function sameWindows(a: Record<number, CapWindow>, b: Record<number, CapWindow>): boolean {
   const keys = Object.keys(a);
-  return keys.length === Object.keys(b).length && keys.every((key) => a[Number(key)] === b[Number(key)]);
+  return (
+    keys.length === Object.keys(b).length &&
+    keys.every((key) => {
+      const x = a[Number(key)];
+      const y = b[Number(key)];
+      return x.start === y.start && x.end === y.end;
+    })
+  );
 }
 
-/** 「继续订阅」这一步：再订阅一批；剩下的不足一批就一次订完。 */
-export function continueStep(win: EpisodeWindow): { next: number; remaining: number; last: boolean } {
-  const remaining = win.total - win.cap;
-  const next = Math.min(win.total, win.cap + EPISODE_CAP_BATCH);
-  return { next, remaining, last: next >= win.total };
+/** 把某一季的窗口改成 next 之后的完整窗口表；next 盖住整季就去掉这一季的窗口。 */
+export function windowsAfter(
+  current: Record<number, CapWindow>,
+  next: CapWindow | null,
+  seasonNumber: number,
+  total: number,
+): Record<number, CapWindow> {
+  const windows = { ...current };
+  const normalized = next === null ? null : normalizeWindow(next, total);
+  if (normalized === null) delete windows[seasonNumber];
+  else windows[seasonNumber] = normalized;
+  return windows;
 }
 
-/** 把某一季的上限改成 next 之后的完整上限表；next 不低于总集数就是订阅整季（去掉这一季）。 */
-export function capsAfter(
-  current: Record<number, number>,
+/**
+ * 在播窗口订阅的集数：「已订阅最新 N 集」里的 N。锚定**已播**集数（宣称的集数
+ * 可能还没播到），拿不到已播数时退回窗口的总集数（TMDB 已录的最大集号）。
+ */
+export function windowCount(
   win: EpisodeWindow,
-  next: number,
-): Record<number, number> {
-  const caps = { ...current };
-  if (next >= win.total) delete caps[win.season_number];
-  else caps[win.season_number] = next;
-  return caps;
+  airedBySeason?: Readonly<Record<number, number>>,
+): number {
+  const aired = airedBySeason?.[win.season_number];
+  return Math.max(1, (aired ?? win.total) - win.start + 1);
 }
 
-/** 详情页「收录范围」：第 1 季（前 20 集）、第 2 季。 */
+/** 详情页「收录范围」：第 1 季（前 20 集）、第 2 季（最新 25 集）。 */
 export function rangeLabel(
   selectedSeasons: readonly number[],
   windows: readonly EpisodeWindow[] | null | undefined,
+  airedBySeason?: Readonly<Record<number, number>>,
 ): string {
-  const cap = new Map((windows ?? []).map((win) => [win.season_number, win.cap]));
+  const bySeason = new Map((windows ?? []).map((win) => [win.season_number, win]));
   const parts = selectedSeasons.map((season) => {
     const name = season === 0 ? "特别篇" : `第 ${season} 季`;
-    const limit = cap.get(season);
-    return limit === undefined ? name : `${name}（前 ${formatEpisodes(limit)} 集）`;
+    const win = bySeason.get(season);
+    if (win === undefined) return name;
+    return win.end === null
+      ? `${name}（最新 ${formatEpisodes(windowCount(win, airedBySeason))} 集）`
+      : `${name}（前 ${formatEpisodes(win.end)} 集）`;
   });
   return parts.join("、");
 }

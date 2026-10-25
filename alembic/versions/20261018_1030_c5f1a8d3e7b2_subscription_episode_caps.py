@@ -1,10 +1,13 @@
-"""subscription.episode_caps: subscribe to a long season one batch at a time.
+"""subscription.episode_caps: subscribe to part of a very long season at a time.
 
 A single TMDB season can hold a thousand episodes (Chinese comic dramas, daily
-shows). ``episode_caps`` is the per-season upper bound the user chose ("subscribe
-to the first 20 episodes"); the expected set simply stops at the cap and the
-subscription stays open until the user raises or clears it. Existing
-subscriptions have no cap and stay NULL, i.e. whole seasons as before.
+shows). ``episode_caps`` is the per-season window the user chose, stored as
+{"start": x, "end": y}: finished long seasons subscribe from episode 1
+({"start": 1, "end": 20}); airing ones subscribe the latest batch with no upper
+bound ({"start": aired-19, "end": null}) so future episodes keep flowing in.
+The expected set simply stays inside the window and the subscription stays open
+until the user widens or clears it. Existing subscriptions have no window and
+stay NULL, i.e. whole seasons as before.
 
 Revision ID: c5f1a8d3e7b2
 Revises: f9b42d6a8e10

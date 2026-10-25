@@ -1,17 +1,17 @@
-"""订阅上限：一季上千集时，只订阅前 N 集（docs/design/subscription-episode-cap.md）。
+"""订阅上限：一季上千集时，只订阅一部分（docs/design/subscription-episode-cap.md）。
 
 TMDB 里一季可以有上千集（名侦探柯南 1186 集、国产漫剧动辄 1000+）。整季展开成
-上千个工单，既占磁盘与入库后处理，也未必看得完。上限是用户确认的「订阅到第 N 集」，
-**期望集合 E 定义的一部分**：E 里这一季超过上限的集（含追新与占位集）都不在其中，
-所以
+上千个工单，既占磁盘与入库后处理，也未必看得完。上限是用户确认的「这一季先订阅
+哪一段」——一个窗口 ``{start, end}``，**期望集合 E 定义的一部分**：
 
-- 被截断的季不会判「已收齐」（见 ``recompute_subscription_status``），订阅留在
-  订阅中，等用户决定要不要继续；
-- 「继续订阅」就是把上限改大一次，``SubscriptionService.update`` 的 diff 负责补工单；
-  清除上限（「全部」）就回到今天的整季行为。
+- 完结的超长季从第 1 集订起：``{start: 1, end: 20}``，超出的集不在 E，「继续订阅」
+  就是把 end 改大一次，``SubscriptionService.update`` 的 diff 负责补工单；
+- 在播的超长季订最新的一批：``{start: 已播-19, end: None}``，end 不设上界，
+  之后播出的集照常纳入——**上限不再与追新互斥**（追新进来的集只受 start 限制），
+  「往前再订」就是把 start 改小；
 
-与 ``episode_floor`` 方向相反：下限纠正「这季其实有几集」（事实），上限是「我先订阅
-到第几集」（节奏）。只存确实截断了本季的上限——不低于本季总集数的值视为不设。
+清除窗口（``{}``）就回到今天的整季行为。与 ``episode_floor`` 方向相反：下限纠正
+「这季其实有几集」（事实），窗口是「我先订阅这一段」（节奏）。
 """
 
 from __future__ import annotations
@@ -42,21 +42,44 @@ def _positive_int(value: object) -> int | None:
 
 
 @dataclass(frozen=True)
-class EpisodeWindow:
-    """被订阅上限截断的一季：订阅到第 ``cap`` 集，本季共 ``total`` 集。"""
+class EpisodeCap:
+    """一季的订阅窗口：从第 ``start`` 集起（含），到第 ``end`` 集（含）。
 
-    season_number: int
-    cap: int
-    total: int
+    ``end=None`` 不设上界，之后播出的集照常纳入（追新与上限不再互斥）。
+    ``start=1`` 且 ``end=None`` 等于整季，等价于不设窗口，不该存下来。
+    """
+
+    start: int = 1
+    end: int | None = None
+
+    def covers(self, episode_number: int) -> bool:
+        return episode_number >= self.start and (self.end is None or episode_number <= self.end)
+
+    @property
+    def is_head_only(self) -> bool:
+        """「从第 start 集起」的在播窗口：没有上界，新集自动进来。"""
+        return self.end is None
 
 
-def caps_of(subscription: Subscription) -> dict[int, int]:
-    """订阅的集数上限 {季号: 集号}（JSON 键是字符串，这里统一转回整数）。"""
-    caps: dict[int, int] = {}
-    for season, cap in (subscription.episode_caps or {}).items():
-        season_number, number = _positive_int(season), _positive_int(cap)
-        if season_number is not None and number is not None:
-            caps[season_number] = number
+def caps_of(subscription: Subscription) -> dict[int, EpisodeCap]:
+    """订阅的集数窗口 {季号: EpisodeCap}。
+
+    落库形态 ``{季号: {"start": x, "end": y}}``；键是字符串、这里统一转回整数。
+    旧值是纯集号（只订到第 N 集的上限），读作 ``{start: 1, end: N}``。
+    """
+    caps: dict[int, EpisodeCap] = {}
+    for season, value in (subscription.episode_caps or {}).items():
+        season_number = _positive_int(season)
+        if season_number is None:
+            continue
+        if isinstance(value, dict):
+            start = _positive_int(value.get("start")) or 1
+            end = _positive_int(value.get("end"))
+            caps[season_number] = EpisodeCap(start=start, end=end)
+            continue
+        number = _positive_int(value)
+        if number is not None:
+            caps[season_number] = EpisodeCap(start=1, end=number)
     return caps
 
 
@@ -70,11 +93,22 @@ def known_max_of(episodes: list[MediaEpisode]) -> dict[int, int]:
     return known_max
 
 
+@dataclass(frozen=True)
+class EpisodeWindow:
+    """被订阅窗口截断的一季：从第 ``start`` 集起到 ``end``（``None``=含今后新集），
+    本季已录 ``total`` 集。"""
+
+    season_number: int
+    start: int
+    end: int | None
+    total: int
+
+
 def windows_of(subscription: Subscription, known_max: dict[int, int]) -> list[EpisodeWindow]:
-    """订阅范围内被上限截断的季。
+    """订阅范围内被窗口截断的季。
 
     总集数取 TMDB 已录的最大集号与集数下限中大的那个（下限撑起的占位集也算本季的集）。
-    上限不低于总集数的季没有被截断，不在其中。
+    窗口盖住整季的季没有被截断，不在其中。
     """
     if not subscription.episode_caps:
         return []
@@ -84,8 +118,8 @@ def windows_of(subscription: Subscription, known_max: dict[int, int]) -> list[Ep
         if not tracks_season(subscription, season_number):
             continue
         total = max(known_max.get(season_number, 0), floors.get(season_number, 0))
-        if cap < total:
-            windows.append(EpisodeWindow(season_number, cap, total))
+        if cap.start > 1 or (cap.end is not None and cap.end < total):
+            windows.append(EpisodeWindow(season_number, cap.start, cap.end, total))
     return windows
 
 

@@ -131,6 +131,11 @@ export function SubscriptionInspectorView({
 
   const [downloads, setDownloads] = useState<SubscriptionDownload[]>([]);
 
+  // 每季已播集数：「最新 N 集」的展示锚点（TMDB 宣称的集数可能还没播到）
+  const airedBySeason = Object.fromEntries(
+    (detail?.season_collection ?? []).map((s) => [s.season_number, s.aired_count]),
+  );
+
   const reload = useCallback(() => {
     Promise.all([
       getSubscription(id),
@@ -511,7 +516,7 @@ export function SubscriptionInspectorView({
                     ? "正片"
                     : detail.selected_seasons.length > 0
                       ? detail.episode_windows?.length
-                        ? rangeLabel(detail.selected_seasons, detail.episode_windows)
+                        ? rangeLabel(detail.selected_seasons, detail.episode_windows, airedBySeason)
                         : `第 ${detail.selected_seasons.join("、")} 季`
                       : "未勾选季"
                 }

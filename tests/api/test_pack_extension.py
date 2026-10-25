@@ -26,6 +26,7 @@ from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.site_access import SiteUnavailableError
 from movieclaw_api.services.subscription import SubscriptionService
 from movieclaw_api.services.subscription.dispatch import dispatch
+from movieclaw_api.services.subscription.episode_cap import EpisodeCap
 from movieclaw_api.services.subscription.file_selection import UnsatisfiableSelection
 from movieclaw_api.services.subscription.pack_extension import (
     ExtensionRefused,
@@ -342,7 +343,7 @@ class TestExtendOwnedPack:
         adapter.add_task(PACK_FILES, selected=3)
         async with db.session() as session:
             sub = await _service(session).create(
-                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: 6}
+                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: EpisodeCap(1, 6)}
             )
             await _owned_attempt(session, sub, downloader_row_id)
             extended = await extend_owned_pack(
@@ -366,7 +367,7 @@ class TestExtendOwnedPack:
             adapter.add_task(PACK_FILES, selected=3)
         async with db.session() as session:
             sub = await _service(session).create(
-                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: 6}
+                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: EpisodeCap(1, 6)}
             )
             if case != "no_attempt":
                 await _owned_attempt(
@@ -397,7 +398,7 @@ class TestExtendOwnedPack:
         adapter.add_task(PACK_FILES[:5], selected=3)  # 包里没有第 6 集
         async with db.session() as session:
             sub = await _service(session).create(
-                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: 6}
+                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: EpisodeCap(1, 6)}
             )
             await _owned_attempt(session, sub, downloader_row_id)
             with pytest.raises(ExtensionRefused):
@@ -413,7 +414,7 @@ class TestExtendOwnedPack:
         adapter.ignore_selection = True
         async with db.session() as session:
             sub = await _service(session).create(
-                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: 6}
+                MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: EpisodeCap(1, 6)}
             )
             await _owned_attempt(session, sub, downloader_row_id)
             with pytest.raises(RuntimeError):
@@ -489,7 +490,9 @@ async def test_rules_mode_next_batch_extends_the_pack_instead_of_resubmitting(
     seen = _stub_submit(monkeypatch, downloader_row_id)
     async with db.session() as session:
         service = _service(session)
-        sub = await service.create(MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: 3})
+        sub = await service.create(
+            MediaKind.TV, 1043, selected_seasons=[1], episode_caps={1: EpisodeCap(1, 3)}
+        )
         rows = await _wanted(session, sub.id)
         assert await _dispatch(session, sub, [rows[(1, n)] for n in (1, 2, 3)])
         # 带上限的规则订阅：投递层要求严格取舍，且给任务打上稳定的所有者标签
@@ -499,7 +502,7 @@ async def test_rules_mode_next_batch_extends_the_pack_instead_of_resubmitting(
 
         # 第一批下完：下载器里的包只勾了前 3 个文件；用户调大上限
         adapter.add_task(PACK_FILES, selected=3)
-        await service.update(sub.id, episode_caps={1: 6})
+        await service.update(sub.id, episode_caps={1: EpisodeCap(1, 6)})
         rows = await _wanted(session, sub.id)
         assert all(rows[(1, n)].status == WantedStatus.WANTED for n in (4, 5, 6))
         assert await _dispatch(session, sub, [rows[(1, n)] for n in (4, 5, 6)])
@@ -540,7 +543,7 @@ async def test_smart_mode_next_batch_extends_the_pack_and_drops_its_intent(
             selected_seasons=[1],
             selection_mode="smart",
             smart_profile_revision=1,
-            episode_caps={1: 3},
+            episode_caps={1: EpisodeCap(1, 3)},
         )
         rows = await _wanted(session, sub.id)
         first = [rows[(1, n)] for n in (1, 2, 3)]
@@ -549,7 +552,7 @@ async def test_smart_mode_next_batch_extends_the_pack_and_drops_its_intent(
         )
 
         adapter.add_task(PACK_FILES, selected=3)
-        await service.update(sub.id, episode_caps={1: 6})
+        await service.update(sub.id, episode_caps={1: EpisodeCap(1, 6)})
         rows = await _wanted(session, sub.id)
         second = [rows[(1, n)] for n in (4, 5, 6)]
         assert await _dispatch(
@@ -581,14 +584,14 @@ async def test_refused_extension_releases_the_claim_without_looping(
             selected_seasons=[1],
             selection_mode="smart",
             smart_profile_revision=1,
-            episode_caps={1: 3},
+            episode_caps={1: EpisodeCap(1, 3)},
         )
         rows = await _wanted(session, sub.id)
         first = [rows[(1, n)] for n in (1, 2, 3)]
         await _dispatch(session, sub, first, versions={r.id: r.selection_version for r in first})
 
         adapter.add_task(PACK_FILES[:5], selected=3)  # 包里没有第 6 集
-        await service.update(sub.id, episode_caps={1: 6})
+        await service.update(sub.id, episode_caps={1: EpisodeCap(1, 6)})
         rows = await _wanted(session, sub.id)
         second = [rows[(1, n)] for n in (4, 5, 6)]
         assert not await _dispatch(

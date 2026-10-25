@@ -4,17 +4,19 @@ import test from "node:test";
 import {
   EPISODE_CAP_BATCH,
   EPISODE_CAP_THRESHOLD,
-  capsAfter,
   capsPayload,
-  continueStep,
-  currentCaps,
+  currentWindows,
+  defaultWindow,
   draftFromSeasons,
-  effectiveCap,
+  effectiveWindow,
   formatEpisodes,
+  isAiringSeason,
   isLongSeason,
   rangeLabel,
-  sameCaps,
+  sameWindows,
   seasonTotal,
+  windowCount,
+  windowsAfter,
 } from "../lib/subscription-episode-cap.ts";
 import { subscriptionProgressNote } from "../lib/subscription-ui.ts";
 
@@ -32,73 +34,139 @@ test("只有单季集数达到阈值才提供「先订阅一部分」", () => {
   assert.equal(isLongSeason(season(0, 500)), false);
 });
 
+test("在播的一季：剧还在播且它是最近一个开播的季", () => {
+  const seasons = [season(1, 1043), season(2, 100, 0)];
+  assert.equal(isAiringSeason("Returning Series", seasons, 1), true);
+  // 还没开播的新一季不算在播（按完结季从第 1 集订起）
+  assert.equal(isAiringSeason("Returning Series", seasons, 2), false);
+  // 完结剧没有在播的季；TMDB 状态缺失同
+  assert.equal(isAiringSeason("Ended", [season(1, 1043)], 1), false);
+  assert.equal(isAiringSeason(null, [season(1, 1043)], 1), false);
+  // 上一季已播、下一季开播：只有下一季算
+  const both = [season(1, 500), season(2, 300, 10)];
+  assert.equal(isAiringSeason("Returning Series", both, 1), false);
+  assert.equal(isAiringSeason("Returning Series", both, 2), true);
+});
+
 test("超长的季不动草稿就按默认先订阅一批；选了「全部」才是整季", () => {
   const long = season(1, 1043);
-  assert.equal(effectiveCap(long, {}), EPISODE_CAP_BATCH);
-  assert.equal(effectiveCap(long, { 1: null }), null);
-  assert.equal(effectiveCap(long, { 1: 50 }), 50);
-  // 不低于总集数 / 非法值 = 订阅整季，服务端同口径丢弃
-  assert.equal(effectiveCap(long, { 1: 1043 }), null);
-  assert.equal(effectiveCap(long, { 1: 5000 }), null);
-  assert.equal(effectiveCap(long, { 1: 0 }), null);
-  // 不长的季没有这个选项，草稿里有数字也无效
-  assert.equal(effectiveCap(season(2, 12), {}), null);
-  assert.equal(effectiveCap(season(2, 12), { 2: 5 }), null);
+  // 完结季：从第 1 集订一批
+  assert.deepEqual(effectiveWindow(long, {}, false), { start: 1, end: EPISODE_CAP_BATCH });
+  assert.equal(effectiveWindow(long, { 1: null }, false), null);
+  assert.deepEqual(effectiveWindow(long, { 1: { start: 1, end: 50 } }, false), { start: 1, end: 50 });
+  // 盖住整季 = 订阅整季，服务端同口径丢弃
+  assert.equal(effectiveWindow(long, { 1: { start: 1, end: 1043 } }, false), null);
+  assert.equal(effectiveWindow(long, { 1: { start: 1, end: 5000 } }, false), null);
+  assert.deepEqual(effectiveWindow(long, { 1: { start: 0, end: 20 } }, false), { start: 1, end: 20 });
+  // 不长的季没有这个选项，草稿里有值也无效
+  assert.equal(effectiveWindow(season(2, 12), {}, false), null);
+  assert.equal(effectiveWindow(season(2, 12), { 2: { start: 1, end: 5 } }, false), null);
+});
+
+test("在播的超长季默认订最新一批，之后播出的照常进来", () => {
+  const airing = season(1, 1186, 1100);
+  // 默认：第 aired-19 集起、不设上界
+  assert.deepEqual(effectiveWindow(airing, {}, true), { start: 1081, end: null });
+  // 已播不足一批时从第 1 集起
+  assert.deepEqual(
+    effectiveWindow(season(1, 1043, 12), {}, true),
+    { start: 1, end: null },
+  );
+  // 用户改数：n 是「最新几集」，提交时换算回 start
+  assert.deepEqual(
+    effectiveWindow(airing, { 1: { start: 1061, end: null } }, true),
+    { start: 1061, end: null },
+  );
+  assert.deepEqual(defaultWindow(airing, true), { start: 1081, end: null });
+  assert.deepEqual(defaultWindow(airing, false), { start: 1, end: EPISODE_CAP_BATCH });
 });
 
 test("提交内容只含被勾选、且确实截断了本季的季", () => {
-  const seasons = [season(1, 1043), season(2, 300), season(3, 12)];
-  assert.deepEqual(capsPayload(seasons, new Set([1, 2, 3]), {}), { 1: 20, 2: 20 });
-  assert.deepEqual(capsPayload(seasons, new Set([2, 3]), { 2: null }), {});
-  assert.deepEqual(capsPayload(seasons, new Set([1]), { 1: 60 }), { 1: 60 });
+  const seasons = [season(1, 1043), season(2, 300), season(3, 12, 0)];
+  assert.deepEqual(capsPayload(seasons, new Set([1, 2, 3]), {}, "Ended"), {
+    1: { start: 1, end: EPISODE_CAP_BATCH },
+    2: { start: 1, end: EPISODE_CAP_BATCH },
+  });
+  assert.deepEqual(capsPayload(seasons, new Set([2, 3]), { 2: null }, "Ended"), {});
+  assert.deepEqual(
+    capsPayload(seasons, new Set([1]), { 1: { start: 1, end: 60 } }, "Ended"),
+    { 1: { start: 1, end: 60 } },
+  );
+  // 在播剧：只有最近开播的第 2 季按最新一批提交；更早的季已播完，仍从第 1 集订起
+  assert.deepEqual(capsPayload(seasons, new Set([1, 2]), {}, "Returning Series"), {
+    1: { start: 1, end: EPISODE_CAP_BATCH },
+    2: { start: 281, end: null },
+  });
 });
 
 test("存量订阅打开调整弹层不会被默认值悄悄改成先订阅一批", () => {
   const stored = [
-    { season_number: 1, tmdb_count: 1043, floor: null, cap: null },
-    { season_number: 2, tmdb_count: 300, floor: null, cap: 40 },
+    { season_number: 1, tmdb_count: 1043, floor: null, window: null },
+    { season_number: 2, tmdb_count: 300, floor: null, window: { start: 1, end: 40 } },
+    { season_number: 3, tmdb_count: 1186, floor: null, window: { start: 1081, end: null } },
   ];
-  const seasons = [season(1, 1043), season(2, 300), season(3, 500)];
+  const seasons = [season(1, 1043), season(2, 300), season(3, 1186, 1100), season(4, 500)];
   const draft = draftFromSeasons(stored);
-  assert.deepEqual(draft, { 1: null, 2: 40 });
-  // 第 1 季原本就是整季：保持整季；第 2 季保持 40；弹层里新勾上的第 3 季才按默认
-  assert.deepEqual(capsPayload(seasons, new Set([1, 2, 3]), draft), { 2: 40, 3: 20 });
-  assert.deepEqual(currentCaps(stored), { 2: 40 });
-  assert.deepEqual(currentCaps(null), {});
-});
-
-test("上限表按内容比较，与键顺序无关", () => {
-  assert.equal(sameCaps({ 1: 20, 2: 40 }, { 2: 40, 1: 20 }), true);
-  assert.equal(sameCaps({ 1: 20 }, { 1: 40 }), false);
-  assert.equal(sameCaps({ 1: 20 }, {}), false);
-  assert.equal(sameCaps({}, {}), true);
-});
-
-test("继续订阅：每次再加一批，剩下不足一批就一次订完", () => {
-  assert.deepEqual(continueStep({ season_number: 1, cap: 20, total: 1043 }), {
-    next: 40,
-    remaining: 1023,
-    last: false,
+  assert.deepEqual(draft, {
+    1: null,
+    2: { start: 1, end: 40 },
+    3: { start: 1081, end: null },
   });
-  assert.deepEqual(continueStep({ season_number: 1, cap: 1030, total: 1043 }), {
-    next: 1043,
-    remaining: 13,
-    last: true,
+  // 每一季都保持原状；弹层里新勾上的第 4 季才按默认
+  assert.deepEqual(capsPayload(seasons, new Set([1, 2, 3, 4]), draft, "Ended"), {
+    2: { start: 1, end: 40 },
+    3: { start: 1081, end: null },
+    4: { start: 1, end: EPISODE_CAP_BATCH },
   });
-  // 刚好剩一批：这一步订完整季
-  assert.equal(continueStep({ season_number: 1, cap: 80, total: 100 }).last, true);
+  assert.deepEqual(currentWindows(stored), {
+    2: { start: 1, end: 40 },
+    3: { start: 1081, end: null },
+  });
+  assert.deepEqual(currentWindows(null), {});
 });
 
-test("改上限时整体替换：其它季原样带回，订到末尾等于去掉这一季的上限", () => {
-  const window = { season_number: 1, cap: 20, total: 100 };
-  assert.deepEqual(capsAfter({ 1: 20, 2: 50 }, window, 40), { 1: 40, 2: 50 });
-  assert.deepEqual(capsAfter({ 1: 20, 2: 50 }, window, 100), { 2: 50 });
+test("窗口表按内容比较，与键顺序无关", () => {
+  assert.equal(
+    sameWindows({ 1: { start: 1, end: 20 }, 2: { start: 5, end: null } }, { 2: { start: 5, end: null }, 1: { start: 1, end: 20 } }),
+    true,
+  );
+  assert.equal(sameWindows({ 1: { start: 1, end: 20 } }, { 1: { start: 1, end: 40 } }), false);
+  assert.equal(sameWindows({ 1: { start: 1, end: 20 } }, {}), false);
+  assert.equal(sameWindows({}, {}), true);
+});
+
+test("改窗口时整体替换：其它季原样带回，盖住整季等于去掉这一季的窗口", () => {
+  assert.deepEqual(
+    windowsAfter({ 1: { start: 1, end: 20 }, 2: { start: 5, end: null } }, { start: 1, end: 40 }, 1, 1043),
+    { 1: { start: 1, end: 40 }, 2: { start: 5, end: null } },
+  );
+  assert.deepEqual(
+    windowsAfter({ 1: { start: 1, end: 20 }, 2: { start: 5, end: null } }, { start: 1, end: 1043 }, 1, 1043),
+    { 2: { start: 5, end: null } },
+  );
+  // 往前订到第 1 集 = 整季 = 去掉窗口
+  assert.deepEqual(
+    windowsAfter({ 1: { start: 5, end: null } }, { start: 1, end: null }, 1, 100),
+    {},
+  );
+});
+
+test("在播窗口订阅的集数随本季已录集数生长", () => {
+  assert.equal(windowCount({ season_number: 1, start: 1081, end: null, total: 1100 }), 20);
+  assert.equal(windowCount({ season_number: 1, start: 1081, end: null, total: 1110 }), 30);
 });
 
 test("详情页收录范围标出被截断的季", () => {
-  assert.equal(rangeLabel([1], [{ season_number: 1, cap: 20, total: 1043 }]), "第 1 季（前 20 集）");
   assert.equal(
-    rangeLabel([1, 2], [{ season_number: 2, cap: 1020, total: 1043 }]),
+    rangeLabel([1], [{ season_number: 1, start: 1, end: 20, total: 1043 }]),
+    "第 1 季（前 20 集）",
+  );
+  assert.equal(
+    rangeLabel([1], [{ season_number: 1, start: 1081, end: null, total: 1100 }]),
+    "第 1 季（最新 20 集）",
+  );
+  assert.equal(
+    rangeLabel([1, 2], [{ season_number: 2, start: 1, end: 1020, total: 1043 }]),
     "第 1 季、第 2 季（前 1,020 集）",
   );
   assert.equal(rangeLabel([0, 1], null), "特别篇、第 1 季");
@@ -119,14 +187,19 @@ function subscription({ status = "active", wanted = 0, grabbed = 0, imported = 2
   };
 }
 
-test("下完这一批：说订阅到第几集、可继续，而不是等新集播出", () => {
-  const windows = [{ season_number: 1, cap: 20, total: 1043 }];
-  assert.equal(subscriptionProgressNote(subscription({ windows })), "已订阅到第 20 集 · 可继续");
-  // 没有上限的订阅保持原样
+test("下完这一批：完结季说订阅到第几集、可继续；在播季说最新几集、可往前补", () => {
+  const tail = [{ season_number: 1, start: 1, end: 20, total: 1043 }];
+  assert.equal(subscriptionProgressNote(subscription({ windows: tail })), "已订阅到第 20 集 · 可继续");
+  const head = [{ season_number: 1, start: 1081, end: null, total: 1100 }];
+  assert.equal(
+    subscriptionProgressNote(subscription({ windows: head })),
+    "已订阅最新 20 集 · 可以往前补",
+  );
+  // 没有窗口的订阅保持原样
   assert.equal(subscriptionProgressNote(subscription({})), "等待新集播出");
   // 还在下载时照旧报下载进度
   assert.equal(
-    subscriptionProgressNote(subscription({ grabbed: 3, windows })),
+    subscriptionProgressNote(subscription({ grabbed: 3, windows: tail })),
     "3 集下载中 · 已入库 20",
   );
 });

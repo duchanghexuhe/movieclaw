@@ -26,6 +26,7 @@ from movieclaw_api.schemas.subscription import (
     DispatchPreviewView,
     DoubanEpisodesView,
     DownloadUnitView,
+    EpisodeCapSpec,
     EpisodeHintDismissPayload,
     EpisodeHintView,
     EpisodeSeasonView,
@@ -80,6 +81,7 @@ from movieclaw_api.services.subscription import (
     recent_arrivals,
 )
 from movieclaw_api.services.subscription.episode_cap import (
+    EpisodeCap,
     caps_of,
     season_episode_max_many,
     windows_of,
@@ -455,13 +457,20 @@ async def _detail_view(
         known_max = await season_episode_max(session, item.id)
         floors = floors_of(sub)
         caps = caps_of(sub)
-        view.episode_seasons = [
-            EpisodeSeasonView(
+
+        def _season_view(season: int) -> EpisodeSeasonView:
+            window = caps.get(season)
+            return EpisodeSeasonView(
                 season_number=season,
                 tmdb_count=known_max.get(season, 0),
                 floor=floors.get(season),
-                cap=caps.get(season),
+                window=None
+                if window is None
+                else EpisodeCapSpec(start=window.start, end=window.end),
             )
+
+        view.episode_seasons = [
+            _season_view(season)
             for season in sorted(set(known_max) | set(floors))
             if season != 0 and tracks_season(sub, season)
         ]
@@ -515,11 +524,23 @@ async def _detail_view(
     return view
 
 
+def _cap_windows(
+    payload_caps: dict[int, EpisodeCapSpec] | None,
+) -> dict[int, EpisodeCap] | None:
+    """接口载荷的窗口 {季号: EpisodeCapSpec} 转成服务层的 {季号: EpisodeCap}。
+
+    None 原样返回（=「不传，不变」），``{}`` 原样返回（=「清除」）。
+    """
+    if payload_caps is None:
+        return None
+    return {season: EpisodeCap(spec.start, spec.end) for season, spec in payload_caps.items()}
+
+
 def _window_views(sub: Subscription, known_max: dict[int, int]) -> list[EpisodeWindowView] | None:
     """被订阅上限截断的季；没有被截断的季返回 None（与「没设上限」同一形态）。"""
     windows = windows_of(sub, known_max)
     return [
-        EpisodeWindowView(season_number=w.season_number, cap=w.cap, total=w.total)
+        EpisodeWindowView(season_number=w.season_number, start=w.start, end=w.end, total=w.total)
         for w in windows
     ] or None
 
@@ -771,7 +792,7 @@ async def create_subscription(
         selection_mode=payload.selection_mode,
         smart_profile_revision=payload.smart_profile_revision,
         episode_floors=payload.episode_floors,
-        episode_caps=payload.episode_caps,
+        episode_caps=_cap_windows(payload.episode_caps),
         smart_choice=SmartChoice(
             language_answer=payload.smart_language_answer,
             resolution=payload.smart_resolution,
@@ -1162,7 +1183,7 @@ async def update_subscription(
             payload.library_id if admin and "library_id" in payload.model_fields_set else ...
         ),
         episode_floors=payload.episode_floors,
-        episode_caps=payload.episode_caps,
+        episode_caps=_cap_windows(payload.episode_caps),
     )
     sub, item, wanted = await service.detail(subscription_id)
     resource_timings = await service.resource_timings(subscription_id)

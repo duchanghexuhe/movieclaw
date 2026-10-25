@@ -48,7 +48,8 @@ import type { MediaType } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
 import {
   capsPayload,
-  effectiveCap,
+  effectiveWindow,
+  isAiringSeason,
   isLongSeason,
   type CapDraft,
 } from "@/lib/subscription-episode-cap";
@@ -281,7 +282,11 @@ export function SubscribeDialog({
       ? prepared.douban_episodes
       : null;
 
-  // 勾上的超长季（洗版不涉及）：多出一行「先订阅前 N 集」
+  // 勾上的超长季（洗版不涉及）：多出一行「先订阅一部分」。在播的超长季默认订
+  // 最新的几集（之后播出的照常进来），完结的从第 1 集订起
+  const mediaStatus = prepared?.media?.status ?? null;
+  const airingOf = (seasonNumber: number) =>
+    isAiringSeason(mediaStatus, prepared?.seasons ?? [], seasonNumber);
   const capSeasons = upgradeMode
     ? []
     : (prepared?.seasons ?? []).filter(
@@ -293,7 +298,7 @@ export function SubscribeDialog({
     setBusy(true);
     setError(null);
     try {
-      const episodeCaps = capsPayload(capSeasons, selectedSeasons, capDraft);
+      const episodeCaps = capsPayload(capSeasons, selectedSeasons, capDraft, mediaStatus);
       // 提交预检已经收敛好的 TMDB 引用，而不是入口的豆瓣引用：豆瓣→TMDB 的
       // 收敛（多路 TMDB 搜索 + 逐候选季表）没有缓存，再传豆瓣引用会让创建接口
       // 把这一整套外网请求重跑一遍。豆瓣身份靠 source_title_ref 原样带回。
@@ -479,7 +484,8 @@ export function SubscribeDialog({
         {capSeasons.map((season) => <SeasonCapLine
           key={season.season_number}
           season={season}
-          cap={effectiveCap(season, capDraft)}
+          win={effectiveWindow(season, capDraft, airingOf(season.season_number))}
+          airing={airingOf(season.season_number)}
           showName={selectedSeasons.size > 1}
           onChange={(next) => setCapDraft((prev) => ({ ...prev, [season.season_number]: next }))}
         />)}

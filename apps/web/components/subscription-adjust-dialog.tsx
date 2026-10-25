@@ -47,11 +47,12 @@ import {
 import { usePermissions } from "@/lib/permissions";
 import {
   capsPayload,
-  currentCaps,
+  currentWindows,
   draftFromSeasons,
-  effectiveCap,
+  effectiveWindow,
+  isAiringSeason,
   isLongSeason,
-  sameCaps,
+  sameWindows,
   type CapDraft,
 } from "@/lib/subscription-episode-cap";
 
@@ -149,12 +150,15 @@ export function SubscriptionAdjustDialog({
     return detail.selected_seasons.filter((s) => !kept.has(s) && progressed.has(s));
   }, [detail, isMovie, selectedSeasons]);
 
-  // 提交的是整份上限（后端整体替换）；勾上的超长季才有一行「先订阅前 N 集」
+  // 提交的是整份窗口（后端整体替换）；勾上的超长季才有一行「先订阅一部分」。
+  // 在播的超长季默认订最新的几集，完结的从第 1 集订起
   const nextCaps = useMemo(
-    () => capsPayload(seasons ?? [], selectedSeasons, capDraft),
-    [seasons, selectedSeasons, capDraft],
+    () => capsPayload(seasons ?? [], selectedSeasons, capDraft, detail.media.status),
+    [seasons, selectedSeasons, capDraft, detail.media.status],
   );
-  const setCap = (seasonNumber: number, next: number | null) =>
+  const airingOf = (seasonNumber: number) =>
+    isAiringSeason(detail.media.status, seasons ?? [], seasonNumber);
+  const setCap = (seasonNumber: number, next: CapDraft[number]) =>
     setCapDraft((prev) => ({ ...prev, [seasonNumber]: next }));
 
   const changed = useMemo(() => {
@@ -166,7 +170,9 @@ export function SubscriptionAdjustDialog({
       seasons: seasonsChanged,
       library: canManageSubscriptions && libraryId !== detail.library_id,
       caps:
-        !isMovie && seasons !== null && !sameCaps(nextCaps, currentCaps(detail.episode_seasons)),
+        !isMovie &&
+        seasons !== null &&
+        !sameWindows(nextCaps, currentWindows(detail.episode_seasons)),
     };
   }, [canManageSubscriptions, detail, isMovie, libraryId, nextCaps, seasons, selectedSeasons]);
   const dirty = changed.seasons || changed.library || changed.caps;
@@ -299,7 +305,8 @@ export function SubscriptionAdjustDialog({
                   {selectedSeasons.has(s.season_number) && isLongSeason(s) && (
                     <SeasonCapLine
                       season={s}
-                      cap={effectiveCap(s, capDraft)}
+                      win={effectiveWindow(s, capDraft, airingOf(s.season_number))}
+                      airing={airingOf(s.season_number)}
                       showName={false}
                       onChange={(next) => setCap(s.season_number, next)}
                       className="min-h-11 px-4 py-2.5"
@@ -375,7 +382,8 @@ export function SubscriptionAdjustDialog({
                       {selectedSeasons.has(s.season_number) && isLongSeason(s) && (
                         <SeasonCapLine
                           season={s}
-                          cap={effectiveCap(s, capDraft)}
+                          win={effectiveWindow(s, capDraft, airingOf(s.season_number))}
+                          airing={airingOf(s.season_number)}
                           showName={false}
                           onChange={(next) => setCap(s.season_number, next)}
                           className="px-4 pb-1 pt-2"

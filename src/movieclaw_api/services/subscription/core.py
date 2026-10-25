@@ -41,6 +41,8 @@ from movieclaw_api.services.subscription.cleanup import (
 )
 from movieclaw_api.services.subscription.episode_cap import (
     CAP_MAX,
+    EpisodeCap,
+    EpisodeWindow,
     caps_of,
     known_max_of,
     windows_of,
@@ -240,14 +242,16 @@ def expected_units(
     selected: list[int],
     follow_future: bool,
     floors: dict[int, int] | None = None,
-    caps: dict[int, int] | None = None,
+    caps: dict[int, EpisodeCap] | None = None,
 ) -> list[ExpectedUnit]:
     """按 E 的定义展开期望单元（订阅创建/修改与元数据刷新共用）。
 
     E = 勾选季的全部已知集 ∪（follow_future ? 评估时刻之后播出的集 : ∅）
         ∪ 集数下限超出 TMDB 的占位集（``floors``，issue #640）
-        再截去超过订阅上限的集（``caps``，docs/design/subscription-episode-cap.md）：
-        上限是硬边界，追新与占位集一并受限，清除上限才恢复
+        再截进订阅窗口（``caps``，docs/design/subscription-episode-cap.md）：
+        窗口外的集一律不在 E。``end=None`` 的窗口（在播季「从第 X 集起」）
+        没有上界，之后播出的集照常进来——追新与上限不再互斥；
+        ``end`` 设值的窗口超过它的集不在 E（含未来集），清除窗口才恢复
 
     集数据来自 ``media_episode`` 表（集数据唯一事实源，metadata.md 第 1 节）。
     追新的锚定取**评估时刻**而非订阅创建时刻：创建时二者等价；后来才打开
@@ -297,7 +301,9 @@ def expected_units(
         units = [
             unit
             for unit in units
-            if unit.season_number not in caps or unit.episode_number <= caps[unit.season_number]
+            if unit.season_number not in caps or caps[unit.season_number].covers(
+                unit.episode_number
+            )
         ]
     return units
 
@@ -349,6 +355,16 @@ def movie_schedule(release_date: date | None, status: str | None) -> tuple[datet
     return None, 0  # 明确未上映且未定档：等定档回填
 
 
+def _cap_text(w: EpisodeWindow) -> str:
+    """活动/创建消息里的一句窗口描述：完结季「前 N 集」，在播季「最新 N 集」。"""
+    if w.end is None:
+        return (
+            f"第 {w.season_number} 季先订阅最新 {w.total - w.start + 1} 集"
+            f"（从第 {w.start} 集起，新集播出后自动纳入）"
+        )
+    return f"第 {w.season_number} 季先订阅到第 {w.end} 集（本季共 {w.total} 集）"
+
+
 async def recompute_subscription_status(
     session: AsyncSession, subscription: Subscription, item: MediaItem
 ) -> None:
@@ -388,7 +404,7 @@ async def recompute_subscription_status(
         else {}
     )
     hinted = bool(subscription.episode_evidence) and bool(pending_hints(subscription, known_max))
-    # 订阅上限截断了本季（用户只订阅了前 N 集）：被截掉的集不是缺口，订阅也谈不上
+    # 订阅窗口截断了本季（用户只订阅了一段）：被截掉的集不是缺口，订阅也谈不上
     # 「收齐」——留在订阅中，等用户决定要不要继续（docs/design/subscription-episode-cap.md）
     truncated = bool(windows_of(subscription, known_max))
     new_status = (
@@ -412,7 +428,7 @@ async def recompute_subscription_status(
         message = "订阅已收齐：期望的内容都已安排完毕，且暂无会新增的内容"
         activity_type = ActivityType.COMPLETED
     elif truncated and not (has_open or growing or hinted):
-        message = "本季还有更多集，目前订阅到上限，可随时继续订阅"
+        message = "本季还有没订到的集，可随时继续订阅"
         activity_type = ActivityType.REOPENED
     else:
         message = "出现新的缺口，重新进入追踪"
@@ -471,13 +487,13 @@ class SubscriptionService:
         selection_mode: str = "rules",
         smart_profile_revision: int | None = None,
         episode_floors: dict[int, int] | None = None,
-        episode_caps: dict[int, int] | None = None,
+        episode_caps: dict[int, EpisodeCap] | None = None,
         smart_choice: SmartChoice | None = None,
     ) -> Subscription:
         """创建订阅并生成初始工单。同一条目已有订阅时幂等返回已有（不改参数）。
 
         ``episode_floors``：每季集数下限（订阅弹层里确认了"按豆瓣集数追"时带上）。
-        ``episode_caps``：每季订阅到第几集的上限（超长的一季只先订阅一部分）。
+        ``episode_caps``：每季的订阅窗口（完结季前 N 集 / 在播季最新 N 集起）。
 
         ``member_id``：发起成员（None=超管）。已有订阅时成员的"再订"转为
         **关注**（docs/design/member-management.md §3.5）——订阅出现在他的
@@ -626,8 +642,7 @@ class SubscriptionService:
         windows = windows_of(subscription, known_max_of(episodes))
         if windows:
             created_message += "；" + "、".join(
-                f"第 {w.season_number} 季先订阅到第 {w.cap} 集（本季共 {w.total} 集）"
-                for w in windows
+                _cap_text(w) for w in windows
             )
         if route_note:
             created_message += f"；{route_note}"
@@ -672,16 +687,16 @@ class SubscriptionService:
         rule_set_id: int | None = None,
         library_id: int | None | EllipsisType = ...,
         episode_floors: dict[int, int] | None = None,
-        episode_caps: dict[int, int] | None = None,
+        episode_caps: dict[int, EpisodeCap] | None = None,
     ) -> Subscription:
-        """修改 E 的定义（季选择/自动续订/规则组/入库目标库/集数下限/订阅上限），diff 重算工单。
+        """修改 E 的定义（季选择/自动续订/规则组/入库目标库/集数下限/订阅窗口），diff 重算工单。
 
         ``episode_floors``：整体替换每季集数下限，不传=不变；不超过 TMDB 已录
         集数的季视为清除（下限只补 TMDB 之外的集）。
 
-        ``episode_caps``：整体替换每季订阅上限，不传=不变，``{}`` 清除；不截断本季
-        （不低于总集数）的季视为清除。调大 = 新入域的集补工单，调小 = 超出的集
-        只切 ``in_scope``，已下载、已入库的内容一律保留。
+        ``episode_caps``：整体替换每季订阅窗口，不传=不变，``{}`` 清除；盖住整季
+        的窗口视为清除。窗口往宽调 = 新入域的集补工单（调大 end 或把 start 往前挪），
+        往窄调 = 超出的集只切 ``in_scope``，已下载、已入库的内容一律保留。
 
         ``library_id`` 用 ``...``（Ellipsis）作「未传=不变」的哨兵：显式传 None
         表示清除指定库、改回按默认库路由——旧订阅（library_id 为空）需要这条
@@ -772,8 +787,8 @@ class SubscriptionService:
 
         def _should_be_in_scope(w: WantedItem) -> bool:
             cap = caps.get(w.season_number)
-            if cap is not None and w.episode_number > cap:
-                # 超出订阅上限：与减季同款，只切 in_scope，已下载的内容保留
+            if cap is not None and not cap.covers(w.episode_number):
+                # 窗口外的集：与减季同款，只切 in_scope，已下载的内容保留
                 return False
             key = (w.season_number, w.episode_number)
             if key in expected_keys:
@@ -831,9 +846,10 @@ class SubscriptionService:
             else "改回以 TMDB 为准"
         )
         floor_note = f"，集数{floor_text}" if floors_after != floors_before else ""
+        window_list = windows_of(subscription, known_max_of(episodes))
         cap_text = (
-            "、".join(f"第 {s} 季订阅到第 {n} 集" for s, n in sorted(caps.items()))
-            if caps
+            "、".join(_cap_text(w) for w in window_list)
+            if window_list
             else "不再限制订阅的集数"
         )
         cap_note = f"，{cap_text}" if caps != caps_before else ""
@@ -1892,30 +1908,42 @@ class SubscriptionService:
     @staticmethod
     def _validate_caps(
         kind: MediaKind,
-        caps: dict[int, int] | None,
+        caps: dict[int, EpisodeCap] | None,
         seasons: list[MediaSeason],
         episodes: list[MediaEpisode],
         floors: dict[int, int],
     ) -> dict | None:
-        """校验订阅上限并归一成落库形态；不截断本季（不低于总集数）的季直接丢弃。
+        """校验订阅窗口并归一成落库形态；盖住整季的窗口直接丢弃。
 
-        总集数 = TMDB 已录的最大集号与集数下限中大的那个——与 ``windows_of`` 同口径，
-        存下来的上限都确实截断了本季。
+        窗口要么「从第 X 集起」（start>1，end 不设——在播季，新集照常进来），
+        要么「订阅到第 N 集」（start=1，end 设值——完结季），两头都收的混合窗口
+        不接受。总集数 = TMDB 已录的最大集号与集数下限中大的那个——与
+        ``windows_of`` 同口径，存下来的窗口都确实截断了本季。
         """
         if not caps:
             return None
         if kind is not MediaKind.TV:
-            raise BadRequestException("只有剧集订阅可以设置订阅的集数上限")
+            raise BadRequestException("只有剧集订阅可以设置订阅的集数窗口")
         valid = {row.season_number for row in seasons}
         known_max = known_max_of(episodes)
-        cleaned: dict[str, int] = {}
+        cleaned: dict[str, dict] = {}
         for season, cap in caps.items():
             if season not in valid:
                 raise BadRequestException(f"第 {season} 季不在这部剧的季列表里")
-            if not 1 <= cap <= CAP_MAX:
-                raise BadRequestException(f"订阅的集数上限需在 1～{CAP_MAX} 之间")
-            if cap < max(known_max.get(season, 0), floors.get(season, 0)):
-                cleaned[str(season)] = cap
+            if not 1 <= cap.start <= CAP_MAX or not (
+                cap.end is None or cap.start <= cap.end <= CAP_MAX
+            ):
+                raise BadRequestException(f"订阅的集数窗口需在 1～{CAP_MAX} 之间")
+            if cap.start > 1 and cap.end is not None:
+                raise BadRequestException(
+                    "订阅窗口只能是「从第 X 集起」或「订阅到第 N 集」其中一种"
+                )
+            total = max(known_max.get(season, 0), floors.get(season, 0))
+            if cap.start > total:
+                raise BadRequestException(f"第 {season} 季还没有第 {cap.start} 集")
+            if cap.start == 1 and (cap.end is None or cap.end >= total):
+                continue  # 盖住整季：等于不设，丢弃
+            cleaned[str(season)] = {"start": cap.start, "end": cap.end}
         return cleaned or None
 
     async def dismiss_episode_hint(self, subscription_id: int, season_number: int) -> Subscription:

@@ -1,9 +1,10 @@
-"""订阅上限浏览器验收专用后端：外部元数据隔离，业务服务保持真实。
+"""订阅窗口浏览器验收专用后端：外部元数据隔离，业务服务保持真实。
 
-两部剧：《长篇漫剧》TMDB 一季 120 集（全部已播、已完结）——超过「先订阅一部分」的
-集数阈值；《短篇剧》一季 12 集——远低于阈值，订阅弹层里不该多出任何选项。
-TMDB 换成本地假响应，走的仍是真实的订阅创建、E 展开与状态派生。
-``/__lab/import-all`` 只模拟一件外部事件：文件整理入库。
+三部剧：《长篇漫剧》TMDB 一季 120 集（全部已播、已完结）——完结超长季，
+「先订阅前 20 集」；《在播长篇剧》一季 120 集已播、剧还在播——在播超长季，
+默认「先订阅最新 20 集」且追新照常；《短篇剧》一季 12 集——远低于阈值，
+订阅弹层里不该多出任何选项。TMDB 换成本地假响应，走的仍是真实的订阅创建、
+E 展开与状态派生。``/__lab/import-all`` 只模拟一件外部事件：文件整理入库。
 """
 
 from datetime import date, timedelta
@@ -18,13 +19,13 @@ from movieclaw_media.service import MediaDiscoverService
 AIRED = (date.today() - timedelta(days=30)).isoformat()
 
 
-def _show(tmdb_id: int, name: str, original: str, episodes: int) -> dict:
+def _show(tmdb_id: int, name: str, original: str, episodes: int, status: str = "Ended") -> dict:
     return {
         "id": tmdb_id,
         "name": name,
         "original_name": original,
         "first_air_date": "2025-01-01",
-        "status": "Ended",
+        "status": status,
         "poster_path": "/lab.jpg",
         "external_ids": {},
         "alternative_titles": {"results": []},
@@ -35,6 +36,11 @@ def _show(tmdb_id: int, name: str, original: str, episodes: int) -> dict:
 
 LONG = _show(1043, "长篇漫剧", "Long Comic Drama", 120)
 SHORT = _show(1044, "短篇剧", "Short Drama", 12)
+AIRING = _show(1045, "在播长篇剧", "Airing Long Drama", 120, status="Returning Series")
+
+
+def _brief(show: dict) -> dict:
+    return {**show, "media_type": "tv"}
 
 
 def _season(episodes: int) -> dict:
@@ -53,8 +59,10 @@ routes = {
     "/3/tv/1043/season/1": _season(120),
     "/3/tv/1044": SHORT,
     "/3/tv/1044/season/1": _season(12),
-    "/3/search/tv": {"results": [{**LONG, "media_type": "tv"}, {**SHORT, "media_type": "tv"}]},
-    "/3/search/multi": {"results": [{**LONG, "media_type": "tv"}, {**SHORT, "media_type": "tv"}]},
+    "/3/tv/1045": AIRING,
+    "/3/tv/1045/season/1": _season(120),
+    "/3/search/tv": {"results": [_brief(LONG), _brief(SHORT), _brief(AIRING)]},
+    "/3/search/multi": {"results": [_brief(LONG), _brief(SHORT), _brief(AIRING)]},
     "/3/genre/tv/list": {"genres": []},
     "/3/genre/movie/list": {"genres": []},
 }

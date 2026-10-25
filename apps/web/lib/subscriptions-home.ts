@@ -840,11 +840,17 @@ export function missingAired(sub: Subscription): number {
     );
     scoped = latest ? [latest] : [];
   }
-  // 被订阅上限截断的季只算订阅范围内的集：后面的集用户还没订阅，不是缺集
-  const cap = new Map((sub.episode_windows ?? []).map((win) => [win.season_number, win.cap]));
+  // 被订阅窗口截断的季只算订阅范围内的集：窗口外的集用户还没订阅，不是缺集。
+  // 完结季是「前 N 集」（≤ end），在播季是「从第 start 集起」（≥ start）
+  const windows = new Map((sub.episode_windows ?? []).map((win) => [win.season_number, win]));
   return scoped.reduce((sum, season) => {
-    const aired = Math.min(season.aired_count, cap.get(season.season_number) ?? season.aired_count);
-    return sum + Math.max(0, aired - season.owned_count);
+    const win = windows.get(season.season_number);
+    const expected = win
+      ? win.end === null
+        ? Math.max(0, season.aired_count - win.start + 1)
+        : Math.min(season.aired_count, win.end)
+      : season.aired_count;
+    return sum + Math.max(0, expected - season.owned_count);
   }, 0);
 }
 

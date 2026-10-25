@@ -299,6 +299,19 @@ class DispatchPreviewView(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class EpisodeCapSpec(BaseModel):
+    """一季的订阅窗口：从第 ``start`` 集起（含），到第 ``end`` 集（含）。
+
+    ``end=None`` 不设上界（在播季「从第 X 集起」，之后播出的新集照常纳入）；
+    ``start=1`` 且 ``end`` 设值即「订阅到第 N 集」。两头都收的混合窗口不接受。
+    """
+
+    start: int = Field(default=1, ge=1, description="从第几集起（含）")
+    end: int | None = Field(
+        default=None, ge=1, description="订阅到第几集（含）；null=不设上界，新集照常纳入"
+    )
+
+
 class SubscriptionCreatePayload(BaseModel):
     """从 Discover 条目创建订阅的公开请求。
 
@@ -357,11 +370,13 @@ class SubscriptionCreatePayload(BaseModel):
             '（如 {"1": 27}）；不超过 TMDB 已录集数的季忽略'
         ),
     )
-    episode_caps: dict[int, int] | None = Field(
+    episode_caps: dict[int, EpisodeCapSpec] | None = Field(
         default=None,
         description=(
-            "每季订阅到第几集的上限 {季号: 集号}：一季上千集时先订阅前面一部分"
-            '（如 {"1": 20}），之后可随时调大；不低于本季总集数的季忽略'
+            "每季的订阅窗口 {季号: {start, end}}：一季上千集时先订阅一部分——"
+            '完结季从第 1 集订起（如 {"1": {"start": 1, "end": 20}}），在播季订'
+            '最新一批（如 {"1": {"start": 1081, "end": null}}，新集照常纳入）；'
+            "之后可随时调整；盖住整季的窗口忽略"
         ),
     )
 
@@ -407,11 +422,11 @@ class SubscriptionUpdatePayload(BaseModel):
             "改回以 TMDB 为准；不传=不变"
         ),
     )
-    episode_caps: dict[int, int] | None = Field(
+    episode_caps: dict[int, EpisodeCapSpec] | None = Field(
         default=None,
         description=(
-            '整体替换每季订阅到第几集的上限 {季号: 集号}，如 {"1": 40}；传 {} 清除、'
-            "改回订阅整季；不传=不变。调大会补上新增的集，调小只让超出的集退出追踪"
+            "整体替换每季订阅窗口 {季号: {start, end}}；传 {} 清除、改回订阅整季；"
+            "不传=不变。窗口往宽调补上新增的集，往窄调只让超出的集退出追踪"
         ),
     )
 
@@ -566,11 +581,12 @@ class SmartSubtitleView(BaseModel):
 
 
 class EpisodeWindowView(BaseModel):
-    """被订阅上限截断的一季：订阅到第 cap 集，本季共 total 集。"""
+    """被订阅窗口截断的一季：从第 start 集起到 end（None=含今后新集），本季已录 total 集。"""
 
     season_number: int
-    cap: int = Field(description="订阅到第几集（含）")
-    total: int = Field(description="本季总集数（TMDB 已录最大集号与集数下限取大）")
+    start: int = Field(description="从第几集起（含）")
+    end: int | None = Field(description="订阅到第几集（含）；null=不设上界，新集照常纳入")
+    total: int = Field(description="本季已录集数（TMDB 最大集号与集数下限取大）")
 
 
 class SubscriptionView(BaseModel):
@@ -610,12 +626,18 @@ class SubscriptionView(BaseModel):
         selected = {s for s in self.selected_seasons if s > 0}
         if not selected and seasons:
             selected = {max(s.season_number for s in seasons)}
-        # 被订阅上限截断的季只算订阅范围内的集：后面的集用户还没订阅，不是缺集
-        caps = {w.season_number: w.cap for w in self.episode_windows or []}
+        # 被订阅窗口截断的季只算订阅范围内的集：窗口外的集用户还没订阅，不是缺集
+        windows = {w.season_number: w for w in self.episode_windows or []}
+
+        def _expected(season: SeasonOverview) -> int:
+            win = windows.get(season.season_number)
+            if win is None:
+                return season.aired_count
+            end = season.aired_count if win.end is None else min(season.aired_count, win.end)
+            return max(0, end - win.start + 1)
+
         missing = any(
-            min(s.aired_count, caps.get(s.season_number, s.aired_count)) > s.owned_count
-            for s in seasons
-            if s.season_number in selected
+            _expected(s) > s.owned_count for s in seasons if s.season_number in selected
         )
         progress = self.progress
         if missing or progress.wanted + progress.grabbed + progress.downloaded > 0:
@@ -944,7 +966,9 @@ class EpisodeSeasonView(BaseModel):
     season_number: int
     tmdb_count: int = Field(description="TMDB 已录到的最大集号")
     floor: int | None = Field(default=None, description="已设的集数下限；null=以 TMDB 为准")
-    cap: int | None = Field(default=None, description="已设的订阅上限；null=订阅整季")
+    window: EpisodeCapSpec | None = Field(
+        default=None, description="已设的订阅窗口；null=订阅整季。旧服务端没有"
+    )
 
 
 class EpisodeHintView(BaseModel):
