@@ -180,7 +180,11 @@ def test_package_events_and_notifications_from_install_to_uninstall(data_dir) ->
         assert detail.status_code == 200, detail.text
         adds = {(a["kind"], a["title"], a["detail"]) for a in detail.json()["data"]["adds"]}
         assert ("event", "会发出「站点配额超限」", "别的插件、Webhook 能订") in adds
-        assert ("notification", "会发通知：站点配额超限", "发给事件里的那个成员；收不收在「账号 → 通知」里开") in adds
+        assert (
+            "notification",
+            "会发通知：站点配额超限",
+            "发给事件里的那个成员；收不收在「账号 → 通知」里开",
+        ) in adds
         # 每条事件 / 通知行都带自己的去处，前端逐行给「查看」（webhook 订它 / 通知设置收不收）
         assert [
             a["href"] for a in detail.json()["data"]["adds"] if a["kind"] == "notification"
