@@ -123,6 +123,14 @@ fun MainShell(args: LaunchArgs) {
     val pendingLink by graph.deepLinks.collectAsState()
     LaunchedEffect(pendingLink) {
         when (val link = pendingLink ?: return@LaunchedEffect) {
+            // 桌面壳的主页键（androidtv-home.md §7.1）：退出播放（走 closePlayer 的现有路径，进度照常上报）、
+            // 收起侧栏、清空二级页、回首页根部
+            is io.movieclaw.androidtv.system.DeepLink.Home -> {
+                if (router.player != null) router.closePlayer()
+                sidebarOpen = false
+                router.select(MainTab.Home)
+                router.stack.clear()
+            }
             is io.movieclaw.androidtv.system.DeepLink.Play -> router.play(PlayRequest(link.mediaItemId, link.season, link.episode))
             is io.movieclaw.androidtv.system.DeepLink.Item -> {
                 router.select(MainTab.Home)
