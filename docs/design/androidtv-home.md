@@ -482,3 +482,36 @@ plugins/tv-home/
 1. 服务器（插件进程）到电视的 5555 在常见 NAS 部署（桥接 / NAT / host）下是否都通。
 2. 国行 N1 能否装声明 HOME 的包、主页键是否被固定——决定接管模式要不要提前。
 3. 只提供配对式无线调试的机型（多为 Google TV）怎么配对：纯 Python 客户端不支持，要么插件带官方 adb，要么这类机型只走电脑备选。
+
+## 13. 深度融合：aerial 壳以「MovieClaw 桌面」呈现（2026-10-25 勘察与方案）
+
+目标（用户 2026-10-25 定）：接受 aerial-tv 当桌面，但 MC 必须表现得是它的「默认播放器」——桌面处处体现 MC。
+系统层没有「默认视频播放器」可设（Android 默认应用只有浏览器等少数类别），所以它是**事实三件套**：
+dock 第一格是 MC（点击走 §7.1 的 `movieclaw://home` 回首页根部）＋ 观影入口只有 MC ＋ 待机屏保是 MC 的内容。
+
+### 13.1 勘察结论（读 aerial-tv v1.48 源码：ConfigReceiver.kt、ARCHITECTURE.md）
+
+- **免 fork 就能配置**：`ConfigReceiver` 是 ADB 广播入口（`am broadcast -a app.orchard.tv.CONFIG`，manifest 要求发送方持
+  `WRITE_SECURE_SETTINGS`——adb shell 满足，插件的 adb 链正好能发）。可配：首页布局布尔（`large_clock` / `clock_right` /
+  `one_row_home` / `peek_next_row` / `home_plate` / `show_all_names`）、屏保模式（aerial / photos / clock / videos / system）、
+  `own_screensaver`、`keep_adb`、`check_update` 等。**插件装完壳可以顺手把布局和屏保配置好，用户不用进个性化页。**
+- **必须 fork 才能做的**：dock/网格磁贴的预置与排序（`LayoutStore` 是应用私有数据，外部注入不了）、品牌更名与图标、MC 磁贴特绘。
+- **fork 的挂点是现成的薄位**（ARCHITECTURE.md 证实）：`TileRecipes` 本来就按包名给 App 指定磁贴重绘方式（品牌色、白色 logo、
+  自绘图标）——给 `io.movieclaw.androidtv` 配一条即是 tvOS 质感的 MC 磁贴；`LayoutStore` 补一个「首启预置排序」；
+  `Wallpapers` 内置壁纸列表换 MC 品牌图；MC tile 的点击启动特判走 deep link（现在用 getLaunchIntent）。
+
+### 13.2 方案
+
+- **「MovieClaw 桌面（aerial 版）」fork**：源码放插件仓 `plugins/tv-home/aerial-fork/`，pin 上游 v1.48、定期评估合并；
+  补丁四处——品牌资源（名/图标/关于页，MIT 与出处写进关于页）、首启预置 MC 第一格、默认壁纸、MC tile 走 deep link。
+  产物 APK（约 2.9 MB）打进插件包（与 wheels 同思路，安装零联网）；`shell=aerial` 改装 fork。
+- **配置注入**：插件的 `install`（shell=aerial）装完经 adb broadcast 写入布局与屏保模式（13.1），作为 `say` 的附加动作。
+- **MC 海报屏保（DayDream）**：MC 侧独立工程，待机轮播媒体库海报/剧照/继续观看卡 + MC 角标（小设计见 [androidtv-mc-screensaver.md](androidtv-mc-screensaver.md)）；与 aerial 屏保互斥
+  （`screensaver_components` 单槽），agent 在 say 里问用户「待机看航拍还是你的海报墙」，装哪个设哪个；fork 版默认指向 MC 屏保。
+- 付给上游：MC 磁贴的 TileRecipes 条目、体验反馈，按上游惯例提 PR 回 aerial-tv（经用户同意）。
+
+### 13.3 排期
+
+1. 免 fork 部分先落地：插件注入布局与屏保模式（模拟器截图验收）。
+2. fork 薄补丁 + 上游 pin；CI 的 Android 构建接 fork 产物进插件包（与 P1 的壳构建同一批）。
+3. MC DayDream 另立小设计（数据源：媒体库海报 API；待机/充电触发；焦点无关）。
