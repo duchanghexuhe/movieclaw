@@ -20,6 +20,7 @@ from movieclaw_api import hooks
 from movieclaw_sdk.events import LIBRARY_INGEST_COMPLETED, PLUGIN_EVENTS, plugin_event
 from movieclaw_api.plugins.keys import PLUGIN_DATA, PLUGIN_ROUTES
 from movieclaw_kernel import DURABLE_EVENTS
+from movieclaw_scheduler import SCHEDULED_TASKS, TaskDefinition, TriggerType
 from movieclaw_sdk import plugin
 from movieclaw_sdk.callbacks import PLUGIN_CALLBACKS, CallbackResponse
 
@@ -44,9 +45,24 @@ async def apply(ctx) -> None:
     def pick(query):
         return None
 
+    async def patrol() -> None:
+        return None
+
     ctx.on(LIBRARY_INGEST_COMPLETED, on_imported, id="imported", durable=True)
     ctx.on(hooks.DOWNLOADER_SELECT, pick)
     await ctx.use(PLUGIN_EVENTS).register(ctx, GRAB_FAILED)
+    # 贡献 id 会带「插件id:」前缀，任务 key 不带——详情 href 必须用后者（回归见「定时任务」行）
+    ctx.contribute(
+        SCHEDULED_TASKS,
+        "acme_detail_patrol",
+        TaskDefinition(
+            key="acme_detail_patrol",
+            title="详情示例巡检",
+            handler=patrol,
+            default_trigger_type=TriggerType.INTERVAL,
+            default_interval_seconds=3600,
+        ),
+    )
     router = APIRouter()
 
     @router.get("/recent", operation_id="plugins.acme-detail.recent")
@@ -152,6 +168,8 @@ def test_row_links_land_on_the_row_itself(app_env) -> None:
         by_kind = {a["kind"]: a for a in data["adds"]}
         assert by_kind["notification"]["href"] == "/settings/notifications?event=acme-detail.grab.failed"
         assert by_kind["event"]["href"] == "/settings/webhook"
+        # 定位键是任务 key，不是带「插件id:」前缀的贡献 id
+        assert by_kind["task"]["href"] == "/settings/app?tab=tasks&task=acme_detail_patrol"
         # 闭环：href 里的键就是「账号 → 通知」那一行的 key（通知规则的 pref_key = 事件名）
         me = client.get("/api/v1/push/me").json()["data"]
         assert "acme-detail.grab.failed" in {e["key"] for e in me["events"]}

@@ -85,8 +85,9 @@ def _adds(
                     "kind": "task",
                     "title": f"定时任务「{getattr(c.item, 'title', c.id)}」",
                     "detail": "周期可在「定时任务」里调整",
-                    # 定位键 = 贡献 id = TaskDefinition.key，即「定时任务」页每行的 task.key
-                    "href": f"/settings/app?tab=tasks&task={c.id}",
+                    # 定位键 = TaskDefinition.key，即「定时任务」页每行的 task.key。
+                    # 不能用贡献 id：第三方插件的贡献 id 带「插件id:」前缀，与任务 key 不同
+                    "href": f"/settings/app?tab=tasks&task={c.item.key}",
                 }
             )
     for c in kernel.registry(INGEST_STEPS).contributions():
