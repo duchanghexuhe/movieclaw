@@ -245,10 +245,8 @@ export function PluginDetailView({ id }: { id: string }) {
           </p>
         ) : (
           <SettingsList>
-            {detail.adds.map((a, index) => {
+            {detail.adds.map((a) => {
               const Icon = ADD_ICON[a.kind] ?? GearIcon;
-              // 同一个去处（几个定时任务都去「定时任务」）只在第一条给链接
-              const href = detail.adds.findIndex((b) => b.href === a.href) === index ? a.href : null;
               return (
                 <SettingsRow
                   key={`${a.kind}:${a.title}`}
@@ -260,7 +258,7 @@ export function PluginDetailView({ id }: { id: string }) {
                   label={a.kind === "command" ? <code className="font-mono text-sub">{a.title}</code> : a.title}
                   description={a.detail || undefined}
                 >
-                  {href && <GoLink href={href} />}
+                  {a.href && <GoLink href={a.href} />}
                 </SettingsRow>
               );
             })}

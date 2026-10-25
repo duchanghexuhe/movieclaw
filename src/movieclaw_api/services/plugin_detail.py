@@ -222,11 +222,14 @@ def _adds(
         for spec in declared.notifications:
             who = audiences[spec.audience.partition(":")[0]]
             allowed = declared.members_allowed or not spec.reaches_members
+            note = "" if allowed else "（没有获得批准，不会发）"
             out.append(
                 {
                     "kind": "notification",
                     "title": f"会发通知：{declared.events.get(spec.event, spec.event)}",
-                    "detail": f"发给{who}" if allowed else f"发给{who}（没有获得批准，不会发）",
+                    # 「会发出」的查看去 Webhook（订它），这里的查看去通知设置（收不收），
+                    # 两个落点是刻意的，在行说明里点明
+                    "detail": f"发给{who}；收不收在「账号 → 通知」里开{note}",
                     "href": "/settings/notifications",
                 }
             )
