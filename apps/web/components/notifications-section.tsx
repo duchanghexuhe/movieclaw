@@ -42,6 +42,7 @@ import {
   testTargetHint,
   toggleLibrary,
 } from "@/lib/cloud-push-display";
+import { ROW_ANCHOR_CLASS, useRowAnchor } from "@/lib/row-anchor";
 
 /** 「媒体库有新片」的事件键：打开时在它下面选关心哪些库 */
 const LIBRARY_EVENT = "library.items.arrived";
@@ -54,6 +55,8 @@ export function NotificationsSection() {
   const [testing, setTesting] = useState(false);
   // 只采纳最后一次改开关的响应：连着拨两个开关时，先回来的那份不能把后一个拨回去
   const seqRef = useRef(0);
+  // 插件详情「会发通知」行的深链：?event=<事件名> 落到这条开关上（键就是事件名）
+  useRowAnchor("event", "data-event-key", view != null);
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -218,13 +221,15 @@ export function NotificationsSection() {
         <SettingsSection key={group.group} title={group.group}>
           <SettingsList>
             {group.items.map((event) => (
-              <SettingsRow key={event.key} label={event.title} description={event.description}>
-                <Toggle
-                  checked={event.enabled}
-                  label={`${event.title}通知`}
-                  onChange={(next) => toggle(event.key, next)}
-                />
-              </SettingsRow>
+              <div key={event.key} data-event-key={event.key} className={ROW_ANCHOR_CLASS}>
+                <SettingsRow label={event.title} description={event.description}>
+                  <Toggle
+                    checked={event.enabled}
+                    label={`${event.title}通知`}
+                    onChange={(next) => toggle(event.key, next)}
+                  />
+                </SettingsRow>
+              </div>
             ))}
             {/* 「媒体库有新片」打开、而且能看到不止一个库时，就地选关心哪些库 */}
             {group.items.some((e) => e.key === LIBRARY_EVENT && e.enabled) &&

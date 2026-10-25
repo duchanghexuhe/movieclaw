@@ -27,6 +27,7 @@ import {
   suggestReconcileInterval,
   toggleUpdate,
 } from "@/lib/scheduled-tasks";
+import { ROW_ANCHOR_CLASS, useRowAnchor } from "@/lib/row-anchor";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
 
 /**
@@ -43,6 +44,8 @@ export function ScheduledTasksSection() {
   const [anyNetwork, setAnyNetwork] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  // 插件详情「定时任务」行的深链：?task=<task.key> 落到这个任务的那一行
+  useRowAnchor("task", "data-task-key", tasks != null);
 
   const reload = useCallback(() => {
     Promise.all([listScheduledTasks(), listLibraries().catch(() => [])])
@@ -187,7 +190,7 @@ function TaskRow({
       : draft.cron_expr !== task.cron_expr);
 
   return (
-    <div>
+    <div data-task-key={task.key} className={ROW_ANCHOR_CLASS}>
       <SettingsRow
         label={
           <span className="flex flex-wrap items-baseline gap-x-2">
